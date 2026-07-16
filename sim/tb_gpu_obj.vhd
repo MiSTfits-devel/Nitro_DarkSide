@@ -110,6 +110,7 @@ begin
    (
       clk                  => clk,
       drawline             => drawline,
+      busy                 => open,
       ypos                 => ypos,
       ypos_mosaic          => ypos_mosaic,
       one_dim_mapping      => one_dim_mapping,
