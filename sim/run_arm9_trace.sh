@@ -9,6 +9,7 @@ cd "$(dirname "$0")/.."
 MAXINSTR="${MAXINSTR:-1000000}"
 HEXFILE="${HEXFILE:-sim/tests/arm9_island.hex}"
 TIMEOUT_MS="${TIMEOUT_MS:-100}"
+LOADADDR="${LOADADDR:-0}"
 WORK=sim/nvc_work
 mkdir -p "$WORK"
 
@@ -27,6 +28,7 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/proc_bus_gba.vhd \
    rtl/reg_savestates.vhd \
    rtl/nds_cpu9.vhd \
+   rtl/nds_cache9.vhd \
    rtl/reggba_timer.vhd \
    rtl/gba_timer_module.vhd \
    rtl/gba_timer.vhd \
@@ -37,5 +39,5 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    sim/tb_arm9_trace.vhd
 
 nvc -H 2g -L "$WORK" --work="$WORK/work" -e tb_arm9_trace \
-   -gMAXINSTR="$MAXINSTR" -gHEXFILE="$HEXFILE" -gTIMEOUT_MS="$TIMEOUT_MS"
+   -gMAXINSTR="$MAXINSTR" -gHEXFILE="$HEXFILE" -gTIMEOUT_MS="$TIMEOUT_MS" -gLOADADDR="$LOADADDR"
 nvc -H 2g -L "$WORK" --work="$WORK/work" -r tb_arm9_trace --ieee-warnings=off --exit-severity=failure

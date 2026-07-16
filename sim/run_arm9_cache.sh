@@ -1,7 +1,7 @@
 #!/bin/sh
-# ARM9 island (roadmap M3): nds_cpu9 (v5TE + CP15 + TCMs) + nds_membus9 +
-# memory fabric, running sim/tests/arm9_island.hex as the boot ROM at
-# 0xFFFF0000. TIMEOUT_MS env extends the watchdog.
+# ARM9 cache test (roadmap M3): the island harness booting arm9_cache.hex -
+# self-checking nds_cache9 exercise (write-back, clean/invalidate, I-cache
+# staleness). TIMEOUT_MS env extends the watchdog.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -34,5 +34,5 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_membus9.vhd \
    sim/tb_arm9_island.vhd
 
-nvc -H 1g -L "$WORK" --work="$WORK/work" -e tb_arm9_island -gTIMEOUT_MS="$TIMEOUT_MS"
+nvc -H 1g -L "$WORK" --work="$WORK/work" -e tb_arm9_island -gTIMEOUT_MS="$TIMEOUT_MS" -gHEXFILE=sim/tests/arm9_cache.hex
 nvc -H 1g -L "$WORK" --work="$WORK/work" -r tb_arm9_island --ieee-warnings=off --exit-severity=failure

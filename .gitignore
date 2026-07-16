@@ -9,3 +9,12 @@ c5_pin_model_dump.txt
 build_id.v
 *.qws
 .DS_Store
+
+# generated test workloads (deterministic from gen_arm9_torture.py)
+sim/tests/arm9_torture.s
+sim/tests/arm9_torture.bin
+sim/tests/arm9_torture.hex
+sim/tests/arm7_island.bin
+sim/tests/arm9_island.bin
+sim/melonds_tracer/build/
+arm9_trace.log

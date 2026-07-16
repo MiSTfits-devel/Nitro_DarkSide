@@ -19,12 +19,15 @@ Repo, docs, vendored primitives + ARM7TDMI, VRAM map decoder + passing unit test
 - Exit: hand-written ARM7 binary (NitroSDK toolchain or devkitARM) runs, exercises timers/
   IRQ/IPC-loopback, writes magic to shared RAM. Cycle counts sanity-checked.
 
-## M3 — ARM946E-S
+## M3 — ARM946E-S  ✅ (2026-07-16)
 - `nds_cpu9.vhd`: v5TE instruction set, CP15, TCMs, caches (write-back D-cache w/ correct
-  clean/invalidate ops), 2× pacing.
-- Exit: armwrestler-style NDS CPU test ROM passes in sim; differential instruction trace vs
-  melonDS over ≥10M instructions, zero divergence. (This is the 60-hour-sim milestone —
-  worth every hour.)
+  clean/invalidate ops — `nds_cache9.vhd`, self-checking exit test `run_arm9_cache.sh`),
+  2× pacing (CPU at full ce, peripherals at ce/2 with IO-pulse alignment in membus9).
+- Exit: armwrestler-style workload = `gen_arm9_torture.py` (seeded random v5TE chunks);
+  differential trace vs melonDS 0.9.5 (docs/TRACE_DIFF.md) over 10M instructions,
+  **zero divergence**, caches off and on. Took ~40 min on the cluster, not 60 hours.
+  Found 1 RTL bug (ROR-by-reg C flag) and 2 melonDS 0.9.5 bugs (EORS/LSR table typo,
+  ADC/SBC/RSC V-flag double-overflow) on the way.
 
 ## M4 — Dual-CPU + boot HLE
 - Both CPUs + IPC FIFO + EXMEMCNT + card-header HLE loader (images pre-staged in SDRAM).

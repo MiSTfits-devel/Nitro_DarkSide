@@ -37,6 +37,14 @@ entity nds_membus9 is
       dtcm_base      : in  std_logic_vector(31 downto 12);
       dtcm_size      : in  std_logic_vector(4 downto 0);
 
+      -- cache attributes of the current address + maintenance (from nds_cpu9)
+      bus_cacheable_i : in  std_logic;
+      bus_cacheable_d : in  std_logic;
+      cache_op_ena    : in  std_logic;
+      cache_op        : in  std_logic_vector(3 downto 0);
+      cache_op_addr   : in  std_logic_vector(31 downto 0);
+      cache_op_busy   : out std_logic;
+
       -- gba_cpu-style bus
       cpu_adr        : in  std_logic_vector(31 downto 0);
       cpu_rnw        : in  std_logic;
@@ -95,7 +103,12 @@ entity nds_membus9 is
       mr_done        : in  std_logic;
       mr_readdata    : in  std_logic_vector(31 downto 0);
 
-      -- IO register bus
+      -- IO register bus. The peripherals may live in a slower ce domain
+      -- (33 MHz vs the 66 MHz ARM9): io_ce_next is the value their ce will
+      -- have in the NEXT cycle - the 1-cycle io_bus.ena pulse is only issued
+      -- when it will land on an active peripheral cycle. Tie to '1' when the
+      -- peripherals run at full rate.
+      io_ce_next     : in  std_logic := '1';
       io_bus         : out proc_bus_gb_type := ((others => '0'), (others => '0'), '1', '0', "00", "0000", '0');
       io_wired_out   : in  std_logic_vector(31 downto 0);
       io_wired_done  : in  std_logic
@@ -105,7 +118,7 @@ end entity;
 architecture arch of nds_membus9 is
 
    type t_target is (T_ITCM, T_DTCM, T_BROM, T_MAIN, T_WRAMSH, T_IO, T_VRAM, T_OPEN);
-   type t_state  is (IDLE, FINISH, W_WRAMSH, W_VRAM, W_MAIN);
+   type t_state  is (IDLE, FINISH, W_WRAMSH, W_VRAM, W_MAIN, W_IO_ALIGN);
 
    signal state    : t_state  := IDLE;
    signal target   : t_target := T_OPEN;
@@ -120,7 +133,45 @@ architecture arch of nds_membus9 is
 
    signal din_unrot  : std_logic_vector(31 downto 0);
 
+   -- cache <-> CPU-request side (main RAM only; the cache owns the mr_* port)
+   signal creq_ena       : std_logic := '0';
+   signal creq_rnw       : std_logic := '1';
+   signal creq_code      : std_logic := '0';
+   signal creq_cacheable : std_logic := '0';
+   signal creq_addr      : std_logic_vector(31 downto 0) := (others => '0');
+   signal creq_be        : std_logic_vector(3 downto 0) := (others => '0');
+   signal creq_wdata     : std_logic_vector(31 downto 0) := (others => '0');
+   signal cresp_done     : std_logic;
+   signal cresp_rdata    : std_logic_vector(31 downto 0);
+
 begin
+
+   icache : entity work.nds_cache9
+   port map
+   (
+      clk           => clk,
+      reset         => reset,
+      req_ena       => creq_ena,
+      req_rnw       => creq_rnw,
+      req_code      => creq_code,
+      req_cacheable => creq_cacheable,
+      req_addr      => creq_addr,
+      req_be        => creq_be,
+      req_wdata     => creq_wdata,
+      resp_done     => cresp_done,
+      resp_rdata    => cresp_rdata,
+      mem_ena       => mr_ena,
+      mem_rnw       => mr_rnw,
+      mem_addr      => mr_addr,
+      mem_be        => mr_be,
+      mem_wdata     => mr_writedata,
+      mem_done      => mr_done,
+      mem_rdata     => mr_readdata,
+      op_ena        => cache_op_ena,
+      op            => cache_op,
+      op_addr       => cache_op_addr,
+      op_busy       => cache_op_busy
+   );
 
    -- ================= TCM decode =================
    process (all)
@@ -217,7 +268,7 @@ begin
 
          wsh_ena  <= '0';
          vram_ena <= '0';
-         mr_ena   <= '0';
+         creq_ena <= '0';
          itcm_we  <= '0';
          dtcm_we  <= '0';
          io_bus.ena <= '0';
@@ -227,14 +278,20 @@ begin
             state <= IDLE;
          else
             case state is
-               when IDLE     => can_accept := true;
-               when FINISH   => can_accept := true;
-               when W_WRAMSH => can_accept := (wsh_done  = '1');
-               when W_VRAM   => can_accept := (vram_done = '1');
-               when W_MAIN   => can_accept := (mr_done   = '1');
+               when IDLE       => can_accept := true;
+               when FINISH     => can_accept := true;
+               when W_WRAMSH   => can_accept := (wsh_done  = '1');
+               when W_VRAM     => can_accept := (vram_done = '1');
+               when W_MAIN     => can_accept := (cresp_done = '1');
+               when W_IO_ALIGN => can_accept := false;
             end case;
 
-            if can_accept then
+            if (state = W_IO_ALIGN) then
+               if (io_ce_next = '1') then
+                  io_bus.ena <= '1';
+                  state      <= FINISH;
+               end if;
+            elsif can_accept then
                state <= IDLE;
                if (cpu_ena = '1') then
                   target <= dec_target;
@@ -282,21 +339,31 @@ begin
                         state     <= W_VRAM;
 
                      when T_MAIN =>
-                        mr_ena       <= '1';
-                        mr_rnw       <= cpu_rnw;
-                        mr_addr      <= cpu_adr(21 downto 2);
-                        mr_be        <= be;
-                        mr_writedata <= wdata;
-                        state        <= W_MAIN;
+                        creq_ena   <= '1';
+                        creq_rnw   <= cpu_rnw;
+                        creq_code  <= cpu_code;
+                        creq_addr  <= cpu_adr;
+                        creq_be    <= be;
+                        creq_wdata <= wdata;
+                        if (cpu_code = '1') then
+                           creq_cacheable <= bus_cacheable_i;
+                        else
+                           creq_cacheable <= bus_cacheable_d;
+                        end if;
+                        state <= W_MAIN;
 
                      when T_IO =>
-                        io_bus.ena  <= '1';
                         io_bus.rnw  <= cpu_rnw;
                         io_bus.Adr  <= x"0" & cpu_adr(23 downto 2) & "00";
                         io_bus.acc  <= cpu_acc;
                         io_bus.Din  <= wdata;
                         io_bus.bEna <= be;
-                        state       <= FINISH;
+                        if (io_ce_next = '1') then
+                           io_bus.ena <= '1';
+                           state      <= FINISH;
+                        else
+                           state <= W_IO_ALIGN;
+                        end if;
 
                      when T_OPEN =>
                         state <= FINISH;
@@ -308,10 +375,10 @@ begin
       end if;
    end process;
 
-   cpu_done <= '1'       when state = FINISH   else
-               wsh_done  when state = W_WRAMSH else
-               vram_done when state = W_VRAM   else
-               mr_done   when state = W_MAIN   else '0';
+   cpu_done <= '1'        when state = FINISH   else
+               wsh_done   when state = W_WRAMSH else
+               vram_done  when state = W_VRAM   else
+               cresp_done when state = W_MAIN   else '0';
 
    -- ================= read data mux + rotation (gba_mem_readrotate) =================
    din_unrot <= itcm_readdata when target = T_ITCM   else
@@ -319,7 +386,7 @@ begin
                 brom_data     when target = T_BROM   else
                 wsh_dout      when target = T_WRAMSH else
                 vram_dout     when target = T_VRAM   else
-                mr_readdata   when target = T_MAIN   else
+                cresp_rdata   when target = T_MAIN   else
                 io_wired_out  when (target = T_IO and io_wired_done = '1') else
                 cpu_lastread;
 

@@ -53,6 +53,11 @@ architecture sim of tb_arm9_island is
    signal cp15_dtcm_base : std_logic_vector(31 downto 12);
    signal cp15_dtcm_size, cp15_itcm_size : std_logic_vector(4 downto 0);
 
+   signal bus_cacheable_i, bus_cacheable_d : std_logic;
+   signal cache_op_ena, cache_op_busy : std_logic;
+   signal cache_op      : std_logic_vector(3 downto 0);
+   signal cache_op_addr : std_logic_vector(31 downto 0);
+
    signal ss_bus : proc_bus_gb_type := ((others => '0'), (others => '0'), '1', '0', "00", "0000", '0');
 
    -- boot ROM (32 KB, linked at 0xFFFF0000)
@@ -131,6 +136,12 @@ architecture sim of tb_arm9_island is
 
    signal mailbox_bits : std_logic_vector(31 downto 0) := (others => '0');
    signal tests_done   : boolean := false;
+
+   -- ARM9 runs at 2x the system/bus clock: the CPU gets ce='1' every clk1x
+   -- cycle while the ARM7-domain peripherals (timers, IRQ fabric) tick on
+   -- ce_half - the pacing nds_top will use (66 MHz core / 33 MHz bus).
+   signal ce_half    : std_logic := '0';
+   signal io_ce_next : std_logic;
 
 begin
 
@@ -217,7 +228,13 @@ begin
       cp15_dtcm_load  => cp15_dtcm_load,
       cp15_dtcm_base  => cp15_dtcm_base,
       cp15_dtcm_size  => cp15_dtcm_size,
-      cp15_itcm_size  => cp15_itcm_size
+      cp15_itcm_size  => cp15_itcm_size,
+      bus_cacheable_i => bus_cacheable_i,
+      bus_cacheable_d => bus_cacheable_d,
+      cache_op_ena    => cache_op_ena,
+      cache_op        => cache_op,
+      cache_op_addr   => cache_op_addr,
+      cache_op_busy   => cache_op_busy
    );
 
    -- ================= bus decoder =================
@@ -225,6 +242,9 @@ begin
    port map
    (
       clk => clk1x, reset => reset,
+      bus_cacheable_i => bus_cacheable_i, bus_cacheable_d => bus_cacheable_d,
+      cache_op_ena => cache_op_ena, cache_op => cache_op,
+      cache_op_addr => cache_op_addr, cache_op_busy => cache_op_busy,
       itcm_ena => cp15_itcm_ena, itcm_load => cp15_itcm_load, itcm_size => cp15_itcm_size,
       dtcm_ena => cp15_dtcm_ena, dtcm_load => cp15_dtcm_load,
       dtcm_base => cp15_dtcm_base, dtcm_size => cp15_dtcm_size,
@@ -242,6 +262,7 @@ begin
       vram_din => vram_din, vram_dout => (others => '0'), vram_done => '0',
       mr_ena => mr9_ena, mr_rnw => mr9_rnw, mr_addr => mr9_addr, mr_be => mr9_be,
       mr_writedata => mr9_writedata, mr_done => mr9_done, mr_readdata => mr9_readdata,
+      io_ce_next => io_ce_next,
       io_bus => io_bus, io_wired_out => io_wired_out, io_wired_done => io_wired_done
    );
 
@@ -277,10 +298,19 @@ begin
    irq_in <= (3 => irp_timer(0), 4 => irp_timer(1), 5 => irp_timer(2), 6 => irp_timer(3),
               others => '0');
 
+   io_ce_next <= not ce_half;
+
+   p_cehalf : process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         ce_half <= not ce_half;
+      end if;
+   end process;
+
    iirq : entity work.nds_irq
    port map
    (
-      clk => clk1x, ce => '1', reset => reset,
+      clk => clk1x, ce => ce_half, reset => reset,
       gb_bus => io_bus, wired_out => irq_wired_out, wired_done => irq_wired_done,
       irq_in => irq_in, cpu_irq => cpu_irq, cpu_unhalt => cpu_unhalt
    );
@@ -289,7 +319,7 @@ begin
    generic map ( is_simu => '0' )
    port map
    (
-      clk => clk1x, ce => '1', reset => reset,
+      clk => clk1x, ce => ce_half, reset => reset,
       savestate_bus => ss_bus, ss_wired_out => open, ss_wired_done => open,
       loading_savestate => '0',
       gb_bus => io_bus, wired_out => timer_wired_out, wired_done => timer_wired_done,
