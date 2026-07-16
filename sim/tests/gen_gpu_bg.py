@@ -100,6 +100,47 @@ def render_text(cfg):
         last = col
     return out
 
+def render_extended(cfg):
+    out = [0x8000] * 256
+    size = cfg["screensize"]
+    var = cfg["variant"]
+    if var == 0:
+        w, h = 128 << size, 128 << size
+    else:
+        w, h = [(128, 128), (256, 256), (512, 256), (512, 512)][size]
+    rx, ry = s28(cfg["refX"]), s28(cfg["refY"])
+    dx, dy = s16(cfg["dx"]), s16(cfg["dy"])
+    for x in range(256):
+        xxx = rx >> 8
+        yyy = ry >> 8
+        rx = s28(rx + dx)
+        ry = s28(ry + dy)
+        if cfg["wrapping"]:
+            xxx %= w
+            yyy %= h
+        elif xxx < 0 or yyy < 0 or xxx >= w or yyy >= h:
+            continue
+        if var == 0:
+            ea = (cfg["mapbase"] + ((xxx >> 3) + (yyy >> 3) * (w >> 3)) * 2) & 0x7FFFF
+            tile = rd16(VRAM, ea)
+            tno   = tile & 0x3FF
+            palno = (tile >> 12) & 0xF
+            px = (7 - (xxx & 7)) if (tile >> 10) & 1 else (xxx & 7)
+            py = (7 - (yyy & 7)) if (tile >> 11) & 1 else (yyy & 7)
+            c = VRAM[(cfg["tilebase"] + tno * 64 + py * 8 + px) & 0x7FFFF]
+            if c == 0:
+                continue
+            out[x] = extpal16(cfg["extpal_slot"], palno, c) if cfg["extpal"] else pal16(c)
+        elif var == 1:
+            c = VRAM[(cfg["mapbase"] + yyy * w + xxx) & 0x7FFFF]
+            if c != 0:
+                out[x] = pal16(c)
+        else:
+            v = rd16(VRAM, (cfg["mapbase"] + (yyy * w + xxx) * 2) & 0x7FFFF)
+            if v & 0x8000:
+                out[x] = v & 0x7FFF
+    return out
+
 def render_affine(cfg):
     out = [0x8000] * 256
     size = cfg["screensize"]
@@ -130,14 +171,22 @@ def text(ypos, mapbase, tilebase, hicolor=0, extpal=0, slot=0, mosaic=0,
                 tilebase=tilebase, hicolor=hicolor, extpal=extpal,
                 extpal_slot=slot, mosaic=mosaic, mosaic_h=mosaic_h,
                 wrapping=0, screensize=size, scrollX=sx, scrollY=sy,
-                refX=0, refY=0, dx=0, dy=0)
+                refX=0, refY=0, dx=0, dy=0, variant=0)
 
 def affine(mapbase, tilebase, size, wrap, refX, refY, dx, dy):
     return dict(kind=1, ypos=0, ypos_mosaic=0, mapbase=mapbase,
                 tilebase=tilebase, hicolor=0, extpal=0, extpal_slot=0,
                 mosaic=0, mosaic_h=0, wrapping=wrap, screensize=size,
                 scrollX=0, scrollY=0, refX=refX & 0xFFFFFFF,
-                refY=refY & 0xFFFFFFF, dx=dx & 0xFFFF, dy=dy & 0xFFFF)
+                refY=refY & 0xFFFFFFF, dx=dx & 0xFFFF, dy=dy & 0xFFFF, variant=0)
+
+def ext(variant, mapbase, tilebase, size, wrap, refX, refY, dx, dy, extpal=0, slot=0):
+    return dict(kind=2, ypos=0, ypos_mosaic=0, mapbase=mapbase,
+                tilebase=tilebase, hicolor=0, extpal=extpal, extpal_slot=slot,
+                mosaic=0, mosaic_h=0, wrapping=wrap, screensize=size,
+                scrollX=0, scrollY=0, refX=refX & 0xFFFFFFF,
+                refY=refY & 0xFFFFFFF, dx=dx & 0xFFFF, dy=dy & 0xFFFF,
+                variant=variant)
 
 cases = []
 # text: 4bpp basics, all screen sizes, boundary-crossing scrolls
@@ -165,6 +214,17 @@ cases.append(affine(0x7F800, 0x20000, size=2, wrap=1, refX=(-40) << 8, refY=300 
 cases.append(affine(0x08800, 0x40000, size=1, wrap=0, refX=(-10) << 8, refY=5 << 8, dx=0x100, dy=0x40))
 cases.append(affine(0x30000, 0x60000, size=3, wrap=1, refX=0x123456, refY=(-0x23456), dx=-0x200, dy=0x100))
 cases.append(affine(0x00000, 0x10000, size=0, wrap=0, refX=(-300) << 8, refY=0, dx=-0x100, dy=0))  # fully off-map
+# extended: 8bpp tiles w/ 16-bit map entries (flips + ext palettes)
+cases.append(ext(0, 0x00000, 0x10000, size=0, wrap=0, refX=0, refY=40 << 8, dx=0x100, dy=0))
+cases.append(ext(0, 0x08800, 0x40000, size=1, wrap=1, refX=(-77) << 8, refY=1000 << 8, dx=0x152, dy=0x9D, extpal=1, slot=2))
+cases.append(ext(0, 0x30000, 0x60000, size=3, wrap=1, refX=0x654321, refY=(-0x1234) << 4, dx=-0x1D3, dy=0xE7, extpal=1, slot=3))
+cases.append(ext(0, 0x7E000, 0x04000, size=2, wrap=0, refX=(-20) << 8, refY=100 << 8, dx=0x0C0, dy=0x20))
+# extended: 256-color bitmap (std palette)
+cases.append(ext(1, 0x20000, 0, size=0, wrap=0, refX=5 << 8, refY=10 << 8, dx=0x100, dy=0))
+cases.append(ext(1, 0x48000, 0, size=2, wrap=1, refX=(-300) << 8, refY=777 << 8, dx=0x1C5, dy=-0x8B))
+# extended: direct-color bitmap (bit15 = alpha)
+cases.append(ext(2, 0x00000, 0, size=1, wrap=0, refX=30 << 8, refY=200 << 8, dx=0xB3, dy=0x41))
+cases.append(ext(2, 0x40000, 0, size=3, wrap=1, refX=0x1000000, refY=(-0x8000), dx=-0x155, dy=0x99))
 
 def whex(f, v):
     f.write(f"{v & 0xFFFFFFFF:08x}\n")
@@ -185,10 +245,11 @@ with open("gpu_bg_vectors.hex", "w") as f:
         hdr = [cfg["kind"], cfg["ypos"], cfg["ypos_mosaic"], cfg["mapbase"],
                cfg["tilebase"], flags, cfg["extpal_slot"], cfg["mosaic_h"],
                cfg["screensize"], cfg["scrollX"], cfg["scrollY"],
-               cfg["refX"], cfg["refY"], cfg["dx"], cfg["dy"], 0]
+               cfg["refX"], cfg["refY"], cfg["dx"], cfg["dy"], cfg["variant"]]
         for w in hdr:
             whex(f, w)
-        line = render_text(cfg) if cfg["kind"] == 0 else render_affine(cfg)
+        line = (render_text(cfg) if cfg["kind"] == 0 else
+                render_affine(cfg) if cfg["kind"] == 1 else render_extended(cfg))
         for p in line:
             whex(f, p)
 

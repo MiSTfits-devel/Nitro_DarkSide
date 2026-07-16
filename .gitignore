@@ -18,3 +18,7 @@ sim/tests/arm7_island.bin
 sim/tests/arm9_island.bin
 sim/melonds_tracer/build/
 arm9_trace.log
+
+# generated GPU golden vectors (deterministic from gen_gpu_bg.py / gen_gpu_obj.py)
+sim/tests/gpu_bg_*.hex
+sim/tests/gpu_obj_*.hex

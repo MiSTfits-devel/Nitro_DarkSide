@@ -41,13 +41,21 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_cpu9.vhd \
    rtl/nds_cache9.vhd \
    rtl/nds_membus9.vhd \
+   rtl/nds_drawer_text.vhd \
+   rtl/nds_drawer_affine.vhd \
+   rtl/nds_drawer_extended.vhd \
+   rtl/nds_drawer_obj.vhd \
    rtl/nds_top.vhd \
    sim/tb_vram_map.vhd \
    sim/tb_vram_torture.vhd \
    sim/tb_mainram.vhd \
    sim/tb_arm7_island.vhd \
    sim/tb_arm9_island.vhd \
-   sim/tb_arm9_trace.vhd
+   sim/tb_arm9_trace.vhd \
+   sim/tb_gpu_bg.vhd \
+   sim/tb_gpu_obj.vhd
+# (tb_gpu_* are analyze-only: their hex-file constants load at elaboration
+#  and the vectors are generated, not checked in)
 
 # 4) elaborate the standalone entities as a sanity gate
 nvc -L "$WORK" --work="$WORK/work" -e nds_top
