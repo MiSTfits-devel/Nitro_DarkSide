@@ -14,9 +14,11 @@
 --    vblank shadow tracks hardware behavior for well-behaved games
 --    (mid-frame ext-pal remaps are not modeled yet)
 --
--- Line pacing is functional, not cycle-accurate: drawline starts the BG
--- drawers and a line-buffer clear, the merge streams once every active
--- drawer finished. Real dot timing arrives with nds_gpu_timing (M5 part 6).
+-- Line pacing comes from nds_gpu_timing (drawline at the real dot
+-- cadence); within a line the render is functional: drawline starts the
+-- BG drawers and a line-buffer clear, the merge streams once every
+-- active drawer finished. A drawline landing while the previous line is
+-- still busy is dropped (tb_gpu2d_timed counts those as budget overruns).
 -- OBJ renders one line ahead into the parity buffer (drawObj +
 -- linecounter_obj), donor style. 3D-as-BG0 renders transparent (stub).
 -- Affine refs reload on vblank_trigger and on CPU writes, and step by

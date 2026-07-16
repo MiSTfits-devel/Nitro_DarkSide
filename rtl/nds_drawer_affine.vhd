@@ -104,6 +104,18 @@ architecture arch of nds_drawer_affine is
    signal palette_newPixel     : std_logic := '0';
    signal palette_x_cnt        : integer range 0 to 255;
 
+   -- last-word caches on the map and char fetch streams: neighboring
+   -- pixels usually sample the same 32-bit word (a map word covers 4
+   -- tiles = 32 screen pixels, a char word 4 texels), so most of the two
+   -- per-pixel round-trips through the line server collapse to hits.
+   -- Invalidated at drawline (per line - VRAM writes land between lines).
+   signal cache_map_addr       : unsigned(18 downto 2) := (others => '0');
+   signal cache_map_data       : std_logic_vector(31 downto 0) := (others => '0');
+   signal cache_map_valid      : std_logic := '0';
+   signal cache_chr_addr       : unsigned(18 downto 2) := (others => '0');
+   signal cache_chr_data       : std_logic_vector(31 downto 0) := (others => '0');
+   signal cache_chr_valid      : std_logic := '0';
+
    signal mosaik_cnt           : integer range 0 to 15 := 0;
 
 begin
@@ -171,7 +183,9 @@ begin
                      when 3 => scroll_mod <= 1024;
                      when others => null;
                   end case;
-                  x_cnt     <= 0;
+                  x_cnt           <= 0;
+                  cache_map_valid <= '0';
+                  cache_chr_valid <= '0';
                elsif (palettefetch = IDLE and palette_newPixel = '0') then
                   busy         <= '0';   -- the last pixel may still be in the palette pipe
                end if;
@@ -186,6 +200,15 @@ begin
                   else
                      vramfetch <= IDLE;
                   end if;
+               elsif (cache_map_valid = '1' and cache_map_addr = VRAM_byteaddr(18 downto 2)) then
+                  case (to_integer(VRAM_byteaddr(1 downto 0))) is
+                     when 0 => tileinfo <= cache_map_data( 7 downto  0);
+                     when 1 => tileinfo <= cache_map_data(15 downto  8);
+                     when 2 => tileinfo <= cache_map_data(23 downto 16);
+                     when 3 => tileinfo <= cache_map_data(31 downto 24);
+                     when others => null;
+                  end case;
+                  vramfetch <= EVALTILE;
                else
                   VRAM_byteaddr_low <= VRAM_byteaddr(1 downto 0);
                   VRAM_addr_r       <= VRAM_byteaddr(18 downto 2);
@@ -202,21 +225,38 @@ begin
                      when 3 => tileinfo <= VRAM_Drawer_data(31 downto 24);
                      when others => null;
                   end case;
+                  cache_map_addr  <= VRAM_addr_r;
+                  cache_map_data  <= VRAM_Drawer_data;
+                  cache_map_valid <= '1';
                   vramfetch  <= EVALTILE;
                end if;
 
             when EVALTILE =>
-               VRAM_byteaddr_low <= VRAM_byteaddr(1 downto 0);
-               VRAM_addr_r       <= VRAM_byteaddr(18 downto 2);
-               VRAM_Drawer_req   <= '1';
-               vramfetch         <= WAITREAD_COLOR;
+               if (cache_chr_valid = '1' and cache_chr_addr = VRAM_byteaddr(18 downto 2)) then
+                  case (to_integer(VRAM_byteaddr(1 downto 0))) is
+                     when 0 => colordata_r <= cache_chr_data( 7 downto  0);
+                     when 1 => colordata_r <= cache_chr_data(15 downto  8);
+                     when 2 => colordata_r <= cache_chr_data(23 downto 16);
+                     when 3 => colordata_r <= cache_chr_data(31 downto 24);
+                     when others => null;
+                  end case;
+                  vramfetch <= HANDOFF;
+               else
+                  VRAM_byteaddr_low <= VRAM_byteaddr(1 downto 0);
+                  VRAM_addr_r       <= VRAM_byteaddr(18 downto 2);
+                  VRAM_Drawer_req   <= '1';
+                  vramfetch         <= WAITREAD_COLOR;
+               end if;
 
             -- capture the color byte on the done cycle, then hold the pixel
             -- until the palette FSM is free (the donor advanced immediately
             -- and relied on the GBA 4-phase service cadence)
             when WAITREAD_COLOR =>
                if (VRAM_Drawer_done = '1') then
-                  colordata_r <= colordata;
+                  colordata_r     <= colordata;
+                  cache_chr_addr  <= VRAM_addr_r;
+                  cache_chr_data  <= VRAM_Drawer_data;
+                  cache_chr_valid <= '1';
                   vramfetch   <= HANDOFF;
                end if;
 

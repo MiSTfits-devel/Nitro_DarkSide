@@ -129,6 +129,19 @@ architecture arch of nds_drawer_extended is
    signal map_entryaddr        : integer;
    signal pixeladdr            : integer;
 
+   -- last-word caches on the map and pixel fetch streams: a map word
+   -- covers 2 tiles = 16 screen pixels, a char/bitmap word 4 (8bpp) or 2
+   -- (16bpp) pixels, so most per-pixel round-trips through the line
+   -- server collapse to hits. Invalidated at drawline (per line - VRAM
+   -- writes land between lines).
+   signal cache_map_addr       : unsigned(18 downto 2) := (others => '0');
+   signal cache_map_data       : std_logic_vector(31 downto 0) := (others => '0');
+   signal cache_map_valid      : std_logic := '0';
+   signal cache_pix_addr       : unsigned(18 downto 2) := (others => '0');
+   signal cache_pix_data       : std_logic_vector(31 downto 0) := (others => '0');
+   signal cache_pix_valid      : std_logic := '0';
+   signal cache_pix_color16    : std_logic_vector(15 downto 0);
+
 begin
 
    -- request address is registered when req issues - VRAM_byteaddr is a
@@ -167,6 +180,17 @@ begin
          when (vramfetch = CALCADDR and variant = "00") else
       to_unsigned(pixeladdr mod 524288, VRAM_byteaddr'length);
 
+   -- colordata16 extraction from the cached pixel word (hit path: the
+   -- live VRAM_byteaddr low bits select the lane, same shape as the
+   -- data-valid-cycle extraction below)
+   cache_pix_color16 <=
+      x"00" & cache_pix_data( 7 downto  0) when (variant /= "10" and VRAM_byteaddr(1 downto 0) = "00") else
+      x"00" & cache_pix_data(15 downto  8) when (variant /= "10" and VRAM_byteaddr(1 downto 0) = "01") else
+      x"00" & cache_pix_data(23 downto 16) when (variant /= "10" and VRAM_byteaddr(1 downto 0) = "10") else
+      x"00" & cache_pix_data(31 downto 24) when (variant /= "10") else
+      cache_pix_data(15 downto  0)         when (VRAM_byteaddr(1) = '0') else
+      cache_pix_data(31 downto 16);
+
    -- vramfetch
    process (clk)
    begin
@@ -202,7 +226,9 @@ begin
                         when others => xlim <= 512; ylim <= 512;
                      end case;
                   end if;
-                  x_cnt     <= 0;
+                  x_cnt           <= 0;
+                  cache_map_valid <= '0';
+                  cache_pix_valid <= '0';
                elsif (palettefetch = IDLE and palette_newPixel = '0') then
                   busy         <= '0';
                end if;
@@ -217,6 +243,17 @@ begin
                   else
                      vramfetch <= IDLE;
                   end if;
+               elsif (variant = "00" and cache_map_valid = '1' and cache_map_addr = VRAM_byteaddr(18 downto 2)) then
+                  if (VRAM_byteaddr(1) = '0') then
+                     tileentry <= cache_map_data(15 downto  0);
+                  else
+                     tileentry <= cache_map_data(31 downto 16);
+                  end if;
+                  vramfetch <= EVALTILE;
+               elsif (variant /= "00" and cache_pix_valid = '1' and cache_pix_addr = VRAM_byteaddr(18 downto 2)) then
+                  colordata_r <= cache_pix_color16;
+                  palno_r     <= palno;
+                  vramfetch   <= HANDOFF;
                else
                   VRAM_byteaddr_low <= VRAM_byteaddr(1 downto 0);
                   VRAM_addr_r       <= VRAM_byteaddr(18 downto 2);
@@ -234,6 +271,9 @@ begin
                      when 0 | 1  => tileentry <= VRAM_Drawer_data(15 downto  0);
                      when others => tileentry <= VRAM_Drawer_data(31 downto 16);
                   end case;
+                  cache_map_addr  <= VRAM_addr_r;
+                  cache_map_data  <= VRAM_Drawer_data;
+                  cache_map_valid <= '1';
                   vramfetch  <= EVALTILE;
                end if;
 
@@ -241,15 +281,24 @@ begin
                -- tile pixel address is combinational from tileentry, which
                -- WAITREAD_TILE just loaded
                palno <= tileentry(15 downto 12);
-               VRAM_byteaddr_low <= VRAM_byteaddr(1 downto 0);
-               VRAM_addr_r       <= VRAM_byteaddr(18 downto 2);
-               VRAM_Drawer_req   <= '1';
-               vramfetch <= WAITREAD_COLOR;
+               if (cache_pix_valid = '1' and cache_pix_addr = VRAM_byteaddr(18 downto 2)) then
+                  colordata_r <= cache_pix_color16;
+                  palno_r     <= tileentry(15 downto 12);
+                  vramfetch   <= HANDOFF;
+               else
+                  VRAM_byteaddr_low <= VRAM_byteaddr(1 downto 0);
+                  VRAM_addr_r       <= VRAM_byteaddr(18 downto 2);
+                  VRAM_Drawer_req   <= '1';
+                  vramfetch <= WAITREAD_COLOR;
+               end if;
 
             when WAITREAD_COLOR =>
                if (VRAM_Drawer_done = '1') then
-                  colordata_r <= colordata16;
-                  palno_r     <= palno;
+                  colordata_r     <= colordata16;
+                  palno_r         <= palno;
+                  cache_pix_addr  <= VRAM_addr_r;
+                  cache_pix_data  <= VRAM_Drawer_data;
+                  cache_pix_valid <= '1';
                   vramfetch   <= HANDOFF;
                end if;
 

@@ -39,6 +39,21 @@ package pReg_nds_display is
    constant DISPCNT_BG_ExtPal            : regmap_type := (16#000#,  30,     30,        1,        0,   readwrite);
    constant DISPCNT_OBJ_ExtPal           : regmap_type := (16#000#,  31,     31,        1,        0,   readwrite);
 
+   -- DISPSTAT (0x004) / VCOUNT (0x006) — owned by nds_gpu_timing, one
+   -- register set per CPU (ARM9 and ARM7 each have their own DISPSTAT and
+   -- can each write VCOUNT; the flags/VCOUNT values are shared). The
+   -- V-count match value is 9 bits: bits 15:8 are the low byte, bit 7 the
+   -- MSB (GBATEK: LYC 0..262). Bit 6 is unused, reads 0.
+   constant DISPSTAT_V_Blank_flag        : regmap_type := (16#004#,   0,      0,        1,        0,   readonly);  -- set lines 192..261 (not 262)
+   constant DISPSTAT_H_Blank_flag        : regmap_type := (16#004#,   1,      1,        1,        0,   readonly);  -- set from dot 256+48lead each line
+   constant DISPSTAT_V_Counter_flag      : regmap_type := (16#004#,   2,      2,        1,        0,   readonly);
+   constant DISPSTAT_V_Blank_IRQ_Enable  : regmap_type := (16#004#,   3,      3,        1,        0,   readwrite);
+   constant DISPSTAT_H_Blank_IRQ_Enable  : regmap_type := (16#004#,   4,      4,        1,        0,   readwrite);
+   constant DISPSTAT_V_Counter_IRQ_Enable: regmap_type := (16#004#,   5,      5,        1,        0,   readwrite);
+   constant DISPSTAT_V_Count_Setting_MSB : regmap_type := (16#004#,   7,      7,        1,        0,   readwrite); -- bit 8 of the 9-bit match
+   constant DISPSTAT_V_Count_Setting     : regmap_type := (16#004#,  15,      8,        1,        0,   readwrite); -- bits 7:0 of the match
+   constant VCOUNT                       : regmap_type := (16#004#,  31,     16,        1,        0,   readwrite); -- reads 9-bit line; writes land at next scanline
+
    -- BGxCNT
    constant BG0CNT_Priority              : regmap_type := (16#008#,   1,      0,        1,        0,   readwrite);
    constant BG0CNT_Char_Base             : regmap_type := (16#008#,   5,      2,        1,        0,   readwrite); -- 16 KB units
