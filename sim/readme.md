@@ -24,6 +24,11 @@ eyeball-checked.
   differential (docs/TRACE_DIFF.md); `LOADADDR=33554432` boots a main-RAM
   workload instead of the boot ROM. The melonDS side lives in
   `sim/melonds_tracer/`.
+- `run_gpu_bg.sh` — M5 BG drawer line tests (text/affine/extended + ext
+  palettes) vs the `gen_gpu_bg.py` golden model. Regenerate the hex inputs
+  with `python3 sim/tests/gen_gpu_bg.py` (from `sim/tests/`) first.
+- `run_gpu_obj.sh` — M5 OBJ drawer line tests (tile/bitmap/affine sprites,
+  ext palettes, priority merge) vs `gen_gpu_obj.py`; same regenerate flow.
 
 ## Adding a bench
 

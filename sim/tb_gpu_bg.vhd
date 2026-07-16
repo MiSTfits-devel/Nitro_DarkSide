@@ -65,8 +65,9 @@ architecture sim of tb_gpu_bg is
    signal refX, refY  : signed(27 downto 0) := (others => '0');
    signal dx, dy      : signed(15 downto 0) := (others => '0');
 
-   signal drawline_t, drawline_a, line_trigger : std_logic := '0';
-   signal busy_t, busy_a : std_logic;
+   signal drawline_t, drawline_a, drawline_e, line_trigger : std_logic := '0';
+   signal busy_t, busy_a, busy_e : std_logic;
+   signal variant : unsigned(1 downto 0) := "00";
 
    -- text drawer memory ports
    signal t_pal_addr    : integer range 0 to 127;
@@ -79,12 +80,18 @@ architecture sim of tb_gpu_bg is
    signal a_vram_addr   : integer range 0 to 131071;
    signal a_pal_data, a_vram_data : std_logic_vector(31 downto 0);
 
+   -- extended drawer memory ports
+   signal e_pal_addr    : integer range 0 to 127;
+   signal e_extpal_addr : integer range 0 to 8191;
+   signal e_vram_addr   : integer range 0 to 131071;
+   signal e_pal_data, e_extpal_data, e_vram_data : std_logic_vector(31 downto 0);
+
    signal mem_valid : std_logic := '0';
 
    -- pixel outputs
-   signal pixel_we_t, pixel_we_a : std_logic;
-   signal pixeldata_t, pixeldata_a : std_logic_vector(15 downto 0);
-   signal pixel_x_t, pixel_x_a : integer range 0 to 255;
+   signal pixel_we_t, pixel_we_a, pixel_we_e : std_logic;
+   signal pixeldata_t, pixeldata_a, pixeldata_e : std_logic_vector(15 downto 0);
+   signal pixel_x_t, pixel_x_a, pixel_x_e : integer range 0 to 255;
 
    type t_line is array (0 to 255) of std_logic_vector(15 downto 0);
    signal linebuf : t_line := (others => (others => '0'));
@@ -158,6 +165,42 @@ begin
       VRAM_Drawer_valid    => mem_valid
    );
 
+   idrawer_ext : entity work.nds_drawer_extended
+   port map
+   (
+      clk                  => clk,
+      line_trigger         => line_trigger,
+      drawline             => drawline_e,
+      busy                 => busy_e,
+      variant              => variant,
+      mapbase              => mapbase,
+      tilebase             => tilebase,
+      extpalette           => extpalette,
+      extpal_slot          => extpal_slot,
+      screensize           => screensize,
+      wrapping             => wrapping,
+      mosaic               => mosaic,
+      Mosaic_H_Size        => mosaic_h,
+      refX                 => refX,
+      refY                 => refY,
+      refX_mosaic          => refX,
+      refY_mosaic          => refY,
+      dx                   => dx,
+      dy                   => dy,
+      pixel_we             => pixel_we_e,
+      pixeldata            => pixeldata_e,
+      pixel_x              => pixel_x_e,
+      PALETTE_Drawer_addr  => e_pal_addr,
+      PALETTE_Drawer_data  => e_pal_data,
+      PALETTE_Drawer_valid => mem_valid,
+      EXTPAL_Drawer_addr   => e_extpal_addr,
+      EXTPAL_Drawer_data   => e_extpal_data,
+      EXTPAL_Drawer_valid  => mem_valid,
+      VRAM_Drawer_addr     => e_vram_addr,
+      VRAM_Drawer_data     => e_vram_data,
+      VRAM_Drawer_valid    => mem_valid
+   );
+
    -- memory service: latch on the valid='0' edge, present next cycle
    p_mem : process (clk)
    begin
@@ -168,6 +211,9 @@ begin
             t_extpal_data <= extpal(t_extpal_addr);
             a_vram_data   <= vram(a_vram_addr);
             a_pal_data    <= pal(a_pal_addr);
+            e_vram_data   <= vram(e_vram_addr);
+            e_pal_data    <= pal(e_pal_addr);
+            e_extpal_data <= extpal(e_extpal_addr);
          end if;
          mem_valid <= not mem_valid;
       end if;
@@ -185,6 +231,9 @@ begin
             end if;
             if (pixel_we_a = '1') then
                linebuf(pixel_x_a) <= pixeldata_a;
+            end if;
+            if (pixel_we_e = '1') then
+               linebuf(pixel_x_e) <= pixeldata_e;
             end if;
          end if;
       end if;
@@ -225,6 +274,7 @@ begin
          refY        <= signed(vectors(base + 12)(27 downto 0));
          dx          <= signed(vectors(base + 13)(15 downto 0));
          dy          <= signed(vectors(base + 14)(15 downto 0));
+         variant     <= unsigned(vectors(base + 15)(1 downto 0));
 
          -- clear the collected line
          clear_line <= '1';
@@ -234,14 +284,19 @@ begin
 
          for k in 1 to 4 loop wait until rising_edge(clk); end loop;
 
-         if (kind = 1) then
+         if (kind = 1 or kind = 2) then
             line_trigger <= '1';
             wait until rising_edge(clk);
             line_trigger <= '0';
             wait until rising_edge(clk);
-            drawline_a <= '1';
+            if (kind = 1) then
+               drawline_a <= '1';
+            else
+               drawline_e <= '1';
+            end if;
             wait until rising_edge(clk);
             drawline_a <= '0';
+            drawline_e <= '0';
          else
             drawline_t <= '1';
             wait until rising_edge(clk);
@@ -251,7 +306,9 @@ begin
          -- wait for completion (busy rises on the drawline cycle)
          loop
             wait until rising_edge(clk);
-            if (kind = 1) then v_busy := busy_a; else v_busy := busy_t; end if;
+            if (kind = 1) then v_busy := busy_a;
+            elsif (kind = 2) then v_busy := busy_e;
+            else v_busy := busy_t; end if;
             exit when v_busy = '0';
          end loop;
          for k in 1 to 4 loop wait until rising_edge(clk); end loop;
