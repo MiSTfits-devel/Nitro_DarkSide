@@ -54,6 +54,8 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    sim/tb_arm9_trace.vhd \
    sim/tb_gpu_bg.vhd \
    sim/tb_gpu_obj.vhd \
+   rtl/nds_drawer_merge.vhd \
+   sim/tb_gpu_merge.vhd \
    sim/tb_vram_ls.vhd
 # (tb_gpu_* / tb_vram_ls are analyze-only: their hex-file constants load at
 #  elaboration and the vectors are generated, not checked in)
