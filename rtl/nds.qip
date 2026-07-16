@@ -14,3 +14,5 @@ set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) "nds_mainr
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) "nds_irq.vhd"]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) "nds_ipc.vhd"]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) "nds_membus7.vhd"]
+set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) "nds_cpu9.vhd"]
+set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) "nds_membus9.vhd"]
