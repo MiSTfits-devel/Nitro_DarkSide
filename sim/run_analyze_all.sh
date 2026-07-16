@@ -41,6 +41,7 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_cpu9.vhd \
    rtl/nds_cache9.vhd \
    rtl/nds_membus9.vhd \
+   rtl/reg_nds_display.vhd \
    rtl/nds_drawer_text.vhd \
    rtl/nds_drawer_affine.vhd \
    rtl/nds_drawer_extended.vhd \
@@ -55,10 +56,17 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    sim/tb_gpu_bg.vhd \
    sim/tb_gpu_obj.vhd \
    rtl/nds_drawer_merge.vhd \
+   rtl/nds_gpu2d.vhd \
+   rtl/nds_gpu_timing.vhd \
    sim/tb_gpu_merge.vhd \
-   sim/tb_vram_ls.vhd
-# (tb_gpu_* / tb_vram_ls are analyze-only: their hex-file constants load at
-#  elaboration and the vectors are generated, not checked in)
+   sim/tb_vram_ls.vhd \
+   sim/tb_gpu2d.vhd \
+   sim/tb_gpu2d_frame.vhd \
+   sim/tb_gpu2d_timed.vhd \
+   sim/tb_gpu_timing.vhd
+# (tb_gpu_* / tb_vram_ls / tb_gpu2d* are analyze-only: their hex-file
+#  constants load at elaboration and the vectors are generated, not
+#  checked in)
 
 # 4) elaborate the standalone entities as a sanity gate
 nvc -L "$WORK" --work="$WORK/work" -e nds_top
@@ -68,5 +76,6 @@ nvc -H 1g -L "$WORK" --work="$WORK/work" -e tb_mainram
 nvc -H 1g -L "$WORK" --work="$WORK/work" -e tb_arm7_island
 nvc -H 1g -L "$WORK" --work="$WORK/work" -e tb_arm9_island
 nvc -H 1g -L "$WORK" --work="$WORK/work" -e tb_arm9_trace
+nvc -L "$WORK" --work="$WORK/work" -e tb_gpu_timing
 
 echo "analyze-all: OK"
