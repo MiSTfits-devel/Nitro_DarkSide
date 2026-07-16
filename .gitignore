@@ -1,0 +1,11 @@
+sim/nvc_work/
+*.o
+*.rbf
+*.sof
+output_files/
+db/
+incremental_db/
+c5_pin_model_dump.txt
+build_id.v
+*.qws
+.DS_Store
