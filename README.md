@@ -1,0 +1,46 @@
+# NDS_MiSTfits — Nintendo DS core for MiSTer
+
+An in-progress Nintendo DS core for the MiSTer FPGA platform (DE10-Nano, Cyclone V 5CSEBA6U23I7).
+
+## Thesis
+
+Robert Peip established that an NDS core is feasible — his unreleased prototype ran 2D titles
+(e.g. Kirby: Squeak Squad) correctly — and described the NDS as "roughly the GBA2P core with
+bolts on." The blockers were never correctness; they were **resources**:
+
+1. **Memory banks.** The NDS has a very large number of small, independently-addressed,
+   tightly-timed memories (9 remappable VRAM banks, shared WRAM with 4 mapping modes,
+   TCMs, per-engine palette/OAM, ARM7 WRAM…) that all want to be BRAM, on a device where
+   BRAM is the scarcest commodity.
+2. **Fitting.** Two CPUs (ARM946E-S + ARM7TDMI), two 2D engines, 16ch sound, and the card
+   interface must fit alongside the MiSTer framework.
+
+This project starts from **GBA_MiSTfits**, a heavily resource-optimized fork of the GBA2P
+core. The optimization headroom won there is the budget we spend here.
+
+## Scope (deliberate)
+
+- **In:** 2D games. ARM9 + ARM7, both 2D engines, VRAM banking, IPC, DMA, timers, sound,
+  card interface, touchscreen, firmware/RTC/SPI, save memory.
+- **Out (initially):** 3D geometry/rendering engine (games requiring 3D will not run),
+  wifi (stubbed), GBA-slot compatibility mode, DSi extensions.
+
+## Layout
+
+- `rtl/` — core RTL. NDS-specific sources are `nds_*.vhd`; shared primitives inherited
+  from GBA_MiSTfits keep their names.
+- `docs/` — architecture, the NDS→DE10 memory budget (read `MEMORY_MAP.md` first — it is
+  the load-bearing analysis), and the roadmap.
+- `sim/` — nvc-based simulation harness, same flow as GBA_MiSTfits (long runs execute on
+  the k8s build host).
+- `sys/` — MiSTer framework (copied from GBA_MiSTer, unmodified).
+
+## Reference material
+
+- `../GBA_MiSTer` — GBA_MiSTfits fork: donor core and proving ground.
+- `../NitroSDK`, `../NitroSystem` — public reconstructions of the official SDKs; used as
+  hardware ground truth (register maps, memory maps, boot protocol) alongside GBATEK.
+
+## License
+
+GPL-2.0, inherited from the GBA_MiSTer core this derives from. See `COPYING`/`LICENSE`.
