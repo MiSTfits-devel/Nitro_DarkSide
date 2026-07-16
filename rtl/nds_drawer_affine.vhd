@@ -49,9 +49,12 @@ entity nds_drawer_affine is
       PALETTE_Drawer_data  : in  std_logic_vector(31 downto 0);
       PALETTE_Drawer_valid : in  std_logic;
 
+      -- one request in flight; req one-cycle pulse, addr held until the
+      -- done pulse (data valid that cycle)
+      VRAM_Drawer_req      : out std_logic := '0';
       VRAM_Drawer_addr     : out integer range 0 to 131071;
       VRAM_Drawer_data     : in  std_logic_vector(31 downto 0);
-      VRAM_Drawer_valid    : in  std_logic
+      VRAM_Drawer_done     : in  std_logic
    );
 end entity;
 
@@ -78,6 +81,7 @@ architecture arch of nds_drawer_affine is
 
    signal VRAM_byteaddr        : unsigned(18 downto 0) := (others => '0');
    signal VRAM_byteaddr_low    : unsigned(1 downto 0) := (others => '0');
+   signal VRAM_addr_r          : unsigned(18 downto 2) := (others => '0');
 
    signal PALETTE_byteaddr     : std_logic_vector(8 downto 0) := (others => '0');
    signal palette_readwait     : integer range 0 to 1;
@@ -104,7 +108,9 @@ architecture arch of nds_drawer_affine is
 
 begin
 
-   VRAM_Drawer_addr    <= to_integer(VRAM_byteaddr(18 downto 2));
+   -- request address is registered when req issues - VRAM_byteaddr is a
+   -- combinational mux on the FSM state and would drift mid-request
+   VRAM_Drawer_addr    <= to_integer(VRAM_addr_r);
    PALETTE_Drawer_addr <= to_integer(unsigned(PALETTE_byteaddr(8 downto 2)));
 
    xxx_pre <= realX(realX'left downto realX'left  - 19);
@@ -140,6 +146,7 @@ begin
       if rising_edge(clk) then
 
          palette_newPixel <= '0';
+         VRAM_Drawer_req  <= '0';
 
          case (vramfetch) is
 
@@ -170,46 +177,48 @@ begin
                end if;
 
             when CALCADDR =>
-               if (VRAM_Drawer_valid = '0') then
-                  VRAM_byteaddr_low <= VRAM_byteaddr(1 downto 0);
-                  vramfetch     <= WAITREAD_TILE;
-
-                  if (wrapping = '0') then
-                     if (xxx_pre < 0 or yyy_pre < 0 or xxx_pre >= scroll_mod or yyy_pre >= scroll_mod) then
-                        realX <= realX + dx;
-                        realY <= realy + dy;
-                        if (x_cnt < 255) then
-                           vramfetch <= CALCADDR;
-                           x_cnt     <= x_cnt + 1;
-                        else
-                           vramfetch <= IDLE;
-                        end if;
-                     end if;
+               if (wrapping = '0' and (xxx_pre < 0 or yyy_pre < 0 or xxx_pre >= scroll_mod or yyy_pre >= scroll_mod)) then
+                  realX <= realX + dx;
+                  realY <= realy + dy;
+                  if (x_cnt < 255) then
+                     vramfetch <= CALCADDR;
+                     x_cnt     <= x_cnt + 1;
+                  else
+                     vramfetch <= IDLE;
                   end if;
+               else
+                  VRAM_byteaddr_low <= VRAM_byteaddr(1 downto 0);
+                  VRAM_addr_r       <= VRAM_byteaddr(18 downto 2);
+                  VRAM_Drawer_req   <= '1';
+                  vramfetch         <= WAITREAD_TILE;
                end if;
 
             when WAITREAD_TILE =>
-               case (to_integer(VRAM_byteaddr_low(1 downto 0))) is
-                  when 0 => tileinfo <= VRAM_Drawer_data( 7 downto  0);
-                  when 1 => tileinfo <= VRAM_Drawer_data(15 downto  8);
-                  when 2 => tileinfo <= VRAM_Drawer_data(23 downto 16);
-                  when 3 => tileinfo <= VRAM_Drawer_data(31 downto 24);
-                  when others => null;
-               end case;
-               vramfetch  <= EVALTILE;
+               if (VRAM_Drawer_done = '1') then
+                  case (to_integer(VRAM_byteaddr_low(1 downto 0))) is
+                     when 0 => tileinfo <= VRAM_Drawer_data( 7 downto  0);
+                     when 1 => tileinfo <= VRAM_Drawer_data(15 downto  8);
+                     when 2 => tileinfo <= VRAM_Drawer_data(23 downto 16);
+                     when 3 => tileinfo <= VRAM_Drawer_data(31 downto 24);
+                     when others => null;
+                  end case;
+                  vramfetch  <= EVALTILE;
+               end if;
 
             when EVALTILE =>
                VRAM_byteaddr_low <= VRAM_byteaddr(1 downto 0);
-               vramfetch     <= WAITREAD_COLOR;
+               VRAM_addr_r       <= VRAM_byteaddr(18 downto 2);
+               VRAM_Drawer_req   <= '1';
+               vramfetch         <= WAITREAD_COLOR;
 
-            -- capture the color byte while the data bus is valid, then hold
-            -- the pixel until the palette FSM is free - the donor advanced
-            -- immediately and relied on the GBA 4-phase service cadence to
-            -- never overrun the palette pipeline; with other cadences that
-            -- silently dropped pixels
+            -- capture the color byte on the done cycle, then hold the pixel
+            -- until the palette FSM is free (the donor advanced immediately
+            -- and relied on the GBA 4-phase service cadence)
             when WAITREAD_COLOR =>
-               colordata_r <= colordata;
-               vramfetch   <= HANDOFF;
+               if (VRAM_Drawer_done = '1') then
+                  colordata_r <= colordata;
+                  vramfetch   <= HANDOFF;
+               end if;
 
             when HANDOFF =>
                if (palettefetch = IDLE and palette_newPixel = '0') then

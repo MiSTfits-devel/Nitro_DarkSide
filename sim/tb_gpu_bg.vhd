@@ -74,19 +74,27 @@ architecture sim of tb_gpu_bg is
    signal t_extpal_addr : integer range 0 to 8191;
    signal t_vram_addr   : integer range 0 to 131071;
    signal t_pal_data, t_extpal_data, t_vram_data : std_logic_vector(31 downto 0);
+   signal t_vram_req : std_logic;
+   signal t_vram_done : std_logic := '0';
 
    -- affine drawer memory ports
    signal a_pal_addr    : integer range 0 to 127;
    signal a_vram_addr   : integer range 0 to 131071;
    signal a_pal_data, a_vram_data : std_logic_vector(31 downto 0);
+   signal a_vram_req : std_logic;
+   signal a_vram_done : std_logic := '0';
 
    -- extended drawer memory ports
    signal e_pal_addr    : integer range 0 to 127;
    signal e_extpal_addr : integer range 0 to 8191;
    signal e_vram_addr   : integer range 0 to 131071;
    signal e_pal_data, e_extpal_data, e_vram_data : std_logic_vector(31 downto 0);
+   signal e_vram_req : std_logic;
+   signal e_vram_done : std_logic := '0';
 
    signal mem_valid : std_logic := '0';
+   -- done defaults
+
 
    -- pixel outputs
    signal pixel_we_t, pixel_we_a, pixel_we_e : std_logic;
@@ -130,9 +138,10 @@ begin
       EXTPAL_Drawer_addr   => t_extpal_addr,
       EXTPAL_Drawer_data   => t_extpal_data,
       EXTPAL_Drawer_valid  => mem_valid,
+      VRAM_Drawer_req      => t_vram_req,
       VRAM_Drawer_addr     => t_vram_addr,
       VRAM_Drawer_data     => t_vram_data,
-      VRAM_Drawer_valid    => mem_valid
+      VRAM_Drawer_done     => t_vram_done
    );
 
    idrawer_affine : entity work.nds_drawer_affine
@@ -160,9 +169,10 @@ begin
       PALETTE_Drawer_addr  => a_pal_addr,
       PALETTE_Drawer_data  => a_pal_data,
       PALETTE_Drawer_valid => mem_valid,
+      VRAM_Drawer_req      => a_vram_req,
       VRAM_Drawer_addr     => a_vram_addr,
       VRAM_Drawer_data     => a_vram_data,
-      VRAM_Drawer_valid    => mem_valid
+      VRAM_Drawer_done     => a_vram_done
    );
 
    idrawer_ext : entity work.nds_drawer_extended
@@ -196,27 +206,63 @@ begin
       EXTPAL_Drawer_addr   => e_extpal_addr,
       EXTPAL_Drawer_data   => e_extpal_data,
       EXTPAL_Drawer_valid  => mem_valid,
+      VRAM_Drawer_req      => e_vram_req,
       VRAM_Drawer_addr     => e_vram_addr,
       VRAM_Drawer_data     => e_vram_data,
-      VRAM_Drawer_valid    => mem_valid
+      VRAM_Drawer_done     => e_vram_done
    );
 
-   -- memory service: latch on the valid='0' edge, present next cycle
+   -- palette/ext-pal service on the fixed valid cadence (local BRAMs in
+   -- the real engine); VRAM char/map data on req/done with random latency
+   -- (the line-server contract)
    p_mem : process (clk)
    begin
       if rising_edge(clk) then
          if (mem_valid = '0') then
-            t_vram_data   <= vram(t_vram_addr);
             t_pal_data    <= pal(t_pal_addr);
             t_extpal_data <= extpal(t_extpal_addr);
-            a_vram_data   <= vram(a_vram_addr);
             a_pal_data    <= pal(a_pal_addr);
-            e_vram_data   <= vram(e_vram_addr);
             e_pal_data    <= pal(e_pal_addr);
             e_extpal_data <= extpal(e_extpal_addr);
          end if;
          mem_valid <= not mem_valid;
       end if;
+   end process;
+
+   p_vram_t : process
+      variable seed : unsigned(31 downto 0) := to_unsigned(11111, 32);
+   begin
+      wait until rising_edge(clk) and t_vram_req = '1';
+      seed := seed xor shift_left(seed, 13); seed := seed xor shift_right(seed, 17); seed := seed xor shift_left(seed, 5);
+      for k in 0 to to_integer(seed(2 downto 0)) loop wait until rising_edge(clk); end loop;
+      t_vram_data <= vram(t_vram_addr);
+      t_vram_done <= '1';
+      wait until rising_edge(clk);
+      t_vram_done <= '0';
+   end process;
+
+   p_vram_a : process
+      variable seed : unsigned(31 downto 0) := to_unsigned(22222, 32);
+   begin
+      wait until rising_edge(clk) and a_vram_req = '1';
+      seed := seed xor shift_left(seed, 13); seed := seed xor shift_right(seed, 17); seed := seed xor shift_left(seed, 5);
+      for k in 0 to to_integer(seed(2 downto 0)) loop wait until rising_edge(clk); end loop;
+      a_vram_data <= vram(a_vram_addr);
+      a_vram_done <= '1';
+      wait until rising_edge(clk);
+      a_vram_done <= '0';
+   end process;
+
+   p_vram_e : process
+      variable seed : unsigned(31 downto 0) := to_unsigned(33333, 32);
+   begin
+      wait until rising_edge(clk) and e_vram_req = '1';
+      seed := seed xor shift_left(seed, 13); seed := seed xor shift_right(seed, 17); seed := seed xor shift_left(seed, 5);
+      for k in 0 to to_integer(seed(2 downto 0)) loop wait until rising_edge(clk); end loop;
+      e_vram_data <= vram(e_vram_addr);
+      e_vram_done <= '1';
+      wait until rising_edge(clk);
+      e_vram_done <= '0';
    end process;
 
    -- pixel collect

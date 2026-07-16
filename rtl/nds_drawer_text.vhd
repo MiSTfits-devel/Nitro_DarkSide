@@ -53,9 +53,13 @@ entity nds_drawer_text is
       EXTPAL_Drawer_data   : in  std_logic_vector(31 downto 0);
       EXTPAL_Drawer_valid  : in  std_logic;
 
+      -- VRAM char/map fetch: one request in flight; req is a one-cycle
+      -- pulse, addr held until the done pulse (data valid that cycle) -
+      -- latency-tolerant for the VRAM line server
+      VRAM_Drawer_req      : out std_logic := '0';
       VRAM_Drawer_addr     : out integer range 0 to 131071; -- word into 512 KB BG space
       VRAM_Drawer_data     : in  std_logic_vector(31 downto 0);
-      VRAM_Drawer_valid    : in  std_logic
+      VRAM_Drawer_done     : in  std_logic
    );
 end entity;
 
@@ -80,7 +84,6 @@ architecture arch of nds_drawer_text is
    signal palettefetch : tPALETTEState := IDLE;
 
    signal VRAM_byteaddr        : unsigned(18 downto 0) := (others => '0');
-   signal vram_readwait        : integer range 0 to 1;
 
    signal PALETTE_byteaddr     : std_logic_vector(8 downto 0) := (others => '0');
    signal PALETTE_byteaddr_1   : std_logic_vector(8 downto 0) := (others => '0');
@@ -141,6 +144,7 @@ begin
       if rising_edge(clk) then
 
          palette_newPixel <= '0';
+         VRAM_Drawer_req  <= '0';
 
          case (vramfetch) is
 
@@ -181,14 +185,12 @@ begin
                   tileindex_var := tileindex_var + 2048;
                end if;
                tileaddr_var  := tileindex_var + offset_y + to_integer(x_scrolled(7 downto 3));
-               VRAM_byteaddr <= to_unsigned((to_integer(mapbase) + (tileaddr_var * 2)) mod 524288, VRAM_byteaddr'length);
-               vramfetch     <= WAITREAD_TILE;
-               vram_readwait <= 1;
+               VRAM_byteaddr   <= to_unsigned((to_integer(mapbase) + (tileaddr_var * 2)) mod 524288, VRAM_byteaddr'length);
+               VRAM_Drawer_req <= '1';
+               vramfetch       <= WAITREAD_TILE;
 
             when WAITREAD_TILE =>
-               if (vram_readwait > 0) then
-                  vram_readwait <= vram_readwait - 1;
-               elsif (VRAM_Drawer_valid = '1') then
+               if (VRAM_Drawer_done = '1') then
                   if (VRAM_byteaddr(1) = '1') then
                      tileinfo <= VRAM_Drawer_data(31 downto 16);
                      if (hicolor = '0') then
@@ -228,10 +230,17 @@ begin
                   end if;
                end if;
                VRAM_byteaddr <= to_unsigned(pixeladdr mod 524288, VRAM_byteaddr'length);
+               -- only issue a request when the word cache misses - a stale
+               -- in-flight response would otherwise be misassociated
+               if (VRAM_lastcolor_valid = '0' or
+                   VRAM_lastcolor_addr /= to_unsigned(pixeladdr mod 524288, 19)(18 downto 2)) then
+                  VRAM_Drawer_req <= '1';
+               end if;
                vramfetch     <= WAITREAD_COLOR;
-               vram_readwait <= 1;
 
             when WAITREAD_COLOR =>
+               -- live cache check: also covers the palette-stall cycles
+               -- after a fresh word landed (done registers it below)
                done_var := '0';
                if (VRAM_lastcolor_valid = '1' and VRAM_lastcolor_addr = VRAM_byteaddr(VRAM_byteaddr'left downto 2)) then
                   done_var := '1';
@@ -242,9 +251,7 @@ begin
                      when "11" => colordata <= VRAM_lastcolor_data(31 downto 24);
                      when others => null;
                   end case;
-               elsif (vram_readwait > 0) then
-                  vram_readwait <= vram_readwait - 1;
-               elsif (VRAM_Drawer_valid = '1') then
+               elsif (VRAM_Drawer_done = '1') then
                   done_var := '1';
                   VRAM_lastcolor_addr  <= VRAM_byteaddr(VRAM_byteaddr'left downto 2);
                   VRAM_lastcolor_data  <= VRAM_Drawer_data;

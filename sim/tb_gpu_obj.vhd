@@ -78,9 +78,10 @@ architecture sim of tb_gpu_obj is
    signal o_pal_addr    : integer range 0 to 127;
    signal o_extpal_addr : integer range 0 to 2047;
    signal o_vram_addr   : integer range 0 to 65535;
+   signal o_vram_req    : std_logic;
+   signal o_vram_done   : std_logic := '0';
    signal o_pal_data, o_extpal_data, o_vram_data : std_logic_vector(31 downto 0);
 
-   signal mem_valid : std_logic := '0';
 
    -- pixel outputs
    signal pixel_we_color    : std_logic;
@@ -131,9 +132,10 @@ begin
       PALETTE_Drawer_data  => o_pal_data,
       EXTPAL_Drawer_addr   => o_extpal_addr,
       EXTPAL_Drawer_data   => o_extpal_data,
+      VRAM_Drawer_req      => o_vram_req,
       VRAM_Drawer_addr     => o_vram_addr,
       VRAM_Drawer_data     => o_vram_data,
-      VRAM_Drawer_valid    => mem_valid
+      VRAM_Drawer_done     => o_vram_done
    );
 
    -- OAM: plain registered read, data one cycle after address
@@ -144,19 +146,26 @@ begin
       end if;
    end process;
 
-   -- memory service: VRAM on the valid cadence (latch on the valid='0'
-   -- edge, present next cycle); the palette/ext-pal ports have no valid
-   -- handshake - the pipeline expects a plain 1-cycle registered read
+   -- palette/ext-pal: plain 1-cycle registered reads (local BRAMs); VRAM
+   -- char/bitmap data on req/done with random latency (line-server contract)
    p_mem : process (clk)
    begin
       if rising_edge(clk) then
-         if (mem_valid = '0') then
-            o_vram_data <= vram(o_vram_addr);
-         end if;
-         mem_valid <= not mem_valid;
          o_pal_data    <= pal(o_pal_addr);
          o_extpal_data <= extpal(o_extpal_addr);
       end if;
+   end process;
+
+   p_vram : process
+      variable seed : unsigned(31 downto 0) := to_unsigned(44444, 32);
+   begin
+      wait until rising_edge(clk) and o_vram_req = '1';
+      seed := seed xor shift_left(seed, 13); seed := seed xor shift_right(seed, 17); seed := seed xor shift_left(seed, 5);
+      for k in 0 to to_integer(seed(2 downto 0)) loop wait until rising_edge(clk); end loop;
+      o_vram_data <= vram(o_vram_addr);
+      o_vram_done <= '1';
+      wait until rising_edge(clk);
+      o_vram_done <= '0';
    end process;
 
    -- pixel collect

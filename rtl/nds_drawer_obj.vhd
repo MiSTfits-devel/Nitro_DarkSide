@@ -67,9 +67,12 @@ entity nds_drawer_obj is
       EXTPAL_Drawer_addr   : out integer range 0 to 2047;      -- 8 KB OBJ ext-pal slot
       EXTPAL_Drawer_data   : in  std_logic_vector(31 downto 0);
 
+      -- one request in flight; req one-cycle pulse, addr held until the
+      -- done pulse (data valid that cycle)
+      VRAM_Drawer_req      : out std_logic := '0';
       VRAM_Drawer_addr     : out integer range 0 to 65535;     -- 256 KB OBJ space
       VRAM_Drawer_data     : in  std_logic_vector(31 downto 0);
-      VRAM_Drawer_valid    : in  std_logic
+      VRAM_Drawer_done     : in  std_logic
    );
 end entity;
 
@@ -164,7 +167,8 @@ architecture arch of nds_drawer_obj is
    (
       WAITOAM,
       NEXTADDR,
-      PIXELISSUE
+      AFF_SUM,
+      PIXELWAIT
    );
    signal PIXELGen : t_PIXELGen := WAITOAM;
 
@@ -193,9 +197,7 @@ architecture arch of nds_drawer_obj is
    signal realY             : integer range -8388608 to 8388607;
    signal target            : integer range 0 to 255;
    signal second_pix        : std_logic := '0';
-   signal vram_reuse        : std_logic := '0';
    signal firstpix          : std_logic;
-   signal skippixel         : std_logic;
    signal issue_pixel       : std_logic;
    signal pixeladdr_x       : unsigned(17 downto 0) := (others => '0');
 
@@ -235,7 +237,6 @@ architecture arch of nds_drawer_obj is
 
    signal second_pix_eval   : std_logic;
 
-   signal vram_reuse_eval   : std_logic;
    signal VRAM_data_next    : std_logic_vector(31 downto 0) := (others => '0');
 
    signal readaddr_mux_eval : unsigned(1 downto 0);
@@ -274,8 +275,10 @@ architecture arch of nds_drawer_obj is
    signal PALETTE_addrlow   : std_logic;
    signal EXTPAL_addrlow    : std_logic;
 
-   signal pixeltime         : integer range 0 to 2130;
-   signal maxpixeltime      : integer range 0 to 2130;
+   -- generous while the line-server latency story settles (melonDS does
+   -- not model the OBJ time budget; tighten during hardware bring-up)
+   signal pixeltime         : integer range 0 to 8191;
+   signal maxpixeltime      : integer range 0 to 8191;
 
 begin
 
@@ -334,9 +337,9 @@ begin
       if rising_edge(clk) then
 
          if (hblankfree = '1') then
-            maxpixeltime <= 1664;
+            maxpixeltime <= 6400;
          else
-            maxpixeltime <= 2130;
+            maxpixeltime <= 8191;
          end if;
 
          case (OAMFetch) is
@@ -497,11 +500,13 @@ begin
       variable xxx               : integer range 0 to 63;
       variable yyy               : integer range 0 to 63;
       variable pixeladdr_calc    : integer;
+      variable skip_var          : std_logic;
    begin
       if rising_edge(clk) then
 
          consumeSettings   <= '0';
          issue_pixel       <= '0';
+         VRAM_Drawer_req   <= '0';
          applyNextSettings := '0';
 
          if (drawline = '1') then
@@ -520,20 +525,18 @@ begin
 
             when NEXTADDR =>
                firstpix  <= '0';
-               skippixel <= '0';
+               skip_var  := '0';
                if ((x + posX) < 256 and (x + posX) >= 0) then
                   target    <= x + posX;
                else
-                  skippixel <= '1';
+                  skip_var := '1';
                end if;
 
                pixeladdr_calc := pixeladdr;
 
-               vram_reuse <= '0';
-
                if (Pixel_data0(OAM_AFFINE) = '1') then
                   if (realX < 0 or (realX / 256) >= sizeX or realY < 0 or (realY / 256) >= sizeY) then
-                     skippixel <= '1';
+                     skip_var := '1';
                   end if;
 
                   -- synthesis translate_off
@@ -597,8 +600,6 @@ begin
                      end if;
                   end if;
 
-                  pixeladdr_x <= to_unsigned(pixeladdr_calc mod 262144, 18);
-
                end if;
 
                realX <= realX + dx;
@@ -610,48 +611,47 @@ begin
                   PIXELGen <= WAITOAM;
                else
                   x <= x + 1;
-                  PIXELGen <= PIXELISSUE;
-                  if (Pixel_data0(OAM_AFFINE) = '0') then
-                     if ((pixeladdr_calc / 2 = pixeladdr_x(pixeladdr_x'left downto 1) and firstpix = '0') or VRAM_Drawer_valid = '1') then
-                        if (pixeladdr_calc / 2 = pixeladdr_x(pixeladdr_x'left downto 1) and firstpix = '0') then
-                           vram_reuse  <= '1';
-                        end if;
-                        if ((x + posX) < 256 and (x + posX) >= 0) then
-                           issue_pixel <= '1';
-                        end if;
-                        PIXELGen    <= NEXTADDR;
-                        if (x + 1 >= fieldX and OAMFetch = DONE) then
-                           applyNextSettings := '1';
-                        end if;
-                     end if;
+                  if (skip_var = '1') then
+                     -- nothing to fetch or draw; pixeladdr_x keeps the last
+                     -- fetched word so the reuse compare stays truthful
+                     PIXELGen <= NEXTADDR;
+                  elsif (Pixel_data0(OAM_AFFINE) = '1') then
+                     PIXELGen <= AFF_SUM;
+                  elsif (pixeladdr_calc / 2 = pixeladdr_x(pixeladdr_x'left downto 1) and firstpix = '0') then
+                     -- same halfword as the last access: reuse the fetched
+                     -- word, but update the address - its low bits select
+                     -- the byte lane in the pixel pipeline
+                     pixeladdr_x <= to_unsigned(pixeladdr_calc mod 262144, 18);
+                     issue_pixel <= '1';
+                     PIXELGen    <= NEXTADDR;
+                  else
+                     pixeladdr_x     <= to_unsigned(pixeladdr_calc mod 262144, 18);
+                     VRAM_Drawer_req <= '1';
+                     PIXELGen        <= PIXELWAIT;
                   end if;
                end if;
 
-            when PIXELISSUE =>
-               if (VRAM_Drawer_valid = '1') then -- sync on vram mux
+            when AFF_SUM =>
+               if (is_bitmap = '1') then
+                  pixeladdr_x <= to_unsigned((pixeladdr_base
+                                 + to_integer(pixeladdr_x_aff0)
+                                 + to_integer(pixeladdr_x_aff4)) mod 262144, 18);
+               elsif (one_dim_mapping = '1') then
+                  pixeladdr_x <= to_unsigned((pixeladdr_base
+                                 + to_integer(pixeladdr_x_aff0) + to_integer(pixeladdr_x_aff1)
+                                 + to_integer(pixeladdr_x_aff4) + to_integer(pixeladdr_x_aff5)) mod 262144, 18);
+               else
+                  pixeladdr_x <= to_unsigned((pixeladdr_base
+                                 + to_integer(pixeladdr_x_aff2) + to_integer(pixeladdr_x_aff3)
+                                 + to_integer(pixeladdr_x_aff4) + to_integer(pixeladdr_x_aff5)) mod 262144, 18);
+               end if;
+               VRAM_Drawer_req <= '1';
+               PIXELGen        <= PIXELWAIT;
+
+            when PIXELWAIT =>
+               if (VRAM_Drawer_done = '1') then
+                  issue_pixel <= '1';
                   PIXELGen    <= NEXTADDR;
-
-                  issue_pixel <= not skippixel;
-                  if (skippixel = '0') then
-
-                     if (Pixel_data0(OAM_AFFINE) = '1') then
-                        if (is_bitmap = '1') then
-                           pixeladdr_x <= to_unsigned((pixeladdr_base
-                                          + to_integer(pixeladdr_x_aff0)
-                                          + to_integer(pixeladdr_x_aff4)) mod 262144, 18);
-                        elsif (one_dim_mapping = '1') then
-                           pixeladdr_x <= to_unsigned((pixeladdr_base
-                                          + to_integer(pixeladdr_x_aff0) + to_integer(pixeladdr_x_aff1)
-                                          + to_integer(pixeladdr_x_aff4) + to_integer(pixeladdr_x_aff5)) mod 262144, 18);
-                        else
-                           pixeladdr_x <= to_unsigned((pixeladdr_base
-                                          + to_integer(pixeladdr_x_aff2) + to_integer(pixeladdr_x_aff3)
-                                          + to_integer(pixeladdr_x_aff4) + to_integer(pixeladdr_x_aff5)) mod 262144, 18);
-                        end if;
-                     end if;
-
-                  end if;
-
                end if;
 
          end case;
@@ -765,7 +765,6 @@ begin
          readaddr_mux_eval <= pixeladdr_x(1 downto 0);
          target_eval       <= target;
          second_pix_eval   <= second_pix;
-         vram_reuse_eval   <= vram_reuse;
 
          prio_eval       <= prio_issue;
          mode_eval       <= mode_issue;
@@ -788,14 +787,13 @@ begin
          if (mode_eval = "01") then Pixel_wait.alpha  <= '1'; else Pixel_wait.alpha  <= '0'; end if;
          if (mode_eval = "10") then Pixel_wait.objwnd <= '1'; else Pixel_wait.objwnd <= '0'; end if;
 
-         if (VRAM_Drawer_valid = '1') then
+         if (VRAM_Drawer_done = '1') then
             VRAM_data_next <= VRAM_Drawer_data;
          end if;
 
-         VRAM_Drawer_dataMuxed := VRAM_Drawer_data;
-         if (vram_reuse_eval = '1') then
-            VRAM_Drawer_dataMuxed := VRAM_data_next;
-         end if;
+         -- reads always come from the done-registered word: fresh fetches
+         -- were captured on their done pulse, reused pixels keep it
+         VRAM_Drawer_dataMuxed := VRAM_data_next;
 
          case (readaddr_mux_eval(1 downto 0)) is
             when "00" => colorbyte := VRAM_Drawer_dataMuxed(7  downto 0);
