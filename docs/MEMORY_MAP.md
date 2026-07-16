@@ -3,6 +3,16 @@
 This is the analysis that decides whether the core fits. Everything else is engineering;
 this is the bet. Companion ground truth: [NDS_HARDWARE.md](NDS_HARDWARE.md).
 
+> **Why even a hybrid core doesn't dodge this** — Robert Peip (July 2026), on whether a
+> Dreamcast-style hybrid (CPU emulated on the HPS ARM, graphics on FPGA) could rescue the
+> DS: "the issue with DS is the memory for the graphics part, so exactly what is running
+> for dreamcast on the FPGA part is not great to do for DS. (yes DS is more demanding in
+> this regard than DC)." The graphics-memory problem is unavoidable on any FPGA-rendered
+> path — hybrid or full-FPGA — which is why this document attacks it head-on, and why
+> solving it here keeps the (preferable) full-FPGA core viable. Our advantage over the DC
+> situation: the NDS 2D engines' access patterns are line-buffered and prefetchable
+> (§Renderer feed), unlike a PowerVR TA doing random texture walks.
+
 ## What the FPGA offers (Cyclone V 5CSEBA6U23I7)
 
 | Resource | Amount | Notes |

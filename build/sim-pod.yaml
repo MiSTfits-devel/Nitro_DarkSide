@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Headless nvc simulation pod for the NDS core.
+# Driven by build/remote-sim.sh - it streams the source in with git archive
+# (plus optionally uncommitted files with tar), so nothing needs pushing.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nds-nvc-sim
+  labels:
+    app: nds-nvc-sim
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/arch: amd64
+  containers:
+  - name: nvc
+    image: ghcr.io/nickg/nvc:latest
+    command: ["/bin/sh", "-c"]
+    args:
+      - |
+        set -u
+        mkdir -p /work/src
+        echo "waiting for source (build/remote-sim.sh streams it in)..."
+        while [ ! -f /work/src/.ready ]; do sleep 2; done
+        cd /work/src
+        SCRIPT=$(cat .script)
+        echo "=== nvc $(nvc --version | head -1) : sim/${SCRIPT} ==="
+        sh "sim/${SCRIPT}"
+        rc=$?
+        echo "=== sim finished, exit ${rc} ==="
+        echo ${rc} > /work/exitcode
+        # stay alive so the driver can fetch artifacts/logs
+        sleep infinity
+    resources:
+      requests:
+        cpu: "1"
+        memory: 2Gi
+      limits:
+        memory: 12Gi
