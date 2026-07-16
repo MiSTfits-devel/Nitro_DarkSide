@@ -15,6 +15,15 @@ eyeball-checked.
   Run after every RTL change.
 - `run_vram_map_tb.sh` — unit test for `nds_vram_map` (VRAMCNT decode) against the
   NitroSDK `gx_vramcnt.c` truth table. 84 checks.
+- `run_vram_torture_tb.sh` / `run_mainram_tb.sh` — M1 memory-fabric benches.
+- `run_arm7_island.sh` / `run_arm9_island.sh` — CPU islands with self-checking
+  mailbox exit tests (M2/M3).
+- `run_arm9_cache.sh` — nds_cache9 exercise (write-back, clean/invalidate,
+  I-cache staleness) on the island harness.
+- `run_arm9_trace.sh` — per-retired-instruction trace for the melonDS
+  differential (docs/TRACE_DIFF.md); `LOADADDR=33554432` boots a main-RAM
+  workload instead of the boot ROM. The melonDS side lives in
+  `sim/melonds_tracer/`.
 
 ## Adding a bench
 

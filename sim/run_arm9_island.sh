@@ -24,6 +24,7 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/proc_bus_gba.vhd \
    rtl/reg_savestates.vhd \
    rtl/nds_cpu9.vhd \
+   rtl/nds_cache9.vhd \
    rtl/reggba_timer.vhd \
    rtl/gba_timer_module.vhd \
    rtl/gba_timer.vhd \

@@ -39,6 +39,7 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_ipc.vhd \
    rtl/nds_membus7.vhd \
    rtl/nds_cpu9.vhd \
+   rtl/nds_cache9.vhd \
    rtl/nds_membus9.vhd \
    rtl/nds_top.vhd \
    sim/tb_vram_map.vhd \

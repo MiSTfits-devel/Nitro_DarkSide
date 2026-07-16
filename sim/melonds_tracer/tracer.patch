@@ -1,0 +1,117 @@
+diff --git a/src/ARM.cpp b/src/ARM.cpp
+index e19cb00..b8a8656 100644
+--- a/src/ARM.cpp
++++ b/src/ARM.cpp
+@@ -567,6 +567,23 @@ void ARMv5::DataAbort()
+     JumpTo(ExceptionBase + 0x10);
+ }
+ 
++// --- NDS_MiSTfits differential-trace hook (see docs/TRACE_DIFF.md there) ---
++// One line per retired instruction: <pc> <opcode> <cpsr> <r0>..<r14>.
++// pc is the pipeline value captured before execution (addr+8 ARM, +4 Thumb),
++// cpsr/regs are post-execute — matching the RTL export in nds_cpu9.
++FILE* ARM9TraceFile = nullptr;
++u64 ARM9TraceCount = 0;
++u64 ARM9TraceMax = 0;
++
++static inline void ARM9TraceLine(u32 pc, u32 instr, u32 cpsr, u32* r)
++{
++    if (!ARM9TraceFile || ARM9TraceCount >= ARM9TraceMax) return;
++    fprintf(ARM9TraceFile, "%08x %08x %08x", pc, instr, cpsr);
++    for (int i = 0; i < 15; i++) fprintf(ARM9TraceFile, " %08x", r[i]);
++    fputc('\n', ARM9TraceFile);
++    ARM9TraceCount++;
++}
++
+ void ARMv5::Execute()
+ {
+     if (Halted)
+@@ -600,8 +617,10 @@ void ARMv5::Execute()
+             else             NextInstr[1] = CodeRead32(R[15], false);
+ 
+             // actually execute
++            u32 trace_pc = R[15];
+             u32 icode = (CurInstr >> 6) & 0x3FF;
+             ARMInterpreter::THUMBInstrTable[icode](this);
++            ARM9TraceLine(trace_pc, CurInstr & 0xFFFF, CPSR, R);
+         }
+         else
+         {
+@@ -612,6 +631,7 @@ void ARMv5::Execute()
+             NextInstr[1] = CodeRead32(R[15], false);
+ 
+             // actually execute
++            u32 trace_pc = R[15];
+             if (CheckCondition(CurInstr >> 28))
+             {
+                 u32 icode = ((CurInstr >> 4) & 0xF) | ((CurInstr >> 16) & 0xFF0);
+@@ -623,6 +643,7 @@ void ARMv5::Execute()
+             }
+             else
+                 AddCycles_C();
++            ARM9TraceLine(trace_pc, CurInstr, CPSR, R);
+         }
+ 
+         // TODO optimize this shit!!!
+diff --git a/src/ARMInterpreter_ALU.cpp b/src/ARMInterpreter_ALU.cpp
+index 3949bb1..81b8e37 100644
+--- a/src/ARMInterpreter_ALU.cpp
++++ b/src/ARMInterpreter_ALU.cpp
+@@ -466,7 +466,7 @@ A_IMPLEMENT_ALU_OP(ADD,)
+     cpu->SetNZCV(res & 0x80000000, \
+                  !res, \
+                  CARRY_ADD(a, b) | CARRY_ADD(res_tmp, carry), \
+-                 OVERFLOW_ADD(a, b, res_tmp) | OVERFLOW_ADD(res_tmp, carry, res)); \
++                 OVERFLOW_ADD(a, b, res_tmp) ^ OVERFLOW_ADD(res_tmp, carry, res)); \
+     if (c) cpu->AddCycles_CI(c); else cpu->AddCycles_C(); \
+     if (((cpu->CurInstr>>12) & 0xF) == 15) \
+     { \
+@@ -501,7 +501,7 @@ A_IMPLEMENT_ALU_OP(ADC,)
+     cpu->SetNZCV(res & 0x80000000, \
+                  !res, \
+                  CARRY_SUB(a, b) & CARRY_SUB(res_tmp, carry), \
+-                 OVERFLOW_SUB(a, b, res_tmp) | OVERFLOW_SUB(res_tmp, carry, res)); \
++                 OVERFLOW_SUB(a, b, res_tmp) ^ OVERFLOW_SUB(res_tmp, carry, res)); \
+     if (c) cpu->AddCycles_CI(c); else cpu->AddCycles_C(); \
+     if (((cpu->CurInstr>>12) & 0xF) == 15) \
+     { \
+@@ -536,7 +536,7 @@ A_IMPLEMENT_ALU_OP(SBC,)
+     cpu->SetNZCV(res & 0x80000000, \
+                  !res, \
+                  CARRY_SUB(b, a) & CARRY_SUB(res_tmp, carry), \
+-                 OVERFLOW_SUB(b, a, res_tmp) | OVERFLOW_SUB(res_tmp, carry, res)); \
++                 OVERFLOW_SUB(b, a, res_tmp) ^ OVERFLOW_SUB(res_tmp, carry, res)); \
+     if (c) cpu->AddCycles_CI(c); else cpu->AddCycles_C(); \
+     if (((cpu->CurInstr>>12) & 0xF) == 15) \
+     { \
+@@ -1336,7 +1336,7 @@ void T_ADC_REG(ARM* cpu)
+     cpu->SetNZCV(res & 0x80000000,
+                  !res,
+                  CARRY_ADD(a, b) | CARRY_ADD(res_tmp, carry),
+-                 OVERFLOW_ADD(a, b, res_tmp) | OVERFLOW_ADD(res_tmp, carry, res));
++                 OVERFLOW_ADD(a, b, res_tmp) ^ OVERFLOW_ADD(res_tmp, carry, res));
+     cpu->AddCycles_C();
+ }
+ 
+@@ -1351,7 +1351,7 @@ void T_SBC_REG(ARM* cpu)
+     cpu->SetNZCV(res & 0x80000000,
+                  !res,
+                  CARRY_SUB(a, b) & CARRY_SUB(res_tmp, carry),
+-                 OVERFLOW_SUB(a, b, res_tmp) | OVERFLOW_SUB(res_tmp, carry, res));
++                 OVERFLOW_SUB(a, b, res_tmp) ^ OVERFLOW_SUB(res_tmp, carry, res));
+     cpu->AddCycles_C();
+ }
+ 
+diff --git a/src/ARM_InstrTable.h b/src/ARM_InstrTable.h
+index e4b2906..f59e4a8 100644
+--- a/src/ARM_InstrTable.h
++++ b/src/ARM_InstrTable.h
+@@ -39,7 +39,7 @@ INSTRFUNC_PROTO(ARMInstrTable[4096]) =
+     // 0000 0011 0000
+     A_EOR_REG_LSL_IMM_S, A_EOR_REG_LSL_REG_S, A_EOR_REG_LSR_IMM_S, A_EOR_REG_LSR_REG_S,
+     A_EOR_REG_ASR_IMM_S, A_EOR_REG_ASR_REG_S, A_EOR_REG_ROR_IMM_S, A_EOR_REG_ROR_REG_S,
+-    A_EOR_REG_LSL_IMM_S, A_MLA, A_EOR_REG_ROR_IMM_S, A_UNK,
++    A_EOR_REG_LSL_IMM_S, A_MLA, A_EOR_REG_LSR_IMM_S, A_UNK, // was ROR_IMM_S: 0.9.5 table typo, EORS ...,LSR #odd ran as ROR
+     A_EOR_REG_ASR_IMM_S, A_UNK, A_EOR_REG_ROR_IMM_S, A_UNK,
+ 
+     // 0000 0100 0000

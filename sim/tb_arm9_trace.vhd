@@ -23,7 +23,11 @@ entity tb_arm9_trace is
       HEXFILE    : string  := "sim/tests/arm9_island.hex";
       TRACEFILE  : string  := "arm9_trace.log";
       MAXINSTR   : integer := 1000000;
-      TIMEOUT_MS : integer := 100
+      TIMEOUT_MS : integer := 100;
+      -- 0: HEXFILE is the boot ROM at 0xFFFF0000 (island style). Otherwise:
+      -- load HEXFILE into main RAM at this address and boot from it
+      -- (0x02000000 for the melonDS differential workloads).
+      LOADADDR   : integer := 0
    );
 end entity;
 
@@ -58,6 +62,11 @@ architecture sim of tb_arm9_trace is
    signal cp15_dtcm_base : std_logic_vector(31 downto 12);
    signal cp15_dtcm_size, cp15_itcm_size : std_logic_vector(4 downto 0);
 
+   signal bus_cacheable_i, bus_cacheable_d : std_logic;
+   signal cache_op_ena, cache_op_busy : std_logic;
+   signal cache_op      : std_logic_vector(3 downto 0);
+   signal cache_op_addr : std_logic_vector(31 downto 0);
+
    signal ss_bus : proc_bus_gb_type := ((others => '0'), (others => '0'), '1', '0', "00", "0000", '0');
 
    type t_brom is array (0 to 8191) of std_logic_vector(31 downto 0);
@@ -78,7 +87,23 @@ architecture sim of tb_arm9_trace is
       file_close(f);
       return mem;
    end function;
-   constant brom : t_brom := load_hex(HEXFILE);
+   impure function init_brom return t_brom is
+      variable z : t_brom := (others => (others => '0'));
+   begin
+      if (LOADADDR = 0) then
+         return load_hex(HEXFILE);
+      end if;
+      return z;
+   end function;
+   constant brom : t_brom := init_brom;
+
+   function boot_pc return std_logic_vector is
+   begin
+      if (LOADADDR = 0) then
+         return x"FFFF0000";
+      end if;
+      return std_logic_vector(to_unsigned(LOADADDR, 32));
+   end function;
    signal brom_addr : unsigned(14 downto 2);
    signal brom_data : std_logic_vector(31 downto 0);
 
@@ -159,7 +184,7 @@ begin
       ss_bus.rst <= '0';
       wait until rising_edge(clk1x);
       ss_bus.Adr  <= (others => '0');
-      ss_bus.Din  <= x"FFFF0000";
+      ss_bus.Din  <= boot_pc;
       ss_bus.rnw  <= '0';
       ss_bus.bEna <= "1111";
       ss_bus.ena  <= '1';
@@ -214,13 +239,22 @@ begin
       cp15_dtcm_load  => cp15_dtcm_load,
       cp15_dtcm_base  => cp15_dtcm_base,
       cp15_dtcm_size  => cp15_dtcm_size,
-      cp15_itcm_size  => cp15_itcm_size
+      cp15_itcm_size  => cp15_itcm_size,
+      bus_cacheable_i => bus_cacheable_i,
+      bus_cacheable_d => bus_cacheable_d,
+      cache_op_ena    => cache_op_ena,
+      cache_op        => cache_op,
+      cache_op_addr   => cache_op_addr,
+      cache_op_busy   => cache_op_busy
    );
 
    imembus : entity work.nds_membus9
    port map
    (
       clk => clk1x, reset => reset,
+      bus_cacheable_i => bus_cacheable_i, bus_cacheable_d => bus_cacheable_d,
+      cache_op_ena => cache_op_ena, cache_op => cache_op,
+      cache_op_addr => cache_op_addr, cache_op_busy => cache_op_busy,
       itcm_ena => cp15_itcm_ena, itcm_load => cp15_itcm_load, itcm_size => cp15_itcm_size,
       dtcm_ena => cp15_dtcm_ena, dtcm_load => cp15_dtcm_load,
       dtcm_base => cp15_dtcm_base, dtcm_size => cp15_dtcm_size,
@@ -321,7 +355,27 @@ begin
 
    psdram : process
       type t_mem is array (0 to 1048575) of std_logic_vector(31 downto 0);
-      variable mem : t_mem := (others => (others => '0'));
+      impure function init_mem return t_mem is
+         file f       : text;
+         variable l   : line;
+         variable w   : std_logic_vector(31 downto 0);
+         variable m   : t_mem := (others => (others => '0'));
+         variable i   : integer;
+      begin
+         if (LOADADDR /= 0) then
+            i := (LOADADDR mod 4194304) / 4;
+            file_open(f, HEXFILE, read_mode);
+            while not endfile(f) loop
+               readline(f, l);
+               hread(l, w);
+               m(i) := w;
+               i := i + 1;
+            end loop;
+            file_close(f);
+         end if;
+         return m;
+      end function;
+      variable mem : t_mem := init_mem;
       variable a   : integer;
       variable w   : integer;
       variable refresh_cnt : integer := 0;

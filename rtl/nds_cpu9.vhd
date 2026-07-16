@@ -81,7 +81,23 @@ entity nds_cpu9 is
       cp15_dtcm_load   : out   std_logic;                      -- control bit 17
       cp15_dtcm_base   : out   std_logic_vector(31 downto 12); -- region base
       cp15_dtcm_size   : out   std_logic_vector(4 downto 0);   -- 512B << N
-      cp15_itcm_size   : out   std_logic_vector(4 downto 0)
+      cp15_itcm_size   : out   std_logic_vector(4 downto 0);
+
+      -- PU cachability of the current bus address (combinational lookup on
+      -- gb_bus_Adr; qualified with the control-reg cache enables)
+      bus_cacheable_i  : out   std_logic;
+      bus_cacheable_d  : out   std_logic;
+
+      -- cache maintenance ops (MCR c7): one-cycle ena pulse, the CPU stalls
+      -- until cache_op_busy has fallen again. op encoding:
+      --   0000 inv I all   0001 inv I line MVA
+      --   0010 inv D all   0011 inv D line MVA   0100 inv D line idx
+      --   0101 clean D MVA 0110 clean D idx
+      --   0111 clean+inv D MVA                   1000 clean+inv D idx
+      cache_op_ena     : out   std_logic := '0';
+      cache_op         : out   std_logic_vector(3 downto 0) := (others => '0');
+      cache_op_addr    : out   std_logic_vector(31 downto 0) := (others => '0');
+      cache_op_busy    : in    std_logic
    );
 end entity;
 
@@ -127,6 +143,7 @@ architecture arch of nds_cpu9 is
    signal cp15_trace_pid   : std_logic_vector(31 downto 0) := (others => '0'); -- c13 (stored)
 
    signal execute_wfi      : std_logic;   -- MCR c7,c0,4: halt until IRQ
+   signal execute_cp15_cacheop : std_logic; -- MCR c7 op handled by nds_cache9
    
    signal cpu_mode         : std_logic_vector(3 downto 0) := CPUMODE_SUPERVISOR;
    
@@ -355,6 +372,7 @@ architecture arch of nds_cpu9 is
    signal alu_result_add                  : unsigned(32 downto 0);
    signal alu_shiftercarry                : std_logic;
    signal alu_wait_shift                  : std_logic := '0';
+   signal execute_cacheop_wait            : std_logic := '0';
    
    signal execute_flag_Carry              : std_logic;
    signal execute_flag_Zero               : std_logic;
@@ -537,6 +555,29 @@ begin
    cp15_dtcm_base  <= cp15_dtcm_reg(31 downto 12);
    cp15_dtcm_size  <= cp15_dtcm_reg(5 downto 1);
    cp15_itcm_size  <= cp15_itcm_reg(5 downto 1);
+
+   -- PU cachability lookup for the current bus address. Highest-numbered
+   -- matching region wins; PU disabled or no region hit = uncachable.
+   -- Region reg: bit 0 enable, bits 5:1 size code (2^(N+1) bytes), 31:12 base.
+   process (all)
+      variable a  : unsigned(31 downto 0);
+      variable sz : integer range 0 to 31;
+   begin
+      bus_cacheable_i <= '0';
+      bus_cacheable_d <= '0';
+      a := unsigned(gb_bus_Adr);
+      if (cp15_control(0) = '1') then
+         for r in 0 to 7 loop
+            if (cp15_pu_region(r)(0) = '1') then
+               sz := to_integer(unsigned(cp15_pu_region(r)(5 downto 1)));
+               if (shift_right(a xor unsigned(std_logic_vector'(cp15_pu_region(r)(31 downto 12) & x"000")), sz + 1) = 0) then
+                  bus_cacheable_i <= cp15_control(12) and cp15_pu_icache(r);
+                  bus_cacheable_d <= cp15_control(2)  and cp15_pu_dcache(r);
+               end if;
+            end if;
+         end loop;
+      end if;
+   end process;
    
    -- savestates
    gSAVESTATE_REGS : for i in 0 to 15 generate
@@ -868,8 +909,15 @@ begin
             
             if (execute_now = '1' and decode_shift_regbased = '1') then
                decode_Rn_op1 <= decode_Rn_op1_save;
-               if (decode_shift_mode = "11" and unsigned(execute_op1) > 32) then
-                  decode_shift_amount <= to_integer(unsigned(execute_op1(4 downto 0)));
+               -- only Rs[7:0] participates; ROR by a nonzero multiple of 32
+               -- must behave as ROR #32 (result unchanged, C := Rm[31]), not
+               -- as ROR #0 (everything unchanged)
+               if (decode_shift_mode = "11" and unsigned(execute_op1(7 downto 0)) > 32) then
+                  if (unsigned(execute_op1(4 downto 0)) = 0) then
+                     decode_shift_amount <= 32;
+                  else
+                     decode_shift_amount <= to_integer(unsigned(execute_op1(4 downto 0)));
+                  end if;
                else
                   decode_shift_amount <= to_integer(unsigned(execute_op1(7 downto 0)));
                end if;
@@ -2231,6 +2279,14 @@ begin
                             decode_cp15_mrc = '0' and decode_cp15_crn = x"7" and
                             decode_cp15_crm = x"0" and decode_cp15_op2 = "100") else '0';
 
+   -- MCR c7 ops that go to nds_cache9 (and therefore stall until it finishes)
+   execute_cp15_cacheop <=
+      '1' when (decode_cp15_mrc = '0' and decode_cp15_crn = x"7" and
+                ((decode_cp15_crm = x"5" and (decode_cp15_op2 = "000" or decode_cp15_op2 = "001")) or
+                 (decode_cp15_crm = x"6" and (decode_cp15_op2 = "000" or decode_cp15_op2 = "001" or decode_cp15_op2 = "010")) or
+                 (decode_cp15_crm = x"A" and (decode_cp15_op2 = "001" or decode_cp15_op2 = "010")) or
+                 (decode_cp15_crm = x"E" and (decode_cp15_op2 = "001" or decode_cp15_op2 = "010")))) else '0';
+
    -- data read/write
    execute_blockRW_last <= '1' when (decode_block_reglist = x"0000") else '0';
    
@@ -2541,10 +2597,15 @@ begin
                   execute_done      <= '1';
 
                when cp15_op =>
-                  execute_done <= '1';
-                  if (decode_cp15_mrc = '1' and decode_rdest /= x"F") then
-                     execute_writedata <= unsigned(cp15_rdata);
-                     execute_writeback <= '1';
+                  if (execute_cp15_cacheop = '1') then
+                     -- MCR c7 cache maintenance: done arrives when nds_cache9
+                     -- has finished (stall section below)
+                  else
+                     execute_done <= '1';
+                     if (decode_cp15_mrc = '1' and decode_rdest /= x"F") then
+                        execute_writedata <= unsigned(cp15_rdata);
+                        execute_writeback <= '1';
+                     end if;
                   end if;
 
                when nop_detail =>
@@ -2618,6 +2679,12 @@ begin
 
                   when others => null;
                end case;
+
+            when cp15_op =>
+               -- cache maintenance op completing
+               if (execute_cacheop_wait = '1' and cache_op_ena = '0' and cache_op_busy = '0') then
+                  execute_done <= '1';
+               end if;
 
             when mul_dsp =>
                case (execute_MUL_State) is
@@ -2754,6 +2821,7 @@ begin
       variable dsp_pw    : signed(47 downto 0);
       variable dsp_sum33 : unsigned(32 downto 0);
       variable cp15_wval : std_logic_vector(31 downto 0);
+      variable v_cacheop : std_logic_vector(3 downto 0);
    begin
       if (rising_edge(clk)) then
 
@@ -2823,8 +2891,12 @@ begin
             execute_RW_State  <= DATARW_IDLE;
             execute_MUL_State <= MUL_IDLE;
             alu_wait_shift   <= '0';
-            
+            cache_op_ena         <= '0';
+            execute_cacheop_wait <= '0';
+
          elsif (ce = '1') then
+
+            cache_op_ena <= '0';
             
             if (execute_writeback = '1' and execute_writereg /= 15) then
                regs(to_integer(execute_writereg)) <= execute_writedata;
@@ -2856,10 +2928,17 @@ begin
             end if;
             
             if (execute_stall = '1') then
-               
+
                if (alu_wait_shift = '1') then
                   execute_stall  <= '0';
                   alu_wait_shift <= '0';
+               end if;
+
+               -- cache maintenance: wait for nds_cache9 to finish (busy is
+               -- combinationally high from the ena pulse onwards)
+               if (execute_cacheop_wait = '1' and cache_op_ena = '0' and cache_op_busy = '0') then
+                  execute_cacheop_wait <= '0';
+                  execute_stall        <= '0';
                end if;
                
                if (decode_functions_detail = mulboth) then
@@ -3191,7 +3270,38 @@ begin
                                  end if;
                               when x"6" =>
                                  cp15_pu_region(to_integer(unsigned(decode_cp15_crm(2 downto 0)))) <= cp15_wval;
-                              when x"7" => null; -- cache maintenance: accepted (wfi handled in decode)
+                              when x"7" =>
+                                 -- cache maintenance -> nds_cache9 (wfi c7,c0,4
+                                 -- is handled in decode; c7,c10,4 drain write
+                                 -- buffer and c7,c13,1 prefetch are no-ops)
+                                 v_cacheop := "1111"; -- invalid = no op
+                                 case (decode_cp15_crm) is
+                                    when x"5" =>
+                                       if    (decode_cp15_op2 = "000") then v_cacheop := "0000";
+                                       elsif (decode_cp15_op2 = "001") then v_cacheop := "0001";
+                                       end if;
+                                    when x"6" =>
+                                       if    (decode_cp15_op2 = "000") then v_cacheop := "0010";
+                                       elsif (decode_cp15_op2 = "001") then v_cacheop := "0011";
+                                       elsif (decode_cp15_op2 = "010") then v_cacheop := "0100";
+                                       end if;
+                                    when x"A" =>
+                                       if    (decode_cp15_op2 = "001") then v_cacheop := "0101";
+                                       elsif (decode_cp15_op2 = "010") then v_cacheop := "0110";
+                                       end if;
+                                    when x"E" =>
+                                       if    (decode_cp15_op2 = "001") then v_cacheop := "0111";
+                                       elsif (decode_cp15_op2 = "010") then v_cacheop := "1000";
+                                       end if;
+                                    when others => null;
+                                 end case;
+                                 if (v_cacheop /= "1111") then
+                                    cache_op             <= v_cacheop;
+                                    cache_op_addr        <= cp15_wval;
+                                    cache_op_ena         <= '1';
+                                    execute_stall        <= '1';
+                                    execute_cacheop_wait <= '1';
+                                 end if;
                               when x"9" =>
                                  if (decode_cp15_crm = x"1") then
                                     if (decode_cp15_op2 = "001") then
