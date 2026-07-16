@@ -191,6 +191,7 @@ architecture arch of nds_vram is
    signal rstate : rtstate := RIDLE;
 
    signal rreq_vec     : std_logic_vector(3 downto 0);
+   signal rpend        : std_logic_vector(3 downto 0) := (others => '0');
    signal rpick        : integer range 0 to 3 := 0;
    signal rpick_valid  : std_logic;
    signal rdispatch    : std_logic;
@@ -273,10 +274,29 @@ begin
    -- renderer channel arbitration: round-robin, one op in flight. Each req is
    -- masked with its own done pulse so a requester that deasserts on the done
    -- cycle is never spuriously re-dispatched.
-   rreq_vec <= (rdr_objep_req and not rdone_int(3)) &
-               (rdr_bgep_req  and not rdone_int(2)) &
-               (rdr_obj_req   and not rdone_int(1)) &
-               (rdr_bg_req    and not rdone_int(0));
+   -- req is a one-cycle pulse from the drawer; pulses arriving while the FSM
+   -- serves another channel are latched in rpend (cleared on dispatch)
+   rreq_vec <= ((rdr_objep_req or rpend(3)) and not rdone_int(3)) &
+               ((rdr_bgep_req  or rpend(2)) and not rdone_int(2)) &
+               ((rdr_obj_req   or rpend(1)) and not rdone_int(1)) &
+               ((rdr_bg_req    or rpend(0)) and not rdone_int(0));
+
+   prpend : process (clk)
+   begin
+      if rising_edge(clk) then
+         if (reset = '1') then
+            rpend <= (others => '0');
+         else
+            if (rdr_bg_req = '1')    then rpend(0) <= '1'; end if;
+            if (rdr_obj_req = '1')   then rpend(1) <= '1'; end if;
+            if (rdr_bgep_req = '1')  then rpend(2) <= '1'; end if;
+            if (rdr_objep_req = '1') then rpend(3) <= '1'; end if;
+            if (rdispatch = '1') then
+               rpend(rpick) <= '0';
+            end if;
+         end if;
+      end if;
+   end process;
 
    rdr_bg_done    <= rdone_int(0);
    rdr_obj_done   <= rdone_int(1);

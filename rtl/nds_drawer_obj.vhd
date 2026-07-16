@@ -38,6 +38,7 @@ entity nds_drawer_obj is
       clk                  : in  std_logic;
 
       drawline             : in  std_logic;
+      busy                 : out std_logic := '0';
       ypos                 : in  integer range 0 to 191;
       ypos_mosaic          : in  integer range 0 to 191;
 
@@ -281,6 +282,10 @@ architecture arch of nds_drawer_obj is
    signal maxpixeltime      : integer range 0 to 8191;
 
 begin
+
+   busy <= '1' when (OAMFetch /= IDLE or PIXELGen /= WAITOAM
+                     or enable_eval = '1' or enable_wait = '1' or enable_merge = '1'
+                     or issue_pixel = '1') else '0';
 
    VRAM_Drawer_addr    <= to_integer(pixeladdr_x(17 downto 2));
    PALETTE_Drawer_addr <= to_integer(unsigned(PALETTE_byteaddr(8 downto 2)));

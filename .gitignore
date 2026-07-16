@@ -23,3 +23,12 @@ arm9_trace.log
 sim/tests/gpu_bg_*.hex
 sim/tests/gpu_obj_*.hex
 sim/tests/vram_ls_vectors.hex
+
+# generated gpu2d vectors (deterministic from gen_gpu2d.py / gen_gpu2d_frame.py)
+sim/tests/gpu2d_*.hex
+sim/tests/__pycache__/
+sim/tests/sim/
+
+# gpu2d TB dump outputs
+gpu2d_frame_fb.txt
+gpu2d_dbg_line.txt
