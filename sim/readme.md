@@ -29,6 +29,10 @@ eyeball-checked.
   with `python3 sim/tests/gen_gpu_bg.py` (from `sim/tests/`) first.
 - `run_gpu_obj.sh` — M5 OBJ drawer line tests (tile/bitmap/affine sprites,
   ext palettes, priority merge) vs `gen_gpu_obj.py`; same regenerate flow.
+- `run_vram_ls_tb.sh` — M5 VRAM line-server tests: the renderer BG/OBJ/
+  ext-palette read channels of `nds_vram` vs the `gen_vram_ls.py` golden
+  (independent GBATEK mapping model), with CPU-port differential reads and
+  concurrent-channel arbiter checks; same regenerate flow.
 
 ## Adding a bench
 

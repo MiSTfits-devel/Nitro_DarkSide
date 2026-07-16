@@ -22,3 +22,4 @@ arm9_trace.log
 # generated GPU golden vectors (deterministic from gen_gpu_bg.py / gen_gpu_obj.py)
 sim/tests/gpu_bg_*.hex
 sim/tests/gpu_obj_*.hex
+sim/tests/vram_ls_vectors.hex

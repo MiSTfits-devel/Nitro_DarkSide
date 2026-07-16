@@ -53,9 +53,10 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    sim/tb_arm9_island.vhd \
    sim/tb_arm9_trace.vhd \
    sim/tb_gpu_bg.vhd \
-   sim/tb_gpu_obj.vhd
-# (tb_gpu_* are analyze-only: their hex-file constants load at elaboration
-#  and the vectors are generated, not checked in)
+   sim/tb_gpu_obj.vhd \
+   sim/tb_vram_ls.vhd
+# (tb_gpu_* / tb_vram_ls are analyze-only: their hex-file constants load at
+#  elaboration and the vectors are generated, not checked in)
 
 # 4) elaborate the standalone entities as a sanity gate
 nvc -L "$WORK" --work="$WORK/work" -e nds_top
