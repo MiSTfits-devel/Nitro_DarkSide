@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Unit test for the VRAM bank mapping decoder (nds_vram_map).
 # Follows the GBA_MiSTfits nvc flow; no ROM/BIOS assets needed.
-set -euo pipefail
-cd "$(git rev-parse --show-toplevel)"
+set -eu
+cd "$(dirname "$0")/.."
 
 WORK=sim/nvc_work
 mkdir -p "$WORK"

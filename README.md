@@ -31,8 +31,11 @@ core. The optimization headroom won there is the budget we spend here.
   from GBA_MiSTfits keep their names.
 - `docs/` — architecture, the NDS→DE10 memory budget (read `MEMORY_MAP.md` first — it is
   the load-bearing analysis), and the roadmap.
-- `sim/` — nvc-based simulation harness, same flow as GBA_MiSTfits (long runs execute on
-  the k8s build host).
+- `sim/` — nvc-based simulation harness, same flow as GBA_MiSTfits. Run heavy benches on
+  the cluster: `build/remote-sim.sh run_<x>_tb.sh` (see `build/`; `DIRTY=1` for the
+  working tree, `ENV="OPCOUNT=..."` for generics).
+- `build/` — k8s pod driver for remote nvc runs, patterned on GBA_MiSTer's
+  `build/remote-build.sh` Quartus flow.
 - `sys/` — MiSTer framework (copied from GBA_MiSTer, unmodified).
 
 ## Reference material
