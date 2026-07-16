@@ -60,9 +60,12 @@ entity nds_drawer_extended is
       EXTPAL_Drawer_data   : in  std_logic_vector(31 downto 0);
       EXTPAL_Drawer_valid  : in  std_logic;
 
+      -- one request in flight; req one-cycle pulse, addr held until the
+      -- done pulse (data valid that cycle)
+      VRAM_Drawer_req      : out std_logic := '0';
       VRAM_Drawer_addr     : out integer range 0 to 131071;
       VRAM_Drawer_data     : in  std_logic_vector(31 downto 0);
-      VRAM_Drawer_valid    : in  std_logic
+      VRAM_Drawer_done     : in  std_logic
    );
 end entity;
 
@@ -89,6 +92,7 @@ architecture arch of nds_drawer_extended is
 
    signal VRAM_byteaddr        : unsigned(18 downto 0) := (others => '0');
    signal VRAM_byteaddr_low    : unsigned(1 downto 0) := (others => '0');
+   signal VRAM_addr_r          : unsigned(18 downto 2) := (others => '0');
 
    -- latched by the palette FSM at trigger time - colordata_r/palno_r move
    -- on with the next pixel while a lookup is still in flight
@@ -127,7 +131,9 @@ architecture arch of nds_drawer_extended is
 
 begin
 
-   VRAM_Drawer_addr    <= to_integer(VRAM_byteaddr(18 downto 2));
+   -- request address is registered when req issues - VRAM_byteaddr is a
+   -- combinational mux on the FSM state and would drift mid-request
+   VRAM_Drawer_addr    <= to_integer(VRAM_addr_r);
    PALETTE_Drawer_addr <= to_integer(unsigned(PALETTE_byteaddr(8 downto 2)));
    EXTPAL_Drawer_addr  <= to_integer(unsigned(EXTPAL_byteaddr(14 downto 2)));
 
@@ -167,6 +173,7 @@ begin
       if rising_edge(clk) then
 
          palette_newPixel <= '0';
+         VRAM_Drawer_req  <= '0';
 
          case (vramfetch) is
 
@@ -201,47 +208,50 @@ begin
                end if;
 
             when CALCADDR =>
-               if (VRAM_Drawer_valid = '0') then
+               if (wrapping = '0' and (xxx_pre < 0 or yyy_pre < 0 or xxx_pre >= xlim or yyy_pre >= ylim)) then
+                  realX <= realX + dx;
+                  realY <= realy + dy;
+                  if (x_cnt < 255) then
+                     vramfetch <= CALCADDR;
+                     x_cnt     <= x_cnt + 1;
+                  else
+                     vramfetch <= IDLE;
+                  end if;
+               else
                   VRAM_byteaddr_low <= VRAM_byteaddr(1 downto 0);
+                  VRAM_addr_r       <= VRAM_byteaddr(18 downto 2);
+                  VRAM_Drawer_req   <= '1';
                   if (variant = "00") then
                      vramfetch <= WAITREAD_TILE;
                   else
                      vramfetch <= WAITREAD_COLOR;
                   end if;
-
-                  if (wrapping = '0') then
-                     if (xxx_pre < 0 or yyy_pre < 0 or xxx_pre >= xlim or yyy_pre >= ylim) then
-                        realX <= realX + dx;
-                        realY <= realy + dy;
-                        if (x_cnt < 255) then
-                           vramfetch <= CALCADDR;
-                           x_cnt     <= x_cnt + 1;
-                        else
-                           vramfetch <= IDLE;
-                        end if;
-                     end if;
-                  end if;
                end if;
 
             when WAITREAD_TILE =>
-               case (to_integer(VRAM_byteaddr_low(1 downto 0))) is
-                  when 0 | 1  => tileentry <= VRAM_Drawer_data(15 downto  0);
-                  when others => tileentry <= VRAM_Drawer_data(31 downto 16);
-               end case;
-               vramfetch  <= EVALTILE;
+               if (VRAM_Drawer_done = '1') then
+                  case (to_integer(VRAM_byteaddr_low(1 downto 0))) is
+                     when 0 | 1  => tileentry <= VRAM_Drawer_data(15 downto  0);
+                     when others => tileentry <= VRAM_Drawer_data(31 downto 16);
+                  end case;
+                  vramfetch  <= EVALTILE;
+               end if;
 
             when EVALTILE =>
-               -- EVALTILE is the RAM latch slot for the tile pixel address
-               -- (combinational from tileentry); WAITREAD_TILE was the
-               -- data-valid cycle that loaded tileentry
+               -- tile pixel address is combinational from tileentry, which
+               -- WAITREAD_TILE just loaded
                palno <= tileentry(15 downto 12);
                VRAM_byteaddr_low <= VRAM_byteaddr(1 downto 0);
+               VRAM_addr_r       <= VRAM_byteaddr(18 downto 2);
+               VRAM_Drawer_req   <= '1';
                vramfetch <= WAITREAD_COLOR;
 
             when WAITREAD_COLOR =>
-               colordata_r <= colordata16;
-               palno_r     <= palno;
-               vramfetch   <= HANDOFF;
+               if (VRAM_Drawer_done = '1') then
+                  colordata_r <= colordata16;
+                  palno_r     <= palno;
+                  vramfetch   <= HANDOFF;
+               end if;
 
             when HANDOFF =>
                if (palettefetch = IDLE and palette_newPixel = '0') then
