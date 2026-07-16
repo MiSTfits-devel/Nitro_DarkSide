@@ -81,7 +81,11 @@ entity nds_membus7 is
       mr_done        : in  std_logic;
       mr_readdata    : in  std_logic_vector(31 downto 0);
 
-      -- IO register bus (wired_out/-done OR-reduced over all banks outside)
+      -- IO register bus (wired_out/-done OR-reduced over all banks outside).
+      -- io_ce_next: the ce-gated peripherals' enable in the NEXT cycle; the
+      -- 1-cycle io_bus.ena pulse is only issued when it will land on an
+      -- active peripheral cycle. Tie to '1' at full rate.
+      io_ce_next     : in  std_logic := '1';
       io_bus         : out proc_bus_gb_type := ((others => '0'), (others => '0'), '1', '0', "00", "0000", '0');
       io_wired_out   : in  std_logic_vector(31 downto 0);
       io_wired_done  : in  std_logic
@@ -91,7 +95,7 @@ end entity;
 architecture arch of nds_membus7 is
 
    type t_target is (T_BIOS, T_MAIN, T_WRAMSH, T_WRAM7, T_IO, T_VRAM, T_OPEN);
-   type t_state  is (IDLE, FINISH, W_WRAMSH, W_VRAM, W_MAIN);
+   type t_state  is (IDLE, FINISH, W_WRAMSH, W_VRAM, W_MAIN, W_IO_ALIGN);
 
    signal state    : t_state  := IDLE;
    signal target   : t_target := T_OPEN;
@@ -185,14 +189,20 @@ begin
             state <= IDLE;
          else
             case state is
-               when IDLE     => can_accept := true;
-               when FINISH   => can_accept := true;              -- done this cycle
-               when W_WRAMSH => can_accept := (wsh_done  = '1');
-               when W_VRAM   => can_accept := (vram_done = '1');
-               when W_MAIN   => can_accept := (mr_done   = '1');
+               when IDLE       => can_accept := true;
+               when FINISH     => can_accept := true;            -- done this cycle
+               when W_WRAMSH   => can_accept := (wsh_done  = '1');
+               when W_VRAM     => can_accept := (vram_done = '1');
+               when W_MAIN     => can_accept := (mr_done   = '1');
+               when W_IO_ALIGN => can_accept := false;
             end case;
 
-            if can_accept then
+            if (state = W_IO_ALIGN) then
+               if (io_ce_next = '1') then
+                  io_bus.ena <= '1';
+                  state      <= FINISH;
+               end if;
+            elsif can_accept then
                state <= IDLE;
                if (cpu_ena = '1') then
                   target <= dec_target;
@@ -239,13 +249,17 @@ begin
                         state        <= W_MAIN;
 
                      when T_IO =>
-                        io_bus.ena  <= '1';
                         io_bus.rnw  <= cpu_rnw;
                         io_bus.Adr  <= x"0" & cpu_adr(23 downto 2) & "00";
                         io_bus.acc  <= cpu_acc;
                         io_bus.Din  <= wdata;
                         io_bus.bEna <= be;
-                        state       <= FINISH;
+                        if (io_ce_next = '1') then
+                           io_bus.ena <= '1';
+                           state      <= FINISH;
+                        else
+                           state <= W_IO_ALIGN;
+                        end if;
 
                      when T_OPEN =>
                         state <= FINISH;
