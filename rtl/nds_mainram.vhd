@@ -1,0 +1,218 @@
+-- SPDX-License-Identifier: GPL-2.0-or-later
+-- NDS main RAM (4 MB in SDRAM): dual guest channels for ARM9 and ARM7 sharing
+-- one SDRAM request port, following the gba_mem_ewram_sdram idiom from
+-- GBA_MiSTfits (request latched on clk1x, issued on clkMem at phase 0 when the
+-- extern scheduler allows, done/readdata re-registered back onto clk1x).
+--
+-- Both CPUs address the same 4 MB window (Softmap_NDS_MAINRAM_ADDR). When both
+-- have a request pending, `arm7_priority` picks the winner (EXMEMCNT bit 15
+-- semantics land here later); the loser is served immediately after — the
+-- channel keeps the request bus (busy) until both queues drain, so a scheduler
+-- never interleaves a foreign op between our back-to-back grants.
+--
+-- clkMemIndex counts the clkMem phases inside one clk1x period (0 on the
+-- rising edge of clk1x). GBA used 6 phases at 16.78 MHz x6; the NDS plan is
+-- 3 phases at 33.514 MHz x3 — the module only cares about phase 0.
+
+library IEEE;
+use IEEE.std_logic_1164.all;
+use IEEE.numeric_std.all;
+
+entity nds_mainram is
+   generic
+   (
+      Softmap_NDS_MAINRAM_ADDR : integer  -- byte offset of the 4 MB window in SDRAM
+   );
+   port
+   (
+      clk1x            : in  std_logic;
+      clkMem           : in  std_logic;
+      clkMemIndex      : in  unsigned(1 downto 0);
+      reset            : in  std_logic;
+
+      arm7_priority    : in  std_logic;   -- '1': ARM7 wins simultaneous pendings
+
+      -- ARM9 port (dword address inside the 4 MB)
+      mem9_ena         : in  std_logic;
+      mem9_rnw         : in  std_logic;
+      mem9_addr        : in  std_logic_vector(21 downto 2);
+      mem9_be          : in  std_logic_vector(3 downto 0);
+      mem9_writedata   : in  std_logic_vector(31 downto 0);
+      mem9_done        : out std_logic := '0';
+      mem9_readdata    : out std_logic_vector(31 downto 0) := (others => '0');
+
+      -- ARM7 port
+      mem7_ena         : in  std_logic;
+      mem7_rnw         : in  std_logic;
+      mem7_addr        : in  std_logic_vector(21 downto 2);
+      mem7_be          : in  std_logic_vector(3 downto 0);
+      mem7_writedata   : in  std_logic_vector(31 downto 0);
+      mem7_done        : out std_logic := '0';
+      mem7_readdata    : out std_logic_vector(31 downto 0) := (others => '0');
+
+      -- extern scheduler handshake (gba_mem_ewram_sdram idiom)
+      mainram_allow    : in  std_logic;   -- scheduler idle, may start at clkMemIndex 0
+      mainram_active   : out std_logic;   -- request pending or in flight
+      mainram_busy     : out std_logic;   -- SDRAM op in flight -> owns the request bus
+
+      -- SDRAM controller request port (ch2-style 32-bit op)
+      mr_sdram_ena     : out std_logic := '0';
+      mr_sdram_rnw     : out std_logic := '0';
+      mr_sdram_Adr     : out std_logic_vector(26 downto 0) := (others => '0');
+      mr_sdram_Din     : out std_logic_vector(31 downto 0) := (others => '0');
+      mr_sdram_be      : out std_logic_vector(3 downto 0) := (others => '1');
+      sdram_Dout       : in  std_logic_vector(31 downto 0);
+      sdram_done32     : in  std_logic
+   );
+end entity;
+
+architecture arch of nds_mainram is
+
+   type tState is
+   (
+      MR_IDLE,
+      MR_WAIT,
+      MR_DONE
+   );
+   signal state         : tState := MR_IDLE;
+   signal serving7      : std_logic := '0';
+
+   signal req9_pending  : std_logic := '0';
+   signal req9_rnw      : std_logic := '0';
+   signal req9_addr     : std_logic_vector(21 downto 2) := (others => '0');
+   signal req9_be       : std_logic_vector(3 downto 0)  := (others => '0');
+   signal req9_din      : std_logic_vector(31 downto 0) := (others => '0');
+
+   signal req7_pending  : std_logic := '0';
+   signal req7_rnw      : std_logic := '0';
+   signal req7_addr     : std_logic_vector(21 downto 2) := (others => '0');
+   signal req7_be       : std_logic_vector(3 downto 0)  := (others => '0');
+   signal req7_din      : std_logic_vector(31 downto 0) := (others => '0');
+
+   signal done9_6x      : std_logic := '0';  -- op completed, clk1x side must retire
+   signal done7_6x      : std_logic := '0';
+   signal readdata_6x   : std_logic_vector(31 downto 0) := (others => '0');
+
+begin
+
+   mainram_active <= req9_pending or req7_pending;
+   mainram_busy   <= '1' when (state /= MR_IDLE) else '0';
+
+   -- clk1x side: latch requests, retire completions (registered 6x->1x capture,
+   -- same reasoning as gba_mem_ewram_sdram: keep the readmux cone off the
+   -- cross-domain transfer)
+   process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+
+         mem9_done <= '0';
+         mem7_done <= '0';
+
+         if (reset = '1') then
+            req9_pending <= '0';
+            req7_pending <= '0';
+         else
+
+            if (mem9_ena = '1') then
+               req9_pending <= '1';
+               req9_rnw     <= mem9_rnw;
+               req9_addr    <= mem9_addr;
+               req9_be      <= mem9_be;
+               req9_din     <= mem9_writedata;
+            elsif (req9_pending = '1' and done9_6x = '1') then
+               req9_pending  <= '0';
+               mem9_done     <= '1';
+               mem9_readdata <= readdata_6x;
+            end if;
+
+            if (mem7_ena = '1') then
+               req7_pending <= '1';
+               req7_rnw     <= mem7_rnw;
+               req7_addr    <= mem7_addr;
+               req7_be      <= mem7_be;
+               req7_din     <= mem7_writedata;
+            elsif (req7_pending = '1' and done7_6x = '1') then
+               req7_pending  <= '0';
+               mem7_done     <= '1';
+               mem7_readdata <= readdata_6x;
+            end if;
+
+         end if;
+      end if;
+   end process;
+
+   -- clkMem side: arbitrate + issue
+   process (clkMem)
+      variable pick7 : std_logic;
+   begin
+      if rising_edge(clkMem) then
+
+         mr_sdram_ena <= '0';
+
+         case (state) is
+
+            when MR_IDLE =>
+               done9_6x <= '0';
+               done7_6x <= '0';
+               if (reset = '0' and (req9_pending = '1' or req7_pending = '1') and
+                   clkMemIndex = 0 and mainram_allow = '1' and
+                   done9_6x = '0' and done7_6x = '0') then
+
+                  if (req9_pending = '1' and req7_pending = '1') then
+                     pick7 := arm7_priority;
+                  elsif (req7_pending = '1') then
+                     pick7 := '1';
+                  else
+                     pick7 := '0';
+                  end if;
+
+                  serving7     <= pick7;
+                  mr_sdram_ena <= '1';
+                  if (pick7 = '1') then
+                     mr_sdram_rnw <= req7_rnw;
+                     mr_sdram_Adr <= std_logic_vector(to_unsigned(Softmap_NDS_MAINRAM_ADDR, 27) + (unsigned(req7_addr) & "00"));
+                     mr_sdram_Din <= req7_din;
+                     mr_sdram_be  <= req7_be;
+                  else
+                     mr_sdram_rnw <= req9_rnw;
+                     mr_sdram_Adr <= std_logic_vector(to_unsigned(Softmap_NDS_MAINRAM_ADDR, 27) + (unsigned(req9_addr) & "00"));
+                     mr_sdram_Din <= req9_din;
+                     mr_sdram_be  <= req9_be;
+                  end if;
+                  state <= MR_WAIT;
+               end if;
+
+            -- drains even during reset, same as the EWRAM channel: the request
+            -- bus stays owned until the controller consumed the op
+            when MR_WAIT =>
+               if (sdram_done32 = '1') then
+                  readdata_6x <= sdram_Dout;
+                  if (reset = '1') then
+                     state <= MR_IDLE;
+                  else
+                     if (serving7 = '1') then
+                        done7_6x <= '1';
+                     else
+                        done9_6x <= '1';
+                     end if;
+                     state <= MR_DONE;
+                  end if;
+               end if;
+
+            when MR_DONE =>
+               if (reset = '1') then
+                  state <= MR_IDLE;
+               elsif (serving7 = '1' and req7_pending = '0') then
+                  done7_6x <= '0';
+                  state    <= MR_IDLE;
+               elsif (serving7 = '0' and req9_pending = '0') then
+                  done9_6x <= '0';
+                  state    <= MR_IDLE;
+               end if;
+
+         end case;
+
+      end if;
+   end process;
+
+end architecture;

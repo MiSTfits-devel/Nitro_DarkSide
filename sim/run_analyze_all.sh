@@ -28,16 +28,27 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/gba_cpu.vhd \
    rtl/dpram.vhd \
    rtl/DDR3Mux.vhd \
+   rtl/reggba_timer.vhd \
+   rtl/gba_timer_module.vhd \
+   rtl/gba_timer.vhd \
    rtl/nds_vram_map.vhd \
    rtl/nds_vram.vhd \
    rtl/nds_wram.vhd \
+   rtl/nds_mainram.vhd \
+   rtl/nds_irq.vhd \
+   rtl/nds_ipc.vhd \
+   rtl/nds_membus7.vhd \
    rtl/nds_top.vhd \
    sim/tb_vram_map.vhd \
-   sim/tb_vram_torture.vhd
+   sim/tb_vram_torture.vhd \
+   sim/tb_mainram.vhd \
+   sim/tb_arm7_island.vhd
 
 # 4) elaborate the standalone entities as a sanity gate
 nvc -L "$WORK" --work="$WORK/work" -e nds_top
 nvc -L "$WORK" --work="$WORK/work" -e tb_vram_map
 nvc -L "$WORK" --work="$WORK/work" -e tb_vram_torture
+nvc -H 1g -L "$WORK" --work="$WORK/work" -e tb_mainram
+nvc -H 1g -L "$WORK" --work="$WORK/work" -e tb_arm7_island
 
 echo "analyze-all: OK"
