@@ -94,6 +94,18 @@ entity nds_membus9 is
       vram_dout      : in  std_logic_vector(31 downto 0);
       vram_done      : in  std_logic;
 
+      -- palette / OAM (nds_gpu2d engine-A BRAM write ports; 0x400-mirror
+      -- halves belong to engine B later. CPU readback is a known gap -
+      -- reads return 0 until the BRAMs grow a read port)
+      pal_we         : out std_logic := '0';
+      pal_addr       : out integer range 0 to 255 := 0;
+      pal_din        : out std_logic_vector(31 downto 0) := (others => '0');
+      pal_be         : out std_logic_vector(3 downto 0) := (others => '0');
+      oam_we         : out std_logic := '0';
+      oam_addr       : out integer range 0 to 255 := 0;
+      oam_din        : out std_logic_vector(31 downto 0) := (others => '0');
+      oam_be         : out std_logic_vector(3 downto 0) := (others => '0');
+
       -- main RAM (nds_mainram mem9 port)
       mr_ena         : out std_logic := '0';
       mr_rnw         : out std_logic := '1';
@@ -117,7 +129,7 @@ end entity;
 
 architecture arch of nds_membus9 is
 
-   type t_target is (T_ITCM, T_DTCM, T_BROM, T_MAIN, T_WRAMSH, T_IO, T_VRAM, T_OPEN);
+   type t_target is (T_ITCM, T_DTCM, T_BROM, T_MAIN, T_WRAMSH, T_IO, T_VRAM, T_PAL, T_OAM, T_OPEN);
    type t_state  is (IDLE, FINISH, W_WRAMSH, W_VRAM, W_MAIN, W_IO_ALIGN);
 
    signal state    : t_state  := IDLE;
@@ -222,7 +234,9 @@ begin
                if (cpu_adr(23) = '0') then
                   dec_target <= T_IO;
                end if;
+            when x"5" => dec_target <= T_PAL;
             when x"6" => dec_target <= T_VRAM;
+            when x"7" => dec_target <= T_OAM;
             when others => null;
          end case;
       end if;
@@ -271,6 +285,8 @@ begin
          creq_ena <= '0';
          itcm_we  <= '0';
          dtcm_we  <= '0';
+         pal_we   <= '0';
+         oam_we   <= '0';
          io_bus.ena <= '0';
          io_bus.rst <= reset;
 
@@ -338,6 +354,26 @@ begin
                         vram_din  <= wdata;
                         state     <= W_VRAM;
 
+                     when T_PAL =>
+                        -- engine A std palette: low 1 KB of each 2 KB mirror
+                        if (cpu_rnw = '0' and cpu_adr(10) = '0') then
+                           pal_we   <= '1';
+                           pal_addr <= to_integer(unsigned(cpu_adr(9 downto 2)));
+                           pal_be   <= be;
+                           pal_din  <= wdata;
+                        end if;
+                        state <= FINISH;
+
+                     when T_OAM =>
+                        -- engine A OAM: low 1 KB of each 2 KB mirror
+                        if (cpu_rnw = '0' and cpu_adr(10) = '0') then
+                           oam_we   <= '1';
+                           oam_addr <= to_integer(unsigned(cpu_adr(9 downto 2)));
+                           oam_be   <= be;
+                           oam_din  <= wdata;
+                        end if;
+                        state <= FINISH;
+
                      when T_MAIN =>
                         creq_ena   <= '1';
                         creq_rnw   <= cpu_rnw;
@@ -386,6 +422,7 @@ begin
                 brom_data     when target = T_BROM   else
                 wsh_dout      when target = T_WRAMSH else
                 vram_dout     when target = T_VRAM   else
+                x"00000000"   when (target = T_PAL or target = T_OAM) else -- readback gap: BRAMs are write-only from the CPU
                 cresp_rdata   when target = T_MAIN   else
                 io_wired_out  when (target = T_IO and io_wired_done = '1') else
                 cpu_lastread;
