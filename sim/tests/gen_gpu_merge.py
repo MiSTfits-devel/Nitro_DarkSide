@@ -6,7 +6,9 @@
 # word, then per case 16 header words + 256 words per plane in order
 # bg0, bg1, bg2, bg3 (16 bit, bit15 transparent), obj (24 bit: [15:0]
 # color/transparent, [17:16] prio, [18] semi, [19] bitmap, [23:20] bitmap
-# alpha), objwnd (1 bit), expected (15 bit).
+# alpha), objwnd (1 bit), expected (18 bit BGR666 — NDS color math is
+# 6-bit per channel with hardware rounding, melonDS-verified; see
+# nds_drawer_merge.vhd header).
 #
 # The golden merge implements the donor's hardware-verified GBA semantics
 # (window select, priority incl. OBJ-wins-ties, first/second target
@@ -19,6 +21,11 @@ import random
 rnd = random.Random(0x3E26E)
 
 BG0, BG1, BG2, BG3, OBJ, BD = range(6)
+
+def expand666(c15):
+    return (((c15 & 0x1F) << 1)
+            | ((((c15 >> 5) & 0x1F) << 1) << 6)
+            | ((((c15 >> 10) & 0x1F) << 1) << 12))
 
 def in_range(v, a, b):
     return (a <= b and a <= v < b) or (a > b and (v >= a or v < b))
@@ -104,27 +111,27 @@ def merge_line(cfg, bg, obj, objwnd):
             apply = 0
 
         if apply:
-            def ch(v, sh):
-                return (v >> sh) & 31
+            def ch6(v, sh):
+                return ((v >> sh) & 31) << 1   # 555 channel -> 666
             res = 0
             if eff == 1:
                 if obmp and first == OBJ:
                     ea, eb = obalpha + 1, 16 - (obalpha + 1)
                 else:
                     ea, eb = eva, evb
-                for sh in (0, 5, 10):
-                    res |= min(31, (ch(firstpixel, sh) * ea + ch(secondpixel, sh) * eb) // 16) << sh
+                for i, sh in enumerate((0, 5, 10)):
+                    res |= min(63, (ch6(firstpixel, sh) * ea + ch6(secondpixel, sh) * eb + 8) // 16) << (6 * i)
             elif eff == 2:
-                for sh in (0, 5, 10):
-                    c = ch(firstpixel, sh)
-                    res |= min(31, c + ((31 - c) * bldy) // 16) << sh
+                for i, sh in enumerate((0, 5, 10)):
+                    c = ch6(firstpixel, sh)
+                    res |= (c + ((63 - c) * bldy + 8) // 16) << (6 * i)
             else:
-                for sh in (0, 5, 10):
-                    c = ch(firstpixel, sh)
-                    res |= max(0, c - (c * bldy) // 16) << sh
+                for i, sh in enumerate((0, 5, 10)):
+                    c = ch6(firstpixel, sh)
+                    res |= (c - (c * bldy + 7) // 16) << (6 * i)
             out.append(res)
         else:
-            out.append(layercolor(top))
+            out.append(expand666(layercolor(top)))
     return out
 
 def rnd_layer(p_transp=0.4):

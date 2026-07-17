@@ -103,10 +103,11 @@ entity nds_top is
       vrsrv_dout       : in  std_logic_vector(31 downto 0);
       vrsrv_done       : in  std_logic;
 
-      -- video out: engine A composed lines (RGB555 like the GBA path)
+      -- video out: engine A composed lines, BGR666 (the NDS 18-bit LCD
+      -- format; B in [17:12])
       pixel_out_x      : out integer range 0 to 255;
       pixel_out_y      : out integer range 0 to 191;
-      pixel_out_data   : out std_logic_vector(14 downto 0);
+      pixel_out_data   : out std_logic_vector(17 downto 0);
       pixel_out_we     : out std_logic;
       pixel_out_engB   : out std_logic;
       vblank_out       : out std_logic;

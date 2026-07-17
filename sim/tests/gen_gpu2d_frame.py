@@ -8,7 +8,7 @@
 #                      H (8192), I (4096) - 167936 words
 #   gpu2d_vectors.hex  case count; per case: reg-write count, (offset,value)
 #                      pairs, 256 palette words (BG then OBJ), 256 OAM words,
-#                      49152 expected frame words (15-bit color)
+#                      49152 expected frame words (18-bit BGR666)
 #
 # The TB maps banks with the fixed VRAMCNT below (A=BG 0x00000, D=BG 0x20000,
 # B=OBJ, E=BG ext pal, F=OBJ ext pal; C/G/H/I off) and this model reads
@@ -333,6 +333,11 @@ def pick_top(ena, objprio, prios):
 
 OBJ, BD = 4, 5
 
+def expand666(c15):
+    return (((c15 & 0x1F) << 1)
+            | ((((c15 >> 5) & 0x1F) << 1) << 6)
+            | ((((c15 >> 10) & 0x1F) << 1) << 12))
+
 def merge_line(m, y, bg, obj, objwnd):
     out = []
     prios = m["prios"]
@@ -390,27 +395,27 @@ def merge_line(m, y, bg, obj, objwnd):
         if eff > 1 and first == OBJ and not ((m["first"] >> OBJ) & 1):
             apply = 0
         if apply:
-            def ch(v, sh):
-                return (v >> sh) & 31
+            def ch6(v, sh):
+                return ((v >> sh) & 31) << 1   # 555 channel -> 666
             res = 0
             if eff == 1:
                 if obmp and first == OBJ:
                     ea, eb = obalpha + 1, 16 - (obalpha + 1)
                 else:
                     ea, eb = eva, evb
-                for sh in (0, 5, 10):
-                    res |= min(31, (ch(firstpixel, sh) * ea + ch(secondpixel, sh) * eb) // 16) << sh
+                for i, sh in enumerate((0, 5, 10)):
+                    res |= min(63, (ch6(firstpixel, sh) * ea + ch6(secondpixel, sh) * eb + 8) // 16) << (6 * i)
             elif eff == 2:
-                for sh in (0, 5, 10):
-                    cch = ch(firstpixel, sh)
-                    res |= min(31, cch + ((31 - cch) * bldy) // 16) << sh
+                for i, sh in enumerate((0, 5, 10)):
+                    cch = ch6(firstpixel, sh)
+                    res |= (cch + ((63 - cch) * bldy + 8) // 16) << (6 * i)
             else:
-                for sh in (0, 5, 10):
-                    cch = ch(firstpixel, sh)
-                    res |= max(0, cch - (cch * bldy) // 16) << sh
+                for i, sh in enumerate((0, 5, 10)):
+                    cch = ch6(firstpixel, sh)
+                    res |= (cch - (cch * bldy + 7) // 16) << (6 * i)
             out.append(res)
         else:
-            out.append(layercolor(top))
+            out.append(expand666(layercolor(top)))
     return out
 
 # ---------------------------------------------------------------- frame
