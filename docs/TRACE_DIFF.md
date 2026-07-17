@@ -31,7 +31,7 @@ deleted, or use `KEEP=1`.
 
 ## melonDS side (done — sim/melonds_tracer/)
 
-`sim/melonds_tracer/build.sh` clones melonDS **0.9.5** (pinned) into
+`sim/melonds_tracer/build.sh` clones melonDS **1.1** (pinned) into
 `$MELONDS_DIR` (default `~/sources/melonDS`), applies `tracer.patch`,
 and builds the headless `melonds_tracer` binary (no Qt/SDL, no JIT, stub
 Platform):
@@ -48,15 +48,19 @@ ARM / +4 Thumb, matching the RTL's `regs(15)` at export), opcode masked
 to 16 bit in Thumb, CPSR/r0-r14 post-execute. Condition-failed
 instructions are traced on both sides; IRQ entry traces on neither.
 
-`tracer.patch` also fixes two genuine melonDS 0.9.5 interpreter bugs the
-differential itself flagged (RTL was right both times, verified against
-the ARM ARM):
+`tracer.patch` also fixes one genuine melonDS interpreter bug the
+differential itself flagged (RTL was right, verified against the ARM
+ARM) that is still present upstream as of 1.1:
 
 - `ARM_InstrTable.h`: the EORS row maps icode 0xA to
   `A_EOR_REG_ROR_IMM_S` — so `EORS ..., LSR #odd` executed as ROR.
-- `ARMInterpreter_ALU.cpp`: ADC/SBC/RSC (ARM + Thumb) combined the two
-  partial overflows with OR instead of XOR, so the double-overflow
-  cancellation case (e.g. `-1 + INT_MIN + carry`) set V wrongly.
+
+History: the tracer originally pinned melonDS 0.9.5, where the patch
+carried more fixes the differential found. Upstream 1.1 already has the
+ADC/SBC/RSC V-flag fix (found here first, fixed differently upstream),
+the LDM^-with-pc writeback-before-mode-switch ordering, CP15 c13 Trace
+Process ID, and byte-wide IPCSYNC access — all of which the 0.9.5 patch
+had to carry for calico/libnds-2.x ROMs.
 
 Initial-state gotchas encoded in the workloads: CP15 control resets to
 0x78 (RTL) vs 0x2078 (melonDS) — write control with an immediate before

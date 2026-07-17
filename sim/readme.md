@@ -52,7 +52,8 @@ eyeball-checked.
   `sim/melonds_tracer/build/melonds_fbdump image.nds mds.txt 10` then
   `python3 sim/tests/compare_fb.py top_frame_fb.txt mds.txt` — pixel-perfect
   is the M5 exit gate. Hand-rolled sample images must follow the melonDS
-  0.9.5 PU/POWCNT rules documented at the top of `sim/tests/arm9_2d.s`.
+  PU/POWCNT rules documented at the top of `sim/tests/arm9_2d.s`
+  (established on 0.9.5, unchanged in 1.1).
   Samples: `nds_2d` (text/affine/OBJ), `nds_2dh` (ext palettes + blending),
   `nds_2dw` (windows + mosaic), `nds_sdk2d` (devkitARM/libnds-built
   DUAL-SCREEN C scene packed by ndstool — `sim/tests/sdk2d/build.sh`, needs

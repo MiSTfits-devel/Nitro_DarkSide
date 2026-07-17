@@ -1,9 +1,9 @@
 diff --git a/src/ARM.cpp b/src/ARM.cpp
-index e19cb00..b8a8656 100644
+index 827fcb01..bbb2f72f 100644
 --- a/src/ARM.cpp
 +++ b/src/ARM.cpp
-@@ -567,6 +567,23 @@ void ARMv5::DataAbort()
-     JumpTo(ExceptionBase + 0x10);
+@@ -589,6 +589,23 @@ void ARM::CheckGdbIncoming()
+     GdbCheckA();
  }
  
 +// --- NDS_MiSTfits differential-trace hook (see docs/TRACE_DIFF.md there) ---
@@ -23,151 +23,51 @@ index e19cb00..b8a8656 100644
 +    ARM9TraceCount++;
 +}
 +
+ template <CPUExecuteMode mode>
  void ARMv5::Execute()
  {
-     if (Halted)
-@@ -600,8 +617,10 @@ void ARMv5::Execute()
-             else             NextInstr[1] = CodeRead32(R[15], false);
+@@ -670,8 +687,10 @@ void ARMv5::Execute()
+                 else             NextInstr[1] = CodeRead32(R[15], false);
  
-             // actually execute
-+            u32 trace_pc = R[15];
-             u32 icode = (CurInstr >> 6) & 0x3FF;
-             ARMInterpreter::THUMBInstrTable[icode](this);
-+            ARM9TraceLine(trace_pc, CurInstr & 0xFFFF, CPSR, R);
-         }
-         else
-         {
-@@ -612,6 +631,7 @@ void ARMv5::Execute()
-             NextInstr[1] = CodeRead32(R[15], false);
- 
-             // actually execute
-+            u32 trace_pc = R[15];
-             if (CheckCondition(CurInstr >> 28))
-             {
-                 u32 icode = ((CurInstr >> 4) & 0xF) | ((CurInstr >> 16) & 0xFF0);
-@@ -623,6 +643,7 @@ void ARMv5::Execute()
+                 // actually execute
++                u32 trace_pc = R[15];
+                 u32 icode = (CurInstr >> 6) & 0x3FF;
+                 ARMInterpreter::THUMBInstrTable[icode](this);
++                ARM9TraceLine(trace_pc, CurInstr & 0xFFFF, CPSR, R);
              }
              else
-                 AddCycles_C();
-+            ARM9TraceLine(trace_pc, CurInstr, CPSR, R);
-         }
+             {
+@@ -685,6 +704,7 @@ void ARMv5::Execute()
+                 NextInstr[1] = CodeRead32(R[15], false);
  
-         // TODO optimize this shit!!!
-diff --git a/src/ARM.h b/src/ARM.h
-index 6cfb677..7391953 100644
---- a/src/ARM.h
-+++ b/src/ARM.h
-@@ -263,6 +263,7 @@ public:
-     u32 CP15Control;
+                 // actually execute
++                u32 trace_pc = R[15];
+                 if (CheckCondition(CurInstr >> 28))
+                 {
+                     u32 icode = ((CurInstr >> 4) & 0xF) | ((CurInstr >> 16) & 0xFF0);
+@@ -696,6 +716,7 @@ void ARMv5::Execute()
+                 }
+                 else
+                     AddCycles_C();
++                ARM9TraceLine(trace_pc, CurInstr, CPSR, R);
+             }
  
-     u32 RNGSeed;
-+    u32 TraceProcessID;
- 
-     u32 DTCMSetting, ITCMSetting;
- 
+             // TODO optimize this shit!!!
 diff --git a/src/ARMInterpreter.cpp b/src/ARMInterpreter.cpp
-index aaa1e7b..210f45d 100644
+index 80b64dea..3f48f7d0 100644
 --- a/src/ARMInterpreter.cpp
 +++ b/src/ARMInterpreter.cpp
-@@ -31,7 +31,7 @@ namespace ARMInterpreter
- void A_UNK(ARM* cpu)
- {
-     printf("undefined ARM%d instruction %08X @ %08X\n", cpu->Num?7:9, cpu->CurInstr, cpu->R[15]-8);
+@@ -40,7 +40,7 @@ void A_UNK(ARM* cpu)
+ #ifdef GDBSTUB_ENABLED
+     cpu->GdbStub.Enter(cpu->GdbStub.IsConnected(), Gdb::TgtStatus::FaultInsn, cpu->R[15]-8);
+ #endif
 -    //for (int i = 0; i < 16; i++) printf("R%d: %08X\n", i, cpu->R[i]);
 +    for (int i = 0; i < 16; i++) printf("R%d: %08X\n", i, cpu->R[i]);
      //NDS::Halt();
      u32 oldcpsr = cpu->CPSR;
      cpu->CPSR &= ~0xBF;
-diff --git a/src/ARMInterpreter_ALU.cpp b/src/ARMInterpreter_ALU.cpp
-index 3949bb1..81b8e37 100644
---- a/src/ARMInterpreter_ALU.cpp
-+++ b/src/ARMInterpreter_ALU.cpp
-@@ -466,7 +466,7 @@ A_IMPLEMENT_ALU_OP(ADD,)
-     cpu->SetNZCV(res & 0x80000000, \
-                  !res, \
-                  CARRY_ADD(a, b) | CARRY_ADD(res_tmp, carry), \
--                 OVERFLOW_ADD(a, b, res_tmp) | OVERFLOW_ADD(res_tmp, carry, res)); \
-+                 OVERFLOW_ADD(a, b, res_tmp) ^ OVERFLOW_ADD(res_tmp, carry, res)); \
-     if (c) cpu->AddCycles_CI(c); else cpu->AddCycles_C(); \
-     if (((cpu->CurInstr>>12) & 0xF) == 15) \
-     { \
-@@ -501,7 +501,7 @@ A_IMPLEMENT_ALU_OP(ADC,)
-     cpu->SetNZCV(res & 0x80000000, \
-                  !res, \
-                  CARRY_SUB(a, b) & CARRY_SUB(res_tmp, carry), \
--                 OVERFLOW_SUB(a, b, res_tmp) | OVERFLOW_SUB(res_tmp, carry, res)); \
-+                 OVERFLOW_SUB(a, b, res_tmp) ^ OVERFLOW_SUB(res_tmp, carry, res)); \
-     if (c) cpu->AddCycles_CI(c); else cpu->AddCycles_C(); \
-     if (((cpu->CurInstr>>12) & 0xF) == 15) \
-     { \
-@@ -536,7 +536,7 @@ A_IMPLEMENT_ALU_OP(SBC,)
-     cpu->SetNZCV(res & 0x80000000, \
-                  !res, \
-                  CARRY_SUB(b, a) & CARRY_SUB(res_tmp, carry), \
--                 OVERFLOW_SUB(b, a, res_tmp) | OVERFLOW_SUB(res_tmp, carry, res)); \
-+                 OVERFLOW_SUB(b, a, res_tmp) ^ OVERFLOW_SUB(res_tmp, carry, res)); \
-     if (c) cpu->AddCycles_CI(c); else cpu->AddCycles_C(); \
-     if (((cpu->CurInstr>>12) & 0xF) == 15) \
-     { \
-@@ -1336,7 +1336,7 @@ void T_ADC_REG(ARM* cpu)
-     cpu->SetNZCV(res & 0x80000000,
-                  !res,
-                  CARRY_ADD(a, b) | CARRY_ADD(res_tmp, carry),
--                 OVERFLOW_ADD(a, b, res_tmp) | OVERFLOW_ADD(res_tmp, carry, res));
-+                 OVERFLOW_ADD(a, b, res_tmp) ^ OVERFLOW_ADD(res_tmp, carry, res));
-     cpu->AddCycles_C();
- }
- 
-@@ -1351,7 +1351,7 @@ void T_SBC_REG(ARM* cpu)
-     cpu->SetNZCV(res & 0x80000000,
-                  !res,
-                  CARRY_SUB(a, b) & CARRY_SUB(res_tmp, carry),
--                 OVERFLOW_SUB(a, b, res_tmp) | OVERFLOW_SUB(res_tmp, carry, res));
-+                 OVERFLOW_SUB(a, b, res_tmp) ^ OVERFLOW_SUB(res_tmp, carry, res));
-     cpu->AddCycles_C();
- }
- 
-diff --git a/src/ARMInterpreter_LoadStore.cpp b/src/ARMInterpreter_LoadStore.cpp
-index e7b83eb..fb801bc 100644
---- a/src/ARMInterpreter_LoadStore.cpp
-+++ b/src/ARMInterpreter_LoadStore.cpp
-@@ -424,9 +424,14 @@ void A_LDM(ARM* cpu)
-         }
-     }
- 
-+    // ldm with pc + S bit (exception return): JumpTo(restore) switches to
-+    // the SPSR's mode, so the jump must happen AFTER the base writeback
-+    // lands in the CURRENT mode's register. Upstream fix backported for
-+    // calico/libnds-2.x, whose IRQ exit "ldmia sp!, {r0-r3,r12,pc}^" was
-+    // clobbering the interrupted thread's sp with the irq-stack pointer.
-+    u32 pc = 0;
-     if (cpu->CurInstr & (1<<15))
-     {
--        u32 pc;
-         if (preinc) base += 4;
-         if (first) cpu->DataRead32 (base, &pc);
-         else       cpu->DataRead32S(base, &pc);
-@@ -434,8 +439,6 @@ void A_LDM(ARM* cpu)
- 
-         if (cpu->Num == 1)
-             pc &= ~0x1;
--
--        cpu->JumpTo(pc, cpu->CurInstr & (1<<22));
-     }
- 
-     if ((cpu->CurInstr & (1<<22)) && !(cpu->CurInstr & (1<<15)))
-@@ -460,6 +463,9 @@ void A_LDM(ARM* cpu)
-             cpu->R[baseid] = wbbase;
-     }
- 
-+    if (cpu->CurInstr & (1<<15))
-+        cpu->JumpTo(pc, cpu->CurInstr & (1<<22));
-+
-     cpu->AddCycles_CDI();
- }
- 
 diff --git a/src/ARM_InstrTable.h b/src/ARM_InstrTable.h
-index e4b2906..f59e4a8 100644
+index 13d67bff..ec60e2f5 100644
 --- a/src/ARM_InstrTable.h
 +++ b/src/ARM_InstrTable.h
 @@ -39,7 +39,7 @@ INSTRFUNC_PROTO(ARMInstrTable[4096]) =
@@ -175,110 +75,7 @@ index e4b2906..f59e4a8 100644
      A_EOR_REG_LSL_IMM_S, A_EOR_REG_LSL_REG_S, A_EOR_REG_LSR_IMM_S, A_EOR_REG_LSR_REG_S,
      A_EOR_REG_ASR_IMM_S, A_EOR_REG_ASR_REG_S, A_EOR_REG_ROR_IMM_S, A_EOR_REG_ROR_REG_S,
 -    A_EOR_REG_LSL_IMM_S, A_MLA, A_EOR_REG_ROR_IMM_S, A_UNK,
-+    A_EOR_REG_LSL_IMM_S, A_MLA, A_EOR_REG_LSR_IMM_S, A_UNK, // was ROR_IMM_S: 0.9.5 table typo, EORS ...,LSR #odd ran as ROR
++    A_EOR_REG_LSL_IMM_S, A_MLA, A_EOR_REG_LSR_IMM_S, A_UNK, // was ROR_IMM_S: table typo, EORS ...,LSR #odd ran as ROR
      A_EOR_REG_ASR_IMM_S, A_UNK, A_EOR_REG_ROR_IMM_S, A_UNK,
  
      // 0000 0100 0000
-diff --git a/src/CP15.cpp b/src/CP15.cpp
-index 4fe91cf..0d46ce2 100644
---- a/src/CP15.cpp
-+++ b/src/CP15.cpp
-@@ -41,6 +41,7 @@ void ARMv5::CP15Reset()
-     CP15Control = 0x2078; // dunno
- 
-     RNGSeed = 44203;
-+    TraceProcessID = 0;
- 
-     DTCMSetting = 0;
-     ITCMSetting = 0;
-@@ -619,6 +620,10 @@ void ARMv5::CP15Write(u32 id, u32 val)
-         UpdateITCMSetting();
-         return;
- 
-+    case 0xD01:
-+        TraceProcessID = val;   // ARM946E-S Trace Process ID (calico scratch)
-+        return;
-+
-     case 0xF00:
-         //printf("cache debug index register %08X\n", val);
-         return;
-@@ -736,6 +741,9 @@ u32 ARMv5::CP15Read(u32 id)
-         return DTCMSetting;
-     case 0x911:
-         return ITCMSetting;
-+
-+    case 0xD01:
-+        return TraceProcessID;
-     }
- 
-     if ((id & 0xF00) == 0xF00) // test/debug shit?
-diff --git a/src/NDS.cpp b/src/NDS.cpp
-index 7418dca..37d8f55 100644
---- a/src/NDS.cpp
-+++ b/src/NDS.cpp
-@@ -2920,6 +2920,9 @@ u8 ARM9IORead8(u32 addr)
- {
-     switch (addr)
-     {
-+    case 0x04000180: return IPCSync9 & 0xFF;
-+    case 0x04000181: return (IPCSync9 >> 8) & 0xFF;
-+
-     case 0x04000130: LagFrameFlag = false; return KeyInput & 0xFF;
-     case 0x04000131: LagFrameFlag = false; return (KeyInput >> 8) & 0xFF;
-     case 0x04000132: return KeyCnt & 0xFF;
-@@ -3315,6 +3318,22 @@ void ARM9IOWrite8(u32 addr, u8 val)
- {
-     switch (addr)
-     {
-+    case 0x04000180:
-+        return; // input nibble, read-only
-+    case 0x04000181:
-+    {
-+        u16 v16 = ((u16)val) << 8;
-+        IPCSync7 &= 0xFFF0;
-+        IPCSync7 |= ((v16 & 0x0F00) >> 8);
-+        IPCSync9 &= 0xB0FF;
-+        IPCSync9 |= (v16 & 0x4F00);
-+        if ((v16 & 0x2000) && (IPCSync7 & 0x4000))
-+        {
-+            SetIRQ(1, IRQ_IPCSync);
-+        }
-+        return;
-+    }
-+
-     case 0x0400006C:
-     case 0x0400006D: GPU::GPU2D_A.Write8(addr, val); return;
-     case 0x0400106C:
-@@ -3778,6 +3797,9 @@ u8 ARM7IORead8(u32 addr)
- {
-     switch (addr)
-     {
-+    case 0x04000180: return IPCSync7 & 0xFF;
-+    case 0x04000181: return (IPCSync7 >> 8) & 0xFF;
-+
-     case 0x04000130: return KeyInput & 0xFF;
-     case 0x04000131: return (KeyInput >> 8) & 0xFF;
-     case 0x04000132: return KeyCnt & 0xFF;
-@@ -4047,6 +4069,22 @@ void ARM7IOWrite8(u32 addr, u8 val)
- {
-     switch (addr)
-     {
-+    case 0x04000180:
-+        return; // input nibble, read-only
-+    case 0x04000181:
-+    {
-+        u16 v16 = ((u16)val) << 8;
-+        IPCSync9 &= 0xFFF0;
-+        IPCSync9 |= ((v16 & 0x0F00) >> 8);
-+        IPCSync7 &= 0xB0FF;
-+        IPCSync7 |= (v16 & 0x4F00);
-+        if ((v16 & 0x2000) && (IPCSync9 & 0x4000))
-+        {
-+            SetIRQ(0, IRQ_IPCSync);
-+        }
-+        return;
-+    }
-+
-     case 0x04000132:
-         KeyCnt = (KeyCnt & 0xFF00) | val;
-         return;
