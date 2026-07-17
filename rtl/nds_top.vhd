@@ -22,8 +22,10 @@
 --   * no DMA / sound / SPI / RTC / card yet; KEYINPUT/EXTKEYIN are wired
 --     directly so samples polling keys see released state
 --   * both 2D engines render (engine B via the 0x1000 register window,
---     palette/OAM upper halves and the C/D/H/I VRAM roles); POWCNT display
---     routing, master brightness and the compose stage are still open
+--     palette/OAM upper halves and the C/D/H/I VRAM roles); POWCNT routes
+--     the screens (swap bit; B-off shows white, palette/OAM writes gated
+--     by engine power) and MASTER_BRIGHT applies per engine in nds_gpu2d.
+--     Still open: LCDC/FIFO display modes, the DDR3 compose stage
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -105,8 +107,8 @@ entity nds_top is
       vrsrv_dout       : in  std_logic_vector(31 downto 0);
       vrsrv_done       : in  std_logic;
 
-      -- video out: both engines' composed lines, BGR666 (the NDS 18-bit
-      -- LCD format; B in [17:12])
+      -- video out: TOP and BOTTOM screen lines after POWCNT routing,
+      -- BGR666 (the NDS 18-bit LCD format; B in [17:12])
       pixel_out_x      : out integer range 0 to 255;
       pixel_out_y      : out integer range 0 to 191;
       pixel_out_data   : out std_logic_vector(17 downto 0);
@@ -340,6 +342,14 @@ architecture arch of nds_top is
    signal drawline, drawObj, line_trigger, hblank_trigger, gpu_vblank, refpoint_update : std_logic;
    signal line_busy, epfill_busy : std_logic;
    signal line_busy_b, epfill_busy_b : std_logic;
+
+   -- engine streams pre-routing
+   signal pow_2da, pow_2db, pow_swap : std_logic;
+   signal pxa_x, pxb_x       : integer range 0 to 255;
+   signal pxa_y, pxb_y       : integer range 0 to 191;
+   signal pxa_data, pxb_data : std_logic_vector(17 downto 0);
+   signal pxa_we, pxb_we     : std_logic;
+   signal pxb_data_eff       : std_logic_vector(17 downto 0);
    signal vcount_out : unsigned(8 downto 0);
 
 begin
@@ -770,6 +780,7 @@ begin
       bus9 => io_bus9, wired_out9 => sys_wired_out9, wired_done9 => sys_wired_done9,
       bus7 => io_bus7, wired_out7 => sys_wired_out7, wired_done7 => sys_wired_done7,
       wramcnt => wramcnt, vramcnt => vramcnt,
+      pow_2da => pow_2da, pow_2db => pow_2db, pow_swap => pow_swap,
       exmem_gba7 => open, exmem_card7 => open, exmem_prio7 => exmem_prio7
    );
 
@@ -902,8 +913,8 @@ begin
       srv_bgep_data => r_bgep_dout, srv_bgep_done => r_bgep_done,
       srv_objep_req => r_objep_req, srv_objep_addr => g_objep_addr,
       srv_objep_data => r_objep_dout, srv_objep_done => r_objep_done,
-      pixel_out_x => pixel_out_x, pixel_out_y => pixel_out_y,
-      pixel_out_data => pixel_out_data, pixel_out_we => pixel_out_we
+      pixel_out_x => pxa_x, pixel_out_y => pxa_y,
+      pixel_out_data => pxa_data, pixel_out_we => pxa_we
    );
 
    -- ================= engine B =================
@@ -919,12 +930,13 @@ begin
    io_bus9b.bEna <= io_bus9.bEna;
    io_bus9b.rst  <= io_bus9.rst;
 
-   -- palette/OAM 2 KB mirrors: low half engine A, high half engine B
-   pal_we_a    <= pal_we when pal_addr < 256 else '0';
-   pal_we_b    <= pal_we when pal_addr >= 256 else '0';
+   -- palette/OAM 2 KB mirrors: low half engine A, high half engine B;
+   -- writes are dropped while the owning engine is powered off (melonDS)
+   pal_we_a    <= pal_we when (pal_addr < 256 and pow_2da = '1') else '0';
+   pal_we_b    <= pal_we when (pal_addr >= 256 and pow_2db = '1') else '0';
    pal_addr_lo <= pal_addr mod 256;
-   oam_we_a    <= oam_we when oam_addr < 256 else '0';
-   oam_we_b    <= oam_we when oam_addr >= 256 else '0';
+   oam_we_a    <= oam_we when (oam_addr < 256 and pow_2da = '1') else '0';
+   oam_we_b    <= oam_we when (oam_addr >= 256 and pow_2db = '1') else '0';
    oam_addr_lo <= oam_addr mod 256;
 
    -- engine B flat spaces are 128 KB: wrap the drawer addresses
@@ -954,9 +966,23 @@ begin
       srv_bgep_data => rb_bgep_dout, srv_bgep_done => rb_bgep_done,
       srv_objep_req => rb_objep_req, srv_objep_addr => gb_objep_addr,
       srv_objep_data => rb_objep_dout, srv_objep_done => rb_objep_done,
-      pixel_out_x => pixelb_out_x, pixel_out_y => pixelb_out_y,
-      pixel_out_data => pixelb_out_data, pixel_out_we => pixelb_out_we
+      pixel_out_x => pxb_x, pixel_out_y => pxb_y,
+      pixel_out_data => pxb_data, pixel_out_we => pxb_we
    );
+
+   -- POWCNT display routing: engine B disabled shows raw white (melonDS-
+   -- documented hardware quirk: engine A keeps rendering with its bit off);
+   -- swap ('1') puts engine A on the top screen
+   pxb_data_eff <= pxb_data when pow_2db = '1' else (others => '1');
+
+   pixel_out_x     <= pxa_x        when pow_swap = '1' else pxb_x;
+   pixel_out_y     <= pxa_y        when pow_swap = '1' else pxb_y;
+   pixel_out_data  <= pxa_data     when pow_swap = '1' else pxb_data_eff;
+   pixel_out_we    <= pxa_we       when pow_swap = '1' else pxb_we;
+   pixelb_out_x    <= pxb_x        when pow_swap = '1' else pxa_x;
+   pixelb_out_y    <= pxb_y        when pow_swap = '1' else pxa_y;
+   pixelb_out_data <= pxb_data_eff when pow_swap = '1' else pxa_data;
+   pixelb_out_we   <= pxb_we       when pow_swap = '1' else pxa_we;
 
    vblank_out <= gpu_vblank;
 

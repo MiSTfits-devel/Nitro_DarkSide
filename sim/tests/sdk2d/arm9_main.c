@@ -7,7 +7,8 @@
 //   BG3  affine 8bpp, procedural rings, rotated +/-45deg, pri 3
 //   OBJ  quadrant sprite (mosaic), semi-transparent 8x8, 256-color OBJ
 //        EXT PAL sprite, right-edge clipped sprite, mode-2 OBJ-window
-//   WIN0 + OBJWIN + blending (alpha 9/7), MOSAIC 0x2202
+//   WIN0 + OBJWIN + blending (alpha 9/7), MOSAIC 0x0232
+//   MASTER_BRIGHT: A up 4/16, B down 6/16; POWCNT swap CLEAR (B on top)
 //
 // libnds is used for register definitions and the VRAM bank helpers only —
 // no calico kernel, no DMA, no BIOS calls (see arm9_crt0.s). All graphics
@@ -178,6 +179,8 @@ static void scene(int b)
     REG16(b, 0x4C) = 0x0232;                   // MOSAIC: BG h=2 v=3, OBJ h=2
     REG16(b, 0x50) = 0x2A51;                   // BLDCNT
     REG16(b, 0x52) = 0x0709;                   // BLDALPHA
+    // MASTER_BRIGHT: A fades up 4/16, B fades down 6/16
+    REG16(b, 0x6C) = b ? (u16)0x8006 : (u16)0x4004;
 
     REG32(b, 0x00) = MODE_1_2D | DISPLAY_BG0_ACTIVE | DISPLAY_BG1_ACTIVE |
                      DISPLAY_BG3_ACTIVE | DISPLAY_SPR_ACTIVE |
@@ -189,7 +192,8 @@ int main(void)
 {
     // POWCNT before any palette/OAM data (writes are dropped while the
     // owning 2D engine is off); then the VRAM banks
-    REG_POWCNT = POWCNT_LCD | POWCNT_2D_GFX_A | POWCNT_2D_GFX_B | POWCNT_LCD_SWAP;
+    // no LCD_SWAP: engine B drives the TOP screen (exercises the routing)
+    REG_POWCNT = POWCNT_LCD | POWCNT_2D_GFX_A | POWCNT_2D_GFX_B;
     vramSetBankA(VRAM_A_MAIN_BG);              // A BG    0x06000000
     vramSetBankB(VRAM_B_MAIN_SPRITE_0x06400000);
     vramSetBankC(VRAM_C_SUB_BG);               // B BG    0x06200000

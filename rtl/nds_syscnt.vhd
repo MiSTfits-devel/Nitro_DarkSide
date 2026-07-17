@@ -14,6 +14,8 @@
 --             (vramcnt(8k+7 downto 8k) = bank k, A = 0). Reads return 0.
 --   VRAMSTAT  0x04000240 (ARM7, read-only): bit0/1 = bank C/D mapped as
 --             ARM7 WRAM (MST=2).
+--   POWCNT1   0x04000304 (ARM9, r/w, stored bits masked 0x820F) - 2D/3D
+--             engine power + LCD swap (bit 15: '1' = engine A on top).
 --
 -- Register semantics per GBATEK / melonDS.
 
@@ -39,6 +41,9 @@ entity nds_syscnt is
 
       wramcnt      : out std_logic_vector(1 downto 0);
       vramcnt      : out std_logic_vector(71 downto 0);
+      pow_2da      : out std_logic;   -- POWCNT1.1: 2D engine A power
+      pow_2db      : out std_logic;   -- POWCNT1.9: 2D engine B power
+      pow_swap     : out std_logic;   -- POWCNT1.15: engine A on top screen
       exmem_gba7   : out std_logic;   -- GBA slot belongs to ARM7
       exmem_card7  : out std_logic;   -- NDS card belongs to ARM7
       exmem_prio7  : out std_logic    -- main-memory priority to ARM7
@@ -51,11 +56,13 @@ architecture arch of nds_syscnt is
    constant ADR_WRAM  : std_logic_vector(27 downto 0) := x"0000240"; -- 0x241/0x247 word base is 0x240/0x244
    constant ADR_WRAM9 : std_logic_vector(27 downto 0) := x"0000244";
    constant ADR_VRAMHI : std_logic_vector(27 downto 0) := x"0000248";
+   constant ADR_POWCNT : std_logic_vector(27 downto 0) := x"0000304";
 
    signal exmem9    : std_logic_vector(15 downto 0) := x"6580"; -- post-BIOS-ish default
    signal exmem7lo  : std_logic_vector(6 downto 0)  := (others => '0');
    signal r_wramcnt : std_logic_vector(1 downto 0)  := "00";
    signal r_vramcnt : std_logic_vector(71 downto 0) := (others => '0');
+   signal r_powcnt  : std_logic_vector(15 downto 0) := (others => '0');
 
    signal exmem9_rd, exmem7_rd : std_logic_vector(15 downto 0);
    signal vramstat  : std_logic_vector(1 downto 0);
@@ -67,9 +74,11 @@ begin
 
    wired_out9 <= x"0000" & exmem9_rd when (bus9.Adr = ADR_EXMEM) else
                  "000000" & r_wramcnt & x"000000" when (bus9.Adr = ADR_WRAM9) else -- 0x247 = byte 3
+                 x"0000" & r_powcnt when (bus9.Adr = ADR_POWCNT) else
                  (others => '0');
    wired_done9 <= '1' when (bus9.Adr = ADR_EXMEM or bus9.Adr = ADR_WRAM9 or
-                            bus9.Adr = ADR_WRAM or bus9.Adr = ADR_VRAMHI) else '0';
+                            bus9.Adr = ADR_WRAM or bus9.Adr = ADR_VRAMHI or
+                            bus9.Adr = ADR_POWCNT) else '0';
 
    -- VRAMSTAT: bank C/D mapped as ARM7 WRAM (enabled, MST=2)
    vramstat(0) <= '1' when (r_vramcnt(23 downto 16) and x"87") = x"82" else '0';
@@ -82,6 +91,9 @@ begin
 
    wramcnt     <= r_wramcnt;
    vramcnt     <= r_vramcnt;
+   pow_2da     <= r_powcnt(1);
+   pow_2db     <= r_powcnt(9);
+   pow_swap    <= r_powcnt(15);
    exmem_gba7  <= exmem9(7);
    exmem_card7 <= exmem9(11);
    exmem_prio7 <= exmem9(15);
@@ -94,6 +106,7 @@ begin
             exmem7lo  <= (others => '0');
             r_wramcnt <= "00";
             r_vramcnt <= (others => '0');
+            r_powcnt  <= (others => '0');
          else
             if (bus9.ena = '1' and bus9.rnw = '0') then
                if (bus9.Adr = ADR_EXMEM) then
@@ -116,6 +129,9 @@ begin
                   if (bus9.bEna(3) = '1') then
                      r_wramcnt <= bus9.Din(25 downto 24);        -- byte 0x247
                   end if;
+               elsif (bus9.Adr = ADR_POWCNT) then
+                  if (bus9.bEna(0) = '1') then r_powcnt(7 downto 0)  <= bus9.Din(7 downto 0)  and x"0F"; end if;
+                  if (bus9.bEna(1) = '1') then r_powcnt(15 downto 8) <= bus9.Din(15 downto 8) and x"82"; end if;
                elsif (bus9.Adr = ADR_VRAMHI) then
                   -- VRAMCNT_H..I, bytes 0x248..0x249
                   for i in 0 to 1 loop

@@ -141,4 +141,8 @@ package pReg_nds_display is
    constant BLDALPHA_EVB                 : regmap_type := (16#050#,  28,     24,        1,        0,   readwrite);
    constant BLDY                         : regmap_type := (16#054#,   4,      0,        1,        0,   writeonly);
 
+   -- 0x6C - MASTER_BRIGHT (applied after compose, in 18-bit space)
+   constant MASTER_BRIGHT_Factor         : regmap_type := (16#06C#,   4,      0,        1,        0,   readwrite);
+   constant MASTER_BRIGHT_Mode           : regmap_type := (16#06C#,  15,     14,        1,        0,   readwrite); -- 0 off, 1 up, 2 down
+
 end package;
