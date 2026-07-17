@@ -98,6 +98,8 @@ def render_line(cfg, oam):
     slot_transp = [True] * 256
     slot_prio   = [3]    * 256
 
+    objidx  = [-1] * 256
+    mosflag = [False] * 256
     for i in range(128):
         a0 = rd16(oam, i*8)
         a1 = rd16(oam, i*8 + 2)
@@ -210,6 +212,23 @@ def render_line(cfg, oam):
                 if not transparent:
                     col[target] = pixcol
                     slot_transp[target] = False
+                    objidx[target] = i
+                    mosflag[target] = bool(mosaic)
+
+    # H mosaic, melonDS ApplySpriteMosaicX (hardware rule: the repeat grid
+    # is screen-aligned and restarts at sprite changes / after holes; only
+    # opaque mosaic-sprite pixels are replaced)
+    mh = cfg["mosaic_h"]
+    if mh > 0:
+        last_col, last_sett = col[0], sett[0]
+        for x in range(1, 256):
+            if not mosflag[x]:
+                continue
+            if objidx[x] != objidx[x - 1] or (x % (mh + 1)) == 0:
+                last_col, last_sett = col[x], sett[x]
+            else:
+                col[x] = last_col
+                sett[x] = (sett[x] & 0x1000) | (last_sett & ~0x1000)
     return col, sett
 
 # ---------------------------------------------------------------- cases
@@ -373,6 +392,24 @@ obj(o, 0, 40, 56, 0, 1, 5, prio=0, palno=2, disable=1)
 o[1*8] = 60; o[1*8 + 1] = 0xC0                              # idx1: enabled, shape 3
 wr16(o, 1*8 + 2, 60); wr16(o, 1*8 + 4, 6)
 obj(o, 2, 120, 56, 0, 1, 7, prio=0, palno=2)
+cases.append((c, o))
+
+# 24: H mosaic, screen-aligned grid (melonDS rule): sprites at x NOT
+# aligned to the grid (40 % 3 = 1, 91 % 3 = 1), plus a non-mosaic control.
+# The sprite-relative counting the donor used renders these differently.
+c = cfg(mosaic_h=2); o = new_oam()
+obj(o, 0, 40, 56, 0, 1, 33, prio=0, palno=1, mosaic=1)
+obj(o, 1, 91, 56, 0, 1, 33, prio=1, palno=3, mosaic=1, hflip=1)
+obj(o, 2, 180, 56, 0, 1, 33, prio=0, palno=2)
+cases.append((c, o))
+
+# 25: H mosaic across transparency holes (4bpp tiles with zero nibbles)
+# and a second mosaic sprite: a hole or a sprite change restarts the
+# repeat block; grid size 4, both sprites off-grid (10 % 5 = 0 though -
+# one aligned, one at 74 % 5 = 4)
+c = cfg(mosaic_h=4); o = new_oam()
+obj(o, 0, 10, 56, 0, 2, 1, prio=0, palno=1, mosaic=1)
+obj(o, 1, 74, 56, 0, 2, 1, prio=0, palno=2, mosaic=1)
 cases.append((c, o))
 
 # ---------------------------------------------------------------- emit

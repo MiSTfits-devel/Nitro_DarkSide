@@ -25,8 +25,11 @@
 --   * per-line budget kept but set to the full NDS line for now (melonDS
 --     does not model the OBJ time limit; revisit for hardware accuracy)
 --
--- OAM layout, affine pipeline, mosaic and the priority merge into the
--- double line buffer are unchanged from the donor.
+-- OAM layout, affine pipeline and the priority merge into the double
+-- line buffer are unchanged from the donor. H-mosaic follows NDS hardware
+-- (melonDS ApplySpriteMosaicX): the repeat grid is screen-aligned
+-- (restart where x mod (size+1) = 0) and restarts at each sprite's first
+-- emitted pixel - the donor counted relative to the sprite edge instead.
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -270,7 +273,25 @@ architecture arch of nds_drawer_obj is
    signal extpal_wait       : std_logic;
    signal extpal_merge      : std_logic;
 
-   signal mosaik_cnt        : integer range 0 to 15 := 0;
+   -- H-mosaic screen grid: MOSTAB0(m, x) is true where x mod (m+1) = 0
+   type t_mostab is array (0 to 15, 0 to 255) of boolean;
+   function init_mostab return t_mostab is
+      variable t : t_mostab;
+   begin
+      for m in 0 to 15 loop
+         for x in 0 to 255 loop
+            t(m, x) := (x mod (m + 1)) = 0;
+         end loop;
+      end loop;
+      return t;
+   end function;
+   constant MOSTAB0 : t_mostab := init_mostab;
+
+   signal spr_seen          : std_logic := '0';
+   signal mos_prevx         : integer range 0 to 256 := 256;  -- last opaque x (256 = none)
+   signal issue_first       : std_logic := '0';
+   signal sprfirst_eval     : std_logic := '0';
+   signal sprfirst_wait     : std_logic := '0';
    signal mosaik_merge      : std_logic;
 
    signal PALETTE_addrlow   : std_logic;
@@ -628,6 +649,8 @@ begin
                      -- the byte lane in the pixel pipeline
                      pixeladdr_x <= to_unsigned(pixeladdr_calc mod 262144, 18);
                      issue_pixel <= '1';
+                     issue_first <= not spr_seen;
+                     spr_seen    <= '1';
                      PIXELGen    <= NEXTADDR;
                   else
                      pixeladdr_x     <= to_unsigned(pixeladdr_calc mod 262144, 18);
@@ -656,6 +679,8 @@ begin
             when PIXELWAIT =>
                if (VRAM_Drawer_done = '1') then
                   issue_pixel <= '1';
+                  issue_first <= not spr_seen;
+                  spr_seen    <= '1';
                   PIXELGen    <= NEXTADDR;
                end if;
 
@@ -666,6 +691,7 @@ begin
 
             x          <= 0;
             firstpix   <= '1';
+            spr_seen   <= '0';
 
             Pixel_data0     <= OAM_data0;
             Pixel_data1     <= OAM_data1;
@@ -767,6 +793,7 @@ begin
 
          -- first cycle - wait for vram to deliver data
          enable_eval       <= issue_pixel;
+         sprfirst_eval     <= issue_first;
          readaddr_mux_eval <= pixeladdr_x(1 downto 0);
          target_eval       <= target;
          second_pix_eval   <= second_pix;
@@ -783,6 +810,7 @@ begin
          -- second cycle - eval vram
          target_wait   <= target_eval;
          enable_wait   <= enable_eval;
+         sprfirst_wait <= sprfirst_eval;
          mosaic_wait   <= mosaic_eval;
          bitmap_wait   <= bitmap_eval;
          bmpalpha_wait <= palette_eval;
@@ -858,18 +886,30 @@ begin
          bmpcolor_merge  <= bmpcolor_wait;
          extpal_merge    <= extpal_wait;
 
-         if (drawline = '1' or mosaic_wait = '0') then
-            mosaik_cnt <= 15;
-         end if;
-
          mosaik_merge <= '0';
+         if (drawline = '1') then
+            mos_prevx <= 256;
+         end if;
          if (enable_wait = '1') then
-            if (mosaik_cnt < Mosaic_H_Size and mosaic_wait = '1') then
-               mosaik_cnt   <= mosaik_cnt + 1;
-               mosaik_merge <= '1';
+            -- repeat needs: mosaic sprite, opaque pixel, not the sprite's
+            -- first emitted pixel, not on the screen-aligned grid restart,
+            -- and the previous screen pixel opaque from this sprite
+            -- (melonDS objIndex continuity - a transparency hole stays a
+            -- hole, restarts the block, and still claims settings like any
+            -- transparent pixel)
+            if (mosaic_wait = '1' and sprfirst_wait = '0' and
+                Pixel_wait.transparent = '0' and
+                mos_prevx = target_wait - 1 and
+                not MOSTAB0(to_integer(Mosaic_H_Size), target_wait)) then
+               mosaik_merge <= '1';      -- repeat the last fresh pixel
+               mos_prevx    <= target_wait;
             else
-               mosaik_cnt  <= 0;
                Pixel_merge <= Pixel_wait;
+               if (Pixel_wait.transparent = '0') then
+                  mos_prevx <= target_wait;
+               else
+                  mos_prevx <= 256;
+               end if;
             end if;
          end if;
 
