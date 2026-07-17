@@ -54,10 +54,15 @@ eyeball-checked.
   is the M5 exit gate. Hand-rolled sample images must follow the melonDS
   0.9.5 PU/POWCNT rules documented at the top of `sim/tests/arm9_2d.s`.
   Samples: `nds_2d` (text/affine/OBJ), `nds_2dh` (ext palettes + blending),
-  `nds_2dw` (windows + mosaic), `nds_sdk2d` (devkitARM/libnds-built C scene
-  packed by ndstool — `sim/tests/sdk2d/build.sh`, needs devkitPro with the
-  nds-dev group; custom crt0, because stock libnds 2.x/calico needs the
-  ARM7 BIOS IRQ trampoline, DMA and engine B, none of which exist yet).
+  `nds_2dw` (windows + mosaic), `nds_sdk2d` (devkitARM/libnds-built
+  DUAL-SCREEN C scene packed by ndstool — `sim/tests/sdk2d/build.sh`, needs
+  devkitPro with the nds-dev group; custom crt0, because stock libnds
+  2.x/calico needs the ARM7 BIOS IRQ trampoline and DMA, which don't exist
+  yet). Engine B (M6) dumps to `DUMPFILE_B`; melonds_fbdump takes the
+  bottom-screen file as its optional 4th argument. Frame-diff scene rules
+  (melonDS-oracle constraints) live at the top of `sim/tests/arm9_2d.s` —
+  plus: no OBJ V-mosaic (melonDS's OBJ mosaic-Y counter free-runs, so its
+  phase depends on setup timing; BG V and OBJ/BG H are deterministic).
 
 ## Adding a bench
 

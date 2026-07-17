@@ -22,6 +22,7 @@ entity tb_top_frame is
    (
       HEXFILE    : string  := "sim/tests/nds_dual.hex";
       DUMPFILE   : string  := "top_frame_fb.txt";
+      DUMPFILE_B : string  := "top_frame_fb_b.txt";
       CARD_WORDS : integer := 1048576;   -- 4 MB staging window
       FRAMES     : integer := 3;
       TIMEOUT_MS : integer := 400
@@ -89,13 +90,18 @@ architecture sim of tb_top_frame is
    signal pixel_out_y    : integer range 0 to 191;
    signal pixel_out_data : std_logic_vector(17 downto 0);
    signal pixel_out_we   : std_logic;
+   signal pixelb_out_x    : integer range 0 to 255;
+   signal pixelb_out_y    : integer range 0 to 191;
+   signal pixelb_out_data : std_logic_vector(17 downto 0);
+   signal pixelb_out_we   : std_logic;
    signal vblank_out     : std_logic;
 
    signal dbg_line_drop, dbg_line_busy, dbg_cpu_err9, dbg_cpu_err7 : std_logic;
 
    -- ================= collectors =================
    type t_frame is array (0 to 49151) of std_logic_vector(17 downto 0);
-   signal framebuf : t_frame := (others => (others => '0'));
+   signal framebuf   : t_frame := (others => (others => '0'));
+   signal framebuf_b : t_frame := (others => (others => '0'));
 
    -- VRAM banks A..D backing store (512 KB)
    type t_banks is array (0 to 131071) of std_logic_vector(31 downto 0);
@@ -159,7 +165,9 @@ begin
       vrsrv_dout => vrsrv_dout, vrsrv_done => vrsrv_done,
       pixel_out_x => pixel_out_x, pixel_out_y => pixel_out_y,
       pixel_out_data => pixel_out_data, pixel_out_we => pixel_out_we,
-      pixel_out_engB => open, vblank_out => vblank_out,
+      pixelb_out_x => pixelb_out_x, pixelb_out_y => pixelb_out_y,
+      pixelb_out_data => pixelb_out_data, pixelb_out_we => pixelb_out_we,
+      vblank_out => vblank_out,
       sound_out_left => open, sound_out_right => open,
       dbg_line_drop => dbg_line_drop, dbg_line_busy => dbg_line_busy,
       dbg_cpu_err9 => dbg_cpu_err9, dbg_cpu_err7 => dbg_cpu_err7
@@ -272,6 +280,9 @@ begin
          if (pixel_out_we = '1') then
             framebuf(pixel_out_y * 256 + pixel_out_x) <= pixel_out_data;
          end if;
+         if (pixelb_out_we = '1') then
+            framebuf_b(pixelb_out_y * 256 + pixelb_out_x) <= pixelb_out_data;
+         end if;
       end if;
    end process;
 
@@ -291,6 +302,7 @@ begin
    -- ================= frame dump =================
    pmain : process
       file fdump   : text open write_mode is DUMPFILE;
+      file fdumpb  : text open write_mode is DUMPFILE_B;
       variable fdl : line;
       variable n   : integer := 0;
    begin

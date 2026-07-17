@@ -4,8 +4,10 @@
 // CPU PCs — no firmware boot, no cart emulation) and runs whole frames,
 // dumping the engine-A (top) screen after each one.
 //
-//   melonds_fbdump <image.nds> <dump.txt> <frames>
+//   melonds_fbdump <image.nds> <dump.txt> <frames> [dump_b.txt]
 //
+// The optional 4th argument also dumps the bottom screen (engine B with
+// POWCNT LCD-swap set) in the same format.
 // Dump format: "frame <n>" then 49152 lines of 8-hex-digit ARGB words
 // (melonDS native: 8-bit channels expanded from the internal 18-bit
 // pipeline). sim/tests/compare_fb.py converts the RTL RGB555 dump with
@@ -28,6 +30,7 @@ int main(int argc, char** argv)
     const char* ndspath  = argv[1];
     const char* dumppath = argv[2];
     int frames = atoi(argv[3]);
+    const char* dumppathb = (argc > 4) ? argv[4] : nullptr;
 
     FILE* f = fopen(ndspath, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", ndspath); return 1; }
@@ -79,6 +82,12 @@ int main(int argc, char** argv)
 
     FILE* d = fopen(dumppath, "w");
     if (!d) { fprintf(stderr, "cannot open %s\n", dumppath); return 1; }
+    FILE* db = nullptr;
+    if (dumppathb)
+    {
+        db = fopen(dumppathb, "w");
+        if (!db) { fprintf(stderr, "cannot open %s\n", dumppathb); return 1; }
+    }
 
     for (int n = 0; n < frames; n++)
     {
@@ -88,8 +97,16 @@ int main(int argc, char** argv)
         fprintf(d, "frame %d\n", n);
         for (int i = 0; i < 256 * 192; i++)
             fprintf(d, "%08x\n", top[i]);
+        if (db)
+        {
+            u32* bot = GPU::Framebuffer[fb][1];
+            fprintf(db, "frame %d\n", n);
+            for (int i = 0; i < 256 * 192; i++)
+                fprintf(db, "%08x\n", bot[i]);
+        }
     }
     fclose(d);
+    if (db) fclose(db);
 
     // scene-debug peeks (harmless noise for real runs)
     printf("DISPCNT=%08X POWCNT=%08X mail=%08X/%08X vb=%u\n",
