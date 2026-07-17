@@ -2,11 +2,11 @@
 -- through the ARM9 CPU port in LCDC mode with a deterministic pattern
 -- (banks A..D live in the behavioral srv/rsrv models which compute the
 -- same pattern on the fly), then walks the gen_vram_ls.py vector list:
--- per VRAMCNT config, renderer-channel reads (BG / OBJ / BG ext pal /
+-- per VRAMCNT config, renderer-channel reads (engine A + B: BG / OBJ / BG ext pal /
 -- OBJ ext pal) are checked against the independent python golden; BG and
 -- OBJ reads are additionally cross-checked against the CPU port at the
 -- canonical region address (same decode, different datapath). The last
--- four reads of each config are fired on all four channels simultaneously
+-- eight reads of each config are fired on all eight channels simultaneously
 -- to exercise the round-robin arbiter.
 -- Run: sim/run_vram_ls_tb.sh  (regenerate vectors first)
 
@@ -87,6 +87,18 @@ architecture sim of tb_vram_ls is
    signal rdr_objep_req, rdr_objep_done : std_logic := '0';
    signal rdr_objep_addr                : unsigned(12 downto 2) := (others => '0');
    signal rdr_objep_dout                : std_logic_vector(31 downto 0);
+   signal rdr_bgb_req, rdr_bgb_done     : std_logic := '0';
+   signal rdr_bgb_addr                  : unsigned(16 downto 2) := (others => '0');
+   signal rdr_bgb_dout                  : std_logic_vector(31 downto 0);
+   signal rdr_objb_req, rdr_objb_done   : std_logic := '0';
+   signal rdr_objb_addr                 : unsigned(16 downto 2) := (others => '0');
+   signal rdr_objb_dout                 : std_logic_vector(31 downto 0);
+   signal rdr_bgepb_req, rdr_bgepb_done : std_logic := '0';
+   signal rdr_bgepb_addr                : unsigned(14 downto 2) := (others => '0');
+   signal rdr_bgepb_dout                : std_logic_vector(31 downto 0);
+   signal rdr_objepb_req, rdr_objepb_done : std_logic := '0';
+   signal rdr_objepb_addr               : unsigned(12 downto 2) := (others => '0');
+   signal rdr_objepb_dout               : std_logic_vector(31 downto 0);
 
    signal rsrv_req, rsrv_done : std_logic := '0';
    signal rsrv_bank : std_logic_vector(1 downto 0);
@@ -119,6 +131,14 @@ begin
       rdr_bgep_dout => rdr_bgep_dout, rdr_bgep_done => rdr_bgep_done,
       rdr_objep_req => rdr_objep_req, rdr_objep_addr => rdr_objep_addr,
       rdr_objep_dout => rdr_objep_dout, rdr_objep_done => rdr_objep_done,
+      rdr_bgb_req => rdr_bgb_req, rdr_bgb_addr => rdr_bgb_addr,
+      rdr_bgb_dout => rdr_bgb_dout, rdr_bgb_done => rdr_bgb_done,
+      rdr_objb_req => rdr_objb_req, rdr_objb_addr => rdr_objb_addr,
+      rdr_objb_dout => rdr_objb_dout, rdr_objb_done => rdr_objb_done,
+      rdr_bgepb_req => rdr_bgepb_req, rdr_bgepb_addr => rdr_bgepb_addr,
+      rdr_bgepb_dout => rdr_bgepb_dout, rdr_bgepb_done => rdr_bgepb_done,
+      rdr_objepb_req => rdr_objepb_req, rdr_objepb_addr => rdr_objepb_addr,
+      rdr_objepb_dout => rdr_objepb_dout, rdr_objepb_done => rdr_objepb_done,
       rsrv_req => rsrv_req, rsrv_bank => rsrv_bank, rsrv_addr => rsrv_addr,
       rsrv_dout => rsrv_dout, rsrv_done => rsrv_done
    );
@@ -209,12 +229,36 @@ begin
                wait until rising_edge(clk) and rdr_bgep_done = '1';
                rdr_bgep_req  <= '0';
                data := rdr_bgep_dout;
-            when others =>
+            when 3 =>
                rdr_objep_addr <= to_unsigned(byteaddr, 13)(12 downto 2);
                rdr_objep_req  <= '1';
                wait until rising_edge(clk) and rdr_objep_done = '1';
                rdr_objep_req  <= '0';
                data := rdr_objep_dout;
+            when 4 =>
+               rdr_bgb_addr <= to_unsigned(byteaddr, 17)(16 downto 2);
+               rdr_bgb_req  <= '1';
+               wait until rising_edge(clk) and rdr_bgb_done = '1';
+               rdr_bgb_req  <= '0';
+               data := rdr_bgb_dout;
+            when 5 =>
+               rdr_objb_addr <= to_unsigned(byteaddr, 17)(16 downto 2);
+               rdr_objb_req  <= '1';
+               wait until rising_edge(clk) and rdr_objb_done = '1';
+               rdr_objb_req  <= '0';
+               data := rdr_objb_dout;
+            when 6 =>
+               rdr_bgepb_addr <= to_unsigned(byteaddr, 15)(14 downto 2);
+               rdr_bgepb_req  <= '1';
+               wait until rising_edge(clk) and rdr_bgepb_done = '1';
+               rdr_bgepb_req  <= '0';
+               data := rdr_bgepb_dout;
+            when others =>
+               rdr_objepb_addr <= to_unsigned(byteaddr, 13)(12 downto 2);
+               rdr_objepb_req  <= '1';
+               wait until rising_edge(clk) and rdr_objepb_done = '1';
+               rdr_objepb_req  <= '0';
+               data := rdr_objepb_dout;
          end case;
       end procedure;
 
@@ -233,10 +277,10 @@ begin
       variable rw, exp, got, gotc : std_logic_vector(31 downto 0);
       variable chan, byteaddr     : integer;
       variable cc                 : std_logic;
-      variable cc_addr            : t_words(0 to 3);
-      variable cc_exp             : t_words(0 to 3);
-      variable cc_got             : t_words(0 to 3);
-      variable cc_done            : std_logic_vector(3 downto 0);
+      variable cc_addr            : t_words(0 to 7);
+      variable cc_exp             : t_words(0 to 7);
+      variable cc_got             : t_words(0 to 7);
+      variable cc_done            : std_logic_vector(7 downto 0);
       variable cc_n               : integer;
    begin
       -- reset
@@ -270,7 +314,7 @@ begin
             rw       := vectors(p);
             exp      := vectors(p + 1);
             p        := p + 2;
-            chan     := to_integer(unsigned(rw(29 downto 28)));
+            chan     := to_integer(unsigned(rw(30 downto 28)));
             cc       := rw(27);
             byteaddr := to_integer(unsigned(rw(19 downto 0)));
 
@@ -288,29 +332,47 @@ begin
                elsif (chan = 1) then
                   cpu9read(16#400000# + byteaddr, gotc);
                   check(c, r, "cpu obj", gotc, exp);
+               elsif (chan = 4) then
+                  cpu9read(16#200000# + byteaddr, gotc);
+                  check(c, r, "cpu sub bg", gotc, exp);
+               elsif (chan = 5) then
+                  cpu9read(16#600000# + byteaddr, gotc);
+                  check(c, r, "cpu sub obj", gotc, exp);
                end if;
             end if;
          end loop;
 
-         -- concurrent batch: all four channels at once (arbiter exercise)
-         assert cc_n = 4 report "bad cc batch" severity failure;
-         rdr_bg_addr    <= unsigned(cc_addr(0)(18 downto 2));
-         rdr_obj_addr   <= unsigned(cc_addr(1)(17 downto 2));
-         rdr_bgep_addr  <= unsigned(cc_addr(2)(14 downto 2));
-         rdr_objep_addr <= unsigned(cc_addr(3)(12 downto 2));
+         -- concurrent batch: all eight channels at once (arbiter exercise)
+         assert cc_n = 8 report "bad cc batch" severity failure;
+         rdr_bg_addr     <= unsigned(cc_addr(0)(18 downto 2));
+         rdr_obj_addr    <= unsigned(cc_addr(1)(17 downto 2));
+         rdr_bgep_addr   <= unsigned(cc_addr(2)(14 downto 2));
+         rdr_objep_addr  <= unsigned(cc_addr(3)(12 downto 2));
+         rdr_bgb_addr    <= unsigned(cc_addr(4)(16 downto 2));
+         rdr_objb_addr   <= unsigned(cc_addr(5)(16 downto 2));
+         rdr_bgepb_addr  <= unsigned(cc_addr(6)(14 downto 2));
+         rdr_objepb_addr <= unsigned(cc_addr(7)(12 downto 2));
          rdr_bg_req     <= '1';
          rdr_obj_req    <= '1';
          rdr_bgep_req   <= '1';
          rdr_objep_req  <= '1';
-         cc_done := "0000";
-         while cc_done /= "1111" loop
+         rdr_bgb_req    <= '1';
+         rdr_objb_req   <= '1';
+         rdr_bgepb_req  <= '1';
+         rdr_objepb_req <= '1';
+         cc_done := x"00";
+         while cc_done /= x"FF" loop
             wait until rising_edge(clk);
-            if (rdr_bg_done = '1')    then cc_got(0) := rdr_bg_dout;    cc_done(0) := '1'; rdr_bg_req    <= '0'; end if;
-            if (rdr_obj_done = '1')   then cc_got(1) := rdr_obj_dout;   cc_done(1) := '1'; rdr_obj_req   <= '0'; end if;
-            if (rdr_bgep_done = '1')  then cc_got(2) := rdr_bgep_dout;  cc_done(2) := '1'; rdr_bgep_req  <= '0'; end if;
-            if (rdr_objep_done = '1') then cc_got(3) := rdr_objep_dout; cc_done(3) := '1'; rdr_objep_req <= '0'; end if;
+            if (rdr_bg_done = '1')     then cc_got(0) := rdr_bg_dout;     cc_done(0) := '1'; rdr_bg_req     <= '0'; end if;
+            if (rdr_obj_done = '1')    then cc_got(1) := rdr_obj_dout;    cc_done(1) := '1'; rdr_obj_req    <= '0'; end if;
+            if (rdr_bgep_done = '1')   then cc_got(2) := rdr_bgep_dout;   cc_done(2) := '1'; rdr_bgep_req   <= '0'; end if;
+            if (rdr_objep_done = '1')  then cc_got(3) := rdr_objep_dout;  cc_done(3) := '1'; rdr_objep_req  <= '0'; end if;
+            if (rdr_bgb_done = '1')    then cc_got(4) := rdr_bgb_dout;    cc_done(4) := '1'; rdr_bgb_req    <= '0'; end if;
+            if (rdr_objb_done = '1')   then cc_got(5) := rdr_objb_dout;   cc_done(5) := '1'; rdr_objb_req   <= '0'; end if;
+            if (rdr_bgepb_done = '1')  then cc_got(6) := rdr_bgepb_dout;  cc_done(6) := '1'; rdr_bgepb_req  <= '0'; end if;
+            if (rdr_objepb_done = '1') then cc_got(7) := rdr_objepb_dout; cc_done(7) := '1'; rdr_objepb_req <= '0'; end if;
          end loop;
-         for k in 0 to 3 loop
+         for k in 0 to 7 loop
             check(c, 1000 + k, "concurrent chan " & integer'image(k), cc_got(k), cc_exp(k));
          end loop;
 
