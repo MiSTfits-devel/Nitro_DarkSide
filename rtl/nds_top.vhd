@@ -22,6 +22,10 @@
 --   * ARM9 DMA (nds_dma9): immediate/vblank/hblank, functional timing;
 --     no ARM7 DMA / sound / SPI / RTC / card yet; KEYINPUT/EXTKEYIN are
 --     wired directly so samples polling keys see released state
+--   * ARM7 HLE BIOS (nds_bios7, generated from sim/tests/hle_bios7):
+--     GBATEK IRQ dispatch via [0x0380FFFC] + the SWIs calico/libnds use;
+--     svcHalt goes through HALTCNT in nds_syscnt. The ARM9 needs no BIOS
+--     (calico ds9 installs its own vectors)
 --   * both 2D engines render (engine B via the 0x1000 register window,
 --     palette/OAM upper halves and the C/D/H/I VRAM roles); POWCNT routes
 --     the screens (swap bit; B-off shows white, palette/OAM writes gated
@@ -254,8 +258,10 @@ architecture arch of nds_top is
    signal cpu7_lowbits  : std_logic_vector(1 downto 0);
    signal error_cpu7    : std_logic;
    signal cpu7_irq, cpu7_unhalt : std_logic;
+   signal cpu7_newhalt : std_logic;
 
-   signal bios_addr : unsigned(13 downto 2);
+   signal bios_addr  : unsigned(13 downto 2);
+   signal bios7_data : std_logic_vector(31 downto 0);
 
    -- ARM7-private WRAM (64 KB, behavioral array until M9)
    type t_wram7 is array (0 to 16383) of std_logic_vector(31 downto 0);
@@ -697,8 +703,11 @@ begin
       jump_out        => open,
       IRQ_in          => cpu7_irq,
       unhalt          => cpu7_unhalt,
-      new_halt        => '0'
+      new_halt        => cpu7_newhalt
    );
+
+   ibios7 : entity work.nds_bios7
+   port map ( bios_addr => bios_addr, bios_data => bios7_data );
 
    imembus7 : entity work.nds_membus7
    port map
@@ -707,7 +716,7 @@ begin
       cpu_adr => cpu7_adr, cpu_rnw => cpu7_rnw, cpu_ena => cpu7_ena, cpu_acc => cpu7_acc,
       cpu_dout => cpu7_dout, cpu_lowbits => cpu7_lowbits, cpu_lastread => cpu7_lastread,
       cpu_din => cpu7_din, cpu_done => cpu7_done,
-      bios_addr => bios_addr, bios_data => x"00000000",
+      bios_addr => bios_addr, bios_data => bios7_data,
       w7p_addr => w7p_addr, w7p_we => w7p_we, w7p_be => w7p_be,
       w7p_writedata => w7p_writedata, w7p_readdata => w7p_readdata,
       wsh_ena => wsh7_ena, wsh_rnw => wsh7_rnw, wsh_addr => wsh7_addr, wsh_be => wsh7_be,
@@ -835,7 +844,8 @@ begin
       bus7 => io_bus7, wired_out7 => sys_wired_out7, wired_done7 => sys_wired_done7,
       wramcnt => wramcnt, vramcnt => vramcnt,
       pow_2da => pow_2da, pow_2db => pow_2db, pow_swap => pow_swap,
-      exmem_gba7 => open, exmem_card7 => open, exmem_prio7 => exmem_prio7
+      exmem_gba7 => open, exmem_card7 => open, exmem_prio7 => exmem_prio7,
+      halt7 => cpu7_newhalt
    );
 
    -- ================= shared memory fabric =================

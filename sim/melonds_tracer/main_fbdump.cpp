@@ -25,6 +25,11 @@
 #include "ARM.h"
 #include "GPU.h"
 
+// tracer.patch globals in ARM.cpp
+extern FILE* ARM9TraceFile;
+extern u64 ARM9TraceCount;
+extern u64 ARM9TraceMax;
+
 int main(int argc, char** argv)
 {
     int argbase = 1;
@@ -100,6 +105,15 @@ int main(int argc, char** argv)
     NDS::ARM9->JumpTo(a9entry);
     NDS::ARM7->JumpTo(a7entry);
     NDS::Start();
+    }
+
+    // TRACE9=<path> [TRACE9MAX=<n>] dumps the ARM9 instruction trace
+    // (tracer.patch hook) - the debug view for stock-ROM boot issues
+    if (const char* tp = getenv("TRACE9"))
+    {
+        ARM9TraceFile = fopen(tp, "w");
+        const char* tm = getenv("TRACE9MAX");
+        ARM9TraceMax = tm ? strtoull(tm, nullptr, 0) : 20000000ull;
     }
 
     FILE* d = fopen(dumppath, "w");
