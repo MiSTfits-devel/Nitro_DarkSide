@@ -33,6 +33,14 @@ use work.pRegmap_gba.all;
 use work.pReg_nds_display.all;
 
 entity nds_gpu2d is
+   generic
+   (
+      -- engine B lacks 3D-as-BG0, the DISPCNT char/screen-base blocks, the
+      -- 1D-bitmap OBJ boundary bit and the large/VRAM/FIFO display modes;
+      -- its register window (0x1000 offset), palette/OAM halves and VRAM
+      -- channels are selected by the integration
+      is_engine_b : std_logic := '0'
+   );
    port
    (
       clk               : in  std_logic;
@@ -119,6 +127,9 @@ architecture arch of nds_gpu2d is
    signal R_bmpbound     : std_logic_vector(22 downto 22);
    signal R_objhbl       : std_logic_vector(23 downto 23);
    signal R_charbase     : std_logic_vector(26 downto 24);
+   signal eff_screenbase : std_logic_vector(2 downto 0);
+   signal eff_charbase   : std_logic_vector(2 downto 0);
+   signal eff_bmpbound   : std_logic;
    signal R_screenbase   : std_logic_vector(29 downto 27);
    signal R_bgextpal     : std_logic_vector(30 downto 30);
    signal R_objextpal    : std_logic_vector(31 downto 31);
@@ -408,10 +419,15 @@ begin
    end process;
 
    -- ================= derived config =================
+   -- engine B: no DISPCNT char/screen-base blocks
+   eff_screenbase <= R_screenbase when is_engine_b = '0' else "000";
+   eff_charbase   <= R_charbase   when is_engine_b = '0' else "000";
+   eff_bmpbound   <= R_bmpbound(22) when is_engine_b = '0' else '0';
+
    gen_cfg : for i in 0 to 3 generate
-      cfg_mapbase(i)  <= to_unsigned((to_integer(unsigned(R_screenbase)) * 65536
+      cfg_mapbase(i)  <= to_unsigned((to_integer(unsigned(eff_screenbase)) * 65536
                                     + to_integer(unsigned(R_bgcnt(i).screenbase)) * 2048) mod 524288, 19);
-      cfg_tilebase(i) <= to_unsigned((to_integer(unsigned(R_charbase)) * 65536
+      cfg_tilebase(i) <= to_unsigned((to_integer(unsigned(eff_charbase)) * 65536
                                     + to_integer(unsigned(R_bgcnt(i).charbase)) * 16384) mod 524288, 19);
       -- extended bitmap variants: screen base field * 16 KB, no DISPCNT offset
       cfg_bmpbase(i)  <= to_unsigned((to_integer(unsigned(R_bgcnt(i).screenbase)) * 16384) mod 524288, 19);
@@ -447,8 +463,9 @@ begin
          when 5 => bgtype <= (1, 1, 3, 3);
          when others => bgtype <= (0, 0, 0, 0);
       end case;
-      -- 3D-as-BG0 stub: BG0 renders nothing (transparent line buffer)
-      if (R_bg0_3d = "1") then
+      -- 3D-as-BG0 stub: BG0 renders nothing (transparent line buffer).
+      -- Engine B has no 3D bit - BG0 always renders as text there.
+      if (R_bg0_3d = "1" and is_engine_b = '0') then
          bgtype(0) <= 0;
       end if;
    end process;
@@ -610,7 +627,7 @@ begin
       tile_boundary        => unsigned(R_objbound),
       bitmap_1d            => R_bmp1d(6),
       bitmap_2d_wide       => R_bmp2dwide(5),
-      bitmap_1d_boundary   => R_bmpbound(22),
+      bitmap_1d_boundary   => eff_bmpbound,
       obj_extpal           => R_objextpal(31),
       Mosaic_H_Size        => unsigned(R_mos_objh),
       hblankfree           => R_objhbl(23),

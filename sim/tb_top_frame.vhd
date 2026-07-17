@@ -313,6 +313,12 @@ begin
             write(fdl, to_hstring("00" & framebuf(i)));
             writeline(fdump, fdl);
          end loop;
+         write(fdl, string'("frame ") & integer'image(n));
+         writeline(fdumpb, fdl);
+         for i in 0 to 49151 loop
+            write(fdl, to_hstring("00" & framebuf_b(i)));
+            writeline(fdumpb, fdl);
+         end loop;
          report "frame " & integer'image(n) & " dumped, drops so far " &
                 integer'image(drops) severity note;
          n := n + 1;
