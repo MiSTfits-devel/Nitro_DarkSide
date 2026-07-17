@@ -10,6 +10,7 @@ HEXFILE="${1:-${HEXFILE:-sim/tests/nds_dual.hex}}"
 FRAMES="${FRAMES:-3}"
 TIMEOUT_MS="${TIMEOUT_MS:-400}"
 DUMPFILE="${DUMPFILE:-top_frame_fb.txt}"
+DUMPFILE_B="${DUMPFILE_B:-top_frame_fb_b.txt}"
 WORK=sim/nvc_work
 mkdir -p "$WORK"
 
@@ -55,5 +56,6 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    sim/tb_top_frame.vhd
 
 nvc -H 2g -L "$WORK" --work="$WORK/work" -e tb_top_frame \
-   -gHEXFILE="$HEXFILE" -gFRAMES="$FRAMES" -gTIMEOUT_MS="$TIMEOUT_MS" -gDUMPFILE="$DUMPFILE"
+   -gHEXFILE="$HEXFILE" -gFRAMES="$FRAMES" -gTIMEOUT_MS="$TIMEOUT_MS" \
+   -gDUMPFILE="$DUMPFILE" -gDUMPFILE_B="$DUMPFILE_B"
 nvc -H 2g -L "$WORK" --work="$WORK/work" -r tb_top_frame --ieee-warnings=off --exit-severity=failure

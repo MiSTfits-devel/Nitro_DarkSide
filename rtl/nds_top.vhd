@@ -21,7 +21,9 @@
 --   * TCMs, ARM7-private WRAM: behavioral arrays (BRAM entities land in M9)
 --   * no DMA / sound / SPI / RTC / card yet; KEYINPUT/EXTKEYIN are wired
 --     directly so samples polling keys see released state
---   * engine B absent: pixel_out_engB is tied low (M6)
+--   * both 2D engines render (engine B via the 0x1000 register window,
+--     palette/OAM upper halves and the C/D/H/I VRAM roles); POWCNT display
+--     routing, master brightness and the compose stage are still open
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -103,13 +105,16 @@ entity nds_top is
       vrsrv_dout       : in  std_logic_vector(31 downto 0);
       vrsrv_done       : in  std_logic;
 
-      -- video out: engine A composed lines, BGR666 (the NDS 18-bit LCD
-      -- format; B in [17:12])
+      -- video out: both engines' composed lines, BGR666 (the NDS 18-bit
+      -- LCD format; B in [17:12])
       pixel_out_x      : out integer range 0 to 255;
       pixel_out_y      : out integer range 0 to 191;
       pixel_out_data   : out std_logic_vector(17 downto 0);
       pixel_out_we     : out std_logic;
-      pixel_out_engB   : out std_logic;
+      pixelb_out_x     : out integer range 0 to 255;
+      pixelb_out_y     : out integer range 0 to 191;
+      pixelb_out_data  : out std_logic_vector(17 downto 0);
+      pixelb_out_we    : out std_logic;
       vblank_out       : out std_logic;
 
       -- sound
@@ -197,9 +202,11 @@ architecture arch of nds_top is
    signal vram9_din, vram9_dout : std_logic_vector(31 downto 0);
 
    signal pal_we, oam_we : std_logic;
-   signal pal_addr, oam_addr : integer range 0 to 255;
+   signal pal_addr, oam_addr : integer range 0 to 511;
    signal pal_din, oam_din : std_logic_vector(31 downto 0);
    signal pal_be, oam_be : std_logic_vector(3 downto 0);
+   signal pal_we_a, pal_we_b, oam_we_a, oam_we_b : std_logic;
+   signal pal_addr_lo, oam_addr_lo : integer range 0 to 255;
 
    signal mr9_ena, mr9_rnw, mr9_done : std_logic;
    signal mr9_addr : std_logic_vector(21 downto 2);
@@ -211,8 +218,9 @@ architecture arch of nds_top is
    signal io_wired_done9, irq_wired_done9, timer_wired_done9 : std_logic;
    signal ipc_wired_out9, sys_wired_out9 : std_logic_vector(31 downto 0);
    signal ipc_wired_done9, sys_wired_done9 : std_logic;
-   signal tim_wired_out9, g2d_wired_out : std_logic_vector(31 downto 0);
-   signal tim_wired_done9, g2d_wired_done : std_logic;
+   signal tim_wired_out9, g2d_wired_out, g2db_wired_out : std_logic_vector(31 downto 0);
+   signal tim_wired_done9, g2d_wired_done, g2db_wired_done : std_logic;
+   signal io_bus9b : proc_bus_gb_type;
    signal key_wired_out9 : std_logic_vector(31 downto 0);
    signal key_wired_done9 : std_logic;
    signal irq_in9    : std_logic_vector(31 downto 0);
@@ -307,12 +315,31 @@ architecture arch of nds_top is
    signal g_bgep_addr  : integer range 0 to 8191;
    signal g_objep_addr : integer range 0 to 2047;
 
+   signal rb_bg_req, rb_bg_done       : std_logic;
+   signal rb_bg_addr                  : unsigned(16 downto 2);
+   signal rb_bg_dout                  : std_logic_vector(31 downto 0);
+   signal rb_obj_req, rb_obj_done     : std_logic;
+   signal rb_obj_addr                 : unsigned(16 downto 2);
+   signal rb_obj_dout                 : std_logic_vector(31 downto 0);
+   signal rb_bgep_req, rb_bgep_done   : std_logic;
+   signal rb_bgep_addr                : unsigned(14 downto 2);
+   signal rb_bgep_dout                : std_logic_vector(31 downto 0);
+   signal rb_objep_req, rb_objep_done : std_logic;
+   signal rb_objep_addr               : unsigned(12 downto 2);
+   signal rb_objep_dout               : std_logic_vector(31 downto 0);
+
+   signal gb_bg_addr    : integer range 0 to 131071;
+   signal gb_obj_addr   : integer range 0 to 65535;
+   signal gb_bgep_addr  : integer range 0 to 8191;
+   signal gb_objep_addr : integer range 0 to 2047;
+
    -- timing -> gpu2d line control
    signal gpu_ce          : std_logic := '0';
    signal linecounter     : integer range 0 to 191;
    signal linecounter_obj : integer range 0 to 191;
    signal drawline, drawObj, line_trigger, hblank_trigger, gpu_vblank, refpoint_update : std_logic;
    signal line_busy, epfill_busy : std_logic;
+   signal line_busy_b, epfill_busy_b : std_logic;
    signal vcount_out : unsigned(8 downto 0);
 
 begin
@@ -654,9 +681,9 @@ begin
 
    -- ================= IO register banks =================
    io_wired_out9  <= irq_wired_out9 or timer_wired_out9 or ipc_wired_out9 or sys_wired_out9 or
-                     tim_wired_out9 or g2d_wired_out or key_wired_out9;
+                     tim_wired_out9 or g2d_wired_out or g2db_wired_out or key_wired_out9;
    io_wired_done9 <= irq_wired_done9 or timer_wired_done9 or ipc_wired_done9 or sys_wired_done9 or
-                     tim_wired_done9 or g2d_wired_done or key_wired_done9;
+                     tim_wired_done9 or g2d_wired_done or g2db_wired_done or key_wired_done9;
    io_wired_out7  <= irq_wired_out7 or timer_wired_out7 or ipc_wired_out7 or sys_wired_out7 or
                      tim_wired_out7 or key_wired_out7;
    io_wired_done7 <= irq_wired_done7 or timer_wired_done7 or ipc_wired_done7 or sys_wired_done7 or
@@ -794,6 +821,14 @@ begin
       rdr_bgep_dout => r_bgep_dout, rdr_bgep_done => r_bgep_done,
       rdr_objep_req => r_objep_req, rdr_objep_addr => r_objep_addr,
       rdr_objep_dout => r_objep_dout, rdr_objep_done => r_objep_done,
+      rdr_bgb_req => rb_bg_req, rdr_bgb_addr => rb_bg_addr,
+      rdr_bgb_dout => rb_bg_dout, rdr_bgb_done => rb_bg_done,
+      rdr_objb_req => rb_obj_req, rdr_objb_addr => rb_obj_addr,
+      rdr_objb_dout => rb_obj_dout, rdr_objb_done => rb_obj_done,
+      rdr_bgepb_req => rb_bgep_req, rdr_bgepb_addr => rb_bgep_addr,
+      rdr_bgepb_dout => rb_bgep_dout, rdr_bgepb_done => rb_bgep_done,
+      rdr_objepb_req => rb_objep_req, rdr_objepb_addr => rb_objep_addr,
+      rdr_objepb_dout => rb_objep_dout, rdr_objepb_done => rb_objep_done,
       rsrv_req => vrsrv_req, rsrv_bank => vrsrv_bank, rsrv_addr => vrsrv_addr,
       rsrv_dout => vrsrv_dout, rsrv_done => vrsrv_done
    );
@@ -857,8 +892,8 @@ begin
       line_trigger => line_trigger, hblank_trigger => hblank_trigger,
       vblank_trigger => gpu_vblank, refpoint_update => refpoint_update,
       line_busy => line_busy, epfill_busy => epfill_busy,
-      pal_we => pal_we, pal_addr => pal_addr, pal_din => pal_din, pal_be => pal_be,
-      oam_we => oam_we, oam_addr => oam_addr, oam_din => oam_din, oam_be => oam_be,
+      pal_we => pal_we_a, pal_addr => pal_addr_lo, pal_din => pal_din, pal_be => pal_be,
+      oam_we => oam_we_a, oam_addr => oam_addr_lo, oam_din => oam_din, oam_be => oam_be,
       srv_bg_req => r_bg_req, srv_bg_addr => g_bg_addr,
       srv_bg_data => r_bg_dout, srv_bg_done => r_bg_done,
       srv_obj_req => r_obj_req, srv_obj_addr => g_obj_addr,
@@ -871,11 +906,62 @@ begin
       pixel_out_data => pixel_out_data, pixel_out_we => pixel_out_we
    );
 
-   pixel_out_engB <= '0';   -- engine B lands in M6
-   vblank_out     <= gpu_vblank;
+   -- ================= engine B =================
+   -- register window 0x1000-0x106C: engine B sees the bus with bit 12
+   -- stripped so the shared register map decodes; outside the window the
+   -- address is forced unmatchable so its wired-or stays silent
+   io_bus9b.Din  <= io_bus9.Din;
+   io_bus9b.Adr  <= (io_bus9.Adr(27 downto 13) & '0' & io_bus9.Adr(11 downto 0))
+                    when io_bus9.Adr(27 downto 12) = x"0001" else (others => '1');
+   io_bus9b.rnw  <= io_bus9.rnw;
+   io_bus9b.ena  <= io_bus9.ena;
+   io_bus9b.acc  <= io_bus9.acc;
+   io_bus9b.bEna <= io_bus9.bEna;
+   io_bus9b.rst  <= io_bus9.rst;
 
-   dbg_line_drop <= drawline and line_busy;
-   dbg_line_busy <= line_busy;
+   -- palette/OAM 2 KB mirrors: low half engine A, high half engine B
+   pal_we_a    <= pal_we when pal_addr < 256 else '0';
+   pal_we_b    <= pal_we when pal_addr >= 256 else '0';
+   pal_addr_lo <= pal_addr mod 256;
+   oam_we_a    <= oam_we when oam_addr < 256 else '0';
+   oam_we_b    <= oam_we when oam_addr >= 256 else '0';
+   oam_addr_lo <= oam_addr mod 256;
+
+   -- engine B flat spaces are 128 KB: wrap the drawer addresses
+   rb_bg_addr    <= to_unsigned(gb_bg_addr mod 32768, 15);
+   rb_obj_addr   <= to_unsigned(gb_obj_addr mod 32768, 15);
+   rb_bgep_addr  <= to_unsigned(gb_bgep_addr, 13);
+   rb_objep_addr <= to_unsigned(gb_objep_addr, 11);
+
+   igpu2d_b : entity work.nds_gpu2d
+   generic map ( is_engine_b => '1' )
+   port map
+   (
+      clk => clk1x, reset => resetCpu,
+      gb_bus => io_bus9b, wired_out => g2db_wired_out, wired_done => g2db_wired_done,
+      linecounter => linecounter, drawline => drawline,
+      linecounter_obj => linecounter_obj, drawObj => drawObj,
+      line_trigger => line_trigger, hblank_trigger => hblank_trigger,
+      vblank_trigger => gpu_vblank, refpoint_update => refpoint_update,
+      line_busy => line_busy_b, epfill_busy => epfill_busy_b,
+      pal_we => pal_we_b, pal_addr => pal_addr_lo, pal_din => pal_din, pal_be => pal_be,
+      oam_we => oam_we_b, oam_addr => oam_addr_lo, oam_din => oam_din, oam_be => oam_be,
+      srv_bg_req => rb_bg_req, srv_bg_addr => gb_bg_addr,
+      srv_bg_data => rb_bg_dout, srv_bg_done => rb_bg_done,
+      srv_obj_req => rb_obj_req, srv_obj_addr => gb_obj_addr,
+      srv_obj_data => rb_obj_dout, srv_obj_done => rb_obj_done,
+      srv_bgep_req => rb_bgep_req, srv_bgep_addr => gb_bgep_addr,
+      srv_bgep_data => rb_bgep_dout, srv_bgep_done => rb_bgep_done,
+      srv_objep_req => rb_objep_req, srv_objep_addr => gb_objep_addr,
+      srv_objep_data => rb_objep_dout, srv_objep_done => rb_objep_done,
+      pixel_out_x => pixelb_out_x, pixel_out_y => pixelb_out_y,
+      pixel_out_data => pixelb_out_data, pixel_out_we => pixelb_out_we
+   );
+
+   vblank_out <= gpu_vblank;
+
+   dbg_line_drop <= drawline and (line_busy or line_busy_b);
+   dbg_line_busy <= line_busy or line_busy_b;
    dbg_cpu_err9  <= error_cpu9;
    dbg_cpu_err7  <= error_cpu7;
 

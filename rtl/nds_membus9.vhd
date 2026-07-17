@@ -94,15 +94,16 @@ entity nds_membus9 is
       vram_dout      : in  std_logic_vector(31 downto 0);
       vram_done      : in  std_logic;
 
-      -- palette / OAM (nds_gpu2d engine-A BRAM write ports; 0x400-mirror
-      -- halves belong to engine B later. CPU readback is a known gap -
-      -- reads return 0 until the BRAMs grow a read port)
+      -- palette / OAM write ports (word index 0..255 = engine A, 256..511 =
+      -- engine B half of each 2 KB mirror; the integration splits them onto
+      -- the two nds_gpu2d instances. CPU readback is a known gap - reads
+      -- return 0 until the BRAMs grow a read port)
       pal_we         : out std_logic := '0';
-      pal_addr       : out integer range 0 to 255 := 0;
+      pal_addr       : out integer range 0 to 511 := 0;
       pal_din        : out std_logic_vector(31 downto 0) := (others => '0');
       pal_be         : out std_logic_vector(3 downto 0) := (others => '0');
       oam_we         : out std_logic := '0';
-      oam_addr       : out integer range 0 to 255 := 0;
+      oam_addr       : out integer range 0 to 511 := 0;
       oam_din        : out std_logic_vector(31 downto 0) := (others => '0');
       oam_be         : out std_logic_vector(3 downto 0) := (others => '0');
 
@@ -355,20 +356,20 @@ begin
                         state     <= W_VRAM;
 
                      when T_PAL =>
-                        -- engine A std palette: low 1 KB of each 2 KB mirror
-                        if (cpu_rnw = '0' and cpu_adr(10) = '0') then
+                        -- std palettes: 2 KB mirror, engine A low / B high
+                        if (cpu_rnw = '0') then
                            pal_we   <= '1';
-                           pal_addr <= to_integer(unsigned(cpu_adr(9 downto 2)));
+                           pal_addr <= to_integer(unsigned(cpu_adr(10 downto 2)));
                            pal_be   <= be;
                            pal_din  <= wdata;
                         end if;
                         state <= FINISH;
 
                      when T_OAM =>
-                        -- engine A OAM: low 1 KB of each 2 KB mirror
-                        if (cpu_rnw = '0' and cpu_adr(10) = '0') then
+                        -- OAM: 2 KB mirror, engine A low / B high
+                        if (cpu_rnw = '0') then
                            oam_we   <= '1';
-                           oam_addr <= to_integer(unsigned(cpu_adr(9 downto 2)));
+                           oam_addr <= to_integer(unsigned(cpu_adr(10 downto 2)));
                            oam_be   <= be;
                            oam_din  <= wdata;
                         end if;
