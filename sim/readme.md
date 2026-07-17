@@ -33,6 +33,26 @@ eyeball-checked.
   ext-palette read channels of `nds_vram` vs the `gen_vram_ls.py` golden
   (independent GBATEK mapping model), with CPU-port differential reads and
   concurrent-channel arbiter checks; same regenerate flow.
+- `run_gpu_merge.sh` — M5 merge tests (windows, priority, blending) vs
+  `gen_gpu_merge.py`.
+- `run_gpu_timing.sh` — nds_gpu_timing cadence/DISPSTAT/VCOUNT unit tests.
+- `run_gpu2d.sh` / `run_gpu2d_frame.sh` / `run_gpu2d_timed.sh` — engine-A
+  orchestrator: line cases, full frames (functional pacing), and full frames
+  at the real dot cadence with the drop monitor as the fetch-budget gate
+  (`CE_DIV=3` = the planned 100.5/33.5 MHz topology). Golden vectors from
+  `gen_gpu2d.py` / `gen_gpu2d_frame.py`.
+- `run_dual_boot.sh` — M4 exit: dual-CPU boot through the card-header HLE
+  loader (`sim/tests/build_nds_dual.sh` image), IPC handshake, joint exit.
+- `run_top_frame.sh` — M5 exit: boots a .nds through `nds_top` (the full
+  integrated system: CPUs, membuses, WRAM/main RAM/VRAM, IPC/IRQ/timers/
+  syscnt, gpu timing + gpu2d) and dumps every rendered engine-A frame.
+  `HEXFILE=` picks the image (default the M4 dual-boot one;
+  `sim/tests/nds_2d.hex` is the 2D scene, rebuilt by
+  `sim/tests/build_nds_2d.sh`). Heavy — pod only. Compare against melonDS:
+  `sim/melonds_tracer/build/melonds_fbdump image.nds mds.txt 10` then
+  `python3 sim/tests/compare_fb.py top_frame_fb.txt mds.txt` — pixel-perfect
+  is the M5 exit gate. Hand-rolled sample images must follow the melonDS
+  0.9.5 PU/POWCNT rules documented at the top of `sim/tests/arm9_2d.s`.
 
 ## Adding a bench
 

@@ -41,12 +41,13 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_cpu9.vhd \
    rtl/nds_cache9.vhd \
    rtl/nds_membus9.vhd \
+   rtl/nds_syscnt.vhd \
+   rtl/nds_loader.vhd \
    rtl/reg_nds_display.vhd \
    rtl/nds_drawer_text.vhd \
    rtl/nds_drawer_affine.vhd \
    rtl/nds_drawer_extended.vhd \
    rtl/nds_drawer_obj.vhd \
-   rtl/nds_top.vhd \
    sim/tb_vram_map.vhd \
    sim/tb_vram_torture.vhd \
    sim/tb_mainram.vhd \
@@ -58,6 +59,7 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_drawer_merge.vhd \
    rtl/nds_gpu2d.vhd \
    rtl/nds_gpu_timing.vhd \
+   rtl/nds_top.vhd \
    sim/tb_gpu_merge.vhd \
    sim/tb_vram_ls.vhd \
    sim/tb_gpu2d.vhd \

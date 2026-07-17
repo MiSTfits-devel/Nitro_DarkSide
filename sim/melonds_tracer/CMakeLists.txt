@@ -21,3 +21,8 @@ add_subdirectory(${MELONDS_DIR} melonds-core EXCLUDE_FROM_ALL)
 add_executable(melonds_tracer main.cpp Platform.cpp)
 target_include_directories(melonds_tracer PRIVATE ${MELONDS_DIR}/src)
 target_link_libraries(melonds_tracer PRIVATE core)
+
+# framebuffer dump for the M5 frame diff (tb_top_frame vs melonDS)
+add_executable(melonds_fbdump main_fbdump.cpp Platform.cpp)
+target_include_directories(melonds_fbdump PRIVATE ${MELONDS_DIR}/src)
+target_link_libraries(melonds_fbdump PRIVATE core)
