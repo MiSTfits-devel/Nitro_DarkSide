@@ -102,7 +102,7 @@ end entity;
 architecture arch of nds_gpu2d is
 
    -- ================= registers =================
-   constant REGCOUNT : integer := 70;
+   constant REGCOUNT : integer := 72;
    type t_reg_wired_or is array (0 to REGCOUNT-1) of std_logic_vector(31 downto 0);
    signal reg_wired_or   : t_reg_wired_or := (others => (others => '0'));
    signal reg_wired_done : std_logic_vector(0 to REGCOUNT-1) := (others => '0');
@@ -130,6 +130,10 @@ architecture arch of nds_gpu2d is
    signal eff_screenbase : std_logic_vector(2 downto 0);
    signal eff_charbase   : std_logic_vector(2 downto 0);
    signal eff_bmpbound   : std_logic;
+   signal R_mbright_f    : std_logic_vector(4 downto 0);
+   signal R_mbright_m    : std_logic_vector(15 downto 14);
+   signal raw666         : std_logic_vector(17 downto 0);
+   signal dispmode_eff   : std_logic_vector(1 downto 0);
    signal R_screenbase   : std_logic_vector(29 downto 27);
    signal R_bgextpal     : std_logic_vector(30 downto 30);
    signal R_objextpal    : std_logic_vector(31 downto 31);
@@ -403,6 +407,8 @@ begin
    iEVA    : entity work.eProcReg_gba generic map (BLDALPHA_EVA)      port map (clk, gb_bus, reg_wired_or(66), reg_wired_done(66), R_eva, R_eva);
    iEVB    : entity work.eProcReg_gba generic map (BLDALPHA_EVB)      port map (clk, gb_bus, reg_wired_or(67), reg_wired_done(67), R_evb, R_evb);
    iBLDY   : entity work.eProcReg_gba generic map (BLDY)              port map (clk, gb_bus, reg_wired_or(68), reg_wired_done(68), R_bldy, R_bldy);
+   iMBRF   : entity work.eProcReg_gba generic map (MASTER_BRIGHT_Factor) port map (clk, gb_bus, reg_wired_or(69), reg_wired_done(69), R_mbright_f, R_mbright_f);
+   iMBRM   : entity work.eProcReg_gba generic map (MASTER_BRIGHT_Mode)   port map (clk, gb_bus, reg_wired_or(70), reg_wired_done(70), R_mbright_m, R_mbright_m);
 
    process (all)
       variable wired_or : std_logic_vector(31 downto 0);
@@ -999,6 +1005,44 @@ begin
    );
 
    -- forced blank: hardware outputs white
-   pixel_out_data <= (others => '1') when R_forced_blank = "1" else merge_out666;
+   -- output stage, melonDS DrawScanline order: forced-blank white
+   -- composites like a normal line (master brightness applies); display
+   -- mode 0 shows white and skips master brightness; engine A's VRAM/FIFO
+   -- display modes (2/3) are unimplemented and render like mode 1.
+   -- Master brightness (18-bit space): up c += ((63-c)*f)/16 (bias 0),
+   -- down c -= (c*f + 15)/16 (bias 0xF), factor clamped to 16.
+   raw666 <= (others => '1') when R_forced_blank = "1" else merge_out666;
+
+   dispmode_eff <= R_dispmode(17 downto 16) when is_engine_b = '0' else '0' & R_dispmode(16);
+
+   p_mbright : process (all)
+      variable f    : integer range 0 to 31;
+      variable c    : integer range 0 to 63;
+      variable r    : integer range 0 to 127;
+      variable outv : std_logic_vector(17 downto 0);
+   begin
+      f := to_integer(unsigned(R_mbright_f));
+      if (f > 16) then
+         f := 16;
+      end if;
+      outv := raw666;
+      if (R_mbright_m = "01") then
+         for k in 0 to 2 loop
+            c := to_integer(unsigned(raw666(k*6 + 5 downto k*6)));
+            r := c + (((63 - c) * f) / 16);
+            outv(k*6 + 5 downto k*6) := std_logic_vector(to_unsigned(r, 6));
+         end loop;
+      elsif (R_mbright_m = "10") then
+         for k in 0 to 2 loop
+            c := to_integer(unsigned(raw666(k*6 + 5 downto k*6)));
+            r := c - ((c * f + 15) / 16);
+            outv(k*6 + 5 downto k*6) := std_logic_vector(to_unsigned(r, 6));
+         end loop;
+      end if;
+      if (dispmode_eff = "00") then
+         outv := (others => '1');
+      end if;
+      pixel_out_data <= outv;
+   end process;
 
 end architecture;
