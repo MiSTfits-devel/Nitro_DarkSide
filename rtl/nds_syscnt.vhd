@@ -16,6 +16,11 @@
 --             ARM7 WRAM (MST=2).
 --   POWCNT1   0x04000304 (ARM9, r/w, stored bits masked 0x820F) - 2D/3D
 --             engine power + LCD swap (bit 15: '1' = engine A on top).
+--   POSTFLG   0x04000300 (both CPUs, independent): bit 0 sticky-set until
+--             reset; ARM9 side also has r/w bit 1.
+--   HALTCNT   0x04000301 (ARM7, write-only): value 0x80/0xC0 halts the
+--             ARM7 until IE & IF != 0 (halt7 pulse; sleep = plain halt
+--             until POWCNT2/lid exist). Written by the HLE BIOS svcHalt.
 --
 -- Register semantics per GBATEK / melonDS.
 
@@ -46,7 +51,8 @@ entity nds_syscnt is
       pow_swap     : out std_logic;   -- POWCNT1.15: engine A on top screen
       exmem_gba7   : out std_logic;   -- GBA slot belongs to ARM7
       exmem_card7  : out std_logic;   -- NDS card belongs to ARM7
-      exmem_prio7  : out std_logic    -- main-memory priority to ARM7
+      exmem_prio7  : out std_logic;   -- main-memory priority to ARM7
+      halt7        : out std_logic := '0'  -- 1-cycle pulse: HALTCNT halt
    );
 end entity;
 
@@ -57,12 +63,15 @@ architecture arch of nds_syscnt is
    constant ADR_WRAM9 : std_logic_vector(27 downto 0) := x"0000244";
    constant ADR_VRAMHI : std_logic_vector(27 downto 0) := x"0000248";
    constant ADR_POWCNT : std_logic_vector(27 downto 0) := x"0000304";
+   constant ADR_POSTFLG : std_logic_vector(27 downto 0) := x"0000300";
 
    signal exmem9    : std_logic_vector(15 downto 0) := x"6580"; -- post-BIOS-ish default
    signal exmem7lo  : std_logic_vector(6 downto 0)  := (others => '0');
    signal r_wramcnt : std_logic_vector(1 downto 0)  := "00";
    signal r_vramcnt : std_logic_vector(71 downto 0) := (others => '0');
    signal r_powcnt  : std_logic_vector(15 downto 0) := (others => '0');
+   signal postflg7  : std_logic := '0';
+   signal postflg9  : std_logic_vector(1 downto 0) := "00";
 
    signal exmem9_rd, exmem7_rd : std_logic_vector(15 downto 0);
    signal vramstat  : std_logic_vector(1 downto 0);
@@ -75,10 +84,11 @@ begin
    wired_out9 <= x"0000" & exmem9_rd when (bus9.Adr = ADR_EXMEM) else
                  "000000" & r_wramcnt & x"000000" when (bus9.Adr = ADR_WRAM9) else -- 0x247 = byte 3
                  x"0000" & r_powcnt when (bus9.Adr = ADR_POWCNT) else
+                 x"000000" & "000000" & postflg9 when (bus9.Adr = ADR_POSTFLG) else
                  (others => '0');
    wired_done9 <= '1' when (bus9.Adr = ADR_EXMEM or bus9.Adr = ADR_WRAM9 or
                             bus9.Adr = ADR_WRAM or bus9.Adr = ADR_VRAMHI or
-                            bus9.Adr = ADR_POWCNT) else '0';
+                            bus9.Adr = ADR_POWCNT or bus9.Adr = ADR_POSTFLG) else '0';
 
    -- VRAMSTAT: bank C/D mapped as ARM7 WRAM (enabled, MST=2)
    vramstat(0) <= '1' when (r_vramcnt(23 downto 16) and x"87") = x"82" else '0';
@@ -86,8 +96,10 @@ begin
 
    wired_out7 <= x"0000" & exmem7_rd when (bus7.Adr = ADR_EXMEM) else
                  x"0000" & "000000" & r_wramcnt & "000000" & vramstat when (bus7.Adr = ADR_WRAM) else
+                 x"000000" & "0000000" & postflg7 when (bus7.Adr = ADR_POSTFLG) else
                  (others => '0');
-   wired_done7 <= '1' when (bus7.Adr = ADR_EXMEM or bus7.Adr = ADR_WRAM) else '0';
+   wired_done7 <= '1' when (bus7.Adr = ADR_EXMEM or bus7.Adr = ADR_WRAM or
+                            bus7.Adr = ADR_POSTFLG) else '0';
 
    wramcnt     <= r_wramcnt;
    vramcnt     <= r_vramcnt;
@@ -101,12 +113,15 @@ begin
    process (clk)
    begin
       if rising_edge(clk) then
+         halt7 <= '0';
          if (reset = '1') then
             exmem9    <= x"6580";
             exmem7lo  <= (others => '0');
             r_wramcnt <= "00";
             r_vramcnt <= (others => '0');
             r_powcnt  <= (others => '0');
+            postflg7  <= '0';
+            postflg9  <= "00";
          else
             if (bus9.ena = '1' and bus9.rnw = '0') then
                if (bus9.Adr = ADR_EXMEM) then
@@ -132,6 +147,11 @@ begin
                elsif (bus9.Adr = ADR_POWCNT) then
                   if (bus9.bEna(0) = '1') then r_powcnt(7 downto 0)  <= bus9.Din(7 downto 0)  and x"0F"; end if;
                   if (bus9.bEna(1) = '1') then r_powcnt(15 downto 8) <= bus9.Din(15 downto 8) and x"82"; end if;
+               elsif (bus9.Adr = ADR_POSTFLG) then
+                  if (bus9.bEna(0) = '1') then
+                     postflg9(0) <= postflg9(0) or bus9.Din(0);
+                     postflg9(1) <= bus9.Din(1);
+                  end if;
                elsif (bus9.Adr = ADR_VRAMHI) then
                   -- VRAMCNT_H..I, bytes 0x248..0x249
                   for i in 0 to 1 loop
@@ -144,6 +164,14 @@ begin
             if (bus7.ena = '1' and bus7.rnw = '0' and bus7.Adr = ADR_EXMEM) then
                if (bus7.bEna(0) = '1') then
                   exmem7lo <= bus7.Din(6 downto 0);
+               end if;
+            end if;
+            if (bus7.ena = '1' and bus7.rnw = '0' and bus7.Adr = ADR_POSTFLG) then
+               if (bus7.bEna(0) = '1') then
+                  postflg7 <= postflg7 or bus7.Din(0);
+               end if;
+               if (bus7.bEna(1) = '1' and bus7.Din(15) = '1') then
+                  halt7 <= '1';        -- HALTCNT 0x80 halt / 0xC0 sleep
                end if;
             end if;
          end if;

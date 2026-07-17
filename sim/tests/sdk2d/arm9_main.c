@@ -251,6 +251,26 @@ int main(void)
                   DMA_DST_RESET | DMA_SRC_FIX | 4;
 
     MAIL[0] |= 16;
+
+    // ---- M7: ARM7 HLE BIOS proof ----
+    // The ARM7 posts svcGetCRC16(0xFFFF, pattern, 32) ^ IsDebugger()<<16
+    // ^ 0x5EED0000 from its svcHalt + vblank-IRQ loop (dispatched through
+    // the BIOS vector at [0x0380FFFC]). Block on the exact word, then
+    // recolor BG0 subpal 1 on both engines - the visible proof. A broken
+    // BIOS is a sim timeout (no magic), a wrong CRC16 a stuck ARM9.
+    u16 crc = 0xFFFF;
+    for (int i = 0; i < 32; i++) {
+        crc ^= (u16)((i*7 + 3) & 0xFF);
+        for (int j = 0; j < 8; j++)
+            crc = (crc & 1) ? (u16)((crc >> 1) ^ 0xA001) : (u16)(crc >> 1);
+    }
+    while (MAIL[8] != ((u32)crc ^ 0x5EED0000u)) { }
+    MAIL[0] |= 32;
+    for (int b = 0; b < 2; b++)
+        for (int i = 1; i < 8; i++)
+            BGPAL(b)[16 + i] =
+                (u16)((0x0421u * (3u*(u32)i + 1u) + 0x1234u + (u32)b*0x0842u) & 0x7FFF);
+
     MAIL[1] = 0xCAFEBABE;
 
     for (u32 n = 1;; n++) {
