@@ -1,13 +1,13 @@
 #!/bin/sh
 # Build the headless melonDS tracer (docs/TRACE_DIFF.md).
 #   MELONDS_DIR=~/sources/melonDS sim/melonds_tracer/build.sh
-# Clones melonDS 0.9.5 into MELONDS_DIR if absent, applies tracer.patch
+# Clones melonDS 1.1 into MELONDS_DIR if absent, applies tracer.patch
 # (idempotent), builds into sim/melonds_tracer/build/melonds_tracer.
 set -eu
 cd "$(dirname "$0")"
 
 MELONDS_DIR="${MELONDS_DIR:-$HOME/sources/melonDS}"
-MELONDS_TAG=0.9.5
+MELONDS_TAG=1.1
 
 if [ ! -d "$MELONDS_DIR" ]; then
    git clone --branch "$MELONDS_TAG" --depth 1 \

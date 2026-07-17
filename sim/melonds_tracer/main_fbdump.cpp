@@ -20,15 +20,22 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 
 #include "NDS.h"
+#include "NDSCart.h"
 #include "ARM.h"
 #include "GPU.h"
 
 // tracer.patch globals in ARM.cpp
+namespace melonDS
+{
 extern FILE* ARM9TraceFile;
 extern u64 ARM9TraceCount;
 extern u64 ARM9TraceMax;
+}
+
+using namespace melonDS;
 
 int main(int argc, char** argv)
 {
@@ -62,27 +69,24 @@ int main(int argc, char** argv)
     printf("arm9: off=%08X entry=%08X load=%08X size=%u\n", a9off, a9entry, a9load, a9size);
     printf("arm7: off=%08X entry=%08X load=%08X size=%u\n", a7off, a7entry, a7load, a7size);
 
-    if (!NDS::Init())
-    {
-        fprintf(stderr, "NDS::Init failed\n");
-        return 1;
-    }
-    NDS::SetConsoleType(0);
-    GPU::InitRenderer(0);                 // software renderer, single-threaded
-    GPU::RenderSettings rs{};
-    GPU::SetRenderSettings(0, rs);
-    NDS::Reset();
+    // default NDSArgs: FreeBIOS, generated firmware, software renderer
+    // (heap-allocated: the 1.1 NDS object is far too large for the stack)
+    auto nds_holder = std::make_unique<NDS>();
+    NDS& nds = *nds_holder;
+    nds.Reset();
 
     if (direct)
     {
-        if (!NDS::LoadCart(img, (u32)len, nullptr, 0))
+        auto cart = NDSCart::ParseROM(img, (u32)len);
+        if (!cart)
         {
-            fprintf(stderr, "LoadCart failed\n");
+            fprintf(stderr, "ParseROM failed\n");
             return 1;
         }
-        NDS::Reset();
-        NDS::SetupDirectBoot("rom.nds");
-        NDS::Start();
+        nds.SetNDSCart(std::move(cart));
+        nds.Reset();
+        nds.SetupDirectBoot("rom.nds");
+        nds.Start();
     }
     else
     {
@@ -94,17 +98,17 @@ int main(int argc, char** argv)
         {
             u32 w;
             memcpy(&w, &img[off + i], 4);
-            if (cpu == 7) NDS::ARM7Write32(load + i, w);   // ARM7-WRAM loads
-            else          NDS::ARM9Write32(load + i, w);
+            if (cpu == 7) nds.ARM7Write32(load + i, w);   // ARM7-WRAM loads
+            else          nds.ARM9Write32(load + i, w);
         }
         return true;
     };
     if (!copysec(a9off, a9load, a9size, 9)) return 1;
     if (!copysec(a7off, a7load, a7size, 7)) return 1;
 
-    NDS::ARM9->JumpTo(a9entry);
-    NDS::ARM7->JumpTo(a7entry);
-    NDS::Start();
+    nds.ARM9.JumpTo(a9entry);
+    nds.ARM7.JumpTo(a7entry);
+    nds.Start();
     }
 
     // TRACE9=<path> [TRACE9MAX=<n>] dumps the ARM9 instruction trace
@@ -127,15 +131,15 @@ int main(int argc, char** argv)
 
     for (int n = 0; n < frames; n++)
     {
-        NDS::RunFrame();
-        int fb = GPU::FrontBuffer;
-        u32* top = GPU::Framebuffer[fb][0];
+        nds.RunFrame();
+        int fb = nds.GPU.FrontBuffer;
+        u32* top = nds.GPU.Framebuffer[fb][0].get();
         fprintf(d, "frame %d\n", n);
         for (int i = 0; i < 256 * 192; i++)
             fprintf(d, "%08x\n", top[i]);
         if (db)
         {
-            u32* bot = GPU::Framebuffer[fb][1];
+            u32* bot = nds.GPU.Framebuffer[fb][1].get();
             fprintf(db, "frame %d\n", n);
             for (int i = 0; i < 256 * 192; i++)
                 fprintf(db, "%08x\n", bot[i]);
@@ -143,16 +147,17 @@ int main(int argc, char** argv)
     }
     fclose(d);
     if (db) fclose(db);
+    if (ARM9TraceFile) { fclose(ARM9TraceFile); ARM9TraceFile = nullptr; }
 
     // scene-debug peeks (harmless noise for real runs)
     printf("DISPCNT=%08X POWCNT=%08X mail=%08X/%08X vb=%u\n",
-           NDS::ARM9Read32(0x04000000), NDS::ARM9Read32(0x04000304),
-           NDS::ARM9Read32(0x02FFFF00), NDS::ARM9Read32(0x02FFFF04),
-           NDS::ARM9Read32(0x02FFFF08));
+           nds.ARM9Read32(0x04000000), nds.ARM9Read32(0x04000304),
+           nds.ARM9Read32(0x02FFFF00), nds.ARM9Read32(0x02FFFF04),
+           nds.ARM9Read32(0x02FFFF08));
     printf("pal[0..3]=%08X %08X vram6000000=%08X map6002000=%08X oam=%08X\n",
-           NDS::ARM9Read32(0x05000000), NDS::ARM9Read32(0x05000004),
-           NDS::ARM9Read32(0x06000020), NDS::ARM9Read32(0x06002000),
-           NDS::ARM9Read32(0x07000000));
+           nds.ARM9Read32(0x05000000), nds.ARM9Read32(0x05000004),
+           nds.ARM9Read32(0x06000020), nds.ARM9Read32(0x06002000),
+           nds.ARM9Read32(0x07000000));
     printf("dumped %d frames to %s\n", frames, dumppath);
     return 0;
 }
