@@ -20,6 +20,11 @@
 --   rdr_obj    256 KB main-OBJ space  (banks A/B MST=2, E MST=2, F/G MST=2)
 --   rdr_bgep    32 KB BG ext palette, 4 slots (E MST=4 all, F/G MST=4 by OFS.0)
 --   rdr_objep    8 KB OBJ ext palette (F/G MST=5)
+-- and the engine-B set (M6):
+--   rdr_bgb    128 KB sub-BG space    (C MST=4, H MST=1, I MST=1 @ 0x8000)
+--   rdr_objb   128 KB sub-OBJ space   (D MST=4, I MST=2)
+--   rdr_bgepb   32 KB BG ext palette  (H MST=2, all 4 slots)
+--   rdr_objepb   8 KB OBJ ext palette (I MST=3)
 -- Protocol per channel: hold req with stable addr until done pulses (1 cycle,
 -- dout valid with done); deassert req on the done cycle unless another request
 -- follows. Channels are arbitrated round-robin, one op in flight; E..I hits are
@@ -104,6 +109,26 @@ entity nds_vram is
       rdr_objep_dout : out std_logic_vector(31 downto 0) := (others => '0');
       rdr_objep_done : out std_logic := '0';
 
+      rdr_bgb_req    : in  std_logic := '0';
+      rdr_bgb_addr   : in  unsigned(16 downto 2) := (others => '0');
+      rdr_bgb_dout   : out std_logic_vector(31 downto 0) := (others => '0');
+      rdr_bgb_done   : out std_logic := '0';
+
+      rdr_objb_req   : in  std_logic := '0';
+      rdr_objb_addr  : in  unsigned(16 downto 2) := (others => '0');
+      rdr_objb_dout  : out std_logic_vector(31 downto 0) := (others => '0');
+      rdr_objb_done  : out std_logic := '0';
+
+      rdr_bgepb_req  : in  std_logic := '0';
+      rdr_bgepb_addr : in  unsigned(14 downto 2) := (others => '0');
+      rdr_bgepb_dout : out std_logic_vector(31 downto 0) := (others => '0');
+      rdr_bgepb_done : out std_logic := '0';
+
+      rdr_objepb_req : in  std_logic := '0';
+      rdr_objepb_addr: in  unsigned(12 downto 2) := (others => '0');
+      rdr_objepb_dout: out std_logic_vector(31 downto 0) := (others => '0');
+      rdr_objepb_done: out std_logic := '0';
+
       -- renderer A..D backing channel (read-only)
       rsrv_req  : out std_logic := '0';
       rsrv_bank : out std_logic_vector(1 downto 0) := "00";
@@ -166,18 +191,28 @@ architecture arch of nds_vram is
    -- ==================== renderer line server ====================
 
    -- BG/OBJ channels reuse the CPU decoder at the canonical region addresses
-   signal rdec_bg_addr  : unsigned(23 downto 0);
-   signal rdec_obj_addr : unsigned(23 downto 0);
-   signal rdec_bg_hit   : std_logic_vector(8 downto 0);
-   signal rdec_bg_offs  : t_vram_offs;
-   signal rdec_obj_hit  : std_logic_vector(8 downto 0);
-   signal rdec_obj_offs : t_vram_offs;
+   signal rdec_bg_addr   : unsigned(23 downto 0);
+   signal rdec_obj_addr  : unsigned(23 downto 0);
+   signal rdec_bgb_addr  : unsigned(23 downto 0);
+   signal rdec_objb_addr : unsigned(23 downto 0);
+   signal rdec_bg_hit    : std_logic_vector(8 downto 0);
+   signal rdec_bg_offs   : t_vram_offs;
+   signal rdec_obj_hit   : std_logic_vector(8 downto 0);
+   signal rdec_obj_offs  : t_vram_offs;
+   signal rdec_bgb_hit   : std_logic_vector(8 downto 0);
+   signal rdec_bgb_offs  : t_vram_offs;
+   signal rdec_objb_hit  : std_logic_vector(8 downto 0);
+   signal rdec_objb_offs : t_vram_offs;
 
-   -- ext-palette decode (no CPU mapping; renderer-only roles of E/F/G)
-   signal bgep_hit   : std_logic_vector(8 downto 0);
-   signal bgep_offs  : t_vram_offs;
-   signal objep_hit  : std_logic_vector(8 downto 0);
-   signal objep_offs : t_vram_offs;
+   -- ext-palette decode (no CPU mapping; renderer-only roles of E/F/G/H/I)
+   signal bgep_hit    : std_logic_vector(8 downto 0);
+   signal bgep_offs   : t_vram_offs;
+   signal objep_hit   : std_logic_vector(8 downto 0);
+   signal objep_offs  : t_vram_offs;
+   signal bgepb_hit   : std_logic_vector(8 downto 0);
+   signal bgepb_offs  : t_vram_offs;
+   signal objepb_hit  : std_logic_vector(8 downto 0);
+   signal objepb_offs : t_vram_offs;
 
    type rtstate is
    (
@@ -190,25 +225,26 @@ architecture arch of nds_vram is
    );
    signal rstate : rtstate := RIDLE;
 
-   signal rreq_vec     : std_logic_vector(3 downto 0);
-   signal rpend        : std_logic_vector(3 downto 0) := (others => '0');
-   signal rpick        : integer range 0 to 3 := 0;
+   signal rreq_vec     : std_logic_vector(7 downto 0);
+   signal rpend        : std_logic_vector(7 downto 0) := (others => '0');
+   signal rpick        : integer range 0 to 7 := 0;
    signal rpick_valid  : std_logic;
    signal rdispatch    : std_logic;
    signal rchosen_hit  : std_logic_vector(8 downto 0);
    signal rchosen_offs : t_vram_offs;
-   signal rr_pri       : integer range 0 to 3 := 0;
+   signal rr_pri       : integer range 0 to 7 := 0;
 
    signal rcur_hit  : std_logic_vector(8 downto 0) := (others => '0');
    signal rcur_offs : t_vram_offs := (others => (others => '0'));
-   signal rcur_chan : integer range 0 to 3 := 0;
+   signal rcur_chan : integer range 0 to 7 := 0;
    signal racc      : std_logic_vector(31 downto 0) := (others => '0');
    signal rsrv_idx  : integer range 0 to 4 := 0;
 
    signal bram_dout_b : t_bram_dout;
    signal rbram_ce    : std_logic_vector(BANK_E to BANK_I);
 
-   signal rdone_int   : std_logic_vector(3 downto 0) := (others => '0');
+   signal rdone_int   : std_logic_vector(7 downto 0) := (others => '0');
+   signal rreq_now    : std_logic_vector(7 downto 0);
 
 begin
 
@@ -220,8 +256,10 @@ begin
 
    -- renderer BG/OBJ decode: flat renderer spaces are exactly the ARM9 view of
    -- the main-BG (0x000000) and main-OBJ (0x400000) regions
-   rdec_bg_addr  <= "00000" & rdr_bg_addr & "00";
-   rdec_obj_addr <= "010000" & rdr_obj_addr & "00";
+   rdec_bg_addr   <= "00000" & rdr_bg_addr & "00";
+   rdec_obj_addr  <= "010000" & rdr_obj_addr & "00";
+   rdec_bgb_addr  <= "0010000" & rdr_bgb_addr & "00";   -- 0x06200000 region
+   rdec_objb_addr <= "0110000" & rdr_objb_addr & "00";  -- 0x06600000 region
 
    irdec_bg : entity work.nds_vram_map
    port map ( vramcnt => vramcnt, addr => rdec_bg_addr, is_arm7 => '0', hit => rdec_bg_hit, offs => rdec_bg_offs );
@@ -229,24 +267,47 @@ begin
    irdec_obj : entity work.nds_vram_map
    port map ( vramcnt => vramcnt, addr => rdec_obj_addr, is_arm7 => '0', hit => rdec_obj_hit, offs => rdec_obj_offs );
 
+   irdec_bgb : entity work.nds_vram_map
+   port map ( vramcnt => vramcnt, addr => rdec_bgb_addr, is_arm7 => '0', hit => rdec_bgb_hit, offs => rdec_bgb_offs );
+
+   irdec_objb : entity work.nds_vram_map
+   port map ( vramcnt => vramcnt, addr => rdec_objb_addr, is_arm7 => '0', hit => rdec_objb_hit, offs => rdec_objb_offs );
+
    -- ext-palette decode (GBATEK "DS Video Memory Control", renderer-only):
    --   BG ext pal, 32 KB / 4 slots: E MST=4 covers all slots; F/G MST=4 cover
    --   slots 0-1 (OFS.0=0) or 2-3 (OFS.0=1)
    --   OBJ ext pal, 8 KB: F/G MST=5 (lower half of the bank)
    pextpal : process (all)
-      variable mstE, mstF, mstG : unsigned(2 downto 0);
+      variable mstE, mstF, mstG, mstH, mstI : unsigned(2 downto 0);
       variable ofsF, ofsG       : unsigned(1 downto 0);
    begin
       mstE := unsigned(vramcnt(BANK_E*8 + 2 downto BANK_E*8));
       mstF := unsigned(vramcnt(BANK_F*8 + 2 downto BANK_F*8));
       mstG := unsigned(vramcnt(BANK_G*8 + 2 downto BANK_G*8));
+      mstH := unsigned(vramcnt(BANK_H*8 + 2 downto BANK_H*8));
+      mstI := unsigned(vramcnt(BANK_I*8 + 2 downto BANK_I*8));
       ofsF := unsigned(vramcnt(BANK_F*8 + 4 downto BANK_F*8 + 3));
       ofsG := unsigned(vramcnt(BANK_G*8 + 4 downto BANK_G*8 + 3));
 
-      bgep_hit   <= (others => '0');
-      bgep_offs  <= (others => (others => '0'));
-      objep_hit  <= (others => '0');
-      objep_offs <= (others => (others => '0'));
+      bgep_hit    <= (others => '0');
+      bgep_offs   <= (others => (others => '0'));
+      objep_hit   <= (others => '0');
+      objep_offs  <= (others => (others => '0'));
+      bgepb_hit   <= (others => '0');
+      bgepb_offs  <= (others => (others => '0'));
+      objepb_hit  <= (others => '0');
+      objepb_offs <= (others => (others => '0'));
+
+      -- engine B: bank H MST=2 = BG ext pal (all 4 slots), bank I MST=3 =
+      -- OBJ ext pal (first 8 KB of the 16 KB bank)
+      if (vramcnt(BANK_H*8 + 7) = '1' and mstH = 2) then
+         bgepb_hit(BANK_H)  <= '1';
+         bgepb_offs(BANK_H) <= "00" & rdr_bgepb_addr & "00";
+      end if;
+      if (vramcnt(BANK_I*8 + 7) = '1' and mstI = 3) then
+         objepb_hit(BANK_I)  <= '1';
+         objepb_offs(BANK_I) <= "0000" & rdr_objepb_addr & "00";
+      end if;
 
       if (vramcnt(BANK_E*8 + 7) = '1' and mstE = 4) then
          bgep_hit(BANK_E)  <= '1';
@@ -274,12 +335,22 @@ begin
    -- renderer channel arbitration: round-robin, one op in flight. Each req is
    -- masked with its own done pulse so a requester that deasserts on the done
    -- cycle is never spuriously re-dispatched.
-   -- req is a one-cycle pulse from the drawer; pulses arriving while the FSM
-   -- serves another channel are latched in rpend (cleared on dispatch)
-   rreq_vec <= ((rdr_objep_req or rpend(3)) and not rdone_int(3)) &
-               ((rdr_bgep_req  or rpend(2)) and not rdone_int(2)) &
-               ((rdr_obj_req   or rpend(1)) and not rdone_int(1)) &
-               ((rdr_bg_req    or rpend(0)) and not rdone_int(0));
+   -- channels hold req (stable addr) until their done pulse; requests landing
+   -- while the FSM serves another channel are latched in rpend (cleared on
+   -- dispatch). rpend must NOT re-latch from the still-held req of the
+   -- request being served / just completed - that re-dispatched a stale
+   -- address whose straggler done could answer the channel's next request
+   -- with the previous data (a real bug tb_vram_ls caught with interleaved
+   -- CPU reads; back-to-back requests keep req high across done and DO
+   -- relatch the cycle after, which is the correct new-request case)
+   rreq_now <= rdr_objepb_req & rdr_bgepb_req & rdr_objb_req & rdr_bgb_req &
+               rdr_objep_req & rdr_bgep_req & rdr_obj_req & rdr_bg_req;
+
+   grreq : for i in 0 to 7 generate
+      rreq_vec(i) <= '1' when ((rreq_now(i) = '1' or rpend(i) = '1') and
+                               rdone_int(i) = '0' and
+                               not (rstate /= RIDLE and rcur_chan = i)) else '0';
+   end generate;
 
    prpend : process (clk)
    begin
@@ -287,10 +358,12 @@ begin
          if (reset = '1') then
             rpend <= (others => '0');
          else
-            if (rdr_bg_req = '1')    then rpend(0) <= '1'; end if;
-            if (rdr_obj_req = '1')   then rpend(1) <= '1'; end if;
-            if (rdr_bgep_req = '1')  then rpend(2) <= '1'; end if;
-            if (rdr_objep_req = '1') then rpend(3) <= '1'; end if;
+            for i in 0 to 7 loop
+               if (rreq_now(i) = '1' and rdone_int(i) = '0' and
+                   not (rstate /= RIDLE and rcur_chan = i)) then
+                  rpend(i) <= '1';
+               end if;
+            end loop;
             if (rdispatch = '1') then
                rpend(rpick) <= '0';
             end if;
@@ -298,20 +371,24 @@ begin
       end if;
    end process;
 
-   rdr_bg_done    <= rdone_int(0);
-   rdr_obj_done   <= rdone_int(1);
-   rdr_bgep_done  <= rdone_int(2);
-   rdr_objep_done <= rdone_int(3);
+   rdr_bg_done     <= rdone_int(0);
+   rdr_obj_done    <= rdone_int(1);
+   rdr_bgep_done   <= rdone_int(2);
+   rdr_objep_done  <= rdone_int(3);
+   rdr_bgb_done    <= rdone_int(4);
+   rdr_objb_done   <= rdone_int(5);
+   rdr_bgepb_done  <= rdone_int(6);
+   rdr_objepb_done <= rdone_int(7);
 
    prpick : process (all)
-      variable idx : integer range 0 to 3;
+      variable idx : integer range 0 to 7;
       variable got : std_logic;
    begin
       idx := 0;
       got := '0';
-      for k in 0 to 3 loop
-         if (got = '0' and rreq_vec((rr_pri + k) mod 4) = '1') then
-            idx := (rr_pri + k) mod 4;
+      for k in 0 to 7 loop
+         if (got = '0' and rreq_vec((rr_pri + k) mod 8) = '1') then
+            idx := (rr_pri + k) mod 8;
             got := '1';
          end if;
       end loop;
@@ -321,14 +398,22 @@ begin
 
    rdispatch <= '1' when (rstate = RIDLE and rpick_valid = '1') else '0';
 
-   rchosen_hit  <= rdec_bg_hit   when rpick = 0 else
-                   rdec_obj_hit  when rpick = 1 else
-                   bgep_hit      when rpick = 2 else
-                   objep_hit;
-   rchosen_offs <= rdec_bg_offs  when rpick = 0 else
-                   rdec_obj_offs when rpick = 1 else
-                   bgep_offs     when rpick = 2 else
-                   objep_offs;
+   rchosen_hit  <= rdec_bg_hit    when rpick = 0 else
+                   rdec_obj_hit   when rpick = 1 else
+                   bgep_hit       when rpick = 2 else
+                   objep_hit      when rpick = 3 else
+                   rdec_bgb_hit   when rpick = 4 else
+                   rdec_objb_hit  when rpick = 5 else
+                   bgepb_hit      when rpick = 6 else
+                   objepb_hit;
+   rchosen_offs <= rdec_bg_offs   when rpick = 0 else
+                   rdec_obj_offs  when rpick = 1 else
+                   bgep_offs      when rpick = 2 else
+                   objep_offs     when rpick = 3 else
+                   rdec_bgb_offs  when rpick = 4 else
+                   rdec_objb_offs when rpick = 5 else
+                   bgepb_offs     when rpick = 6 else
+                   objepb_offs;
 
    grdrctl : for i in BANK_E to BANK_I generate
       rbram_ce(i) <= rdispatch and rchosen_hit(i);
@@ -410,7 +495,7 @@ begin
                      rcur_chan <= rpick;
                      racc      <= (others => '0');
                      rsrv_idx  <= 0;
-                     rr_pri    <= (rpick + 1) mod 4;
+                     rr_pri    <= (rpick + 1) mod 8;
                      if ((rchosen_hit(BANK_E) or rchosen_hit(BANK_F) or rchosen_hit(BANK_G) or
                           rchosen_hit(BANK_H) or rchosen_hit(BANK_I)) = '1') then
                         rstate <= RBRAMWAIT;
@@ -458,10 +543,14 @@ begin
 
                when RFINISH =>
                   case rcur_chan is
-                     when 0 => rdr_bg_dout    <= racc;
-                     when 1 => rdr_obj_dout   <= racc;
-                     when 2 => rdr_bgep_dout  <= racc;
-                     when 3 => rdr_objep_dout <= racc;
+                     when 0 => rdr_bg_dout     <= racc;
+                     when 1 => rdr_obj_dout    <= racc;
+                     when 2 => rdr_bgep_dout   <= racc;
+                     when 3 => rdr_objep_dout  <= racc;
+                     when 4 => rdr_bgb_dout    <= racc;
+                     when 5 => rdr_objb_dout   <= racc;
+                     when 6 => rdr_bgepb_dout  <= racc;
+                     when 7 => rdr_objepb_dout <= racc;
                   end case;
                   rdone_int(rcur_chan) <= '1';
                   rstate <= RIDLE;
