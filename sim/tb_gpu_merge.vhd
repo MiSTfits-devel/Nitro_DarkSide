@@ -66,11 +66,11 @@ architecture sim of tb_gpu_merge is
    signal px_obj     : std_logic_vector(23 downto 0) := (others => '0');
    signal objwnd     : std_logic := '0';
 
-   signal out_data   : std_logic_vector(15 downto 0);
+   signal out_data   : std_logic_vector(17 downto 0);
    signal out_x      : integer range 0 to 255;
    signal out_we     : std_logic;
 
-   type t_line is array (0 to 255) of std_logic_vector(14 downto 0);
+   type t_line is array (0 to 255) of std_logic_vector(17 downto 0);
    signal linebuf    : t_line := (others => (others => '0'));
 
    signal tests_done : boolean := false;
@@ -144,7 +144,7 @@ begin
    begin
       if rising_edge(clk) then
          if (out_we = '1') then
-            linebuf(out_x) <= out_data(14 downto 0);
+            linebuf(out_x) <= out_data;
          end if;
       end if;
    end process;
@@ -153,7 +153,7 @@ begin
       variable ncases : integer;
       variable base   : integer;
       variable w      : std_logic_vector(31 downto 0);
-      variable exp    : std_logic_vector(14 downto 0);
+      variable exp    : std_logic_vector(17 downto 0);
       variable nfail  : integer := 0;
    begin
       ncases := to_integer(unsigned(vectors(0)));
@@ -218,7 +218,7 @@ begin
 
          -- compare
          for x in 0 to 255 loop
-            exp := vectors(base + 16 + 6 * 256 + x)(14 downto 0);
+            exp := vectors(base + 16 + 6 * 256 + x)(17 downto 0);
             if (linebuf(x) /= exp) then
                nfail := nfail + 1;
                report "case " & integer'image(c) & " x=" & integer'image(x) &

@@ -122,10 +122,10 @@ architecture sim of tb_gpu2d_timed is
 
    signal pixel_out_x    : integer range 0 to 255;
    signal pixel_out_y    : integer range 0 to 191;
-   signal pixel_out_data : std_logic_vector(14 downto 0);
+   signal pixel_out_data : std_logic_vector(17 downto 0);
    signal pixel_out_we   : std_logic;
 
-   type t_frame is array (0 to 49151) of std_logic_vector(14 downto 0);
+   type t_frame is array (0 to 49151) of std_logic_vector(17 downto 0);
    signal framebuf : t_frame := (others => (others => '0'));
 
    signal drops      : integer := 0;   -- drawline pulses gpu2d had to drop
@@ -307,10 +307,10 @@ begin
       end procedure;
 
       procedure compare_frame(c : integer; pbase : integer) is
-         variable exp : std_logic_vector(14 downto 0);
+         variable exp : std_logic_vector(17 downto 0);
       begin
          for i in 0 to 49151 loop
-            exp := vectors(pbase + i)(14 downto 0);
+            exp := vectors(pbase + i)(17 downto 0);
             if (framebuf(i) /= exp) then
                nfail := nfail + 1;
                if (nfail <= 32) then
@@ -324,7 +324,7 @@ begin
          write(fdl, "case " & integer'image(c));
          writeline(fdump, fdl);
          for i in 0 to 49151 loop
-            write(fdl, to_hstring(framebuf(i)));
+            write(fdl, to_hstring("00" & framebuf(i)));
             writeline(fdump, fdl);
          end loop;
          report "case " & integer'image(c) & " done, fails so far " & integer'image(nfail) &

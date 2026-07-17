@@ -89,10 +89,10 @@ architecture sim of tb_gpu2d is
 
    signal px_x : integer range 0 to 255;
    signal px_y : integer range 0 to 191;
-   signal px_d : std_logic_vector(14 downto 0);
+   signal px_d : std_logic_vector(17 downto 0);
    signal px_we : std_logic;
 
-   type t_fb is array (0 to 49151) of std_logic_vector(14 downto 0);
+   type t_fb is array (0 to 49151) of std_logic_vector(17 downto 0);
    signal fb : t_fb := (others => (others => '1'));
 
    signal tests_done : boolean := false;
@@ -207,7 +207,7 @@ begin
       variable fl      : line;
       variable fw      : std_logic_vector(31 downto 0);
       variable nframes : integer;
-      variable exp     : std_logic_vector(14 downto 0);
+      variable exp     : std_logic_vector(17 downto 0);
       variable nfail   : integer := 0;
       variable regw    : t_words(0 to 31);
 
@@ -315,7 +315,7 @@ begin
          for y in 0 to 191 loop
             for x in 0 to 255 loop
                fw  := next_word;
-               exp := fw(14 downto 0);
+               exp := fw(17 downto 0);
                if (fb(y * 256 + x) /= exp) then
                   nfail := nfail + 1;
                   if (nfail <= 100) then

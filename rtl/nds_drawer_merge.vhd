@@ -10,11 +10,19 @@
 --   * bitmap sprites force alpha blending like semi-transparent OBJs, but
 --     with their own coefficients EVA = alpha+1, EVB = 16-EVA (GBATEK /
 --     melonDS); BLDALPHA is ignored for them
+--   * NDS color math is 18-bit: 555 palette colors expand to 666 (c << 1)
+--     and the effects blend in 6-bit space with hardware rounding biases
+--     (melonDS ColorBlend4 / ColorBrightnessUp/Down):
+--       alpha    c = min(63, (c1*EVA + c2*EVB + 8) >> 4)
+--       whiter   c = c + ((63-c)*EVY + 8) >> 4
+--       blacker  c = c - ((c*EVY + 7) >> 4)
+--     pixeldata_out is therefore 18-bit BGR666 (B in [17:12], like the
+--     555 layout it replaces)
 --
 -- 3D-as-BG0 and master brightness are handled outside (BG0 arrives as a
 -- normal line buffer - transparent while the 3D stub is in place; master
--- brightness applies at compose). Priority/window/blend semantics otherwise
--- unchanged from the hardware-verified donor.
+-- brightness applies at compose, also in 666). Priority/window/blend
+-- semantics otherwise unchanged from the hardware-verified donor.
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -85,7 +93,7 @@ entity nds_drawer_merge is
       pixeldata_back       : in  std_logic_vector(15 downto 0);
       objwindow_in         : in  std_logic;
 
-      pixeldata_out        : out std_logic_vector(15 downto 0) := (others => '0');
+      pixeldata_out        : out std_logic_vector(17 downto 0) := (others => '0');
       pixel_x              : out integer range 0 to 255;
       pixel_y              : out integer range 0 to 191;
       pixel_we             : out std_logic
@@ -229,15 +237,22 @@ architecture arch of nds_drawer_merge is
    signal topprio_cycle4          : std_logic_vector(5 downto 0);
    signal special_effect_cycle4   : unsigned(1 downto 0) := (others => '0');
    signal special_out_cycle4      : std_logic;
-   signal alpha_red               : integer range 0 to 511;
-   signal alpha_green             : integer range 0 to 511;
-   signal alpha_blue              : integer range 0 to 511;
-   signal whiter_red              : integer range 0 to 511;
-   signal whiter_green            : integer range 0 to 511;
-   signal whiter_blue             : integer range 0 to 511;
-   signal blacker_red             : integer range -256 to 255;
-   signal blacker_green           : integer range -256 to 255;
-   signal blacker_blue            : integer range -256 to 255;
+   -- 555 -> 666: NDS palette colors gain a low zero bit per channel
+   function expand666(c : std_logic_vector(14 downto 0)) return std_logic_vector is
+   begin
+      return c(14 downto 10) & '0' & c(9 downto 5) & '0' & c(4 downto 0) & '0';
+   end function;
+
+   -- 6-bit-space effect results (alpha can overflow 63 before the clamp)
+   signal alpha_red               : integer range 0 to 127;
+   signal alpha_green             : integer range 0 to 127;
+   signal alpha_blue              : integer range 0 to 127;
+   signal whiter_red              : integer range 0 to 63;
+   signal whiter_green            : integer range 0 to 63;
+   signal whiter_blue             : integer range 0 to 63;
+   signal blacker_red             : integer range 0 to 63;
+   signal blacker_green           : integer range 0 to 63;
+   signal blacker_blue            : integer range 0 to 63;
 
 begin
 
@@ -570,17 +585,19 @@ begin
             evb_eff := EVB_MAXED;
          end if;
 
-         alpha_blue    <= (to_integer(unsigned(firstpixel_cycle3(14 downto 10))) * eva_eff + to_integer(unsigned(secondpixel(14 downto 10))) * evb_eff) / 16;
-         alpha_green   <= (to_integer(unsigned(firstpixel_cycle3( 9 downto  5))) * eva_eff + to_integer(unsigned(secondpixel( 9 downto  5))) * evb_eff) / 16;
-         alpha_red     <= (to_integer(unsigned(firstpixel_cycle3( 4 downto  0))) * eva_eff + to_integer(unsigned(secondpixel( 4 downto  0))) * evb_eff) / 16;
+         -- NDS effect math is 6-bit per channel: expand 555 -> 666 (c << 1),
+         -- blend with the hardware rounding biases (see header)
+         alpha_blue    <= (to_integer(unsigned(firstpixel_cycle3(14 downto 10) & '0')) * eva_eff + to_integer(unsigned(secondpixel(14 downto 10) & '0')) * evb_eff + 8) / 16;
+         alpha_green   <= (to_integer(unsigned(firstpixel_cycle3( 9 downto  5) & '0')) * eva_eff + to_integer(unsigned(secondpixel( 9 downto  5) & '0')) * evb_eff + 8) / 16;
+         alpha_red     <= (to_integer(unsigned(firstpixel_cycle3( 4 downto  0) & '0')) * eva_eff + to_integer(unsigned(secondpixel( 4 downto  0) & '0')) * evb_eff + 8) / 16;
 
-         whiter_blue   <= to_integer(unsigned(firstpixel_cycle3(14 downto 10))) + (((31 - to_integer(unsigned(firstpixel_cycle3(14 downto 10)))) * BLDY_MAXED) / 16);
-         whiter_green  <= to_integer(unsigned(firstpixel_cycle3( 9 downto  5))) + (((31 - to_integer(unsigned(firstpixel_cycle3( 9 downto  5)))) * BLDY_MAXED) / 16);
-         whiter_red    <= to_integer(unsigned(firstpixel_cycle3( 4 downto  0))) + (((31 - to_integer(unsigned(firstpixel_cycle3( 4 downto  0)))) * BLDY_MAXED) / 16);
+         whiter_blue   <= to_integer(unsigned(firstpixel_cycle3(14 downto 10) & '0')) + (((63 - to_integer(unsigned(firstpixel_cycle3(14 downto 10) & '0'))) * BLDY_MAXED + 8) / 16);
+         whiter_green  <= to_integer(unsigned(firstpixel_cycle3( 9 downto  5) & '0')) + (((63 - to_integer(unsigned(firstpixel_cycle3( 9 downto  5) & '0'))) * BLDY_MAXED + 8) / 16);
+         whiter_red    <= to_integer(unsigned(firstpixel_cycle3( 4 downto  0) & '0')) + (((63 - to_integer(unsigned(firstpixel_cycle3( 4 downto  0) & '0'))) * BLDY_MAXED + 8) / 16);
 
-         blacker_blue  <= to_integer(unsigned(firstpixel_cycle3(14 downto 10))) - ((to_integer(unsigned(firstpixel_cycle3(14 downto 10))) * BLDY_MAXED) / 16);
-         blacker_green <= to_integer(unsigned(firstpixel_cycle3( 9 downto  5))) - ((to_integer(unsigned(firstpixel_cycle3( 9 downto  5))) * BLDY_MAXED) / 16);
-         blacker_red   <= to_integer(unsigned(firstpixel_cycle3( 4 downto  0))) - ((to_integer(unsigned(firstpixel_cycle3( 4 downto  0))) * BLDY_MAXED) / 16);
+         blacker_blue  <= to_integer(unsigned(firstpixel_cycle3(14 downto 10) & '0')) - ((to_integer(unsigned(firstpixel_cycle3(14 downto 10) & '0')) * BLDY_MAXED + 7) / 16);
+         blacker_green <= to_integer(unsigned(firstpixel_cycle3( 9 downto  5) & '0')) - ((to_integer(unsigned(firstpixel_cycle3( 9 downto  5) & '0')) * BLDY_MAXED + 7) / 16);
+         blacker_red   <= to_integer(unsigned(firstpixel_cycle3( 4 downto  0) & '0')) - ((to_integer(unsigned(firstpixel_cycle3( 4 downto  0) & '0')) * BLDY_MAXED + 7) / 16);
 
       end if;
    end process;
@@ -599,38 +616,36 @@ begin
             if (special_out_cycle4 = '1') then
 
                case (to_integer(special_effect_cycle4)) is
-                  when 1 => -- alpha
-                     if (alpha_blue  < 31) then pixeldata_out(14 downto 10) <= std_logic_vector(to_unsigned(alpha_blue , 5)); else pixeldata_out(14 downto 10) <= "11111"; end if;
-                     if (alpha_green < 31) then pixeldata_out( 9 downto  5) <= std_logic_vector(to_unsigned(alpha_green, 5)); else pixeldata_out( 9 downto  5) <= "11111"; end if;
-                     if (alpha_red   < 31) then pixeldata_out( 4 downto  0) <= std_logic_vector(to_unsigned(alpha_red  , 5)); else pixeldata_out( 4 downto  0) <= "11111"; end if;
+                  when 1 => -- alpha (whiter/blacker cannot overflow by construction)
+                     if (alpha_blue  < 63) then pixeldata_out(17 downto 12) <= std_logic_vector(to_unsigned(alpha_blue , 6)); else pixeldata_out(17 downto 12) <= "111111"; end if;
+                     if (alpha_green < 63) then pixeldata_out(11 downto  6) <= std_logic_vector(to_unsigned(alpha_green, 6)); else pixeldata_out(11 downto  6) <= "111111"; end if;
+                     if (alpha_red   < 63) then pixeldata_out( 5 downto  0) <= std_logic_vector(to_unsigned(alpha_red  , 6)); else pixeldata_out( 5 downto  0) <= "111111"; end if;
 
                   when 2 => -- whiter
-                     if (whiter_blue  < 31) then pixeldata_out(14 downto 10) <= std_logic_vector(to_unsigned(whiter_blue , 5)); else pixeldata_out(14 downto 10) <= "11111"; end if;
-                     if (whiter_green < 31) then pixeldata_out( 9 downto  5) <= std_logic_vector(to_unsigned(whiter_green, 5)); else pixeldata_out( 9 downto  5) <= "11111"; end if;
-                     if (whiter_red   < 31) then pixeldata_out( 4 downto  0) <= std_logic_vector(to_unsigned(whiter_red  , 5)); else pixeldata_out( 4 downto  0) <= "11111"; end if;
+                     pixeldata_out(17 downto 12) <= std_logic_vector(to_unsigned(whiter_blue , 6));
+                     pixeldata_out(11 downto  6) <= std_logic_vector(to_unsigned(whiter_green, 6));
+                     pixeldata_out( 5 downto  0) <= std_logic_vector(to_unsigned(whiter_red  , 6));
 
                   when 3 => -- blacker
-                     if (blacker_blue  > 0) then pixeldata_out(14 downto 10) <= std_logic_vector(to_unsigned(blacker_blue , 5)); else pixeldata_out(14 downto 10) <= "00000"; end if;
-                     if (blacker_green > 0) then pixeldata_out( 9 downto  5) <= std_logic_vector(to_unsigned(blacker_green, 5)); else pixeldata_out( 9 downto  5) <= "00000"; end if;
-                     if (blacker_red   > 0) then pixeldata_out( 4 downto  0) <= std_logic_vector(to_unsigned(blacker_red  , 5)); else pixeldata_out( 4 downto  0) <= "00000"; end if;
+                     pixeldata_out(17 downto 12) <= std_logic_vector(to_unsigned(blacker_blue , 6));
+                     pixeldata_out(11 downto  6) <= std_logic_vector(to_unsigned(blacker_green, 6));
+                     pixeldata_out( 5 downto  0) <= std_logic_vector(to_unsigned(blacker_red  , 6));
 
                   when others => null;
                end case;
 
-               pixeldata_out(15) <= '0';
-
             elsif (topprio_cycle4(OBJ) = '1') then
-               pixeldata_out <= pixeldata_obj_cycle4(15 downto 0);
+               pixeldata_out <= expand666(pixeldata_obj_cycle4(14 downto 0));
             elsif (topprio_cycle4(BG0) = '1') then
-               pixeldata_out <= pixeldata_bg0_cycle4;
+               pixeldata_out <= expand666(pixeldata_bg0_cycle4(14 downto 0));
             elsif (topprio_cycle4(BG1) = '1') then
-               pixeldata_out <= pixeldata_bg1_cycle4;
+               pixeldata_out <= expand666(pixeldata_bg1_cycle4(14 downto 0));
             elsif (topprio_cycle4(BG2) = '1') then
-               pixeldata_out <= pixeldata_bg2_cycle4;
+               pixeldata_out <= expand666(pixeldata_bg2_cycle4(14 downto 0));
             elsif (topprio_cycle4(BG3) = '1') then
-               pixeldata_out <= pixeldata_bg3_cycle4;
+               pixeldata_out <= expand666(pixeldata_bg3_cycle4(14 downto 0));
             else
-               pixeldata_out <= pixeldata_back;
+               pixeldata_out <= expand666(pixeldata_back(14 downto 0));
             end if;
 
             pixel_x       <= xpos_cycle4;

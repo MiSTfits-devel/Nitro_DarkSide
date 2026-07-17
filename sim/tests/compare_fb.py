@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-# M5 frame diff: tb_top_frame RTL dump (RGB555) vs melonds_fbdump (ARGB8888).
+# M5 frame diff: tb_top_frame RTL dump (BGR666) vs melonds_fbdump (ARGB8888).
 #
 #   compare_fb.py <rtl_dump.txt> <melonds_dump.txt> [--rtl-frame N] [--mds-frame N]
 #                 [--ppm-prefix out]
 #
-# The RTL pixel is expanded exactly like melonDS's pipeline: c6 = c5 << 1,
-# c8 = (c6 << 2) | (c6 >> 4), so an unblended scene must match bit-exact.
+# The RTL dump is 18-bit BGR666 (the NDS LCD format; the merge blends in
+# 6-bit space with hardware rounding). Expansion to melonDS's 8-bit
+# framebuffer is c8 = (c6 << 2) | (c6 >> 4) per channel — every scene,
+# blended or not, must match bit-exact.
 # Default compares the LAST frame of each dump (both must be stable frames).
 # Exit 0 on pixel-perfect match, 1 otherwise.
 import argparse
@@ -31,11 +33,10 @@ def load_frames(path):
     return frames
 
 
-def rgb555_to_argb(p):
+def bgr666_to_argb(p):
     out = 0xFF000000
-    for shift, dst in ((0, 16), (5, 8), (10, 0)):
-        c5 = (p >> shift) & 0x1F
-        c6 = c5 << 1
+    for shift, dst in ((0, 16), (6, 8), (12, 0)):  # R, G, B(high) -> ARGB
+        c6 = (p >> shift) & 0x3F
         c8 = ((c6 << 2) | (c6 >> 4)) & 0xFF
         out |= c8 << dst
     return out
@@ -61,7 +62,7 @@ def main():
     rtl = load_frames(args.rtl)[args.rtl_frame]
     mds = load_frames(args.mds)[args.mds_frame]
 
-    rtl_argb = [rgb555_to_argb(p) for p in rtl]
+    rtl_argb = [bgr666_to_argb(p) for p in rtl]
 
     if args.ppm_prefix:
         write_ppm(f"{args.ppm_prefix}_rtl.ppm", rtl_argb)

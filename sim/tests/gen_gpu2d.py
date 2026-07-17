@@ -7,7 +7,7 @@
 #   gpu2d_bgep.hex     32 KB BG ext-pal     gpu2d_objep.hex    8 KB OBJ ext-pal
 #   gpu2d_pal.hex      1 KB std palettes    gpu2d_oam.hex      1 KB OAM
 #   gpu2d_frames.hex   frame count, then per frame 32 register words +
-#                      192*256 expected pixels (15 bit)
+#                      192*256 expected pixels (18-bit BGR666)
 #
 # The per-line renderers are the RTL-verified golden models from
 # gen_gpu_bg/gen_gpu_obj/gen_gpu_merge, parameterized over the memories,
@@ -265,6 +265,11 @@ def render_objs(oam, y, cfg):
 
 BG0, BG1, BG2, BG3, OBJ, BD = range(6)
 
+def expand666(c15):
+    return (((c15 & 0x1F) << 1)
+            | ((((c15 >> 5) & 0x1F) << 1) << 6)
+            | ((((c15 >> 10) & 0x1F) << 1) << 12))
+
 def in_range(v, a, b):
     return (a <= b and a <= v < b) or (a > b and (v >= a or v < b))
 
@@ -337,19 +342,19 @@ def merge_line(r, y, bg, objcol, objsett, objwnd):
             res = 0
             if eff == 1:
                 ea, eb = (obalpha + 1, 16 - (obalpha + 1)) if (obmp and first == OBJ) else (eva, evb)
-                for sh in (0, 5, 10):
-                    res |= min(31, (((fp >> sh) & 31) * ea + ((sp >> sh) & 31) * eb) // 16) << sh
+                for i, sh in enumerate((0, 5, 10)):
+                    res |= min(63, ((((fp >> sh) & 31) << 1) * ea + (((sp >> sh) & 31) << 1) * eb + 8) // 16) << (6 * i)
             elif eff == 2:
-                for sh in (0, 5, 10):
-                    c = (fp >> sh) & 31
-                    res |= min(31, c + ((31 - c) * bldy) // 16) << sh
+                for i, sh in enumerate((0, 5, 10)):
+                    c = ((fp >> sh) & 31) << 1
+                    res |= (c + ((63 - c) * bldy + 8) // 16) << (6 * i)
             else:
-                for sh in (0, 5, 10):
-                    c = (fp >> sh) & 31
-                    res |= max(0, c - (c * bldy) // 16) << sh
+                for i, sh in enumerate((0, 5, 10)):
+                    c = ((fp >> sh) & 31) << 1
+                    res |= (c - (c * bldy + 7) // 16) << (6 * i)
             out.append(res)
         else:
-            out.append(layercolor(top))
+            out.append(expand666(layercolor(top)))
     return out
 
 # ---------------- frame composition (mirrors nds_gpu2d) ----------------

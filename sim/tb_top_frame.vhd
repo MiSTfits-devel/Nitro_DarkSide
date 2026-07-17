@@ -8,7 +8,7 @@
 -- A..D, and the frame collector.
 --
 -- Every visible frame after boot_done is dumped to DUMPFILE as "frame <n>"
--- followed by 49152 RGB555 hex lines (tb_gpu2d_timed format). The run stops
+-- followed by 49152 BGR666 hex lines (5 hex digits, B in [17:12]). The run stops
 -- after FRAMES dumps. Compare against melonDS with sim/tests/compare_fb.py.
 -- Run: sim/run_top_frame.sh <image.hex>  (heavy - remote pod only)
 
@@ -87,14 +87,14 @@ architecture sim of tb_top_frame is
 
    signal pixel_out_x    : integer range 0 to 255;
    signal pixel_out_y    : integer range 0 to 191;
-   signal pixel_out_data : std_logic_vector(14 downto 0);
+   signal pixel_out_data : std_logic_vector(17 downto 0);
    signal pixel_out_we   : std_logic;
    signal vblank_out     : std_logic;
 
    signal dbg_line_drop, dbg_line_busy, dbg_cpu_err9, dbg_cpu_err7 : std_logic;
 
    -- ================= collectors =================
-   type t_frame is array (0 to 49151) of std_logic_vector(14 downto 0);
+   type t_frame is array (0 to 49151) of std_logic_vector(17 downto 0);
    signal framebuf : t_frame := (others => (others => '0'));
 
    -- VRAM banks A..D backing store (512 KB)
@@ -310,7 +310,7 @@ begin
          write(fdl, string'("frame ") & integer'image(n));
          writeline(fdump, fdl);
          for i in 0 to 49151 loop
-            write(fdl, to_hstring(framebuf(i)));
+            write(fdl, to_hstring("00" & framebuf(i)));
             writeline(fdump, fdl);
          end loop;
          report "frame " & integer'image(n) & " dumped, drops so far " &

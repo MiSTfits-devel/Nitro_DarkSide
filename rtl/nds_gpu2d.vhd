@@ -86,7 +86,7 @@ entity nds_gpu2d is
       -- merged line out
       pixel_out_x       : out integer range 0 to 255;
       pixel_out_y       : out integer range 0 to 191;
-      pixel_out_data    : out std_logic_vector(14 downto 0);
+      pixel_out_data    : out std_logic_vector(17 downto 0);   -- BGR666 (B in [17:12])
       pixel_out_we      : out std_logic
    );
 end entity;
@@ -287,7 +287,7 @@ architecture arch of nds_gpu2d is
    signal ypos_mosaic_bg  : integer range 0 to 191;
    signal ypos_mosaic_obj : integer range 0 to 191;
 
-   signal merge_out16     : std_logic_vector(15 downto 0);
+   signal merge_out666    : std_logic_vector(17 downto 0);
 
 begin
 
@@ -975,13 +975,13 @@ begin
       pixeldata_obj        => mrg_obj,
       pixeldata_back       => backdrop,
       objwindow_in         => mrg_objwnd,
-      pixeldata_out        => merge_out16,
+      pixeldata_out        => merge_out666,
       pixel_x              => pixel_out_x,
       pixel_y              => pixel_out_y,
       pixel_we             => pixel_out_we
    );
 
    -- forced blank: hardware outputs white
-   pixel_out_data <= (others => '1') when R_forced_blank = "1" else merge_out16(14 downto 0);
+   pixel_out_data <= (others => '1') when R_forced_blank = "1" else merge_out666;
 
 end architecture;
