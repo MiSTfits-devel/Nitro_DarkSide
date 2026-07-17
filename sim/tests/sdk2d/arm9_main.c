@@ -9,6 +9,8 @@
 //        EXT PAL sprite, right-edge clipped sprite, mode-2 OBJ-window
 //   WIN0 + OBJWIN + blending (alpha 9/7), MOSAIC 0x0232
 //   MASTER_BRIGHT: A up 4/16, B down 6/16; POWCNT swap CLEAR (B on top)
+//   DMA: tiles via dmaCopyWords(3), OBJ pal via dmaCopyHalfWords(2),
+//   BG1 tile 3 via dmaFillWords, vblank repeat DMA0 recoloring subpal 3
 //
 // libnds is used for register definitions and the VRAM bank helpers only —
 // no calico kernel, no DMA, no BIOS calls (see arm9_crt0.s). All graphics
@@ -24,9 +26,14 @@
 #include <nds/arm9/video.h>
 #include <nds/arm9/background.h>
 #include <nds/memory.h>
+#include <nds/dma.h>
 #include <calico/nds/pm.h>
 
 #define MAIL ((volatile u32 *)0x02FFFF00)
+// DMA staging in the UNCACHED main-RAM mirror (PU region 2): no cache
+// cleaning needed before the DMA reads it
+#define STAGE   ((u32 *)0x02D00000)
+#define STAGE16 ((u16 *)0x02D00000)
 
 #define REG16(b, off)  (*(volatile u16 *)(0x04000000u + (u32)(b)*0x1000u + (off)))
 #define REG32(b, off)  (*(volatile u32 *)(0x04000000u + (u32)(b)*0x1000u + (off)))
@@ -48,13 +55,15 @@ static void scene(int b)
 {
     u32 vary = (u32)b * 3u;      // pattern/color variation between screens
 
-    // std palettes
+    // std palettes: BG by CPU, OBJ staged + DMA2 immediate 16-bit
     for (int i = 0; i < 256; i++) {
-        BGPAL(b)[i]  = (u16)((i * (0x0421 + vary * 8) + (i >> 3)) & 0x7FFF);
-        OBJPAL(b)[i] = (u16)(((255 - i) * (0x0421 + vary * 4)) & 0x7FFF);
+        BGPAL(b)[i] = (u16)((i * (0x0421 + vary * 8) + (i >> 3)) & 0x7FFF);
+        STAGE16[i]  = (u16)(((255 - i) * (0x0421 + vary * 4)) & 0x7FFF);
     }
+    dmaCopyHalfWords(2, STAGE16, (void *)OBJPAL(b), 256*2);
 
     // ---- BG0 4bpp tiles at char base 0: blank, ring, cross, solid ----
+    // built in uncached staging, loaded by DMA3 immediate 32-bit
     for (int t = 0; t < 4; t++)
         for (int r = 0; r < 8; r++) {
             u32 row = 0;
@@ -66,8 +75,9 @@ static void scene(int b)
                 if (t == 3) px = 4u + (((u32)c + (u32)r) & 3u);
                 row |= px << (4 * c);
             }
-            ((volatile u32 *)BGVRAM(b))[t*8 + r] = row;
+            STAGE[t*8 + r] = row;
         }
+    dmaCopyWords(3, STAGE, (void *)BGVRAM(b), 4*32*4);
 
     // ---- BG3 affine 8bpp tiles 1/2 at char base 1 (0x4000): rings ----
     for (int t = 1; t <= 2; t++)
@@ -97,6 +107,9 @@ static void scene(int b)
             ((volatile u32 *)(BGVRAM(b) + 0x8000 + 64u*(u32)t))[r*2]     = w0;
             ((volatile u32 *)(BGVRAM(b) + 0x8000 + 64u*(u32)t))[r*2 + 1] = w1;
         }
+    // tile 3: solid 256c color via DMA fill (source = the DMA FILL word,
+    // read through the IO bus)
+    dmaFillWords(0x4A4A4A4Au + b*0x10101010u, (void *)(BGVRAM(b) + 0x8000 + 64u*3u), 64);
 
     // ---- maps ----
     // BG3 affine 16x16 byte map at 0x1800: tiles 1/2 checkered
@@ -117,7 +130,7 @@ static void scene(int b)
     // BG1 map at screen base 5 (0x2800): holes + ext palettes 0..7
     for (int i = 0; i < 1024; i++) {
         int x = i & 31, y = i >> 5;
-        u16 e = (u16)((x + 2*y + (int)vary) % 3);
+        u16 e = (u16)((x + 2*y + (int)vary) % 4);
         e |= (u16)(((x >> 2) + y) & 7) << 12;
         ((volatile u16 *)(BGVRAM(b) + 0x2800))[i] = e;
     }
@@ -225,6 +238,17 @@ int main(void)
     MAIL[0] |= 4;
     scene(1);
     MAIL[0] |= 8;
+
+    // DMA0: vblank-triggered repeat copy refreshing BG-A palette entries
+    // 48..55 (BG0 subpal 3) with distinct colors each frame - static
+    // frames, but a dead vblank trigger or repeat path shows immediately
+    // dst ctrl = inc+reload and src fixed, so the transfer is identical
+    // every frame (plain increment would march through palette RAM)
+    STAGE16[512] = 0x7C00; STAGE16[513] = 0x03E0;
+    DMA_SRC(0)  = (u32)&STAGE16[512];
+    DMA_DEST(0) = 0x05000060;
+    DMA_CR(0)   = DMA_ENABLE | DMA_START_VBL | DMA_REPEAT | DMA_32_BIT |
+                  DMA_DST_RESET | DMA_SRC_FIX | 4;
 
     MAIL[0] |= 16;
     MAIL[1] = 0xCAFEBABE;

@@ -46,6 +46,10 @@ entity nds_membus9 is
       cache_op_busy   : out std_logic;
 
       -- gba_cpu-style bus
+      -- '1' while the DMA owns the bus: DMA cannot access the TCMs, so
+      -- their windows fall through to the external map (GBATEK/DualSOUP)
+      dma_bus        : in  std_logic := '0';
+
       cpu_adr        : in  std_logic_vector(31 downto 0);
       cpu_rnw        : in  std_logic;
       cpu_ena        : in  std_logic;
@@ -197,7 +201,7 @@ begin
 
       itcm_limit := shift_left(to_unsigned(512, 33), to_integer(unsigned(itcm_size)));
       itcm_hit   <= '0';
-      if (itcm_ena = '1' and a < itcm_limit) then
+      if (itcm_ena = '1' and a < itcm_limit and dma_bus = '0') then
          -- load mode: writes land in the TCM, reads see the external map
          if (cpu_rnw = '0' or itcm_load = '0') then
             itcm_hit <= '1';
@@ -207,7 +211,7 @@ begin
       dtcm_lo  := unsigned('0' & dtcm_base & x"000");
       dtcm_hi  := dtcm_lo + shift_left(to_unsigned(512, 33), to_integer(unsigned(dtcm_size)));
       dtcm_hit <= '0';
-      if (dtcm_ena = '1' and cpu_code = '0' and a >= dtcm_lo and a < dtcm_hi) then
+      if (dtcm_ena = '1' and cpu_code = '0' and a >= dtcm_lo and a < dtcm_hi and dma_bus = '0') then
          if (cpu_rnw = '0' or dtcm_load = '0') then
             dtcm_hit <= '1';
          end if;
