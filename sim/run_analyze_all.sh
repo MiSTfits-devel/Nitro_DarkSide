@@ -59,6 +59,7 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_drawer_merge.vhd \
    rtl/nds_gpu2d.vhd \
    rtl/nds_gpu_timing.vhd \
+   rtl/nds_dma9.vhd \
    rtl/nds_top.vhd \
    sim/tb_gpu_merge.vhd \
    sim/tb_vram_ls.vhd \

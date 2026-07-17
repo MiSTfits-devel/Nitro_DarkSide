@@ -19,8 +19,9 @@
 --     Consequence: relative to the CPUs the frame is GPU_CE_DIV x longer
 --     than hardware — fine for static scenes, revisited with M9 pacing.
 --   * TCMs, ARM7-private WRAM: behavioral arrays (BRAM entities land in M9)
---   * no DMA / sound / SPI / RTC / card yet; KEYINPUT/EXTKEYIN are wired
---     directly so samples polling keys see released state
+--   * ARM9 DMA (nds_dma9): immediate/vblank/hblank, functional timing;
+--     no ARM7 DMA / sound / SPI / RTC / card yet; KEYINPUT/EXTKEYIN are
+--     wired directly so samples polling keys see released state
 --   * both 2D engines render (engine B via the 0x1000 register window,
 --     palette/OAM upper halves and the C/D/H/I VRAM roles); POWCNT routes
 --     the screens (swap bit; B-off shows white, palette/OAM writes gated
@@ -222,7 +223,22 @@ architecture arch of nds_top is
    signal ipc_wired_done9, sys_wired_done9 : std_logic;
    signal tim_wired_out9, g2d_wired_out, g2db_wired_out : std_logic_vector(31 downto 0);
    signal tim_wired_done9, g2d_wired_done, g2db_wired_done : std_logic;
+   signal dma_wired_out : std_logic_vector(31 downto 0);
+   signal dma_wired_done : std_logic;
    signal io_bus9b : proc_bus_gb_type;
+
+   -- ARM9 DMA bus mastering
+   signal cpu9_bus_idle : std_logic;
+   signal dma_on, dma_bus_on : std_logic;
+   signal dmab_ena, dmab_rnw : std_logic;
+   signal dmab_adr  : std_logic_vector(31 downto 0);
+   signal dmab_acc  : std_logic_vector(1 downto 0);
+   signal dmab_low  : std_logic_vector(1 downto 0);
+   signal dmab_dout : std_logic_vector(31 downto 0);
+   signal irq_dma9  : std_logic_vector(3 downto 0);
+   signal mbus_adr, mbus_dout : std_logic_vector(31 downto 0);
+   signal mbus_rnw, mbus_ena, mbus_code : std_logic;
+   signal mbus_acc, mbus_low : std_logic_vector(1 downto 0);
    signal key_wired_out9 : std_logic_vector(31 downto 0);
    signal key_wired_done9 : std_logic;
    signal irq_in9    : std_logic_vector(31 downto 0);
@@ -531,9 +547,9 @@ begin
       gb_bus_din      => cpu9_din,
       gb_bus_done     => cpu9_done,
       bus_lowbits     => cpu9_lowbits,
-      dma_on          => '0',
+      dma_on          => dma_on,
       done            => open,
-      CPU_bus_idle    => open,
+      CPU_bus_idle    => cpu9_bus_idle,
       PC_in_BIOS      => open,
       cpu_halt        => open,
       lastread        => cpu9_lastread,
@@ -570,8 +586,9 @@ begin
       itcm_ena => cp15_itcm_ena, itcm_load => cp15_itcm_load, itcm_size => cp15_itcm_size,
       dtcm_ena => cp15_dtcm_ena, dtcm_load => cp15_dtcm_load,
       dtcm_base => cp15_dtcm_base, dtcm_size => cp15_dtcm_size,
-      cpu_adr => cpu9_adr, cpu_rnw => cpu9_rnw, cpu_ena => cpu9_ena, cpu_code => cpu9_code,
-      cpu_acc => cpu9_acc, cpu_dout => cpu9_dout, cpu_lowbits => cpu9_lowbits,
+      dma_bus => dma_bus_on,
+      cpu_adr => mbus_adr, cpu_rnw => mbus_rnw, cpu_ena => mbus_ena, cpu_code => mbus_code,
+      cpu_acc => mbus_acc, cpu_dout => mbus_dout, cpu_lowbits => mbus_low,
       cpu_lastread => cpu9_lastread, cpu_din => cpu9_din, cpu_done => cpu9_done,
       itcm_addr => itcm_addr, itcm_we => itcm_we, itcm_be => itcm_be,
       itcm_writedata => itcm_writedata, itcm_readdata => itcm_readdata,
@@ -588,6 +605,40 @@ begin
       mr_writedata => mr9_writedata, mr_done => mr9_done, mr_readdata => mr9_readdata,
       io_ce_next => '1',
       io_bus => io_bus9, io_wired_out => io_wired_out9, io_wired_done => io_wired_done9
+   );
+
+   -- ARM9 bus mux: the DMA owns the membus while dma_bus_on (CPU paused
+   -- via dma_on and drained via CPU_bus_idle before the grant)
+   mbus_adr  <= dmab_adr  when dma_bus_on = '1' else cpu9_adr;
+   mbus_rnw  <= dmab_rnw  when dma_bus_on = '1' else cpu9_rnw;
+   mbus_ena  <= dmab_ena  when dma_bus_on = '1' else cpu9_ena;
+   mbus_code <= '0'       when dma_bus_on = '1' else cpu9_code;
+   mbus_acc  <= dmab_acc  when dma_bus_on = '1' else cpu9_acc;
+   mbus_dout <= dmab_dout when dma_bus_on = '1' else cpu9_dout;
+   mbus_low  <= dmab_low  when dma_bus_on = '1' else cpu9_lowbits;
+
+   idma9 : entity work.nds_dma9
+   port map
+   (
+      clk          => clk1x,
+      reset        => resetCpu,
+      gb_bus       => io_bus9,
+      wired_out    => dma_wired_out,
+      wired_done   => dma_wired_done,
+      trig_vblank  => gpu_vblank,
+      trig_hblank  => hblank_trigger,
+      cpu_bus_idle => cpu9_bus_idle,
+      dma_on       => dma_on,
+      dma_bus_on   => dma_bus_on,
+      mb_ena       => dmab_ena,
+      mb_rnw       => dmab_rnw,
+      mb_adr       => dmab_adr,
+      mb_acc       => dmab_acc,
+      mb_lowbits   => dmab_low,
+      mb_dout      => dmab_dout,
+      mb_din       => cpu9_din,
+      mb_done      => cpu9_done,
+      irq_dma      => irq_dma9
    );
 
    -- TCM stores
@@ -691,9 +742,11 @@ begin
 
    -- ================= IO register banks =================
    io_wired_out9  <= irq_wired_out9 or timer_wired_out9 or ipc_wired_out9 or sys_wired_out9 or
-                     tim_wired_out9 or g2d_wired_out or g2db_wired_out or key_wired_out9;
+                     tim_wired_out9 or g2d_wired_out or g2db_wired_out or dma_wired_out or
+                     key_wired_out9;
    io_wired_done9 <= irq_wired_done9 or timer_wired_done9 or ipc_wired_done9 or sys_wired_done9 or
-                     tim_wired_done9 or g2d_wired_done or g2db_wired_done or key_wired_done9;
+                     tim_wired_done9 or g2d_wired_done or g2db_wired_done or dma_wired_done or
+                     key_wired_done9;
    io_wired_out7  <= irq_wired_out7 or timer_wired_out7 or ipc_wired_out7 or sys_wired_out7 or
                      tim_wired_out7 or key_wired_out7;
    io_wired_done7 <= irq_wired_done7 or timer_wired_done7 or ipc_wired_done7 or sys_wired_done7 or
@@ -701,6 +754,7 @@ begin
 
    irq_in9 <= (0 => irq9_vblank, 1 => irq9_hblank, 2 => irq9_vcount,
                3 => irp_timer9(0), 4 => irp_timer9(1), 5 => irp_timer9(2), 6 => irp_timer9(3),
+               8 => irq_dma9(0), 9 => irq_dma9(1), 10 => irq_dma9(2), 11 => irq_dma9(3),
                16 => ipc9_irq_sync, 17 => ipc9_irq_sendempty, 18 => ipc9_irq_recv,
                others => '0');
    irq_in7 <= (0 => irq7_vblank, 1 => irq7_hblank, 2 => irq7_vcount,

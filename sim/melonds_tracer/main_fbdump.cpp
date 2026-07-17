@@ -4,7 +4,12 @@
 // CPU PCs — no firmware boot, no cart emulation) and runs whole frames,
 // dumping the engine-A (top) screen after each one.
 //
-//   melonds_fbdump <image.nds> <dump.txt> <frames> [dump_b.txt]
+//   melonds_fbdump [--direct] <image.nds> <dump.txt> <frames> [dump_b.txt]
+//
+// --direct uses melonDS's own cart + SetupDirectBoot path (full boot
+// environment: header copy, chip IDs, user settings, CP15 preset) for
+// stock libnds/calico ROMs; the default stays the HLE-loader-equivalent
+// section copy matching the RTL nds_loader.
 //
 // The optional 4th argument also dumps the bottom screen (engine B with
 // POWCNT LCD-swap set) in the same format.
@@ -22,15 +27,18 @@
 
 int main(int argc, char** argv)
 {
-    if (argc < 4)
+    int argbase = 1;
+    bool direct = false;
+    if (argc > 1 && strcmp(argv[1], "--direct") == 0) { direct = true; argbase = 2; }
+    if (argc < argbase + 3)
     {
-        fprintf(stderr, "usage: %s <image.nds> <dump.txt> <frames>\n", argv[0]);
+        fprintf(stderr, "usage: %s [--direct] <image.nds> <dump.txt> <frames> [dump_b.txt]\n", argv[0]);
         return 2;
     }
-    const char* ndspath  = argv[1];
-    const char* dumppath = argv[2];
-    int frames = atoi(argv[3]);
-    const char* dumppathb = (argc > 4) ? argv[4] : nullptr;
+    const char* ndspath  = argv[argbase];
+    const char* dumppath = argv[argbase + 1];
+    int frames = atoi(argv[argbase + 2]);
+    const char* dumppathb = (argc > argbase + 3) ? argv[argbase + 3] : nullptr;
 
     FILE* f = fopen(ndspath, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", ndspath); return 1; }
@@ -60,6 +68,19 @@ int main(int argc, char** argv)
     GPU::SetRenderSettings(0, rs);
     NDS::Reset();
 
+    if (direct)
+    {
+        if (!NDS::LoadCart(img, (u32)len, nullptr, 0))
+        {
+            fprintf(stderr, "LoadCart failed\n");
+            return 1;
+        }
+        NDS::Reset();
+        NDS::SetupDirectBoot("rom.nds");
+        NDS::Start();
+    }
+    else
+    {
     // HLE load, nds_loader semantics: sections go to main RAM (or ARM7 WRAM)
     auto copysec = [&](u32 off, u32 load, u32 size, int cpu) -> bool
     {
@@ -79,6 +100,7 @@ int main(int argc, char** argv)
     NDS::ARM9->JumpTo(a9entry);
     NDS::ARM7->JumpTo(a7entry);
     NDS::Start();
+    }
 
     FILE* d = fopen(dumppath, "w");
     if (!d) { fprintf(stderr, "cannot open %s\n", dumppath); return 1; }
