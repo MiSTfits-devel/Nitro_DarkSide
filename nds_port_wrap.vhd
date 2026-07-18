@@ -195,14 +195,19 @@ begin
       sound_out_left   => sound_out_left,
       sound_out_right  => sound_out_right,
 
-      dbg_line_drop    => open,
-      dbg_line_busy    => open,
-      dbg_cpu_err9     => open,
-      dbg_cpu_err7     => open,
+      -- the record-typed exports only exist in simulation (pragma-stripped
+      -- in nds_top, donor gba_cpu idiom); plain debug taps stay last so the
+      -- stripped list keeps valid comma placement
+-- synthesis translate_off
       dbg_export9_done => open,
       dbg_export9      => open,
       dbg_export7_done => open,
-      dbg_export7      => open
+      dbg_export7      => open,
+-- synthesis translate_on
+      dbg_line_drop    => open,
+      dbg_line_busy    => open,
+      dbg_cpu_err9     => open,
+      dbg_cpu_err7     => open
    );
 
 end architecture;
