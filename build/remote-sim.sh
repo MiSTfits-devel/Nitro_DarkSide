@@ -7,9 +7,11 @@
 #   DIRTY=1 build/remote-sim.sh run_x.sh                # working tree incl. uncommitted
 #   ENV="OPCOUNT=200000 SEED=7" build/remote-sim.sh run_vram_torture_tb.sh
 #   KEEP=1 ...                                          # leave the pod running after
+#   POD=nds-nvc-sim-2 ...                               # separate pod: parallel sims
+#                                                       # (artifacts -> simout/<pod>/)
 #
 # Long benches: the pod survives this script's terminal - rerun with the same
-# script to reuse a warm pod, or watch with: kubectl logs -f nds-nvc-sim
+# script to reuse a warm pod, or watch with: kubectl logs -f <pod name>
 set -euo pipefail
 
 SCRIPT="${1:?usage: build/remote-sim.sh <run_script.sh>}"
@@ -18,7 +20,9 @@ NS="${NS:-default}"
 DIRTY="${DIRTY:-0}"
 ENVVARS="${ENV:-}"
 KEEP="${KEEP:-0}"
-POD="nds-nvc-sim"
+# POD=nds-nvc-sim-2 (any name) runs on a separate pod so sims can run in
+# parallel; default keeps the historical single-pod behavior
+POD="${POD:-nds-nvc-sim}"
 
 cd "$(dirname "$0")/.."
 
@@ -26,7 +30,7 @@ cd "$(dirname "$0")/.."
 
 echo "== recreating pod ${POD} in ${NS}"
 kubectl -n "$NS" delete pod "$POD" --ignore-not-found --wait
-kubectl -n "$NS" apply -f build/sim-pod.yaml
+sed "s/nds-nvc-sim/${POD}/g" build/sim-pod.yaml | kubectl -n "$NS" apply -f -
 kubectl -n "$NS" wait --for=condition=Ready "pod/$POD" --timeout=10m
 
 echo "== streaming source (${REF}, dirty=${DIRTY})"
@@ -58,12 +62,15 @@ kill "$LOGPID" 2>/dev/null || true
 
 echo "== sim exit code: ${RC}"
 # ARTIFACTS="a.txt b.txt" copies files (relative to the repo root in the pod)
-# into simout/ before the pod is deleted
+# into simout/ (or simout/<pod>/ for non-default PODs, so parallel runs
+# don't clobber each other) before the pod is deleted
 if [ -n "${ARTIFACTS:-}" ]; then
-   mkdir -p simout
+   OUTDIR="simout"
+   [ "$POD" != "nds-nvc-sim" ] && OUTDIR="simout/${POD}"
+   mkdir -p "$OUTDIR"
    for f in $ARTIFACTS; do
-      echo "== fetching $f"
-      kubectl -n "$NS" cp "${POD}:/work/src/${f}" "simout/$(basename "$f")" ||
+      echo "== fetching $f -> ${OUTDIR}/"
+      kubectl -n "$NS" cp "${POD}:/work/src/${f}" "${OUTDIR}/$(basename "$f")" ||
          echo "   (missing: $f)"
    done
 fi
