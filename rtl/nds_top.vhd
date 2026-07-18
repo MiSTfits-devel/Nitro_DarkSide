@@ -138,15 +138,20 @@ entity nds_top is
       sound_out_left   : out std_logic_vector(15 downto 0);
       sound_out_right  : out std_logic_vector(15 downto 0);
 
-      -- debug (sim monitors; unconnected in synthesis)
-      dbg_line_drop    : out std_logic;   -- drawline landed while gpu2d was still busy
-      dbg_line_busy    : out std_logic;
-      dbg_cpu_err9     : out std_logic;
-      dbg_cpu_err7     : out std_logic;
+      -- debug (sim monitors; unconnected in synthesis). The record-typed
+      -- exports are sim-only, pragma-stripped like the CPUs' own ports
+      -- (donor gba_cpu idiom); keep plain ports after them so stripping
+      -- never leaves a dangling ';' before the closing paren.
+-- synthesis translate_off
       dbg_export9_done : out std_logic;   -- ARM9 retired-instruction export (is_simu only)
       dbg_export9      : out cpu_export_type;
       dbg_export7_done : out std_logic;   -- ARM7 retired-instruction export (is_simu only)
-      dbg_export7      : out cpu_export_type
+      dbg_export7      : out cpu_export_type;
+-- synthesis translate_on
+      dbg_line_drop    : out std_logic;   -- drawline landed while gpu2d was still busy
+      dbg_line_busy    : out std_logic;
+      dbg_cpu_err9     : out std_logic;
+      dbg_cpu_err7     : out std_logic
    );
 end entity;
 
@@ -630,8 +635,10 @@ begin
       clk             => clk1x,
       ce              => '1',
       reset           => resetCpu,
+-- synthesis translate_off
       cpu_export_done => dbg_export9_done,
       cpu_export      => dbg_export9,
+-- synthesis translate_on
       error_cpu       => error_cpu9,
       savestate_bus   => ss_bus9,
       ss_wired_out    => open,
@@ -772,8 +779,10 @@ begin
       clk             => clk1x,
       ce              => '1',
       reset           => resetCpu,
+-- synthesis translate_off
       cpu_export_done => dbg_export7_done,
       cpu_export      => dbg_export7,
+-- synthesis translate_on
       error_cpu       => error_cpu7,
       savestate_bus   => ss_bus7,
       ss_wired_out    => open,
