@@ -699,7 +699,13 @@ begin
             dx              <= to_integer(signed(OAM_data_aff0));
             dy              <= to_integer(signed(OAM_data_aff2));
 
-            is_bitmap       <= '1' when OAM_data0(OAM_MODE_HI downto OAM_MODE_LO) = "11" else '0';
+            -- if/else, not a conditional assignment: Quartus 17's VHDL-2008
+            -- subset rejects those in sequential code
+            if (OAM_data0(OAM_MODE_HI downto OAM_MODE_LO) = "11") then
+               is_bitmap <= '1';
+            else
+               is_bitmap <= '0';
+            end if;
 
             if (unsigned(OAM_data1(OAM_X_HI downto OAM_X_LO)) > 16#100#) then
                posx <= to_integer(unsigned(OAM_data1(OAM_X_HI downto OAM_X_LO))) - 16#200#;
