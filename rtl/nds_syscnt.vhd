@@ -44,6 +44,10 @@ entity nds_syscnt is
       wired_out7   : out std_logic_vector(31 downto 0);
       wired_done7  : out std_logic;
 
+      -- 1-cycle pulse after a direct boot: firmware-left state
+      -- (WRAMCNT=3, POSTFLG=1, POWCNT1=0x820F)
+      preset_direct : in std_logic := '0';
+
       wramcnt      : out std_logic_vector(1 downto 0);
       vramcnt      : out std_logic_vector(71 downto 0);
       pow_2da      : out std_logic;   -- POWCNT1.1: 2D engine A power
@@ -123,6 +127,12 @@ begin
             postflg7  <= '0';
             postflg9  <= "00";
          else
+            if (preset_direct = '1') then
+               r_wramcnt <= "11";
+               postflg7  <= '1';
+               postflg9  <= "01";
+               r_powcnt  <= x"820F";
+            end if;
             if (bus9.ena = '1' and bus9.rnw = '0') then
                if (bus9.Adr = ADR_EXMEM) then
                   if (bus9.bEna(0) = '1') then exmem9(7 downto 0)  <= bus9.Din(7 downto 0);  end if;

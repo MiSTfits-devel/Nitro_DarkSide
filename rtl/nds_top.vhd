@@ -37,6 +37,7 @@ use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
 
 use work.pProc_bus_gba.all;
+use work.pexport.all;
 
 entity nds_top is
    generic
@@ -52,6 +53,7 @@ entity nds_top is
       clkMemIndex      : in  unsigned(1 downto 0);  -- clkMem phase, 0 on clk1x rising edge
       reset            : in  std_logic;
       nds_on           : in  std_logic;
+      direct_boot      : in  std_logic := '0';  -- synthesize the firmware boot env (stock ROMs)
 
       -- keys (active high) — X/Y/lid are NDS additions routed via ARM7 side
       KeyA             : in  std_logic;
@@ -132,7 +134,11 @@ entity nds_top is
       dbg_line_drop    : out std_logic;   -- drawline landed while gpu2d was still busy
       dbg_line_busy    : out std_logic;
       dbg_cpu_err9     : out std_logic;
-      dbg_cpu_err7     : out std_logic
+      dbg_cpu_err7     : out std_logic;
+      dbg_export9_done : out std_logic;   -- ARM9 retired-instruction export (is_simu only)
+      dbg_export9      : out cpu_export_type;
+      dbg_export7_done : out std_logic;   -- ARM7 retired-instruction export (is_simu only)
+      dbg_export7      : out cpu_export_type
    );
 end entity;
 
@@ -155,6 +161,7 @@ architecture arch of nds_top is
    signal boot_cnt   : integer range 0 to 7 := 0;
 
    signal ld_start, ld_busy, ld_done, ld_error : std_logic;
+   signal preset_direct : std_logic := '0';
    signal arm9_entry, arm7_entry : std_logic_vector(31 downto 0);
    signal ld_wr_ena  : std_logic;
    signal ld_wr_addr, ld_wr_data : std_logic_vector(31 downto 0);
@@ -197,6 +204,7 @@ architecture arch of nds_top is
    signal dtcm_writedata, dtcm_readdata : std_logic_vector(31 downto 0);
 
    signal brom_addr : unsigned(14 downto 2);
+   signal brom_data : std_logic_vector(31 downto 0);
 
    signal wsh9_ena, wsh9_rnw, wsh9_done, wsh9_mapped : std_logic;
    signal wsh9_addr : unsigned(14 downto 2);
@@ -383,7 +391,8 @@ begin
    p_boot : process (clk1x)
    begin
       if rising_edge(clk1x) then
-         ld_start <= '0';
+         ld_start      <= '0';
+         preset_direct <= '0';
          if (reset = '1') then
             boot_state <= B_RESET;
             boot_cnt   <= 0;
@@ -477,6 +486,7 @@ begin
 
                when B_S7POST =>
                   if (boot_cnt = 2) then
+                     boot_cnt   <= 0;
                      boot_state <= B_RUN;
                   else
                      boot_cnt <= boot_cnt + 1;
@@ -484,6 +494,14 @@ begin
 
                when B_RUN =>
                   resetCpu <= '0';
+                  -- firmware-left registers: pulsed WITH the reset release, not at
+                  -- ld_done - nds_syscnt resets on resetCpu, which swallows any
+                  -- earlier preset (WRAMCNT=0 then let the calico crt0 section copy
+                  -- to 0x037F8000 mirror into WRAM7 over the ARM7 stack)
+                  if (boot_cnt = 0) then
+                     boot_cnt      <= 1;
+                     preset_direct <= direct_boot;
+                  end if;
 
                when B_ERROR =>
                   null;
@@ -500,7 +518,8 @@ begin
    port map
    (
       clk => clk1x, reset => reset,
-      start => ld_start, busy => ld_busy, done => ld_done, load_error => ld_error,
+      start => ld_start, direct => direct_boot,
+      busy => ld_busy, done => ld_done, load_error => ld_error,
       arm9_entry => arm9_entry, arm7_entry => arm7_entry,
       card_ena => card_ena, card_addr => card_addr,
       card_done => card_done, card_rdata => card_din,
@@ -530,15 +549,18 @@ begin
    ld_wr_done <= ld_w7_done when ld_to_wram7 = '1' else mem9_done;
 
    -- ================= ARM9 CPU + membus =================
+   ibios9 : entity work.nds_bios9
+   port map ( brom_addr => brom_addr, brom_data => brom_data );
+
    icpu9 : entity work.nds_cpu9
-   generic map ( is_simu => '0' )
+   generic map ( is_simu => is_simu )
    port map
    (
       clk             => clk1x,
       ce              => '1',
       reset           => resetCpu,
-      cpu_export_done => open,
-      cpu_export      => open,
+      cpu_export_done => dbg_export9_done,
+      cpu_export      => dbg_export9,
       error_cpu       => error_cpu9,
       savestate_bus   => ss_bus9,
       ss_wired_out    => open,
@@ -600,7 +622,7 @@ begin
       itcm_writedata => itcm_writedata, itcm_readdata => itcm_readdata,
       dtcm_addr => dtcm_addr, dtcm_we => dtcm_we, dtcm_be => dtcm_be,
       dtcm_writedata => dtcm_writedata, dtcm_readdata => dtcm_readdata,
-      brom_addr => brom_addr, brom_data => x"00000000",
+      brom_addr => brom_addr, brom_data => brom_data,
       wsh_ena => wsh9_ena, wsh_rnw => wsh9_rnw, wsh_addr => wsh9_addr, wsh_be => wsh9_be,
       wsh_din => wsh9_din, wsh_dout => wsh9_dout, wsh_done => wsh9_done, wsh_mapped => wsh9_mapped,
       vram_ena => vram9_ena, vram_rnw => vram9_rnw, vram_addr => vram9_addr, vram_be => vram9_be,
@@ -672,14 +694,14 @@ begin
 
    -- ================= ARM7 CPU + membus =================
    icpu7 : entity work.gba_cpu
-   generic map ( is_simu => '0' )
+   generic map ( is_simu => is_simu )
    port map
    (
       clk             => clk1x,
       ce              => '1',
       reset           => resetCpu,
-      cpu_export_done => open,
-      cpu_export      => open,
+      cpu_export_done => dbg_export7_done,
+      cpu_export      => dbg_export7,
       error_cpu       => error_cpu7,
       savestate_bus   => ss_bus7,
       ss_wired_out    => open,
@@ -842,6 +864,7 @@ begin
       clk => clk1x, reset => resetCpu,
       bus9 => io_bus9, wired_out9 => sys_wired_out9, wired_done9 => sys_wired_done9,
       bus7 => io_bus7, wired_out7 => sys_wired_out7, wired_done7 => sys_wired_done7,
+      preset_direct => preset_direct,
       wramcnt => wramcnt, vramcnt => vramcnt,
       pow_2da => pow_2da, pow_2db => pow_2db, pow_swap => pow_swap,
       exmem_gba7 => open, exmem_card7 => open, exmem_prio7 => exmem_prio7,

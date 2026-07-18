@@ -430,6 +430,7 @@ begin
                 x"00000000"   when (target = T_PAL or target = T_OAM) else -- readback gap: BRAMs are write-only from the CPU
                 cresp_rdata   when target = T_MAIN   else
                 io_wired_out  when (target = T_IO and io_wired_done = '1') else
+                x"00000000"   when target = T_IO else -- unclaimed NDS9 IO reads 0 (not GBA open bus): calico probes SCFG 0x04004000 for NTR/TWL detection
                 cpu_lastread;
 
    process (all)

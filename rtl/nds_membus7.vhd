@@ -283,7 +283,8 @@ begin
                 vram_dout     when target = T_VRAM   else
                 mr_readdata   when target = T_MAIN   else
                 io_wired_out  when (target = T_IO and io_wired_done = '1') else
-                cpu_lastread;  -- open bus, incl. unmapped IO
+                x"00000000"   when target = T_IO else -- unclaimed NDS7 IO reads 0 (not GBA open bus): calico probes SCFG for NTR/TWL detection
+                cpu_lastread;  -- open bus for unmapped regions
 
    process (all)
    begin

@@ -420,6 +420,7 @@ architecture arch of nds_cpu9 is
       DATARW_SWAPWAIT,
       DATARW_BLOCKREAD,
       DATARW_BLOCKWRITE,
+      DATARW_BLOCKSWITCH,  -- ldm^ with pc: CPSR := SPSR + bank swap, one cycle after base writeback
       DATARW_READSTART_D2, -- v5TE LDRD: second word
       DATARW_WRITE_D2      -- v5TE STRD: second word
    );
@@ -2463,6 +2464,18 @@ begin
          
       end if;
       
+      -- ldm^ with pc (exception return): CPSR := SPSR + bank swap in the
+      -- dedicated DATARW_BLOCKSWITCH cycle - after the base writeback, so
+      -- "ldmia sp!, {..., pc}^" leaves the OLD mode's sp updated (calico's
+      -- ARM9 IRQ exit; same ordering melonDS 0.9.5 got wrong)
+      if (decode_functions_detail = block_read and decode_block_switchmode = '1' and
+          execute_RW_State = DATARW_BLOCKSWITCH) then
+         execute_switchmode_now   <= '1';
+         execute_switchmode_val   <= std_logic_vector(SPSR(3 downto 0));
+         execute_msr_setvalue     <= SPSR;
+         execute_msr_setvalue_ena <= '1';
+      end if;
+
       if (decode_functions_detail = IRQ) then
          execute_switchmode_now   <= execute_now;
          execute_switchmode_state <= '1';
@@ -2773,11 +2786,11 @@ begin
 
             when block_read | block_write =>
                if (execute_RW_State = DATARW_READWAITDMA) then
-                  if (dma_on = '0') then
+                  if (dma_on = '0' and decode_block_switchmode = '0') then
                      execute_done <= '1';
                   end if;
                end if;
-               
+
                if (execute_RW_State = DATARW_READWAIT or (decode_functions_detail = block_write and busState = BUSSTATE_WAITDATA and gb_bus_done = '1' and execute_blockRW_last = '1')) then
                   if (decode_datatransfer_writeback = '1') then
                      execute_writeback <= '1';
@@ -2785,11 +2798,17 @@ begin
                      execute_writedata <= execute_blockRW_endaddr;
                   end if;
                end if;
-            
+
                if (execute_RW_State = DATARW_READWAIT) then
-                  if (dma_on_1 = '0' or dma_on = '0') then
+                  if ((dma_on_1 = '0' or dma_on = '0') and decode_block_switchmode = '0') then
                      execute_done      <= '1';
                   end if;
+               end if;
+
+               -- ldm^ with pc: retire on the switch cycle, after the base
+               -- writeback landed in the old mode's register
+               if (execute_RW_State = DATARW_BLOCKSWITCH) then
+                  execute_done <= '1';
                end if;
                
                if (decode_functions_detail = block_read) then
@@ -2902,9 +2921,11 @@ begin
                regs(to_integer(execute_writereg)) <= execute_writedata;
             end if;
 
-            -- v5: a load that writes PC interworks from bit 0
+            -- v5: a load that writes PC interworks from bit 0 (but ldm^ with
+            -- pc takes T from the SPSR restore, not from the loaded value)
             if (execute_writeback = '1' and execute_writereg = 15 and
-                (decode_functions_detail = data_read or decode_functions_detail = block_read)) then
+                (decode_functions_detail = data_read or
+                 (decode_functions_detail = block_read and decode_block_switchmode = '0'))) then
                thumbmode <= execute_writedata(0);
             end if;
 
@@ -3039,16 +3060,24 @@ begin
                      
                   when DATARW_READWAIT =>
                      if (dma_on_1 = '0' or dma_on = '0') then
-                        execute_RW_State <= DATARW_IDLE;
-                        execute_stall    <= '0';  
+                        if (decode_functions_detail = block_read and decode_block_switchmode = '1') then
+                           execute_RW_State <= DATARW_BLOCKSWITCH;
+                        else
+                           execute_RW_State <= DATARW_IDLE;
+                           execute_stall    <= '0';
+                        end if;
                      else
                         execute_RW_State <= DATARW_READWAITDMA;
                      end if;
-                     
+
                   when DATARW_READWAITDMA =>
                      if (dma_on = '0') then
-                        execute_RW_State <= DATARW_IDLE;
-                        execute_stall    <= '0';  
+                        if (decode_functions_detail = block_read and decode_block_switchmode = '1') then
+                           execute_RW_State <= DATARW_BLOCKSWITCH;
+                        else
+                           execute_RW_State <= DATARW_IDLE;
+                           execute_stall    <= '0';
+                        end if;
                      end if;
                      
                   when DATARW_WRITE =>
@@ -3093,10 +3122,14 @@ begin
                         execute_blockRW_addr <= execute_RW_addr + 4;
                         if (execute_blockRW_last = '1') then
                            execute_RW_State   <= DATARW_IDLE;
-                           execute_stall        <= '0';  
+                           execute_stall        <= '0';
                         end if;
                      end if;
-                     
+
+                  when DATARW_BLOCKSWITCH =>
+                     execute_RW_State <= DATARW_IDLE;
+                     execute_stall    <= '0';
+
                   when others => null;
                end case;
          
@@ -3197,9 +3230,6 @@ begin
                         execute_blockRW_writereg <= unsigned(decode_RM_op2);
                         execute_blockRW_endaddr  <= unsigned(signed(execute_busaddress) + decode_block_endmod);
                         execute_blockRW_addr     <= execute_RW_addr + 4;
-                        if (decode_block_switchmode = '1') then
-                           error_cpu <= '1';
-                        end if;
                   
                      when IRQ =>
                         IRQ_disable <= '1';
@@ -3324,11 +3354,18 @@ begin
                      when others =>
                         error_cpu <= '1';
                         report "not implemented execute function" severity failure;
-                  
+
                   end case;
-                  
-                  if (execute_switchmode_now = '1') then
-                  
+
+               end if;
+
+               -- mode switch + bank swap: at execute_now for the single-cycle
+               -- switch sources (msr, exception entry, subs pc), and in the
+               -- DATARW_BLOCKSWITCH cycle for ldm^ with pc (the swap must land
+               -- AFTER the base writeback wrote the old mode's register)
+               if (execute_switchmode_now = '1' and
+                   (execute_now = '1' or execute_RW_State = DATARW_BLOCKSWITCH)) then
+
                      if (execute_switchmode_new = CPUMODE_FIQ and cpu_mode /= CPUMODE_FIQ) then
                         regs_0_8  <= regs(8);
                         regs_0_9  <= regs(9);
@@ -3425,17 +3462,15 @@ begin
                      end case;
                      
                      if (cpu_mode = CPUMODE_FIQ and execute_switchmode_new /= CPUMODE_FIQ) then
-                        regs(8)  <= regs_0_8; 
-                        regs(9)  <= regs_0_9; 
+                        regs(8)  <= regs_0_8;
+                        regs(9)  <= regs_0_9;
                         regs(10) <= regs_0_10;
                         regs(11) <= regs_0_11;
                         regs(12) <= regs_0_12;
                      end if;
-                  
-                  end if;
-                  
+
                end if;
-            
+
             end if;
          
          end if;
