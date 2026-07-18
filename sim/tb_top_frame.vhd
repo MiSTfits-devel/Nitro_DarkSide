@@ -26,6 +26,9 @@ entity tb_top_frame is
       DUMPFILE   : string  := "top_frame_fb.txt";
       DUMPFILE_B : string  := "top_frame_fb_b.txt";
       CARD_WORDS : integer := 1048576;   -- 4 MB staging window
+      GPUCEDIV   : integer := 3;         -- render clocks per dot (1 = full-rate video,
+                                         -- ~110 dropped lines/frame with line server v1:
+                                         -- pixels bad, but game pacing = real hardware)
       FRAMES     : integer := 3;
       TIMEOUT_MS : integer := 400;
       DIRECT     : integer := 0;         -- 1 = firmware direct-boot env (stock ROMs)
@@ -185,7 +188,8 @@ begin
    generic map
    (
       is_simu                  => '1',
-      Softmap_NDS_MAINRAM_ADDR => MAINRAM_BASE
+      Softmap_NDS_MAINRAM_ADDR => MAINRAM_BASE,
+      GPU_CE_DIV               => GPUCEDIV
    )
    port map
    (
@@ -417,7 +421,13 @@ begin
       if rising_edge(clk1x) then
          card_done <= '0';
          if (card_ena = '1') then
-            card_rdata <= card(to_integer(unsigned(card_addr)));
+            -- reads beyond the staged window return zero (real carts mirror,
+            -- but nothing sane reads past its own ROM end)
+            if (to_integer(unsigned(card_addr)) < CARD_WORDS) then
+               card_rdata <= card(to_integer(unsigned(card_addr)));
+            else
+               card_rdata <= (others => '0');
+            end if;
             card_done  <= '1';
          end if;
       end if;

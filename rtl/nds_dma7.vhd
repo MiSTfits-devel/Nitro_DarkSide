@@ -1,32 +1,21 @@
 -- SPDX-License-Identifier: GPL-2.0-or-later
--- NDS ARM9 DMA (M6): 4 channels, registers 0x040000B0-0x040000EF incl. the
--- FILL words. Semantics per DualSOUP dma.c (Jaklyy's hardware research) and
--- GBATEK:
+-- NDS ARM7 DMA: 4 channels, registers 0x040000B0-0x040000DF (no FILL words -
+-- those are ARM9-only). Port of nds_dma9 with the ARM7 differences per
+-- GBATEK/melonDS:
 --
---   * CNT: [20:0] word count (0 -> 0x200000), [22:21] dst ctrl (0 inc,
---     1 dec, 2 fixed, 3 inc-reload), [24:23] src ctrl (3 behaves as inc +
---     reload, DualSOUP), [25] repeat, [26] 32-bit, [29:27] start timing,
---     [30] IRQ, [31] enable. SAD/DAD/CNT all read back (NDS, unlike GBA).
---   * enable rising edge latches src/dst; the word count is latched lazily
---     when the remaining count is 0 (so repeat reloads it per trigger, and
---     ctrl-3 re-latches the address then too) - DualSOUP DMA_Run.
---   * start timings implemented: 0 immediate, 1 vblank, 2 hblank (visible
---     lines only - the gpu2d cadence pulses), 5 card (one pulse per ready
---     data word from nds_card; games arm count=1 + repeat). GX FIFO (7)
---     comes with the 3D subsystem; 3/4/6 are exotic (DualSOUP stubs them).
---   * repeat re-arms every trigger for non-immediate modes; immediate
---     transfers clear enable regardless. IRQ per completed transfer.
---   * transfers go through the ARM9 membus with the CPU paused (dma_on +
---     CPU_bus_idle grant) and the TCM windows bypassed (DMA cannot see
---     ITCM/DTCM). Addresses are masked to 0x0FFFFFFF and hold the size
---     alignment; 16-bit reads take the rotated lane, writes replicate.
+--   * CNT: count in [15:0] - channels 0-2 use 14 bits (0 -> 0x4000),
+--     channel 3 uses 16 (0 -> 0x10000); [22:21] dst ctrl, [24:23] src ctrl,
+--     [25] repeat, [26] 32-bit, [29:28] start timing (2 bits, GBA layout:
+--     0 immediate, 1 vblank, 2 DS card slot, 3 wifi/GBA-slot - stubbed),
+--     [30] IRQ, [31] enable. Bit 27 (GBA gamepak DRQ) is dead. Registers
+--     read back like the ARM9 side (NDS, unlike GBA).
+--   * card trigger: one pulse per ready data word from nds_card when the
+--     ARM7 owns the slot (EXMEMCNT[11]=1); games arm count=1 + repeat.
+--   * transfers go through membus7 with the CPU paused (same dma_on +
+--     CPU_bus_idle grant idiom as the ARM9 side; no TCMs to bypass here).
 --
--- Timing is functional-only for now: one read + one write handshake per
--- unit, no cycle accuracy. The M9 pacing target is the DualSOUP dma.txt
--- measurement: NR+NW first pair, then SR/SW pairs, a 1-cycle stall after
--- a fast first read, and main-RAM read prefetch making later SRs
--- single-cycle. The FSM shape below (first-pair / steady-pair) is chosen
--- so those timings can be dialed in without restructuring.
+-- Timing is functional-only, same caveat and same FSM shape as nds_dma9 so
+-- the DualSOUP pacing can be dialed into both at once (M9).
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -34,7 +23,7 @@ use IEEE.numeric_std.all;
 
 use work.pProc_bus_gba.all;
 
-entity nds_dma9 is
+entity nds_dma7 is
    port
    (
       clk          : in  std_logic;
@@ -44,18 +33,14 @@ entity nds_dma9 is
       wired_out    : out std_logic_vector(31 downto 0) := (others => '0');
       wired_done   : out std_logic;
 
-      -- trigger pulses (gpu2d cadence: vblank start / visible-line hblank;
-      -- card: one pulse per ready data word from nds_card)
       trig_vblank  : in  std_logic;
-      trig_hblank  : in  std_logic;
       trig_card    : in  std_logic;
 
-      -- membus grant: dma_on pauses the CPU, the bus is ours once idle
       cpu_bus_idle : in  std_logic;
       dma_on       : out std_logic := '0';
       dma_bus_on   : out std_logic := '0';
 
-      -- ARM9 membus access port (muxed onto the CPU port in nds_top)
+      -- ARM7 membus access port (muxed onto the CPU port in nds_top)
       mb_ena       : out std_logic := '0';
       mb_rnw       : out std_logic := '1';
       mb_adr       : out std_logic_vector(31 downto 0) := (others => '0');
@@ -69,35 +54,31 @@ entity nds_dma9 is
    );
 end entity;
 
-architecture arch of nds_dma9 is
+architecture arch of nds_dma7 is
 
    constant ADR_BASE : unsigned(27 downto 0) := x"00000B0";
 
    type t_chan is record
       sad      : std_logic_vector(27 downto 0);
       dad      : std_logic_vector(27 downto 0);
-      count    : std_logic_vector(20 downto 0);
+      count    : std_logic_vector(15 downto 0);
       dstctl   : std_logic_vector(1 downto 0);
       srcctl   : std_logic_vector(1 downto 0);
       repeat   : std_logic;
       word32   : std_logic;
-      timing   : std_logic_vector(2 downto 0);
+      timing   : std_logic_vector(1 downto 0);
       irqena   : std_logic;
       enable   : std_logic;
-      -- latched transfer state
       cur_src  : unsigned(27 downto 0);
       cur_dst  : unsigned(27 downto 0);
-      remain   : unsigned(21 downto 0);   -- 0x200000 max
+      remain   : unsigned(16 downto 0);   -- 0x10000 max (ch3)
       pend     : std_logic;
    end record;
    constant CHAN_INIT : t_chan := ((others => '0'), (others => '0'), (others => '0'),
-                                   "00", "00", '0', '0', "000", '0', '0',
+                                   "00", "00", '0', '0', "00", '0', '0',
                                    (others => '0'), (others => '0'), (others => '0'), '0');
    type t_chans is array (0 to 3) of t_chan;
    signal ch : t_chans := (others => CHAN_INIT);
-
-   type t_fill is array (0 to 3) of std_logic_vector(31 downto 0);
-   signal fill : t_fill := (others => (others => '0'));
 
    type t_state is (IDLE, GRANT, LATCH, RD, RD_WAIT, WR, WR_WAIT, NEXTUNIT, COMPLETE);
    signal state  : t_state := IDLE;
@@ -105,11 +86,19 @@ architecture arch of nds_dma9 is
 
    signal rdval  : std_logic_vector(31 downto 0) := (others => '0');
 
-   -- register write/read decode
    signal regsel_ch  : integer range 0 to 3;
    signal regsel_reg : integer range 0 to 2;
    signal reg_hit    : std_logic;
-   signal fill_hit   : std_logic;
+
+   -- per-channel count width mask: 14 bits for 0-2, 16 for 3
+   function count_mask(chn : integer) return std_logic_vector is
+   begin
+      if (chn = 3) then
+         return x"FFFF";
+      else
+         return x"3FFF";
+      end if;
+   end function;
 
    function inc_of(ctl : std_logic_vector(1 downto 0); w32 : std_logic) return integer is
       variable step : integer;
@@ -118,7 +107,7 @@ architecture arch of nds_dma9 is
       case ctl is
          when "01"   => return -step;
          when "10"   => return 0;
-         when others => return step;      -- 0 and 3: increment
+         when others => return step;
       end case;
    end function;
 
@@ -129,29 +118,22 @@ begin
       variable off : integer;
    begin
       reg_hit    <= '0';
-      fill_hit   <= '0';
       regsel_ch  <= 0;
       regsel_reg <= 0;
-      if (unsigned(gb_bus.Adr) >= ADR_BASE and unsigned(gb_bus.Adr) < ADR_BASE + 16#40#) then
+      if (unsigned(gb_bus.Adr) >= ADR_BASE and unsigned(gb_bus.Adr) < ADR_BASE + 16#30#) then
          off := to_integer(unsigned(gb_bus.Adr) - ADR_BASE) / 4;
-         if (off < 12) then
-            reg_hit    <= '1';
-            regsel_ch  <= off / 3;
-            regsel_reg <= off mod 3;
-         else
-            fill_hit  <= '1';
-            regsel_ch <= off mod 4;
-         end if;
+         reg_hit    <= '1';
+         regsel_ch  <= off / 3;
+         regsel_reg <= off mod 3;
       end if;
    end process;
 
-   wired_done <= reg_hit or fill_hit;
-   wired_out  <= fill(regsel_ch) when fill_hit = '1' else
-                 x"0" & ch(regsel_ch).sad when (reg_hit = '1' and regsel_reg = 0) else
+   wired_done <= reg_hit;
+   wired_out  <= x"0" & ch(regsel_ch).sad when (reg_hit = '1' and regsel_reg = 0) else
                  x"0" & ch(regsel_ch).dad when (reg_hit = '1' and regsel_reg = 1) else
-                 ch(regsel_ch).enable & ch(regsel_ch).irqena & ch(regsel_ch).timing &
+                 ch(regsel_ch).enable & ch(regsel_ch).irqena & ch(regsel_ch).timing & '0' &
                  ch(regsel_ch).word32 & ch(regsel_ch).repeat & ch(regsel_ch).srcctl &
-                 ch(regsel_ch).dstctl & ch(regsel_ch).count
+                 ch(regsel_ch).dstctl & "00000" & ch(regsel_ch).count
                  when reg_hit = '1' else (others => '0');
 
    -- ================= main FSM + register writes =================
@@ -161,6 +143,7 @@ begin
       variable v_got   : std_logic;
       variable v_inc   : integer;
       variable lane16  : std_logic_vector(15 downto 0);
+      variable cmask   : std_logic_vector(15 downto 0);
    begin
       if rising_edge(clk) then
 
@@ -175,77 +158,70 @@ begin
          else
 
             -- -------- CPU register writes --------
-            if (gb_bus.ena = '1' and gb_bus.rnw = '0') then
-               if (fill_hit = '1') then
-                  for i in 0 to 3 loop
-                     if (gb_bus.bEna(i) = '1') then
-                        fill(regsel_ch)(i*8 + 7 downto i*8) <= gb_bus.Din(i*8 + 7 downto i*8);
+            if (gb_bus.ena = '1' and gb_bus.rnw = '0' and reg_hit = '1') then
+               case regsel_reg is
+                  when 0 =>
+                     for i in 0 to 3 loop
+                        if (gb_bus.bEna(i) = '1') then
+                           if (i = 3) then
+                              ch(regsel_ch).sad(27 downto 24) <= gb_bus.Din(27 downto 24);
+                           else
+                              ch(regsel_ch).sad(i*8 + 7 downto i*8) <= gb_bus.Din(i*8 + 7 downto i*8);
+                           end if;
+                        end if;
+                     end loop;
+                  when 1 =>
+                     for i in 0 to 3 loop
+                        if (gb_bus.bEna(i) = '1') then
+                           if (i = 3) then
+                              ch(regsel_ch).dad(27 downto 24) <= gb_bus.Din(27 downto 24);
+                           else
+                              ch(regsel_ch).dad(i*8 + 7 downto i*8) <= gb_bus.Din(i*8 + 7 downto i*8);
+                           end if;
+                        end if;
+                     end loop;
+                  when others =>
+                     v_ena := ch(regsel_ch).enable;
+                     cmask := count_mask(regsel_ch);
+                     if (gb_bus.bEna(0) = '1') then
+                        ch(regsel_ch).count(7 downto 0) <= gb_bus.Din(7 downto 0) and cmask(7 downto 0);
                      end if;
-                  end loop;
-               elsif (reg_hit = '1') then
-                  case regsel_reg is
-                     when 0 =>
-                        for i in 0 to 3 loop
-                           if (gb_bus.bEna(i) = '1' and i < 4) then
-                              if (i = 3) then
-                                 ch(regsel_ch).sad(27 downto 24) <= gb_bus.Din(27 downto 24);
-                              else
-                                 ch(regsel_ch).sad(i*8 + 7 downto i*8) <= gb_bus.Din(i*8 + 7 downto i*8);
-                              end if;
-                           end if;
-                        end loop;
-                     when 1 =>
-                        for i in 0 to 3 loop
-                           if (gb_bus.bEna(i) = '1') then
-                              if (i = 3) then
-                                 ch(regsel_ch).dad(27 downto 24) <= gb_bus.Din(27 downto 24);
-                              else
-                                 ch(regsel_ch).dad(i*8 + 7 downto i*8) <= gb_bus.Din(i*8 + 7 downto i*8);
-                              end if;
-                           end if;
-                        end loop;
-                     when others =>
-                        v_ena := ch(regsel_ch).enable;
-                        if (gb_bus.bEna(0) = '1') then ch(regsel_ch).count(7 downto 0)   <= gb_bus.Din(7 downto 0);   end if;
-                        if (gb_bus.bEna(1) = '1') then ch(regsel_ch).count(15 downto 8)  <= gb_bus.Din(15 downto 8);  end if;
-                        if (gb_bus.bEna(2) = '1') then
-                           ch(regsel_ch).count(20 downto 16) <= gb_bus.Din(20 downto 16);
-                           ch(regsel_ch).dstctl <= gb_bus.Din(22 downto 21);
-                           ch(regsel_ch).srcctl(0) <= gb_bus.Din(23);
-                        end if;
-                        if (gb_bus.bEna(3) = '1') then
-                           ch(regsel_ch).srcctl(1) <= gb_bus.Din(24);
-                           ch(regsel_ch).repeat <= gb_bus.Din(25);
-                           ch(regsel_ch).word32 <= gb_bus.Din(26);
-                           ch(regsel_ch).timing <= gb_bus.Din(29 downto 27);
-                           ch(regsel_ch).irqena <= gb_bus.Din(30);
-                           ch(regsel_ch).enable <= gb_bus.Din(31);
-                           -- enable rising edge: latch addresses, arm
-                           if (gb_bus.Din(31) = '1' and v_ena = '0') then
-                              ch(regsel_ch).cur_src <= unsigned(ch(regsel_ch).sad);
-                              ch(regsel_ch).cur_dst <= unsigned(ch(regsel_ch).dad);
-                              ch(regsel_ch).remain  <= (others => '0');
-                              if (gb_bus.Din(29 downto 27) = "000") then
-                                 ch(regsel_ch).pend <= '1';
-                              end if;
+                     if (gb_bus.bEna(1) = '1') then
+                        ch(regsel_ch).count(15 downto 8) <= gb_bus.Din(15 downto 8) and cmask(15 downto 8);
+                     end if;
+                     if (gb_bus.bEna(2) = '1') then
+                        ch(regsel_ch).dstctl <= gb_bus.Din(22 downto 21);
+                        ch(regsel_ch).srcctl(0) <= gb_bus.Din(23);
+                     end if;
+                     if (gb_bus.bEna(3) = '1') then
+                        ch(regsel_ch).srcctl(1) <= gb_bus.Din(24);
+                        ch(regsel_ch).repeat <= gb_bus.Din(25);
+                        ch(regsel_ch).word32 <= gb_bus.Din(26);
+                        ch(regsel_ch).timing <= gb_bus.Din(29 downto 28);
+                        ch(regsel_ch).irqena <= gb_bus.Din(30);
+                        ch(regsel_ch).enable <= gb_bus.Din(31);
+                        if (gb_bus.Din(31) = '1' and v_ena = '0') then
+                           ch(regsel_ch).cur_src <= unsigned(ch(regsel_ch).sad);
+                           ch(regsel_ch).cur_dst <= unsigned(ch(regsel_ch).dad);
+                           ch(regsel_ch).remain  <= (others => '0');
+                           if (gb_bus.Din(29 downto 28) = "00") then
+                              ch(regsel_ch).pend <= '1';
                            end if;
                         end if;
-                  end case;
-               end if;
+                     end if;
+               end case;
             end if;
 
             -- -------- triggers --------
             for i in 0 to 3 loop
                if (ch(i).enable = '1') then
-                  if (trig_vblank = '1' and ch(i).timing = "001") then
+                  if (trig_vblank = '1' and ch(i).timing = "01") then
                      ch(i).pend <= '1';
                   end if;
-                  if (trig_hblank = '1' and ch(i).timing = "010") then
+                  if (trig_card = '1' and ch(i).timing = "10") then
                      ch(i).pend <= '1';
                   end if;
-                  if (trig_card = '1' and ch(i).timing = "101") then
-                     ch(i).pend <= '1';
-                  end if;
+                  -- timing "11" (wifi / GBA slot) never fires
                end if;
             end loop;
 
@@ -278,11 +254,13 @@ begin
 
                when LATCH =>
                   ch(active).pend <= '0';
-                  -- lazy count latch (DualSOUP): remaining 0 means reload;
-                  -- ctrl 3 re-latches its address too
                   if (ch(active).remain = 0) then
                      if (unsigned(ch(active).count) = 0) then
-                        ch(active).remain <= to_unsigned(16#200000#, 22);
+                        if (active = 3) then
+                           ch(active).remain <= to_unsigned(16#10000#, 17);
+                        else
+                           ch(active).remain <= to_unsigned(16#4000#, 17);
+                        end if;
                      else
                         ch(active).remain <= unsigned('0' & ch(active).count);
                      end if;
@@ -311,7 +289,7 @@ begin
 
                when RD_WAIT =>
                   if (mb_done = '1') then
-                     rdval <= mb_din;   -- membus rotates: low half = the halfword
+                     rdval <= mb_din;
                      state <= WR;
                   end if;
 
@@ -338,7 +316,7 @@ begin
 
                when NEXTUNIT =>
                   v_inc := inc_of(ch(active).srcctl, ch(active).word32);
-                  ch(active).cur_src <= ch(active).cur_src + v_inc;  -- wraps mod 2^28 (address mask)
+                  ch(active).cur_src <= ch(active).cur_src + v_inc;
                   v_inc := inc_of(ch(active).dstctl, ch(active).word32);
                   ch(active).cur_dst <= ch(active).cur_dst + v_inc;
                   ch(active).remain  <= ch(active).remain - 1;
@@ -349,9 +327,7 @@ begin
                   end if;
 
                when COMPLETE =>
-                  -- repeat keeps the channel armed for the next trigger;
-                  -- immediate transfers always disable (DualSOUP)
-                  if (ch(active).repeat = '0' or ch(active).timing = "000") then
+                  if (ch(active).repeat = '0' or ch(active).timing = "00") then
                      ch(active).enable <= '0';
                   end if;
                   if (ch(active).irqena = '1') then

@@ -44,6 +44,9 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_membus9.vhd \
    rtl/nds_syscnt.vhd \
    rtl/nds_loader.vhd \
+   rtl/nds_card.vhd \
+   rtl/nds_rtc.vhd \
+   rtl/nds_sound.vhd \
    rtl/reg_nds_display.vhd \
    rtl/nds_drawer_text.vhd \
    rtl/nds_drawer_affine.vhd \
@@ -61,9 +64,11 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_gpu2d.vhd \
    rtl/nds_gpu_timing.vhd \
    rtl/nds_dma9.vhd \
+   rtl/nds_dma7.vhd \
    rtl/nds_bios7.vhd \
    rtl/nds_bios9.vhd \
    rtl/nds_top.vhd \
+   nds_port_wrap.vhd \
    sim/tb_gpu_merge.vhd \
    sim/tb_vram_ls.vhd \
    sim/tb_gpu2d.vhd \
