@@ -33,6 +33,9 @@ namespace melonDS
 extern FILE* ARM9TraceFile;
 extern u64 ARM9TraceCount;
 extern u64 ARM9TraceMax;
+extern FILE* ARM7TraceFile;
+extern u64 ARM7TraceCount;
+extern u64 ARM7TraceMax;
 }
 
 using namespace melonDS;
@@ -112,12 +115,19 @@ int main(int argc, char** argv)
     }
 
     // TRACE9=<path> [TRACE9MAX=<n>] dumps the ARM9 instruction trace
-    // (tracer.patch hook) - the debug view for stock-ROM boot issues
+    // (tracer.patch hook) - the debug view for stock-ROM boot issues.
+    // TRACE7/TRACE7MAX: same for the ARM7.
     if (const char* tp = getenv("TRACE9"))
     {
         ARM9TraceFile = fopen(tp, "w");
         const char* tm = getenv("TRACE9MAX");
         ARM9TraceMax = tm ? strtoull(tm, nullptr, 0) : 20000000ull;
+    }
+    if (const char* tp = getenv("TRACE7"))
+    {
+        ARM7TraceFile = fopen(tp, "w");
+        const char* tm = getenv("TRACE7MAX");
+        ARM7TraceMax = tm ? strtoull(tm, nullptr, 0) : 20000000ull;
     }
 
     FILE* d = fopen(dumppath, "w");
@@ -148,6 +158,7 @@ int main(int argc, char** argv)
     fclose(d);
     if (db) fclose(db);
     if (ARM9TraceFile) { fclose(ARM9TraceFile); ARM9TraceFile = nullptr; }
+    if (ARM7TraceFile) { fclose(ARM7TraceFile); ARM7TraceFile = nullptr; }
 
     // scene-debug peeks (harmless noise for real runs)
     printf("DISPCNT=%08X POWCNT=%08X mail=%08X/%08X vb=%u\n",
