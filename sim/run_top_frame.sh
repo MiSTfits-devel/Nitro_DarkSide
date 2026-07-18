@@ -19,6 +19,9 @@ MAXINSTR="${MAXINSTR:-20000000}"
 DBG_T0="${DBG_T0:-0}"
 DBG_T1="${DBG_T1:-0}"
 DBG_TRIGPC="${DBG_TRIGPC:-0}"
+CARDWORDS="${CARDWORDS:-1048576}"
+NVCHEAP="${NVCHEAP:-2g}"
+GPUCEDIV="${GPUCEDIV:-3}"
 WORK=sim/nvc_work
 mkdir -p "$WORK"
 
@@ -48,6 +51,9 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_spi.vhd \
    rtl/nds_syscnt.vhd \
    rtl/nds_loader.vhd \
+   rtl/nds_card.vhd \
+   rtl/nds_rtc.vhd \
+   rtl/nds_sound.vhd \
    rtl/nds_mainram.vhd \
    rtl/nds_membus7.vhd \
    rtl/nds_membus9.vhd \
@@ -62,6 +68,7 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_gpu2d.vhd \
    rtl/nds_gpu_timing.vhd \
    rtl/nds_dma9.vhd \
+   rtl/nds_dma7.vhd \
    rtl/nds_bios7.vhd \
    rtl/nds_bios9.vhd \
    rtl/nds_top.vhd \
@@ -72,8 +79,8 @@ TRACEGEN=""
 [ -n "$TRACEFILE" ]  && TRACEGEN="$TRACEGEN -gTRACEFILE=$TRACEFILE"
 [ -n "$TRACEFILE7" ] && TRACEGEN="$TRACEGEN -gTRACEFILE7=$TRACEFILE7"
 
-nvc -H 2g -L "$WORK" --work="$WORK/work" -e tb_top_frame \
-   -gHEXFILE="$HEXFILE" -gFWFILE="$FWFILE" -gFRAMES="$FRAMES" -gTIMEOUT_MS="$TIMEOUT_MS" \
+nvc -H "$NVCHEAP" -L "$WORK" --work="$WORK/work" -e tb_top_frame \
+   -gCARD_WORDS="$CARDWORDS" -gGPUCEDIV="$GPUCEDIV" -gHEXFILE="$HEXFILE" -gFWFILE="$FWFILE" -gFRAMES="$FRAMES" -gTIMEOUT_MS="$TIMEOUT_MS" \
    -gDUMPFILE="$DUMPFILE" -gDUMPFILE_B="$DUMPFILE_B" -gDIRECT="$DIRECT" \
    -gMAXINSTR="$MAXINSTR" -gDBG_T0="$DBG_T0" -gDBG_T1="$DBG_T1" -gDBG_TRIGPC="$DBG_TRIGPC" $TRACEGEN
-nvc -H 2g -L "$WORK" --work="$WORK/work" -r tb_top_frame --ieee-warnings=off --exit-severity=failure
+nvc -H "$NVCHEAP" -L "$WORK" --work="$WORK/work" -r tb_top_frame --ieee-warnings=off --exit-severity=failure

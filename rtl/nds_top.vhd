@@ -20,7 +20,7 @@
 --     than hardware — fine for static scenes, revisited with M9 pacing.
 --   * TCMs, ARM7-private WRAM: behavioral arrays (BRAM entities land in M9)
 --   * ARM9 DMA (nds_dma9): immediate/vblank/hblank, functional timing;
---     no ARM7 DMA / sound / RTC / card yet; KEYINPUT/EXTKEYIN are
+--     card/RTC/sound-regs/ARM7-DMA exist (sound mixer DSP pending); KEYINPUT/EXTKEYIN are
 --     wired directly so samples polling keys see released state
 --   * ARM7 SPI bus (nds_spi): PMIC + firmware flash + TSC; the flash serves
 --     the fw_* image port (melonDS default firmware in sim; touch/mic not
@@ -264,6 +264,48 @@ architecture arch of nds_top is
    signal irq_in9    : std_logic_vector(31 downto 0);
    signal irp_timer9 : std_logic_vector(3 downto 0);
    signal ipc9_irq_sync, ipc9_irq_sendempty, ipc9_irq_recv : std_logic;
+
+   -- game-card slot
+   signal card_wired_out9, card_wired_out7   : std_logic_vector(31 downto 0);
+   signal card_wired_done9, card_wired_done7 : std_logic;
+
+   -- RTC
+   signal rtc_wired_out7  : std_logic_vector(31 downto 0);
+   signal rtc_wired_done7 : std_logic;
+
+   -- sound
+   signal snd_wired_out7  : std_logic_vector(31 downto 0);
+   signal snd_wired_done7 : std_logic;
+   signal snd_bus_req     : std_logic;
+   signal snd_bus_ok      : std_logic;
+   signal snd_bus_own     : std_logic;
+   signal sndb7_ena       : std_logic;
+   signal sndb7_adr       : std_logic_vector(31 downto 0);
+   signal cpu7_pause      : std_logic;
+   signal dma7_idle_ok    : std_logic;
+
+   -- ARM7 DMA (mux onto the membus7 CPU port, ARM9 dmab idiom)
+   signal cpu7_bus_idle   : std_logic;
+   signal dma7_on, dma7_bus_on : std_logic;
+   signal dmab7_ena, dmab7_rnw : std_logic;
+   signal dmab7_adr       : std_logic_vector(31 downto 0);
+   signal dmab7_acc       : std_logic_vector(1 downto 0);
+   signal dmab7_low       : std_logic_vector(1 downto 0);
+   signal dmab7_dout      : std_logic_vector(31 downto 0);
+   signal mbus7_adr, mbus7_dout : std_logic_vector(31 downto 0);
+   signal mbus7_rnw, mbus7_ena  : std_logic;
+   signal mbus7_acc       : std_logic_vector(1 downto 0);
+   signal mbus7_low       : std_logic_vector(1 downto 0);
+   signal dma7_wired_out  : std_logic_vector(31 downto 0);
+   signal dma7_wired_done : std_logic;
+   signal irq_dma7        : std_logic_vector(3 downto 0);
+   signal irq9_card, irq7_card               : std_logic;
+   signal dma9_card_trig, dma7_card_trig     : std_logic;
+   signal exmem_card7_s                      : std_logic;
+   signal cardm_ena                          : std_logic;
+   signal cardm_addr                         : std_logic_vector(26 downto 2);
+   signal ld_card_ena                        : std_logic;
+   signal ld_card_addr                       : std_logic_vector(26 downto 2);
    signal irq9_vblank, irq9_hblank, irq9_vcount : std_logic;
 
    -- ================= ARM7 side =================
@@ -532,10 +574,28 @@ begin
       start => ld_start, direct => direct_boot,
       busy => ld_busy, done => ld_done, load_error => ld_error,
       arm9_entry => arm9_entry, arm7_entry => arm7_entry,
-      card_ena => card_ena, card_addr => card_addr,
+      card_ena => ld_card_ena, card_addr => ld_card_addr,
       card_done => card_done, card_rdata => card_din,
       wr_ena => ld_wr_ena, wr_addr => ld_wr_addr, wr_data => ld_wr_data,
       wr_done => ld_wr_done
+   );
+
+   -- card image port: the loader owns it during boot, the slot module after
+   -- (the CPUs are in reset while ld_busy, so no ROMCTRL transfer can overlap)
+   card_ena  <= ld_card_ena  when ld_busy = '1' else cardm_ena;
+   card_addr <= ld_card_addr when ld_busy = '1' else cardm_addr;
+
+   icard : entity work.nds_card
+   port map
+   (
+      clk => clk1x, ce => '1', reset => resetCpu,
+      card7 => exmem_card7_s,
+      bus9 => io_bus9, wired_out9 => card_wired_out9, wired_done9 => card_wired_done9,
+      bus7 => io_bus7, wired_out7 => card_wired_out7, wired_done7 => card_wired_done7,
+      irq9_xfer => irq9_card, irq7_xfer => irq7_card,
+      dma9_card => dma9_card_trig, dma7_card => dma7_card_trig,
+      card_ena => cardm_ena, card_addr => cardm_addr,
+      card_din => card_din, card_done => card_done
    );
 
    -- loader writes route by target: main RAM (0x02xxxxxx) via main-RAM port 9,
@@ -666,6 +726,7 @@ begin
       wired_done   => dma_wired_done,
       trig_vblank  => gpu_vblank,
       trig_hblank  => hblank_trigger,
+      trig_card    => dma9_card_trig,
       cpu_bus_idle => cpu9_bus_idle,
       dma_on       => dma_on,
       dma_bus_on   => dma_bus_on,
@@ -727,9 +788,9 @@ begin
       gb_bus_din      => cpu7_din,
       gb_bus_done     => cpu7_done,
       bus_lowbits     => cpu7_lowbits,
-      dma_on          => '0',
+      dma_on          => cpu7_pause,
       done            => open,
-      CPU_bus_idle    => open,
+      CPU_bus_idle    => cpu7_bus_idle,
       PC_in_BIOS      => open,
       cpu_halt        => open,
       lastread        => cpu7_lastread,
@@ -742,12 +803,59 @@ begin
    ibios7 : entity work.nds_bios7
    port map ( bios_addr => bios_addr, bios_data => bios7_data );
 
+   -- ARM7 bus mux: the DMA owns the membus while dma7_bus_on (CPU paused
+   -- via cpu7_pause and drained via cpu7_bus_idle before the grant); the
+   -- sound fetch unit is a second, lower-priority guest - it pauses the
+   -- CPU the same way (snd_bus_req -> cpu7_pause) but only gets the bus
+   -- when DMA7 neither holds nor wants it, and DMA7's grant is held off
+   -- while a sound word is in flight (dma7_idle_ok)
+   cpu7_pause   <= dma7_on or snd_bus_req;
+   dma7_idle_ok <= cpu7_bus_idle and not snd_bus_own;
+   snd_bus_ok   <= cpu7_bus_idle and not dma7_on and not dma7_bus_on;
+
+   mbus7_adr  <= dmab7_adr  when dma7_bus_on = '1' else
+                 sndb7_adr  when snd_bus_own = '1' else cpu7_adr;
+   mbus7_rnw  <= dmab7_rnw  when dma7_bus_on = '1' else
+                 '1'        when snd_bus_own = '1' else cpu7_rnw;
+   mbus7_ena  <= dmab7_ena  when dma7_bus_on = '1' else
+                 sndb7_ena  when snd_bus_own = '1' else cpu7_ena;
+   mbus7_acc  <= dmab7_acc  when dma7_bus_on = '1' else
+                 ACCESS_32BIT when snd_bus_own = '1' else cpu7_acc;
+   mbus7_dout <= dmab7_dout when dma7_bus_on = '1' else
+                 (others => '0') when snd_bus_own = '1' else cpu7_dout;
+   mbus7_low  <= dmab7_low  when dma7_bus_on = '1' else
+                 "00"       when snd_bus_own = '1' else cpu7_lowbits;
+
+   idma7 : entity work.nds_dma7
+   port map
+   (
+      clk          => clk1x,
+      reset        => resetCpu,
+      gb_bus       => io_bus7,
+      wired_out    => dma7_wired_out,
+      wired_done   => dma7_wired_done,
+      trig_vblank  => gpu_vblank,
+      trig_card    => dma7_card_trig,
+      cpu_bus_idle => dma7_idle_ok,
+      dma_on       => dma7_on,
+      dma_bus_on   => dma7_bus_on,
+      mb_ena       => dmab7_ena,
+      mb_rnw       => dmab7_rnw,
+      mb_adr       => dmab7_adr,
+      mb_acc       => dmab7_acc,
+      mb_lowbits   => dmab7_low,
+      mb_dout      => dmab7_dout,
+      mb_din       => cpu7_din,
+      mb_done      => cpu7_done,
+      irq_dma      => irq_dma7
+   );
+
    imembus7 : entity work.nds_membus7
    port map
    (
       clk => clk1x, reset => resetCpu,
-      cpu_adr => cpu7_adr, cpu_rnw => cpu7_rnw, cpu_ena => cpu7_ena, cpu_acc => cpu7_acc,
-      cpu_dout => cpu7_dout, cpu_lowbits => cpu7_lowbits, cpu_lastread => cpu7_lastread,
+      cpu_adr => mbus7_adr, cpu_rnw => mbus7_rnw, cpu_ena => mbus7_ena, cpu_acc => mbus7_acc,
+      cpu_dout => mbus7_dout, cpu_lowbits => mbus7_low, cpu_lastread => cpu7_lastread,
       cpu_din => cpu7_din, cpu_done => cpu7_done,
       bios_addr => bios_addr, bios_data => bios7_data,
       w7p_addr => w7p_addr, w7p_we => w7p_we, w7p_be => w7p_be,
@@ -785,24 +893,28 @@ begin
    -- ================= IO register banks =================
    io_wired_out9  <= irq_wired_out9 or timer_wired_out9 or ipc_wired_out9 or sys_wired_out9 or
                      tim_wired_out9 or g2d_wired_out or g2db_wired_out or dma_wired_out or
-                     key_wired_out9;
+                     key_wired_out9 or card_wired_out9;
    io_wired_done9 <= irq_wired_done9 or timer_wired_done9 or ipc_wired_done9 or sys_wired_done9 or
                      tim_wired_done9 or g2d_wired_done or g2db_wired_done or dma_wired_done or
-                     key_wired_done9;
+                     key_wired_done9 or card_wired_done9;
    io_wired_out7  <= irq_wired_out7 or timer_wired_out7 or ipc_wired_out7 or sys_wired_out7 or
-                     tim_wired_out7 or key_wired_out7 or spi_wired_out7;
+                     tim_wired_out7 or key_wired_out7 or spi_wired_out7 or card_wired_out7 or
+                     rtc_wired_out7 or snd_wired_out7 or dma7_wired_out;
    io_wired_done7 <= irq_wired_done7 or timer_wired_done7 or ipc_wired_done7 or sys_wired_done7 or
-                     tim_wired_done7 or key_wired_done7 or spi_wired_done7;
+                     tim_wired_done7 or key_wired_done7 or spi_wired_done7 or card_wired_done7 or
+                     rtc_wired_done7 or snd_wired_done7 or dma7_wired_done;
 
    irq_in9 <= (0 => irq9_vblank, 1 => irq9_hblank, 2 => irq9_vcount,
                3 => irp_timer9(0), 4 => irp_timer9(1), 5 => irp_timer9(2), 6 => irp_timer9(3),
                8 => irq_dma9(0), 9 => irq_dma9(1), 10 => irq_dma9(2), 11 => irq_dma9(3),
                16 => ipc9_irq_sync, 17 => ipc9_irq_sendempty, 18 => ipc9_irq_recv,
+               19 => irq9_card,
                others => '0');
    irq_in7 <= (0 => irq7_vblank, 1 => irq7_hblank, 2 => irq7_vcount,
                3 => irp_timer7(0), 4 => irp_timer7(1), 5 => irp_timer7(2), 6 => irp_timer7(3),
+               8 => irq_dma7(0), 9 => irq_dma7(1), 10 => irq_dma7(2), 11 => irq_dma7(3),
                16 => ipc7_irq_sync, 17 => ipc7_irq_sendempty, 18 => ipc7_irq_recv,
-               23 => irq7_spi,
+               19 => irq7_card, 23 => irq7_spi,
                others => '0');
 
    -- KEYINPUT (0x130, both CPUs) + EXTKEYIN (0x136, ARM7): wired directly
@@ -832,6 +944,31 @@ begin
       clk => clk1x, ce => '1', reset => resetCpu,
       gb_bus => io_bus7, wired_out => irq_wired_out7, wired_done => irq_wired_done7,
       irq_in => irq_in7, cpu_irq => cpu7_irq, cpu_unhalt => cpu7_unhalt
+   );
+
+   irtc : entity work.nds_rtc
+   port map
+   (
+      clk => clk1x, ce => '1', reset => resetCpu,
+      bus7 => io_bus7, wired_out7 => rtc_wired_out7, wired_done7 => rtc_wired_done7
+   );
+
+   isound : entity work.nds_sound
+   port map
+   (
+      clk => clk1x, ce => '1', reset => resetCpu,
+      bus7 => io_bus7, wired_out7 => snd_wired_out7, wired_done7 => snd_wired_done7,
+      snd_bus_req => snd_bus_req,
+      snd_bus_ok  => snd_bus_ok,
+      snd_bus_own => snd_bus_own,
+      mb_ena      => sndb7_ena,
+      mb_adr      => sndb7_adr,
+      mb_din      => cpu7_din,
+      mb_done     => cpu7_done,
+      sample_l     => sound_out_left,
+      sample_r     => sound_out_right,
+      sample_valid => open,
+      snd_enable => open, snd_active => open
    );
 
    ispi : entity work.nds_spi
@@ -888,7 +1025,7 @@ begin
       preset_direct => preset_direct,
       wramcnt => wramcnt, vramcnt => vramcnt,
       pow_2da => pow_2da, pow_2db => pow_2db, pow_swap => pow_swap,
-      exmem_gba7 => open, exmem_card7 => open, exmem_prio7 => exmem_prio7,
+      exmem_gba7 => open, exmem_card7 => exmem_card7_s, exmem_prio7 => exmem_prio7,
       halt7 => cpu7_newhalt
    );
 
@@ -1099,7 +1236,5 @@ begin
    dbg_cpu_err9  <= error_cpu9;
    dbg_cpu_err7  <= error_cpu7;
 
-   sound_out_left  <= (others => '0');
-   sound_out_right <= (others => '0');
 
 end architecture;

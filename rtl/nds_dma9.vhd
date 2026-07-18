@@ -11,8 +11,9 @@
 --     when the remaining count is 0 (so repeat reloads it per trigger, and
 --     ctrl-3 re-latches the address then too) - DualSOUP DMA_Run.
 --   * start timings implemented: 0 immediate, 1 vblank, 2 hblank (visible
---     lines only - the gpu2d cadence pulses). Card (5) and GX FIFO (7)
---     come with their subsystems; 3/4/6 are exotic (DualSOUP stubs them).
+--     lines only - the gpu2d cadence pulses), 5 card (one pulse per ready
+--     data word from nds_card; games arm count=1 + repeat). GX FIFO (7)
+--     comes with the 3D subsystem; 3/4/6 are exotic (DualSOUP stubs them).
 --   * repeat re-arms every trigger for non-immediate modes; immediate
 --     transfers clear enable regardless. IRQ per completed transfer.
 --   * transfers go through the ARM9 membus with the CPU paused (dma_on +
@@ -43,9 +44,11 @@ entity nds_dma9 is
       wired_out    : out std_logic_vector(31 downto 0) := (others => '0');
       wired_done   : out std_logic;
 
-      -- trigger pulses (gpu2d cadence: vblank start / visible-line hblank)
+      -- trigger pulses (gpu2d cadence: vblank start / visible-line hblank;
+      -- card: one pulse per ready data word from nds_card)
       trig_vblank  : in  std_logic;
       trig_hblank  : in  std_logic;
+      trig_card    : in  std_logic;
 
       -- membus grant: dma_on pauses the CPU, the bus is ours once idle
       cpu_bus_idle : in  std_logic;
@@ -238,6 +241,9 @@ begin
                      ch(i).pend <= '1';
                   end if;
                   if (trig_hblank = '1' and ch(i).timing = "010") then
+                     ch(i).pend <= '1';
+                  end if;
+                  if (trig_card = '1' and ch(i).timing = "101") then
                      ch(i).pend <= '1';
                   end if;
                end if;
