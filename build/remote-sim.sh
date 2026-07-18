@@ -57,6 +57,16 @@ done
 kill "$LOGPID" 2>/dev/null || true
 
 echo "== sim exit code: ${RC}"
+# ARTIFACTS="a.txt b.txt" copies files (relative to the repo root in the pod)
+# into simout/ before the pod is deleted
+if [ -n "${ARTIFACTS:-}" ]; then
+   mkdir -p simout
+   for f in $ARTIFACTS; do
+      echo "== fetching $f"
+      kubectl -n "$NS" cp "${POD}:/work/src/${f}" "simout/$(basename "$f")" ||
+         echo "   (missing: $f)"
+   done
+fi
 if [ "$KEEP" != "1" ]; then
    kubectl -n "$NS" delete pod "$POD" --wait=false
 fi
