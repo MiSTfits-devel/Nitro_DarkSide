@@ -16,6 +16,7 @@ library IEEE;
 use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
 use std.textio.all;
+use work.pexport.all;
 
 entity tb_top_frame is
    generic
@@ -25,13 +26,22 @@ entity tb_top_frame is
       DUMPFILE_B : string  := "top_frame_fb_b.txt";
       CARD_WORDS : integer := 1048576;   -- 4 MB staging window
       FRAMES     : integer := 3;
-      TIMEOUT_MS : integer := 400
+      TIMEOUT_MS : integer := 400;
+      DIRECT     : integer := 0;         -- 1 = firmware direct-boot env (stock ROMs)
+      TRACEFILE  : string  := "";        -- non-empty: ARM9 retired-instruction trace (TRACE_DIFF format)
+      TRACEFILE7 : string  := "";        -- non-empty: ARM7 retired-instruction trace (same format)
+      MAXINSTR   : integer := 20000000   -- trace line cap (per CPU)
    );
 end entity;
 
 architecture sim of tb_top_frame is
 
    constant MAINRAM_BASE : integer := 8388608;
+
+   function itosl(i : integer) return std_logic is
+   begin
+      if (i /= 0) then return '1'; else return '0'; end if;
+   end function;
 
    signal clk1x       : std_logic := '0';
    signal clkMem      : std_logic := '0';
@@ -97,6 +107,10 @@ architecture sim of tb_top_frame is
    signal vblank_out     : std_logic;
 
    signal dbg_line_drop, dbg_line_busy, dbg_cpu_err9, dbg_cpu_err7 : std_logic;
+   signal dbg_export9_done : std_logic;
+   signal dbg_export9      : cpu_export_type;
+   signal dbg_export7_done : std_logic;
+   signal dbg_export7      : cpu_export_type;
 
    -- ================= collectors =================
    type t_frame is array (0 to 49151) of std_logic_vector(17 downto 0);
@@ -148,6 +162,7 @@ begin
    (
       clk1x => clk1x, clkMem => clkMem, clkMemIndex => clkMemIndex,
       reset => reset, nds_on => '1',
+      direct_boot => itosl(DIRECT),
       KeyA => '0', KeyB => '0', KeySelect => '0', KeyStart => '0',
       KeyRight => '0', KeyLeft => '0', KeyUp => '0', KeyDown => '0',
       KeyR => '0', KeyL => '0', KeyX => '0', KeyY => '0', lid_closed => '0',
@@ -170,8 +185,80 @@ begin
       vblank_out => vblank_out,
       sound_out_left => open, sound_out_right => open,
       dbg_line_drop => dbg_line_drop, dbg_line_busy => dbg_line_busy,
-      dbg_cpu_err9 => dbg_cpu_err9, dbg_cpu_err7 => dbg_cpu_err7
+      dbg_cpu_err9 => dbg_cpu_err9, dbg_cpu_err7 => dbg_cpu_err7,
+      dbg_export9_done => dbg_export9_done, dbg_export9 => dbg_export9,
+      dbg_export7_done => dbg_export7_done, dbg_export7 => dbg_export7
    );
+
+   -- ================= ARM9 trace writer (TRACEFILE /= "") =================
+   -- Same line format as tb_arm9_trace / melonds_tracer (docs/TRACE_DIFF.md):
+   -- <pc> <opcode> <cpsr> <r0>..<r14>, one line per retired instruction.
+   gtrace : if TRACEFILE'length > 0 generate
+   begin
+      p_trace : process
+         file tf     : text;
+         variable l  : line;
+         variable n  : integer := 0;
+      begin
+         file_open(tf, TRACEFILE, write_mode);
+         loop
+            wait until rising_edge(clk1x);
+            if (dbg_export9_done = '1') then
+               write(l, to_hstring(dbg_export9.pc));
+               write(l, ' ');
+               write(l, to_hstring(dbg_export9.opcode));
+               write(l, ' ');
+               write(l, to_hstring(dbg_export9.CPSR));
+               for i in 0 to 14 loop
+                  write(l, ' ');
+                  write(l, to_hstring(dbg_export9.regs(i)));
+               end loop;
+               writeline(tf, l);
+               n := n + 1;
+               if (n mod 500000 = 0) then
+                  report "traced " & integer'image(n) & " instructions" severity note;
+               end if;
+               if (n >= MAXINSTR) then
+                  report "tb_top_frame: trace cap reached, closing " & TRACEFILE severity note;
+                  file_close(tf);
+                  wait;
+               end if;
+            end if;
+         end loop;
+      end process;
+   end generate;
+
+   gtrace7 : if TRACEFILE7'length > 0 generate
+   begin
+      p_trace7 : process
+         file tf     : text;
+         variable l  : line;
+         variable n  : integer := 0;
+      begin
+         file_open(tf, TRACEFILE7, write_mode);
+         loop
+            wait until rising_edge(clk1x);
+            if (dbg_export7_done = '1') then
+               write(l, to_hstring(dbg_export7.pc));
+               write(l, ' ');
+               write(l, to_hstring(dbg_export7.opcode));
+               write(l, ' ');
+               write(l, to_hstring(dbg_export7.CPSR));
+               for i in 0 to 14 loop
+                  write(l, ' ');
+                  write(l, to_hstring(dbg_export7.regs(i)));
+               end loop;
+               writeline(tf, l);
+               n := n + 1;
+               if (n >= MAXINSTR) then
+                  report "tb_top_frame: ARM7 trace cap reached, closing " & TRACEFILE7 severity note;
+                  file_close(tf);
+                  wait;
+               end if;
+            end if;
+         end loop;
+      end process;
+   end generate;
 
    -- ================= behavioral card =================
    p_card : process (clk1x)

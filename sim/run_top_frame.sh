@@ -9,8 +9,12 @@ cd "$(dirname "$0")/.."
 HEXFILE="${1:-${HEXFILE:-sim/tests/nds_dual.hex}}"
 FRAMES="${FRAMES:-3}"
 TIMEOUT_MS="${TIMEOUT_MS:-400}"
+DIRECT="${DIRECT:-0}"
 DUMPFILE="${DUMPFILE:-top_frame_fb.txt}"
 DUMPFILE_B="${DUMPFILE_B:-top_frame_fb_b.txt}"
+TRACEFILE="${TRACEFILE:-}"
+TRACEFILE7="${TRACEFILE7:-}"
+MAXINSTR="${MAXINSTR:-20000000}"
 WORK=sim/nvc_work
 mkdir -p "$WORK"
 
@@ -54,10 +58,17 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_gpu_timing.vhd \
    rtl/nds_dma9.vhd \
    rtl/nds_bios7.vhd \
+   rtl/nds_bios9.vhd \
    rtl/nds_top.vhd \
    sim/tb_top_frame.vhd
 
+# nvc rejects -gNAME= with an empty value: only pass the trace generics when set
+TRACEGEN=""
+[ -n "$TRACEFILE" ]  && TRACEGEN="$TRACEGEN -gTRACEFILE=$TRACEFILE"
+[ -n "$TRACEFILE7" ] && TRACEGEN="$TRACEGEN -gTRACEFILE7=$TRACEFILE7"
+
 nvc -H 2g -L "$WORK" --work="$WORK/work" -e tb_top_frame \
    -gHEXFILE="$HEXFILE" -gFRAMES="$FRAMES" -gTIMEOUT_MS="$TIMEOUT_MS" \
-   -gDUMPFILE="$DUMPFILE" -gDUMPFILE_B="$DUMPFILE_B"
+   -gDUMPFILE="$DUMPFILE" -gDUMPFILE_B="$DUMPFILE_B" -gDIRECT="$DIRECT" \
+   -gMAXINSTR="$MAXINSTR" $TRACEGEN
 nvc -H 2g -L "$WORK" --work="$WORK/work" -r tb_top_frame --ieee-warnings=off --exit-severity=failure
