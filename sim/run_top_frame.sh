@@ -7,6 +7,7 @@ set -eu
 cd "$(dirname "$0")/.."
 
 HEXFILE="${1:-${HEXFILE:-sim/tests/nds_dual.hex}}"
+FWFILE="${FWFILE:-sim/tests/nds_firmware.hex}"
 FRAMES="${FRAMES:-3}"
 TIMEOUT_MS="${TIMEOUT_MS:-400}"
 DIRECT="${DIRECT:-0}"
@@ -41,6 +42,7 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_wram.vhd \
    rtl/nds_irq.vhd \
    rtl/nds_ipc.vhd \
+   rtl/nds_spi.vhd \
    rtl/nds_syscnt.vhd \
    rtl/nds_loader.vhd \
    rtl/nds_mainram.vhd \
@@ -68,7 +70,7 @@ TRACEGEN=""
 [ -n "$TRACEFILE7" ] && TRACEGEN="$TRACEGEN -gTRACEFILE7=$TRACEFILE7"
 
 nvc -H 2g -L "$WORK" --work="$WORK/work" -e tb_top_frame \
-   -gHEXFILE="$HEXFILE" -gFRAMES="$FRAMES" -gTIMEOUT_MS="$TIMEOUT_MS" \
+   -gHEXFILE="$HEXFILE" -gFWFILE="$FWFILE" -gFRAMES="$FRAMES" -gTIMEOUT_MS="$TIMEOUT_MS" \
    -gDUMPFILE="$DUMPFILE" -gDUMPFILE_B="$DUMPFILE_B" -gDIRECT="$DIRECT" \
    -gMAXINSTR="$MAXINSTR" $TRACEGEN
 nvc -H 2g -L "$WORK" --work="$WORK/work" -r tb_top_frame --ieee-warnings=off --exit-severity=failure

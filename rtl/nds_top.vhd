@@ -20,8 +20,11 @@
 --     than hardware — fine for static scenes, revisited with M9 pacing.
 --   * TCMs, ARM7-private WRAM: behavioral arrays (BRAM entities land in M9)
 --   * ARM9 DMA (nds_dma9): immediate/vblank/hblank, functional timing;
---     no ARM7 DMA / sound / SPI / RTC / card yet; KEYINPUT/EXTKEYIN are
+--     no ARM7 DMA / sound / RTC / card yet; KEYINPUT/EXTKEYIN are
 --     wired directly so samples polling keys see released state
+--   * ARM7 SPI bus (nds_spi): PMIC + firmware flash + TSC; the flash serves
+--     the fw_* image port (melonDS default firmware in sim; touch/mic not
+--     wired into the TSC yet)
 --   * ARM7 HLE BIOS (nds_bios7, generated from sim/tests/hle_bios7):
 --     GBATEK IRQ dispatch via [0x0380FFFC] + the SWIs calico/libnds use;
 --     svcHalt goes through HALTCNT in nds_syscnt. The ARM9 needs no BIOS
@@ -85,6 +88,11 @@ entity nds_top is
       card_addr        : out std_logic_vector(26 downto 2);
       card_din         : in  std_logic_vector(31 downto 0);
       card_done        : in  std_logic;
+
+      -- SPI firmware flash image read port (128 KB, word addressed; combinational
+      -- or 1-cycle backing store — hex array in sim, HPS-staged BRAM on hardware)
+      fw_addr          : out unsigned(16 downto 2);
+      fw_data          : in  std_logic_vector(31 downto 0);
 
       -- main RAM: nds_mainram SDRAM request port + scheduler handshake
       mainram_allow    : in  std_logic;
@@ -301,6 +309,9 @@ architecture arch of nds_top is
    signal io_bus7 : proc_bus_gb_type;
    signal io_wired_out7, irq_wired_out7, timer_wired_out7 : std_logic_vector(31 downto 0);
    signal io_wired_done7, irq_wired_done7, timer_wired_done7 : std_logic;
+   signal spi_wired_out7 : std_logic_vector(31 downto 0);
+   signal spi_wired_done7 : std_logic;
+   signal irq7_spi : std_logic;
    signal ipc_wired_out7, sys_wired_out7 : std_logic_vector(31 downto 0);
    signal ipc_wired_done7, sys_wired_done7 : std_logic;
    signal tim_wired_out7 : std_logic_vector(31 downto 0);
@@ -779,9 +790,9 @@ begin
                      tim_wired_done9 or g2d_wired_done or g2db_wired_done or dma_wired_done or
                      key_wired_done9;
    io_wired_out7  <= irq_wired_out7 or timer_wired_out7 or ipc_wired_out7 or sys_wired_out7 or
-                     tim_wired_out7 or key_wired_out7;
+                     tim_wired_out7 or key_wired_out7 or spi_wired_out7;
    io_wired_done7 <= irq_wired_done7 or timer_wired_done7 or ipc_wired_done7 or sys_wired_done7 or
-                     tim_wired_done7 or key_wired_done7;
+                     tim_wired_done7 or key_wired_done7 or spi_wired_done7;
 
    irq_in9 <= (0 => irq9_vblank, 1 => irq9_hblank, 2 => irq9_vcount,
                3 => irp_timer9(0), 4 => irp_timer9(1), 5 => irp_timer9(2), 6 => irp_timer9(3),
@@ -791,6 +802,7 @@ begin
    irq_in7 <= (0 => irq7_vblank, 1 => irq7_hblank, 2 => irq7_vcount,
                3 => irp_timer7(0), 4 => irp_timer7(1), 5 => irp_timer7(2), 6 => irp_timer7(3),
                16 => ipc7_irq_sync, 17 => ipc7_irq_sendempty, 18 => ipc7_irq_recv,
+               23 => irq7_spi,
                others => '0');
 
    -- KEYINPUT (0x130, both CPUs) + EXTKEYIN (0x136, ARM7): wired directly
@@ -820,6 +832,15 @@ begin
       clk => clk1x, ce => '1', reset => resetCpu,
       gb_bus => io_bus7, wired_out => irq_wired_out7, wired_done => irq_wired_done7,
       irq_in => irq_in7, cpu_irq => cpu7_irq, cpu_unhalt => cpu7_unhalt
+   );
+
+   ispi : entity work.nds_spi
+   port map
+   (
+      clk => clk1x, reset => resetCpu,
+      bus7 => io_bus7, wired_out7 => spi_wired_out7, wired_done7 => spi_wired_done7,
+      irq_spi => irq7_spi,
+      fw_addr => fw_addr, fw_data => fw_data
    );
 
    itimer9 : entity work.gba_timer

@@ -22,6 +22,7 @@ entity tb_top_frame is
    generic
    (
       HEXFILE    : string  := "sim/tests/nds_dual.hex";
+      FWFILE     : string  := "sim/tests/nds_firmware.hex";  -- SPI firmware flash image (128 KB)
       DUMPFILE   : string  := "top_frame_fb.txt";
       DUMPFILE_B : string  := "top_frame_fb_b.txt";
       CARD_WORDS : integer := 1048576;   -- 4 MB staging window
@@ -73,6 +74,31 @@ architecture sim of tb_top_frame is
    signal card_ena, card_done : std_logic := '0';
    signal card_addr  : std_logic_vector(26 downto 2);
    signal card_rdata : std_logic_vector(31 downto 0) := (others => '0');
+
+   -- ================= SPI firmware flash store (128 KB) =================
+   type t_fw is array (0 to 32767) of std_logic_vector(31 downto 0);
+   impure function load_fw(fname : string) return t_fw is
+      file f       : text;
+      variable l   : line;
+      variable w   : std_logic_vector(31 downto 0);
+      variable mem : t_fw := (others => (others => '0'));
+      variable i   : integer := 0;
+   begin
+      file_open(f, fname, read_mode);
+      while not endfile(f) and i < 32768 loop
+         readline(f, l);
+         hread(l, w);
+         mem(i) := w;
+         i := i + 1;
+      end loop;
+      file_close(f);
+      report "loaded " & integer'image(i) & " firmware words from " & fname severity note;
+      return mem;
+   end function;
+   constant fwimg : t_fw := load_fw(FWFILE);
+
+   signal fw_addr : unsigned(16 downto 2);
+   signal fw_data : std_logic_vector(31 downto 0);
 
    -- ================= nds_top interface =================
    signal boot_done, boot_error : std_logic;
@@ -170,6 +196,7 @@ begin
       boot_done => boot_done, boot_error => boot_error,
       card_ena => card_ena, card_addr => card_addr,
       card_din => card_rdata, card_done => card_done,
+      fw_addr => fw_addr, fw_data => fw_data,
       mainram_allow => model_allow, mainram_active => mainram_active, mainram_busy => mainram_busy,
       sdram_ena => sdram_ena, sdram_rnw => sdram_rnw, sdram_Adr => sdram_Adr,
       sdram_Din => sdram_Din, sdram_be => sdram_be,
@@ -189,6 +216,10 @@ begin
       dbg_export9_done => dbg_export9_done, dbg_export9 => dbg_export9,
       dbg_export7_done => dbg_export7_done, dbg_export7 => dbg_export7
    );
+
+   -- SPI firmware flash image: combinational serve (nds_spi samples one
+   -- cycle after registering fw_addr, well inside the byte busy window)
+   fw_data <= fwimg(to_integer(fw_addr));
 
    -- ================= ARM9 trace writer (TRACEFILE /= "") =================
    -- Same line format as tb_arm9_trace / melonds_tracer (docs/TRACE_DIFF.md):
