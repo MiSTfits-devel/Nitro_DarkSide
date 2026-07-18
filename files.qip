@@ -1,0 +1,15 @@
+set_global_assignment -name QIP_FILE rtl/nds.qip
+set_global_assignment -name QIP_FILE rtl/mem.qip
+# rtl files the sim-era nds.qip predates (M7/M8 additions)
+set_global_assignment -name VHDL_FILE rtl/export.vhd
+set_global_assignment -name VHDL_FILE rtl/nds_bios9.vhd
+set_global_assignment -name VHDL_FILE rtl/nds_card.vhd
+set_global_assignment -name VHDL_FILE rtl/nds_dma7.vhd
+set_global_assignment -name VHDL_FILE rtl/nds_rtc.vhd
+set_global_assignment -name VHDL_FILE rtl/nds_sound.vhd
+set_global_assignment -name VHDL_FILE rtl/SyncFifoFallThrough.vhd
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/ddram.sv
+set_global_assignment -name VHDL_FILE nds_port_wrap.vhd
+set_global_assignment -name SYSTEMVERILOG_FILE NDS.sv
+set_global_assignment -name SDC_FILE NDS.sdc
