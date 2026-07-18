@@ -3359,117 +3359,118 @@ begin
 
                end if;
 
-               -- mode switch + bank swap: at execute_now for the single-cycle
-               -- switch sources (msr, exception entry, subs pc), and in the
-               -- DATARW_BLOCKSWITCH cycle for ldm^ with pc (the swap must land
-               -- AFTER the base writeback wrote the old mode's register)
-               if (execute_switchmode_now = '1' and
-                   (execute_now = '1' or execute_RW_State = DATARW_BLOCKSWITCH)) then
 
-                     if (execute_switchmode_new = CPUMODE_FIQ and cpu_mode /= CPUMODE_FIQ) then
-                        regs_0_8  <= regs(8);
-                        regs_0_9  <= regs(9);
-                        regs_0_10 <= regs(10);
-                        regs_0_11 <= regs(11);
-                        regs_0_12 <= regs(12);
-                     end if;
+            end if;
+
+            -- mode switch + bank swap: at execute_now for the single-cycle
+            -- switch sources (msr, exception entry, subs pc), and in the
+            -- DATARW_BLOCKSWITCH cycle for ldm^ with pc (the swap must land
+            -- AFTER the base writeback wrote the old mode's register)
+            if (execute_switchmode_now = '1' and
+                (execute_now = '1' or execute_RW_State = DATARW_BLOCKSWITCH)) then
+
+                  if (execute_switchmode_new = CPUMODE_FIQ and cpu_mode /= CPUMODE_FIQ) then
+                     regs_0_8  <= regs(8);
+                     regs_0_9  <= regs(9);
+                     regs_0_10 <= regs(10);
+                     regs_0_11 <= regs(11);
+                     regs_0_12 <= regs(12);
+                  end if;
                   
-                     case (cpu_mode) is
-                        when CPUMODE_USER | CPUMODE_SYSTEM =>
-                           regs_0_13 <= regs(13);
-                           regs_0_14 <= regs(14);
+                  case (cpu_mode) is
+                     when CPUMODE_USER | CPUMODE_SYSTEM =>
+                        regs_0_13 <= regs(13);
+                        regs_0_14 <= regs(14);
       
-                        when CPUMODE_FIQ =>
-                           regs_1_8  <= regs(8);
-                           regs_1_9  <= regs(9);
-                           regs_1_10 <= regs(10);
-                           regs_1_11 <= regs(11);
-                           regs_1_12 <= regs(12);
-                           regs_1_13 <= regs(13);
-                           regs_1_14 <= regs(14);
+                     when CPUMODE_FIQ =>
+                        regs_1_8  <= regs(8);
+                        regs_1_9  <= regs(9);
+                        regs_1_10 <= regs(10);
+                        regs_1_11 <= regs(11);
+                        regs_1_12 <= regs(12);
+                        regs_1_13 <= regs(13);
+                        regs_1_14 <= regs(14);
       
-                        when CPUMODE_IRQ =>
-                           regs_2_13 <= regs(13);
-                           regs_2_14 <= regs(14);
+                     when CPUMODE_IRQ =>
+                        regs_2_13 <= regs(13);
+                        regs_2_14 <= regs(14);
       
-                        when CPUMODE_SUPERVISOR =>
-                           regs_3_13 <= regs(13);
-                           regs_3_14 <= regs(14);
+                     when CPUMODE_SUPERVISOR =>
+                        regs_3_13 <= regs(13);
+                        regs_3_14 <= regs(14);
       
-                        when CPUMODE_ABORT =>
-                           regs_4_13 <= regs(13);
-                           regs_4_14 <= regs(14);
+                     when CPUMODE_ABORT =>
+                        regs_4_13 <= regs(13);
+                        regs_4_14 <= regs(14);
       
-                        when CPUMODE_UNDEFINED =>
-                           regs_5_13 <= regs(13);
-                           regs_5_14 <= regs(14);
+                     when CPUMODE_UNDEFINED =>
+                        regs_5_13 <= regs(13);
+                        regs_5_14 <= regs(14);
                            
-                        when others => report "should never happen" severity failure; 
-                     end case;
+                     when others => report "should never happen" severity failure; 
+                  end case;
 
-                     case (execute_switchmode_new) is
-                        when CPUMODE_USER | CPUMODE_SYSTEM =>
-                           if (cpu_mode /= CPUMODE_USER and cpu_mode /= CPUMODE_SYSTEM) then
-                              regs(13) <= regs_0_13;
-                              regs(14) <= regs_0_14;
-                           end if;
+                  case (execute_switchmode_new) is
+                     when CPUMODE_USER | CPUMODE_SYSTEM =>
+                        if (cpu_mode /= CPUMODE_USER and cpu_mode /= CPUMODE_SYSTEM) then
+                           regs(13) <= regs_0_13;
+                           regs(14) <= regs_0_14;
+                        end if;
       
-                        when CPUMODE_FIQ =>
-                           if (cpu_mode /= CPUMODE_FIQ) then
-                              regs(8)  <= regs_1_8 ;
-                              regs(9)  <= regs_1_9 ;
-                              regs(10) <= regs_1_10;
-                              regs(11) <= regs_1_11;
-                              regs(12) <= regs_1_12;
-                              regs(13) <= regs_1_13;
-                              regs(14) <= regs_1_14;
-                           end if;
-                           if (execute_switchmode_state = '1') then regs_1_17 <= CPSR; end if;
+                     when CPUMODE_FIQ =>
+                        if (cpu_mode /= CPUMODE_FIQ) then
+                           regs(8)  <= regs_1_8 ;
+                           regs(9)  <= regs_1_9 ;
+                           regs(10) <= regs_1_10;
+                           regs(11) <= regs_1_11;
+                           regs(12) <= regs_1_12;
+                           regs(13) <= regs_1_13;
+                           regs(14) <= regs_1_14;
+                        end if;
+                        if (execute_switchmode_state = '1') then regs_1_17 <= CPSR; end if;
       
-                        when CPUMODE_IRQ =>
-                           if (cpu_mode /= CPUMODE_IRQ) then
-                              regs(13) <= regs_2_13;
-                              if (decode_functions_detail /= IRQ) then
-                                 regs(14) <= regs_2_14;
-                              end if;
+                     when CPUMODE_IRQ =>
+                        if (cpu_mode /= CPUMODE_IRQ) then
+                           regs(13) <= regs_2_13;
+                           if (decode_functions_detail /= IRQ) then
+                              regs(14) <= regs_2_14;
                            end if;
-                           if (execute_switchmode_state = '1') then regs_2_17 <= CPSR; end if;
+                        end if;
+                        if (execute_switchmode_state = '1') then regs_2_17 <= CPSR; end if;
       
-                        when CPUMODE_SUPERVISOR =>
-                           if (cpu_mode /= CPUMODE_SUPERVISOR) then
-                              regs(13) <= regs_3_13;
-                              if (decode_functions_detail /= software_interrupt_detail) then
-                                 regs(14) <= regs_3_14;
-                              end if;
+                     when CPUMODE_SUPERVISOR =>
+                        if (cpu_mode /= CPUMODE_SUPERVISOR) then
+                           regs(13) <= regs_3_13;
+                           if (decode_functions_detail /= software_interrupt_detail) then
+                              regs(14) <= regs_3_14;
                            end if;
-                           if (execute_switchmode_state = '1') then regs_3_17 <= CPSR; end if;
+                        end if;
+                        if (execute_switchmode_state = '1') then regs_3_17 <= CPSR; end if;
       
-                        when CPUMODE_ABORT =>
-                           if (cpu_mode /= CPUMODE_ABORT) then
-                              regs(13) <= regs_4_13;
-                              regs(14) <= regs_4_14;
-                           end if;
-                           if (execute_switchmode_state = '1') then regs_4_17 <= CPSR; end if;
+                     when CPUMODE_ABORT =>
+                        if (cpu_mode /= CPUMODE_ABORT) then
+                           regs(13) <= regs_4_13;
+                           regs(14) <= regs_4_14;
+                        end if;
+                        if (execute_switchmode_state = '1') then regs_4_17 <= CPSR; end if;
       
-                        when CPUMODE_UNDEFINED =>
-                           if (cpu_mode /= CPUMODE_UNDEFINED) then
-                              regs(13) <= regs_5_13;
-                              regs(14) <= regs_5_14;
-                           end if;
-                           if (execute_switchmode_state = '1') then regs_5_17 <= CPSR; end if;
+                     when CPUMODE_UNDEFINED =>
+                        if (cpu_mode /= CPUMODE_UNDEFINED) then
+                           regs(13) <= regs_5_13;
+                           regs(14) <= regs_5_14;
+                        end if;
+                        if (execute_switchmode_state = '1') then regs_5_17 <= CPSR; end if;
                            
-                        when others => report "should never happen" severity failure; 
-                     end case;
+                     when others => report "should never happen" severity failure; 
+                  end case;
                      
-                     if (cpu_mode = CPUMODE_FIQ and execute_switchmode_new /= CPUMODE_FIQ) then
-                        regs(8)  <= regs_0_8;
-                        regs(9)  <= regs_0_9;
-                        regs(10) <= regs_0_10;
-                        regs(11) <= regs_0_11;
-                        regs(12) <= regs_0_12;
-                     end if;
-
-               end if;
+                  if (cpu_mode = CPUMODE_FIQ and execute_switchmode_new /= CPUMODE_FIQ) then
+                     regs(8)  <= regs_0_8;
+                     regs(9)  <= regs_0_9;
+                     regs(10) <= regs_0_10;
+                     regs(11) <= regs_0_11;
+                     regs(12) <= regs_0_12;
+                  end if;
 
             end if;
          

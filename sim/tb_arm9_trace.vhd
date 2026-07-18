@@ -27,7 +27,9 @@ entity tb_arm9_trace is
       -- 0: HEXFILE is the boot ROM at 0xFFFF0000 (island style). Otherwise:
       -- load HEXFILE into main RAM at this address and boot from it
       -- (0x02000000 for the melonDS differential workloads).
-      LOADADDR   : integer := 0
+      LOADADDR   : integer := 0;
+      DBG_T0     : integer := 0;         -- TEMP DEBUG window start/end in ns (0 = off)
+      DBG_T1     : integer := 0
    );
 end entity;
 
@@ -463,5 +465,59 @@ begin
       time_up <= true;
       wait;
    end process;
+
+   -- Pipeline debug: per-cycle dump of the CPU's fetch/decode/execute
+   -- handshake between DBG_T0 and DBG_T1 (ns) into pipe_debug.log, via
+   -- external names. Off by default (DBG_T1=0); this is how the ldm^
+   -- bank-swap bug (sim/tests/ldm_bx_irq) was localized.
+   gdbg : if DBG_T1 > 0 generate
+      pdbg : process (clk1x)
+         file df : text open write_mode is "pipe_debug.log";
+         variable l : line;
+         alias a_fetch_PC     is << signal .tb_arm9_trace.icpu.fetch_PC       : unsigned(31 downto 0) >>;
+         alias a_fetch_ready  is << signal .tb_arm9_trace.icpu.fetch_ready    : std_logic >>;
+         alias a_fetch_done   is << signal .tb_arm9_trace.icpu.fetch_done     : std_logic >>;
+         alias a_dec_ready    is << signal .tb_arm9_trace.icpu.decode_ready   : std_logic >>;
+         alias a_dec_PC       is << signal .tb_arm9_trace.icpu.decode_PC      : unsigned(31 downto 0) >>;
+         alias a_ex_branch    is << signal .tb_arm9_trace.icpu.execute_branch : std_logic >>;
+         alias a_ex_done      is << signal .tb_arm9_trace.icpu.execute_done   : std_logic >>;
+         alias a_ex_stall     is << signal .tb_arm9_trace.icpu.execute_stall  : std_logic >>;
+         alias a_ex_now       is << signal .tb_arm9_trace.icpu.execute_now    : std_logic >>;
+         alias a_bus_ena      is << signal .tb_arm9_trace.icpu.gb_bus_ena     : std_logic >>;
+         alias a_bus_done     is << signal .tb_arm9_trace.icpu.gb_bus_done    : std_logic >>;
+         alias a_bus_adr      is << signal .tb_arm9_trace.icpu.gb_bus_Adr     : std_logic_vector(31 downto 0) >>;
+         alias a_branchPC     is << signal .tb_arm9_trace.icpu.execute_branchPC_masked : unsigned(31 downto 0) >>;
+         alias a_fdata        is << signal .tb_arm9_trace.icpu.fetch_data     : std_logic_vector(31 downto 0) >>;
+         alias a_mode         is << signal .tb_arm9_trace.icpu.cpu_mode       : std_logic_vector(3 downto 0) >>;
+         alias a_msr_ena      is << signal .tb_arm9_trace.icpu.execute_msr_setvalue_ena : std_logic >>;
+         alias a_msr_val      is << signal .tb_arm9_trace.icpu.execute_msr_setvalue : unsigned(31 downto 0) >>;
+         alias a_sw_now       is << signal .tb_arm9_trace.icpu.execute_switchmode_now : std_logic >>;
+         alias a_sw_new       is << signal .tb_arm9_trace.icpu.execute_switchmode_new : std_logic_vector(3 downto 0) >>;
+      begin
+         if rising_edge(clk1x) then
+            if now >= DBG_T0 * 1 ns and now <= DBG_T1 * 1 ns then
+               write(l, to_hstring(a_dec_PC) & " fPC=" & to_hstring(a_fetch_PC) &
+                        " fdat=" & to_hstring(a_fdata) &
+                        " fr=" & std_logic'image(a_fetch_ready)(2) &
+                        " fd=" & std_logic'image(a_fetch_done)(2) &
+                        " dr=" & std_logic'image(a_dec_ready)(2) &
+                        " en=" & std_logic'image(a_ex_now)(2) &
+                        " br=" & std_logic'image(a_ex_branch)(2) &
+                        " ed=" & std_logic'image(a_ex_done)(2) &
+                        " st=" & std_logic'image(a_ex_stall)(2) &
+                        " be=" & std_logic'image(a_bus_ena)(2) &
+                        " bd=" & std_logic'image(a_bus_done)(2) &
+                        " ba=" & to_hstring(a_bus_adr) &
+                        " tgt=" & to_hstring(a_branchPC) &
+                        " md=" & to_hstring(a_mode) &
+                        " me=" & std_logic'image(a_msr_ena)(2) &
+                        " mv=" & to_hstring(a_msr_val) &
+                        " sn=" & std_logic'image(a_sw_now)(2) &
+                        " nw=" & to_hstring(a_sw_new));
+               writeline(df, l);
+            end if;
+         end if;
+      end process;
+   end generate;
 
 end architecture;
