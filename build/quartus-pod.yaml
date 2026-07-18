@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Headless Quartus 17.0 Lite build pod for the NDS core (GBA_MiSTer
+# build/quartus-pod.yaml pattern). Driven by build/remote-build.sh - it
+# streams the source in with git archive, so the branch never needs to be
+# pushed anywhere.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nds-quartus-build
+  labels:
+    app: nds-quartus-build
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/arch: amd64
+  containers:
+  - name: quartus
+    image: raetro/quartus:17.0
+    # plain -c: a login shell would source /etc/profile and clobber the
+    # image's PATH, which is where quartus_sh lives
+    command: ["/bin/bash", "-c"]
+    args:
+      - |
+        set -u
+        mkdir -p /work/src
+        echo "waiting for source (build/remote-build.sh streams it in)..."
+        while [ ! -f /work/src/.ready ]; do sleep 2; done
+        cd /work/src
+        P=$(cat .parallel 2>/dev/null || echo 1)
+        sed -i "s/NUM_PARALLEL_PROCESSORS 1/NUM_PARALLEL_PROCESSORS ${P}/" NDS.qsf
+        echo "=== quartus_sh --flow compile NDS (parallel=${P}) ==="
+        quartus_sh --flow compile NDS
+        rc=$?
+        echo "=== flow finished, exit ${rc} ==="
+        cat "output_files/NDS.fit.summary" 2>/dev/null || true
+        # detailed worst-path timing report (the default sta.rpt only has summaries)
+        printf '%s\n' \
+          "project_open NDS -revision NDS" \
+          "create_timing_netlist" \
+          "read_sdc" \
+          "update_timing_netlist" \
+          "report_timing -setup -npaths 50 -detail full_path -file output_files/NDS.paths.rpt" \
+          "project_close" > paths.tcl
+        quartus_sta -t paths.tcl || true
+        echo ${rc} > /work/exitcode
+        # stay alive so the driver can kubectl cp the artifacts out
+        sleep infinity
+    resources:
+      requests:
+        # cpu is compressible - reserve little, burst to the limit
+        cpu: "1"
+        memory: 8Gi
+      limits:
+        cpu: "12"
+        memory: 24Gi
+    volumeMounts:
+    - name: work
+      mountPath: /work
+  volumes:
+  - name: work
+    emptyDir: {}
