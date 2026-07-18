@@ -1,8 +1,8 @@
 diff --git a/src/ARM.cpp b/src/ARM.cpp
-index 827fcb01..bbb2f72f 100644
+index 827fcb01..76613f35 100644
 --- a/src/ARM.cpp
 +++ b/src/ARM.cpp
-@@ -589,6 +589,23 @@ void ARM::CheckGdbIncoming()
+@@ -589,6 +589,36 @@ void ARM::CheckGdbIncoming()
      GdbCheckA();
  }
  
@@ -23,10 +23,23 @@ index 827fcb01..bbb2f72f 100644
 +    ARM9TraceCount++;
 +}
 +
++FILE* ARM7TraceFile = nullptr;
++u64 ARM7TraceCount = 0;
++u64 ARM7TraceMax = 0;
++
++static inline void ARM7TraceLine(u32 pc, u32 instr, u32 cpsr, u32* r)
++{
++    if (!ARM7TraceFile || ARM7TraceCount >= ARM7TraceMax) return;
++    fprintf(ARM7TraceFile, "%08x %08x %08x", pc, instr, cpsr);
++    for (int i = 0; i < 15; i++) fprintf(ARM7TraceFile, " %08x", r[i]);
++    fputc('\n', ARM7TraceFile);
++    ARM7TraceCount++;
++}
++
  template <CPUExecuteMode mode>
  void ARMv5::Execute()
  {
-@@ -670,8 +687,10 @@ void ARMv5::Execute()
+@@ -670,8 +700,10 @@ void ARMv5::Execute()
                  else             NextInstr[1] = CodeRead32(R[15], false);
  
                  // actually execute
@@ -37,7 +50,7 @@ index 827fcb01..bbb2f72f 100644
              }
              else
              {
-@@ -685,6 +704,7 @@ void ARMv5::Execute()
+@@ -685,6 +717,7 @@ void ARMv5::Execute()
                  NextInstr[1] = CodeRead32(R[15], false);
  
                  // actually execute
@@ -45,11 +58,38 @@ index 827fcb01..bbb2f72f 100644
                  if (CheckCondition(CurInstr >> 28))
                  {
                      u32 icode = ((CurInstr >> 4) & 0xF) | ((CurInstr >> 16) & 0xFF0);
-@@ -696,6 +716,7 @@ void ARMv5::Execute()
+@@ -696,6 +729,7 @@ void ARMv5::Execute()
                  }
                  else
                      AddCycles_C();
 +                ARM9TraceLine(trace_pc, CurInstr, CPSR, R);
+             }
+ 
+             // TODO optimize this shit!!!
+@@ -808,8 +842,10 @@ void ARMv4::Execute()
+                 NextInstr[1] = CodeRead16(R[15]);
+ 
+                 // actually execute
++                u32 trace_pc = R[15];
+                 u32 icode = (CurInstr >> 6);
+                 ARMInterpreter::THUMBInstrTable[icode](this);
++                ARM7TraceLine(trace_pc, CurInstr & 0xFFFF, CPSR, R);
+             }
+             else
+             {
+@@ -823,6 +859,7 @@ void ARMv4::Execute()
+                 NextInstr[1] = CodeRead32(R[15]);
+ 
+                 // actually execute
++                u32 trace_pc = R[15];
+                 if (CheckCondition(CurInstr >> 28))
+                 {
+                     u32 icode = ((CurInstr >> 4) & 0xF) | ((CurInstr >> 16) & 0xFF0);
+@@ -830,6 +867,7 @@ void ARMv4::Execute()
+                 }
+                 else
+                     AddCycles_C();
++                ARM7TraceLine(trace_pc, CurInstr, CPSR, R);
              }
  
              // TODO optimize this shit!!!
