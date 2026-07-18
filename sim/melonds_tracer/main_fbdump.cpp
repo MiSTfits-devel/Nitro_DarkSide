@@ -169,6 +169,19 @@ int main(int argc, char** argv)
            nds.ARM9Read32(0x05000000), nds.ARM9Read32(0x05000004),
            nds.ARM9Read32(0x06000020), nds.ARM9Read32(0x06002000),
            nds.ARM9Read32(0x07000000));
+    // sub-engine / console probes
+    {
+        int nzc = 0;
+        for (u32 i = 0; i < 128*1024; i += 4)
+            if (*(u32*)&nds.GPU.VRAM_C[i]) nzc++;
+        printf("VRAMCNT=");
+        for (int b = 0; b < 9; b++) printf("%02X", nds.GPU.VRAMCNT[b]);
+        printf(" subDISPCNT=%08X subBG0CNT=%04X vramC_nz=%d\n",
+               nds.ARM9Read32(0x04001000), nds.ARM9Read16(0x04001008), nzc);
+        printf("subpal[0..3]=%08X %08X vram6200000=%08X %08X\n",
+               nds.ARM9Read32(0x05000400), nds.ARM9Read32(0x05000404),
+               nds.ARM9Read32(0x06200000), nds.ARM9Read32(0x06200004));
+    }
     printf("dumped %d frames to %s\n", frames, dumppath);
     return 0;
 }

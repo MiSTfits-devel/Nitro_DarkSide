@@ -1,10 +1,16 @@
 #!/bin/sh
-# Assemble the ldm^-with-pc / bank-swap regression (M7 boot blocker #6:
-# the swap block sat inside the execute_now branch and never ran in the
-# DATARW_BLOCKSWITCH cycle, leaving IRQ-banked sp/lr live in system mode).
-# Run: HEXFILE=sim/tests/ldm_bx_irq.hex MAXINSTR=20000 TIMEOUT_MS=2 sim/run_arm9_trace.sh
-# Pass: loop PCs FFFF0080/84/88 retire in equal counts; 0xCAFEBABE lands
-# at 0x02001004 after 50 timer IRQs.
+# Assemble the ldm^-with-pc exception-return regression (M7 boot blockers
+# #6 and #7: the bank swap never ran in the DATARW_BLOCKSWITCH cycle, a
+# return into thumb code fetched word-aligned because nextIsthumb took
+# the loaded pc's bit 0 instead of SPSR.T, and the target fetch issued on
+# the BLOCKSWITCH cycle with stale thumbmode, stepping +4 and skipping
+# the halfword after any word-aligned return target).
+# Run: HEXFILE=sim/tests/ldm_bx_irq.hex MAXINSTR=60000 TIMEOUT_MS=3 sim/run_arm9_trace.sh
+# Pass: 0xCAFEBABE at 0x02001004 (50 IRQs, ARM loop), 0x02001008 (70,
+# thumb counting-chain loop), 0x0200100C (90, same with MPU+icache);
+# ends parked at hang (the run then times out - expected).
+# Fail: 0x0BAD0BAD at 0x02001010 (an IRQ exit skipped an instruction),
+# or a livelock/wild jump visible at the end of arm9_trace.log.
 set -eu
 cd "$(dirname "$0")"
 DKA=/opt/devkitpro/devkitARM/bin

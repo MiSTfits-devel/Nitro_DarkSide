@@ -2532,6 +2532,17 @@ begin
    
    execute_nextIsthumb <= '0'                     when (execute_now = '1' and execute_skip = '0' and (decode_functions_detail = IRQ or decode_functions_detail = software_interrupt_detail)) else
                           execute_msr_setvalue(5) when (execute_msr_setvalue_ena = '1') else
+                          -- ldm^ with pc (exception return): T comes from the SPSR,
+                          -- not from bit 0 of the loaded pc (which is a plain
+                          -- stacked return address, bit 0 clear even for thumb).
+                          -- Must hold through DATARW_BLOCKSWITCH: the target fetch
+                          -- issues on that cycle, one cycle before thumbmode
+                          -- updates, and drives the fetch step (+2/+4) and size
+                          SPSR(5)                 when (decode_functions_detail = block_read and decode_block_switchmode = '1' and
+                                                        ((execute_writeback = '1' and execute_writereg = x"F") or
+                                                         execute_RW_State = DATARW_READWAIT or
+                                                         execute_RW_State = DATARW_READWAITDMA or
+                                                         execute_RW_State = DATARW_BLOCKSWITCH)) else
                           -- v5: loads to PC interwork from bit 0
                           execute_writedata(0)    when (execute_writeback = '1' and execute_writereg = x"F" and
                                                         (decode_functions_detail = data_read or decode_functions_detail = block_read)) else

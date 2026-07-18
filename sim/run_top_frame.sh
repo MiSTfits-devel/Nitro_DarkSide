@@ -16,6 +16,9 @@ DUMPFILE_B="${DUMPFILE_B:-top_frame_fb_b.txt}"
 TRACEFILE="${TRACEFILE:-}"
 TRACEFILE7="${TRACEFILE7:-}"
 MAXINSTR="${MAXINSTR:-20000000}"
+DBG_T0="${DBG_T0:-0}"
+DBG_T1="${DBG_T1:-0}"
+DBG_TRIGPC="${DBG_TRIGPC:-0}"
 WORK=sim/nvc_work
 mkdir -p "$WORK"
 
@@ -72,5 +75,5 @@ TRACEGEN=""
 nvc -H 2g -L "$WORK" --work="$WORK/work" -e tb_top_frame \
    -gHEXFILE="$HEXFILE" -gFWFILE="$FWFILE" -gFRAMES="$FRAMES" -gTIMEOUT_MS="$TIMEOUT_MS" \
    -gDUMPFILE="$DUMPFILE" -gDUMPFILE_B="$DUMPFILE_B" -gDIRECT="$DIRECT" \
-   -gMAXINSTR="$MAXINSTR" $TRACEGEN
+   -gMAXINSTR="$MAXINSTR" -gDBG_T0="$DBG_T0" -gDBG_T1="$DBG_T1" -gDBG_TRIGPC="$DBG_TRIGPC" $TRACEGEN
 nvc -H 2g -L "$WORK" --work="$WORK/work" -r tb_top_frame --ieee-warnings=off --exit-severity=failure

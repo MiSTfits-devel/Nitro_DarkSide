@@ -2056,9 +2056,19 @@ begin
                        (execute_now and (not execute_skip)) when (decode_functions_detail = branch_all or decode_functions_detail = IRQ or decode_functions_detail = software_interrupt_detail) else 
                        '0';
    
-   execute_nextIsthumb <= '0'                     when (execute_now = '1' and execute_skip = '0' and (decode_functions_detail = IRQ or decode_functions_detail = software_interrupt_detail)) else 
+   execute_nextIsthumb <= '0'                     when (execute_now = '1' and execute_skip = '0' and (decode_functions_detail = IRQ or decode_functions_detail = software_interrupt_detail)) else
                           execute_msr_setvalue(5) when (execute_msr_setvalue_ena = '1') else
-                          --execute_writedata(0)    when (execute_writeback = '1' and execute_writereg = x"F") else 
+                          -- ldm^ with pc (exception return): T comes from the SPSR,
+                          -- not from the loaded pc (v4 has no load-to-pc interworking).
+                          -- Must hold through DATARW_BLOCKSWITCH: the target fetch
+                          -- issues on that cycle, one cycle before thumbmode
+                          -- updates, and drives the fetch step (+2/+4) and size
+                          SPSR(5)                 when (decode_functions_detail = block_read and decode_block_switchmode = '1' and
+                                                        ((execute_writeback = '1' and execute_writereg = x"F") or
+                                                         execute_RW_State = DATARW_READWAIT or
+                                                         execute_RW_State = DATARW_READWAITDMA or
+                                                         execute_RW_State = DATARW_BLOCKSWITCH)) else
+                          --execute_writedata(0)    when (execute_writeback = '1' and execute_writereg = x"F") else
                           execute_op2(0)          when (decode_set_thumbmode = '1' and execute_branch = '1' and decode_functions_detail = branch_all) else
                           thumbmode;
    

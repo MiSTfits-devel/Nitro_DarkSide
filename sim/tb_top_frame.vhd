@@ -29,6 +29,9 @@ entity tb_top_frame is
       FRAMES     : integer := 3;
       TIMEOUT_MS : integer := 400;
       DIRECT     : integer := 0;         -- 1 = firmware direct-boot env (stock ROMs)
+      DBG_T0     : integer := 0;         -- ARM9 pipeline debug window start/end in us (0 = off)
+      DBG_T1     : integer := 0;
+      DBG_TRIGPC : integer := 0;         -- alternative: trigger on decode_PC (dumps 256 cycles before, 768 after)
       TRACEFILE  : string  := "";        -- non-empty: ARM9 retired-instruction trace (TRACE_DIFF format)
       TRACEFILE7 : string  := "";        -- non-empty: ARM7 retired-instruction trace (same format)
       MAXINSTR   : integer := 20000000   -- trace line cap (per CPU)
@@ -220,6 +223,123 @@ begin
    -- SPI firmware flash image: combinational serve (nds_spi samples one
    -- cycle after registering fw_addr, well inside the byte busy window)
    fw_data <= fwimg(to_integer(fw_addr));
+
+   -- ARM9 pipeline debug (same as tb_arm9_trace): per-cycle handshake dump
+   -- into pipe_debug.log between DBG_T0 and DBG_T1 (microseconds)
+   gdbg : if DBG_T1 > 0 or DBG_TRIGPC /= 0 generate
+      pdbg : process (clk1x)
+         file df : text open write_mode is "pipe_debug.log";
+         variable l : line;
+         alias a_fetch_PC     is << signal .tb_top_frame.idut.icpu9.fetch_PC       : unsigned(31 downto 0) >>;
+         alias a_fetch_ready  is << signal .tb_top_frame.idut.icpu9.fetch_ready    : std_logic >>;
+         alias a_fetch_done   is << signal .tb_top_frame.idut.icpu9.fetch_done     : std_logic >>;
+         alias a_dec_ready    is << signal .tb_top_frame.idut.icpu9.decode_ready   : std_logic >>;
+         alias a_dec_PC       is << signal .tb_top_frame.idut.icpu9.decode_PC      : unsigned(31 downto 0) >>;
+         alias a_ex_branch    is << signal .tb_top_frame.idut.icpu9.execute_branch : std_logic >>;
+         alias a_ex_done      is << signal .tb_top_frame.idut.icpu9.execute_done   : std_logic >>;
+         alias a_ex_stall     is << signal .tb_top_frame.idut.icpu9.execute_stall  : std_logic >>;
+         alias a_ex_now       is << signal .tb_top_frame.idut.icpu9.execute_now    : std_logic >>;
+         alias a_bus_ena      is << signal .tb_top_frame.idut.icpu9.gb_bus_ena     : std_logic >>;
+         alias a_bus_done     is << signal .tb_top_frame.idut.icpu9.gb_bus_done    : std_logic >>;
+         alias a_bus_adr      is << signal .tb_top_frame.idut.icpu9.gb_bus_Adr     : std_logic_vector(31 downto 0) >>;
+         alias a_bus_acc      is << signal .tb_top_frame.idut.icpu9.gb_bus_acc     : std_logic_vector(1 downto 0) >>;
+         alias a_bus_din      is << signal .tb_top_frame.idut.icpu9.gb_bus_din     : std_logic_vector(31 downto 0) >>;
+         alias a_branchPC     is << signal .tb_top_frame.idut.icpu9.execute_branchPC_masked : unsigned(31 downto 0) >>;
+         alias a_nthumb       is << signal .tb_top_frame.idut.icpu9.execute_nextIsthumb : std_logic >>;
+         alias a_thumb        is << signal .tb_top_frame.idut.icpu9.thumbmode      : std_logic >>;
+         alias a_fdata        is << signal .tb_top_frame.idut.icpu9.fetch_data     : std_logic_vector(31 downto 0) >>;
+         alias a_dma_on       is << signal .tb_top_frame.idut.icpu9.dma_on         : std_logic >>;
+         type t_ring is array (0 to 255) of string(1 to 220);
+         variable ring   : t_ring;
+         variable rlen   : t_ring;  -- unused pad
+         variable rl     : integer := 0;
+         variable rfill  : integer := 0;
+         variable fired  : boolean := false;
+         variable post   : integer := 0;
+         variable s      : string(1 to 220);
+         variable slen   : integer;
+      begin
+         if rising_edge(clk1x) then
+            if (DBG_T1 > 0 and now >= DBG_T0 * 1 us and now <= DBG_T1 * 1 us) or DBG_TRIGPC /= 0 then
+               write(l, to_hstring(a_dec_PC) & " fPC=" & to_hstring(a_fetch_PC) &
+                        " fdat=" & to_hstring(a_fdata) &
+                        " fr=" & std_logic'image(a_fetch_ready)(2) &
+                        " fd=" & std_logic'image(a_fetch_done)(2) &
+                        " dr=" & std_logic'image(a_dec_ready)(2) &
+                        " en=" & std_logic'image(a_ex_now)(2) &
+                        " br=" & std_logic'image(a_ex_branch)(2) &
+                        " ed=" & std_logic'image(a_ex_done)(2) &
+                        " st=" & std_logic'image(a_ex_stall)(2) &
+                        " be=" & std_logic'image(a_bus_ena)(2) &
+                        " bd=" & std_logic'image(a_bus_done)(2) &
+                        " ba=" & to_hstring(a_bus_adr) &
+                        " ac=" & to_hstring(a_bus_acc) &
+                        " bi=" & to_hstring(a_bus_din) &
+                        " tgt=" & to_hstring(a_branchPC) &
+                        " nt=" & std_logic'image(a_nthumb)(2) &
+                        " tm=" & std_logic'image(a_thumb)(2) &
+                        " dm=" & std_logic'image(a_dma_on)(2));
+               if (DBG_TRIGPC = 0) then
+                  writeline(df, l);
+               elsif (not fired) then
+                  -- ring-buffer until decode_PC hits the trigger
+                  s := (others => ' ');
+                  slen := l'length;
+                  if slen > 220 then slen := 220; end if;
+                  s(1 to slen) := l.all(1 to slen);
+                  deallocate(l);
+                  ring(rl) := s;
+                  rl := (rl + 1) mod 256;
+                  if rfill < 256 then rfill := rfill + 1; end if;
+                  -- fire on the exception return into the window: a branch
+                  -- whose target lands in [DBG_TRIGPC, +16) issued from ARM
+                  -- mode (the IRQ handler's ldm^) - thumb-mode entries into
+                  -- the same window (beq / bx r0) stay in the pre-ring
+                  if (a_ex_branch = '1' and a_thumb = '0' and
+                      a_branchPC >= to_unsigned(DBG_TRIGPC, 32) and
+                      a_branchPC < to_unsigned(DBG_TRIGPC, 32) + 16) then
+                     fired := true;
+                     post  := 768;
+                     for k in 0 to rfill - 1 loop
+                        write(l, ring((rl + 256 - rfill + k) mod 256));
+                        writeline(df, l);
+                     end loop;
+                  end if;
+               elsif (post > 0) then
+                  writeline(df, l);
+                  post := post - 1;
+                  if (post = 0) then
+                     file_close(df);   -- force the capture to disk
+                     report "PIPEDBG: trigger capture complete";
+                  end if;
+               else
+                  deallocate(l);
+               end if;
+            end if;
+         end if;
+      end process;
+   end generate;
+
+   -- end-of-run video-state probe (VRAMCNT, engine B regs, VRAM bank fill)
+   pprobe : process
+      alias a_vramcnt is << signal .tb_top_frame.idut.vramcnt : std_logic_vector(71 downto 0) >>;
+      alias a_bgmode  is << signal .tb_top_frame.idut.igpu2d_b.R_bgmode : std_logic_vector(2 downto 0) >>;
+      alias a_fblank  is << signal .tb_top_frame.idut.igpu2d_b.R_forced_blank : std_logic_vector(7 downto 7) >>;
+      variable nz : integer;
+   begin
+      wait until tests_done;
+      report "PROBE vramcnt(A..I low->high)=" & to_hstring(a_vramcnt) &
+             " engineB bgmode=" & to_hstring(a_bgmode) &
+             " fblank=" & std_logic'image(a_fblank(7))(2);
+      for b in 0 to 3 loop
+         nz := 0;
+         for i in 0 to 32767 loop
+            if (banks(b*32768 + i) /= x"00000000") then nz := nz + 1; end if;
+         end loop;
+         report "PROBE vram bank " & integer'image(b) & " nonzero words (first 128KB): " & integer'image(nz);
+      end loop;
+      wait;
+   end process;
 
    -- ================= ARM9 trace writer (TRACEFILE /= "") =================
    -- Same line format as tb_arm9_trace / melonds_tracer (docs/TRACE_DIFF.md):
