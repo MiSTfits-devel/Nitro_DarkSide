@@ -18,7 +18,9 @@
 --     lines/frame on an affine scene); tb_gpu2d_timed proves 3 is enough.
 --     Consequence: relative to the CPUs the frame is GPU_CE_DIV x longer
 --     than hardware — fine for static scenes, revisited with M9 pacing.
---   * TCMs, ARM7-private WRAM: behavioral arrays (BRAM entities land in M9)
+--   * TCMs, ARM7-private WRAM: SyncRamDualByteEnable (M10K; the membus
+--     presents addresses combinationally in the accept cycle, the BRAM's
+--     internal address register replaces the old registered-address idiom)
 --   * ARM9 DMA (nds_dma9): immediate/vblank/hblank, functional timing;
 --     card/RTC/sound-regs/ARM7-DMA exist (sound mixer DSP pending); KEYINPUT/EXTKEYIN are
 --     wired directly so samples polling keys see released state
@@ -38,6 +40,8 @@
 library IEEE;
 use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
+
+library MEM;
 
 use work.pProc_bus_gba.all;
 use work.pexport.all;
@@ -89,9 +93,12 @@ entity nds_top is
       card_din         : in  std_logic_vector(31 downto 0);
       card_done        : in  std_logic;
 
-      -- SPI firmware flash image read port (128 KB, word addressed; combinational
-      -- or 1-cycle backing store — hex array in sim, HPS-staged BRAM on hardware)
-      fw_addr          : out unsigned(16 downto 2);
+      -- SPI firmware flash image read port (256 KB, word addressed; req/done
+      -- handshake — hex array in sim answers next cycle, the DDR3 pager on
+      -- hardware answers in tens of cycles, both inside the SPI byte window)
+      fw_addr          : out unsigned(17 downto 2);
+      fw_req           : out std_logic;
+      fw_done          : in  std_logic;
       fw_data          : in  std_logic_vector(31 downto 0);
 
       -- main RAM: nds_mainram SDRAM request port + scheduler handshake
@@ -202,11 +209,7 @@ architecture arch of nds_top is
    signal cache_op      : std_logic_vector(3 downto 0);
    signal cache_op_addr : std_logic_vector(31 downto 0);
 
-   -- TCM stores (behavioral arrays until the M9 BRAM pass)
-   type t_itcm is array (0 to 8191) of std_logic_vector(31 downto 0);
-   type t_dtcm is array (0 to 4095) of std_logic_vector(31 downto 0);
-   signal itcm : t_itcm := (others => (others => '0'));
-   signal dtcm : t_dtcm := (others => (others => '0'));
+   -- TCM stores (M10K, see iitcm/idtcm instances)
    signal itcm_addr : unsigned(14 downto 2);
    signal itcm_we   : std_logic;
    signal itcm_be   : std_logic_vector(3 downto 0);
@@ -326,9 +329,7 @@ architecture arch of nds_top is
    signal bios_addr  : unsigned(13 downto 2);
    signal bios7_data : std_logic_vector(31 downto 0);
 
-   -- ARM7-private WRAM (64 KB, behavioral array until M9)
-   type t_wram7 is array (0 to 16383) of std_logic_vector(31 downto 0);
-   signal wram7 : t_wram7 := (others => (others => '0'));
+   -- ARM7-private WRAM (64 KB, M10K - see iwram7 instance)
    signal w7p_addr      : unsigned(15 downto 2);
    signal w7p_we        : std_logic;
    signal w7p_be        : std_logic_vector(3 downto 0);
@@ -683,6 +684,7 @@ begin
    );
 
    imembus9 : entity work.nds_membus9
+   generic map ( is_simu => is_simu )
    port map
    (
       clk => clk1x, reset => resetCpu,
@@ -748,28 +750,66 @@ begin
       irq_dma      => irq_dma9
    );
 
-   -- TCM stores
-   process (clk1x)
-   begin
-      if rising_edge(clk1x) then
-         if (itcm_we = '1') then
-            for i in 0 to 3 loop
-               if (itcm_be(i) = '1') then
-                  itcm(to_integer(itcm_addr))(i*8 + 7 downto i*8) <= itcm_writedata(i*8 + 7 downto i*8);
-               end if;
-            end loop;
-         end if;
-         if (dtcm_we = '1') then
-            for i in 0 to 3 loop
-               if (dtcm_be(i) = '1') then
-                  dtcm(to_integer(dtcm_addr))(i*8 + 7 downto i*8) <= dtcm_writedata(i*8 + 7 downto i*8);
-               end if;
-            end loop;
-         end if;
-      end if;
-   end process;
-   itcm_readdata <= itcm(to_integer(itcm_addr));
-   dtcm_readdata <= dtcm(to_integer(dtcm_addr));
+   -- TCM stores: M10K. The membus presents address/write combinationally in
+   -- the accept cycle; the BRAM registers the address, so read data is valid
+   -- in the FINISH cycle - same bus timing as the old asynchronous arrays.
+   iitcm : entity MEM.SyncRamDualByteEnable
+   generic map
+   (
+      is_simu     => is_simu,
+      is_cyclone5 => '1',
+      BYTE_WIDTH  => 8,
+      ADDR_WIDTH  => 13,
+      BYTES       => 4
+   )
+   port map
+   (
+      clk       => clk1x,
+      ce_a      => '1',
+      addr_a    => to_integer(itcm_addr),
+      datain_a0 => itcm_writedata( 7 downto  0),
+      datain_a1 => itcm_writedata(15 downto  8),
+      datain_a2 => itcm_writedata(23 downto 16),
+      datain_a3 => itcm_writedata(31 downto 24),
+      dataout_a => itcm_readdata,
+      we_a      => itcm_we,
+      be_a      => itcm_be,
+      ce_b      => '0',
+      addr_b    => 0,
+      datain_b0 => x"00", datain_b1 => x"00", datain_b2 => x"00", datain_b3 => x"00",
+      dataout_b => open,
+      we_b      => '0',
+      be_b      => "0000"
+   );
+
+   idtcm : entity MEM.SyncRamDualByteEnable
+   generic map
+   (
+      is_simu     => is_simu,
+      is_cyclone5 => '1',
+      BYTE_WIDTH  => 8,
+      ADDR_WIDTH  => 12,
+      BYTES       => 4
+   )
+   port map
+   (
+      clk       => clk1x,
+      ce_a      => '1',
+      addr_a    => to_integer(dtcm_addr),
+      datain_a0 => dtcm_writedata( 7 downto  0),
+      datain_a1 => dtcm_writedata(15 downto  8),
+      datain_a2 => dtcm_writedata(23 downto 16),
+      datain_a3 => dtcm_writedata(31 downto 24),
+      dataout_a => dtcm_readdata,
+      we_a      => dtcm_we,
+      be_a      => dtcm_be,
+      ce_b      => '0',
+      addr_b    => 0,
+      datain_b0 => x"00", datain_b1 => x"00", datain_b2 => x"00", datain_b3 => x"00",
+      dataout_b => open,
+      we_b      => '0',
+      be_b      => "0000"
+   );
 
    -- ================= ARM7 CPU + membus =================
    icpu7 : entity work.gba_cpu
@@ -885,19 +925,37 @@ begin
    w7m_be        <= "1111"                     when ld_busy = '1' else w7p_be;
    w7m_writedata <= ld_wr_data                 when ld_busy = '1' else w7p_writedata;
 
-   process (clk1x)
-   begin
-      if rising_edge(clk1x) then
-         if (w7m_we = '1') then
-            for i in 0 to 3 loop
-               if (w7m_be(i) = '1') then
-                  wram7(to_integer(w7m_addr))(i*8 + 7 downto i*8) <= w7m_writedata(i*8 + 7 downto i*8);
-               end if;
-            end loop;
-         end if;
-      end if;
-   end process;
-   w7p_readdata <= wram7(to_integer(w7p_addr));
+   -- M10K store: write capture at the w7m_we edge is identical to the old
+   -- clocked array write; the read side registers the (combinational) membus
+   -- address, so read data lands in the FINISH cycle as before.
+   iwram7 : entity MEM.SyncRamDualByteEnable
+   generic map
+   (
+      is_simu     => is_simu,
+      is_cyclone5 => '1',
+      BYTE_WIDTH  => 8,
+      ADDR_WIDTH  => 14,
+      BYTES       => 4
+   )
+   port map
+   (
+      clk       => clk1x,
+      ce_a      => '1',
+      addr_a    => to_integer(w7m_addr),
+      datain_a0 => w7m_writedata( 7 downto  0),
+      datain_a1 => w7m_writedata(15 downto  8),
+      datain_a2 => w7m_writedata(23 downto 16),
+      datain_a3 => w7m_writedata(31 downto 24),
+      dataout_a => w7p_readdata,
+      we_a      => w7m_we,
+      be_a      => w7m_be,
+      ce_b      => '0',
+      addr_b    => 0,
+      datain_b0 => x"00", datain_b1 => x"00", datain_b2 => x"00", datain_b3 => x"00",
+      dataout_b => open,
+      we_b      => '0',
+      be_b      => "0000"
+   );
 
    -- ================= IO register banks =================
    io_wired_out9  <= irq_wired_out9 or timer_wired_out9 or ipc_wired_out9 or sys_wired_out9 or
@@ -986,7 +1044,7 @@ begin
       clk => clk1x, reset => resetCpu,
       bus7 => io_bus7, wired_out7 => spi_wired_out7, wired_done7 => spi_wired_done7,
       irq_spi => irq7_spi,
-      fw_addr => fw_addr, fw_data => fw_data
+      fw_addr => fw_addr, fw_req => fw_req, fw_done => fw_done, fw_data => fw_data
    );
 
    itimer9 : entity work.gba_timer
@@ -1148,6 +1206,7 @@ begin
    r_objep_addr <= to_unsigned(g_objep_addr, 11);
 
    igpu2d_a : entity work.nds_gpu2d
+   generic map ( is_simu => is_simu )
    port map
    (
       clk => clk1x, reset => resetCpu,
@@ -1200,7 +1259,7 @@ begin
    rb_objep_addr <= to_unsigned(gb_objep_addr, 11);
 
    igpu2d_b : entity work.nds_gpu2d
-   generic map ( is_engine_b => '1' )
+   generic map ( is_engine_b => '1', is_simu => is_simu )
    port map
    (
       clk => clk1x, reset => resetCpu,

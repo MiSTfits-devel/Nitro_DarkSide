@@ -46,11 +46,15 @@ entity nds_membus7 is
       bios_addr      : out unsigned(13 downto 2) := (others => '0');
       bios_data      : in  std_logic_vector(31 downto 0);
 
-      -- ARM7-private WRAM store: comb. read on addr, clocked write on we
-      w7p_addr       : out unsigned(15 downto 2) := (others => '0');
-      w7p_we         : out std_logic := '0';
-      w7p_be         : out std_logic_vector(3 downto 0) := (others => '0');
-      w7p_writedata  : out std_logic_vector(31 downto 0) := (others => '0');
+      -- ARM7-private WRAM store: sync-read BRAM. Address/write presented
+      -- combinationally in the accept cycle; the store registers the address
+      -- (read data valid in the FINISH cycle, same bus timing as the old
+      -- registered-address/asynchronous-read pair) and captures writes at
+      -- the accept edge.
+      w7p_addr       : out unsigned(15 downto 2);
+      w7p_we         : out std_logic;
+      w7p_be         : out std_logic_vector(3 downto 0);
+      w7p_writedata  : out std_logic_vector(31 downto 0);
       w7p_readdata   : in  std_logic_vector(31 downto 0);
 
       -- shared WRAM (nds_wram arm7 port)
@@ -106,9 +110,31 @@ architecture arch of nds_membus7 is
    signal wdata      : std_logic_vector(31 downto 0);
    signal be         : std_logic_vector(3 downto 0);
 
+   signal accept_now : std_logic;
+   signal w7p_sel    : std_logic;
+
    signal din_unrot  : std_logic_vector(31 downto 0);
 
 begin
+
+   -- ================= request accept (combinational mirror of can_accept) =================
+   accept_now <= '1' when reset = '0' and
+                          (state = IDLE or state = FINISH or
+                           (state = W_WRAMSH and wsh_done  = '1') or
+                           (state = W_VRAM   and vram_done = '1') or
+                           (state = W_MAIN   and mr_done   = '1')) else '0';
+
+   -- ================= ARM7-private WRAM store drive =================
+   -- Presented in the accept cycle so the BRAM's internal address register
+   -- takes the role of the old registered w7p_addr: read data is valid in
+   -- the FINISH cycle, writes land at the accept edge (one cycle earlier
+   -- than the old external write process - unobservable, the next request
+   -- is accepted no earlier than the FINISH edge).
+   w7p_sel       <= '1' when (accept_now = '1' and cpu_ena = '1' and dec_target = T_WRAM7) else '0';
+   w7p_addr      <= unsigned(cpu_adr(15 downto 2));
+   w7p_we        <= w7p_sel and not cpu_rnw;
+   w7p_be        <= be;
+   w7p_writedata <= wdata;
 
    -- ================= decode (combinational, sampled at ena) =================
    process (all)
@@ -181,21 +207,13 @@ begin
          wsh_ena  <= '0';
          vram_ena <= '0';
          mr_ena   <= '0';
-         w7p_we   <= '0';
          io_bus.ena <= '0';
          io_bus.rst <= reset;
 
          if (reset = '1') then
             state <= IDLE;
          else
-            case state is
-               when IDLE       => can_accept := true;
-               when FINISH     => can_accept := true;            -- done this cycle
-               when W_WRAMSH   => can_accept := (wsh_done  = '1');
-               when W_VRAM     => can_accept := (vram_done = '1');
-               when W_MAIN     => can_accept := (mr_done   = '1');
-               when W_IO_ALIGN => can_accept := false;
-            end case;
+            can_accept := (accept_now = '1');
 
             if (state = W_IO_ALIGN) then
                if (io_ce_next = '1') then
@@ -216,13 +234,7 @@ begin
                         state     <= FINISH;   -- writes fall through as no-ops
 
                      when T_WRAM7 =>
-                        w7p_addr <= unsigned(cpu_adr(15 downto 2));
-                        if (cpu_rnw = '0') then
-                           w7p_we        <= '1';
-                           w7p_be        <= be;
-                           w7p_writedata <= wdata;
-                        end if;
-                        state <= FINISH;
+                        state <= FINISH;   -- store drive is combinational above
 
                      when T_WRAMSH =>
                         wsh_ena  <= '1';

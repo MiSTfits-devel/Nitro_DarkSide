@@ -209,6 +209,7 @@ begin
    r_objep_addr <= to_unsigned(g_objep_addr, 11);
 
    igpu : entity work.nds_gpu2d
+   generic map ( is_simu => '1' )
    port map
    (
       clk => clk, reset => reset,

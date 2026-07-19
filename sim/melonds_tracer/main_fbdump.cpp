@@ -117,17 +117,24 @@ int main(int argc, char** argv)
     // TRACE9=<path> [TRACE9MAX=<n>] dumps the ARM9 instruction trace
     // (tracer.patch hook) - the debug view for stock-ROM boot issues.
     // TRACE7/TRACE7MAX: same for the ARM7.
-    if (const char* tp = getenv("TRACE9"))
+    // TRACE9STARTFRAME=<n> defers the trace to frame n (divergence hunting
+    // without a multi-GB from-boot trace); same for TRACE7STARTFRAME.
+    const char* trace9path = getenv("TRACE9");
+    const char* trace7path = getenv("TRACE7");
+    int trace9start = 0, trace7start = 0;
+    if (const char* ts = getenv("TRACE9STARTFRAME")) trace9start = atoi(ts);
+    if (const char* ts = getenv("TRACE7STARTFRAME")) trace7start = atoi(ts);
+    if (trace9path)
     {
-        ARM9TraceFile = fopen(tp, "w");
         const char* tm = getenv("TRACE9MAX");
         ARM9TraceMax = tm ? strtoull(tm, nullptr, 0) : 20000000ull;
+        if (trace9start == 0) ARM9TraceFile = fopen(trace9path, "w");
     }
-    if (const char* tp = getenv("TRACE7"))
+    if (trace7path)
     {
-        ARM7TraceFile = fopen(tp, "w");
         const char* tm = getenv("TRACE7MAX");
         ARM7TraceMax = tm ? strtoull(tm, nullptr, 0) : 20000000ull;
+        if (trace7start == 0) ARM7TraceFile = fopen(trace7path, "w");
     }
 
     FILE* d = fopen(dumppath, "w");
@@ -141,6 +148,10 @@ int main(int argc, char** argv)
 
     for (int n = 0; n < frames; n++)
     {
+        if (trace9path && n == trace9start && !ARM9TraceFile)
+            ARM9TraceFile = fopen(trace9path, "w");
+        if (trace7path && n == trace7start && !ARM7TraceFile)
+            ARM7TraceFile = fopen(trace7path, "w");
         nds.RunFrame();
         int fb = nds.GPU.FrontBuffer;
         u32* top = nds.GPU.Framebuffer[fb][0].get();

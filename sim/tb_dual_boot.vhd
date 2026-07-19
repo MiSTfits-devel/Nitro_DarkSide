@@ -353,6 +353,7 @@ begin
    );
 
    imembus9 : entity work.nds_membus9
+   generic map ( is_simu => '1' )
    port map
    (
       clk => clk1x, reset => resetCpu,
@@ -398,10 +399,12 @@ begin
                end if;
             end loop;
          end if;
+         -- sync-read store model (matches the M10K in nds_top; the membus
+         -- presents the address combinationally in the accept cycle)
+         itcm_readdata <= itcm(to_integer(itcm_addr));
+         dtcm_readdata <= dtcm(to_integer(dtcm_addr));
       end if;
    end process;
-   itcm_readdata <= itcm(to_integer(itcm_addr));
-   dtcm_readdata <= dtcm(to_integer(dtcm_addr));
 
    -- ================= ARM7 CPU + membus =================
    icpu7 : entity work.gba_cpu
@@ -459,7 +462,7 @@ begin
       io_bus => io_bus7, io_wired_out => io_wired_out7, io_wired_done => io_wired_done7
    );
 
-   -- ARM7-private WRAM store
+   -- ARM7-private WRAM store (sync-read model, matches the M10K in nds_top)
    process (clk1x)
    begin
       if rising_edge(clk1x) then
@@ -470,9 +473,9 @@ begin
                end if;
             end loop;
          end if;
+         w7p_readdata <= wram7(to_integer(w7p_addr));
       end if;
    end process;
-   w7p_readdata <= wram7(to_integer(w7p_addr));
 
    -- ================= IO register banks =================
    io_wired_out9  <= irq_wired_out9 or timer_wired_out9 or ipc_wired_out9 or sys_wired_out9;

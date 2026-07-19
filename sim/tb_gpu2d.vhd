@@ -102,6 +102,7 @@ begin
    clk <= not clk after 5 ns when not tests_done else '0';
 
    igpu : entity work.nds_gpu2d
+   generic map ( is_simu => '1' )
    port map
    (
       clk             => clk,

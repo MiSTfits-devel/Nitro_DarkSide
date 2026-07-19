@@ -239,6 +239,7 @@ begin
 
    -- ================= bus decoder =================
    imembus : entity work.nds_membus9
+   generic map ( is_simu => '1' )
    port map
    (
       clk => clk1x, reset => reset,
@@ -286,10 +287,12 @@ begin
                end if;
             end loop;
          end if;
+         -- sync-read store model (matches the M10K in nds_top; the membus
+         -- presents the address combinationally in the accept cycle)
+         itcm_readdata <= itcm(to_integer(itcm_addr));
+         dtcm_readdata <= dtcm(to_integer(dtcm_addr));
       end if;
    end process;
-   itcm_readdata <= itcm(to_integer(itcm_addr));
-   dtcm_readdata <= dtcm(to_integer(dtcm_addr));
 
    -- ================= IO register banks =================
    io_wired_out  <= irq_wired_out or timer_wired_out;

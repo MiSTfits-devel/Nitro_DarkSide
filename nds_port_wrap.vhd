@@ -53,7 +53,9 @@ entity nds_port_wrap is
       card_done        : in  std_logic;
 
       -- SPI firmware flash image read port (128 KB, word addressed)
-      fw_addr          : out std_logic_vector(14 downto 0);  -- word address (byte addr 16:2)
+      fw_addr          : out std_logic_vector(15 downto 0);  -- word address (byte addr 17:2)
+      fw_req           : out std_logic;
+      fw_done          : in  std_logic;
       fw_data          : in  std_logic_vector(31 downto 0);
 
       -- main RAM SDRAM request port + scheduler handshake
@@ -104,7 +106,7 @@ architecture arch of nds_port_wrap is
 
    signal pix_x_i, pix_y_i   : integer range 0 to 255;
    signal pixb_x_i, pixb_y_i : integer range 0 to 255;
-   signal fw_addr_u          : unsigned(16 downto 2);
+   signal fw_addr_u          : unsigned(17 downto 2);
    signal vsrv_addr_u        : unsigned(16 downto 2);
    signal vrsrv_addr_u       : unsigned(16 downto 2);
 
@@ -155,6 +157,8 @@ begin
       card_done        => card_done,
 
       fw_addr          => fw_addr_u,
+      fw_req           => fw_req,
+      fw_done          => fw_done,
       fw_data          => fw_data,
 
       mainram_allow    => mainram_allow,

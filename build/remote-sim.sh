@@ -34,10 +34,12 @@ sed "s/nds-nvc-sim/${POD}/g" build/sim-pod.yaml | kubectl -n "$NS" apply -f -
 kubectl -n "$NS" wait --for=condition=Ready "pod/$POD" --timeout=10m
 
 echo "== streaming source (${REF}, dirty=${DIRTY})"
+# NDS.sv/nds_port_wrap.vhd/files.qip live at repo root (M9 wrapper) and are
+# needed by sim/run_analyze_all.sh, which mirrors Quartus's file list.
 if [ "$DIRTY" = "1" ]; then
-   tar -c rtl sim | kubectl -n "$NS" exec -i "$POD" -- tar -x -C /work/src
+   tar -c rtl sim NDS.sv nds_port_wrap.vhd files.qip | kubectl -n "$NS" exec -i "$POD" -- tar -x -C /work/src
 else
-   git archive "$REF" rtl sim | kubectl -n "$NS" exec -i "$POD" -- tar -x -C /work/src
+   git archive "$REF" rtl sim NDS.sv nds_port_wrap.vhd files.qip | kubectl -n "$NS" exec -i "$POD" -- tar -x -C /work/src
 fi
 # env overrides are baked into a wrapper so the pod's sh picks them up
 kubectl -n "$NS" exec -i "$POD" -- sh -c "cat > /work/src/sim/_wrapped.sh" <<EOF

@@ -4,6 +4,9 @@
 # build/remote-build.sh pattern; single revision).
 #
 #   build/remote-build.sh [git-ref]     # default: HEAD
+#   DIRTY=1 build/remote-build.sh       # working tree incl. uncommitted
+#                                       # (same pattern as remote-sim.sh -
+#                                       # measurement builds without a commit)
 #
 # Environment:
 #   NS=default     kubernetes namespace
@@ -17,6 +20,7 @@ set -euo pipefail
 REF="${1:-HEAD}"
 NS="${NS:-default}"
 PARALLEL="${PARALLEL:-8}"
+DIRTY="${DIRTY:-0}"
 POD="nds-quartus-build"
 
 cd "$(git rev-parse --show-toplevel)"
@@ -27,9 +31,15 @@ kubectl -n "$NS" apply -f build/quartus-pod.yaml
 # first run pulls a multi-GB image, give it time
 kubectl -n "$NS" wait --for=condition=Ready "pod/$POD" --timeout=20m
 
-echo "== streaming source (${REF})"
-git archive "$REF" rtl sys NDS.qpf NDS.qsf NDS.sdc NDS.sv nds_port_wrap.vhd files.qip \
-   | kubectl -n "$NS" exec -i "$POD" -- tar -x -C /work/src
+echo "== streaming source (${REF}, dirty=${DIRTY})"
+# clash/ carries the checked-in Clash-generated SV that NDS.qsf sources
+if [ "$DIRTY" = "1" ]; then
+   tar -c rtl sys clash NDS.qpf NDS.qsf NDS.sdc NDS.sv nds_port_wrap.vhd files.qip \
+      | kubectl -n "$NS" exec -i "$POD" -- tar -x -C /work/src
+else
+   git archive "$REF" rtl sys clash NDS.qpf NDS.qsf NDS.sdc NDS.sv nds_port_wrap.vhd files.qip \
+      | kubectl -n "$NS" exec -i "$POD" -- tar -x -C /work/src
+fi
 kubectl -n "$NS" exec "$POD" -- bash -c "echo ${PARALLEL} > /work/src/.parallel && touch /work/src/.ready"
 
 echo "== compiling (this takes a while - fitter on Cyclone V is slow)"
