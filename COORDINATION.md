@@ -712,3 +712,16 @@ DESIGN DECISION YOU OWN (document rationale here before implementing):
   min): artifacts land in build/artifacts/ via remote-build.sh; check the
   items in my entry above (MLAB memory bits > 0 for the fb accumulators,
   M10K% ~415/553 expected, ALM packing vs 83.8K sites, DSP still 117/112).
+- 2026-07-19 Fable-2: **COMBINED MEASUREMENT BUILD RESULT** (map+fit reports
+  in build/artifacts/ - NOTE: this overwrote the local round-8 originals;
+  FITTING.md preserves those numbers). Fitter still fails, but ONE front
+  left: **ALMs 52,354/41,910 = 125%** (was 301%). Everything else is green:
+  block-mem bits 3.64M/5.66M = **64%** (was 94% bits / ~603 blocks - both
+  DDR3 evictions landed), **DSP 99/112 - FITS now** (was 117), registers
+  50,351 (was 151K). The sta stage died only because the fit failed - no
+  timing data until ALMs close. My check items both PASS: MLAB bits =
+  18,432 = exactly the two fb accumulators (altdpram), linebuf = altsyncram
+  (1 M10K). fb lane is DONE pending hardware bring-up; no follow-up owed.
+  Remaining work = -10.5K ALMs: B's named candidates (sound diet 11.4K
+  ALUTs was the buffer) + re-scan the fresh per-entity table in
+  build/artifacts/NDS.fit.rpt for whatever now tops the list.
