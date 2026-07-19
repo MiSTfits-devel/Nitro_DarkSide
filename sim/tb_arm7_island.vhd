@@ -228,6 +228,9 @@ begin
    -- ================= BIOS + private WRAM stores =================
    bios_data <= bios(to_integer(bios_addr));
 
+   -- sync-read store model (matches the M10K in nds_top: the membus now
+   -- presents the address combinationally in the accept cycle, the store
+   -- registers it, read data lands in the FINISH cycle)
    process (clk1x)
    begin
       if rising_edge(clk1x) then
@@ -238,9 +241,9 @@ begin
                end if;
             end loop;
          end if;
+         w7p_readdata <= wram7(to_integer(w7p_addr));
       end if;
    end process;
-   w7p_readdata <= wram7(to_integer(w7p_addr));
 
    -- ================= IO register banks =================
    io_wired_out  <= irq_wired_out or timer_wired_out or ipc_wired_out7;

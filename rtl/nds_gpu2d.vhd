@@ -28,6 +28,8 @@ library IEEE;
 use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
 
+library MEM;
+
 use work.pProc_bus_gba.all;
 use work.pRegmap_gba.all;
 use work.pReg_nds_display.all;
@@ -39,7 +41,8 @@ entity nds_gpu2d is
       -- 1D-bitmap OBJ boundary bit and the large/VRAM/FIFO display modes;
       -- its register window (0x1000 offset), palette/OAM halves and VRAM
       -- channels are selected by the integration
-      is_engine_b : std_logic := '0'
+      is_engine_b : std_logic := '0';
+      is_simu     : std_logic := '0'
    );
    port
    (
@@ -252,10 +255,10 @@ architecture arch of nds_gpu2d is
    signal obj_busy        : std_logic;
 
    -- ================= memories =================
-   type t_pal is array (0 to 255) of std_logic_vector(31 downto 0);
-   signal palram : t_pal := (others => (others => '0'));
-   type t_oam is array (0 to 255) of std_logic_vector(31 downto 0);
-   signal oamram : t_oam := (others => (others => '0'));
+   -- palette RAM: two identical M10K copies (the CPU writes both), one read
+   -- port each for the OBJ drawer and the BG palette service; the backdrop
+   -- color (palette entry 0) is snooped into a register on CPU writes.
+   -- OAM is a single M10K (CPU write / OBJ drawer read).
 
    type t_bgep is array (0 to 8191) of std_logic_vector(31 downto 0);
    signal bgep_shadow : t_bgep := (others => (others => '0'));
@@ -267,19 +270,44 @@ architecture arch of nds_gpu2d is
    signal epfill_addr  : integer range 0 to 8191 := 0;
 
    -- ================= line buffers =================
-   type t_linebuf is array (0 to 255) of std_logic_vector(15 downto 0);
-   signal lb_bg : t_pix_arr;   -- registered read data per BG
-   type t_lb_arr is array (0 to 3) of t_linebuf;
-   signal linebuf_bg : t_lb_arr := (others => (others => x"8000"));
+   -- BG line buffers: one M10K per BG. Port A takes the drawer's pixel
+   -- writes; port B is the per-line clear sweep during LDRAW (suppressed on
+   -- a same-cycle same-index pixel write - the pixel wins, exactly the old
+   -- single-process resolution) and the merge read during LMERGE. The two
+   -- port-B roles are phase-disjoint: LMERGE requires clear_addr = 256.
+   signal lb_bg    : t_pix_arr;   -- merge read data per BG (port B q)
+   type t_q32_arr is array (0 to 3) of std_logic_vector(31 downto 0);
+   signal lb_bg_q32 : t_q32_arr;
+   signal obj_q32   : std_logic_vector(31 downto 0);
+   signal lb_we    : std_logic_vector(0 to 3);
+   signal lb_wa    : t_x_arr;
+   signal lb_wd    : t_pix_arr;
+   signal lb_clrwe : std_logic_vector(0 to 3);
+   signal lb_baddr : integer range 0 to 255;
 
-   type t_objcol_buf is array (0 to 255) of std_logic_vector(15 downto 0);
-   type t_objset_buf is array (0 to 255) of std_logic_vector(7 downto 0);
-   type t_objcol_arr is array (0 to 1) of t_objcol_buf;
-   type t_objset_arr is array (0 to 1) of t_objset_buf;
-   signal linebuf_objcol : t_objcol_arr := (others => (others => x"8000"));
-   signal linebuf_objset : t_objset_arr := (others => (others => x"00"));
+   -- OBJ double buffers: col/set are one M10K each (2 rows x 256, address =
+   -- row*256+x); objwnd stays in flops (512 bits). The BRAM contents are
+   -- never cleared - per-row VALID BITMASKS in flops (cleared in one cycle
+   -- on drawObj, exactly the old whole-row-clear semantics, so no clear-vs-
+   -- draw race exists by construction) and the merge substitutes the old
+   -- clear values for invalid pixels.
+   signal objcol_q    : std_logic_vector(15 downto 0);
+   signal objset_q    : std_logic_vector(7 downto 0);
+   signal objcol_we   : std_logic;
+   signal objset_we   : std_logic;
+   signal objb_wa_col : integer range 0 to 511;
+   signal objb_wa_set : integer range 0 to 511;
+   signal objcol_wd   : std_logic_vector(15 downto 0);
+   signal objset_wd   : std_logic_vector(7 downto 0);
+   signal objb_ra     : integer range 0 to 511;
+   signal mrg_objcol_eff : std_logic_vector(15 downto 0);
+   signal mrg_objset_eff : std_logic_vector(7 downto 0);
+   signal mrg_objcolv    : std_logic;
+   signal mrg_objsetv    : std_logic;
    type t_objwnd_arr is array (0 to 1) of std_logic_vector(0 to 255);
-   signal linebuf_objwnd : t_objwnd_arr := (others => (others => '0'));
+   signal linebuf_objwnd  : t_objwnd_arr := (others => (others => '0'));
+   signal linebuf_objcolv : t_objwnd_arr := (others => (others => '0'));
+   signal linebuf_objsetv : t_objwnd_arr := (others => (others => '0'));
 
    -- ================= line FSM =================
    type t_linestate is (LIDLE, LDRAW, LMERGE, LFLUSH);
@@ -656,28 +684,86 @@ begin
    );
 
    -- ================= palette / OAM =================
-   -- CPU writes; OBJ palette/ext-pal/OAM reads are plain registered reads
+   -- M10K stores; the drawer-side reads keep their 1-cycle registered-read
+   -- timing (the BRAM registers the address, q is unregistered)
+   ipal_obj : entity MEM.SyncRamDualByteEnable
+   generic map ( is_simu => is_simu, is_cyclone5 => '1',
+                 BYTE_WIDTH => 8, ADDR_WIDTH => 8, BYTES => 4 )
+   port map
+   (
+      clk       => clk,
+      ce_a      => '1',
+      addr_a    => pal_addr,
+      datain_a0 => pal_din( 7 downto  0),
+      datain_a1 => pal_din(15 downto  8),
+      datain_a2 => pal_din(23 downto 16),
+      datain_a3 => pal_din(31 downto 24),
+      dataout_a => open,
+      we_a      => pal_we,
+      be_a      => pal_be,
+      ce_b      => '1',
+      addr_b    => 128 + obj_pal_addr,
+      datain_b0 => x"00", datain_b1 => x"00", datain_b2 => x"00", datain_b3 => x"00",
+      dataout_b => obj_pal_data,
+      we_b      => '0',
+      be_b      => "0000"
+   );
+
+   ipal_bg : entity MEM.SyncRamDualByteEnable
+   generic map ( is_simu => is_simu, is_cyclone5 => '1',
+                 BYTE_WIDTH => 8, ADDR_WIDTH => 8, BYTES => 4 )
+   port map
+   (
+      clk       => clk,
+      ce_a      => '1',
+      addr_a    => pal_addr,
+      datain_a0 => pal_din( 7 downto  0),
+      datain_a1 => pal_din(15 downto  8),
+      datain_a2 => pal_din(23 downto 16),
+      datain_a3 => pal_din(31 downto 24),
+      dataout_a => open,
+      we_a      => pal_we,
+      be_a      => pal_be,
+      ce_b      => '1',
+      addr_b    => bgp_addr(to_integer(pal_serve_cnt)),
+      datain_b0 => x"00", datain_b1 => x"00", datain_b2 => x"00", datain_b3 => x"00",
+      dataout_b => bgp_data,
+      we_b      => '0',
+      be_b      => "0000"
+   );
+
+   ioam : entity MEM.SyncRamDualByteEnable
+   generic map ( is_simu => is_simu, is_cyclone5 => '1',
+                 BYTE_WIDTH => 8, ADDR_WIDTH => 8, BYTES => 4 )
+   port map
+   (
+      clk       => clk,
+      ce_a      => '1',
+      addr_a    => oam_addr,
+      datain_a0 => oam_din( 7 downto  0),
+      datain_a1 => oam_din(15 downto  8),
+      datain_a2 => oam_din(23 downto 16),
+      datain_a3 => oam_din(31 downto 24),
+      dataout_a => open,
+      we_a      => oam_we,
+      be_a      => oam_be,
+      ce_b      => '1',
+      addr_b    => obj_oam_addr,
+      datain_b0 => x"00", datain_b1 => x"00", datain_b2 => x"00", datain_b3 => x"00",
+      dataout_b => obj_oam_data,
+      we_b      => '0',
+      be_b      => "0000"
+   );
+
+   -- backdrop = palette entry 0, snooped on CPU writes (bit 15 stays '0')
    process (clk)
    begin
       if rising_edge(clk) then
-         if (pal_we = '1') then
-            for b in 0 to 3 loop
-               if (pal_be(b) = '1') then
-                  palram(pal_addr)(b*8+7 downto b*8) <= pal_din(b*8+7 downto b*8);
-               end if;
-            end loop;
+         if (pal_we = '1' and pal_addr = 0) then
+            if (pal_be(0) = '1') then backdrop( 7 downto 0) <= pal_din( 7 downto 0); end if;
+            if (pal_be(1) = '1') then backdrop(14 downto 8) <= pal_din(14 downto 8); end if;
          end if;
-         if (oam_we = '1') then
-            for b in 0 to 3 loop
-               if (oam_be(b) = '1') then
-                  oamram(oam_addr)(b*8+7 downto b*8) <= oam_din(b*8+7 downto b*8);
-               end if;
-            end loop;
-         end if;
-         obj_oam_data <= oamram(obj_oam_addr);
-         obj_pal_data <= palram(128 + obj_pal_addr);
-         obj_ep_data  <= objep_shadow(obj_ep_addr);
-         backdrop     <= '0' & palram(0)(14 downto 0);
+         obj_ep_data <= objep_shadow(obj_ep_addr);
       end if;
    end process;
 
@@ -690,11 +776,12 @@ begin
                       ep_addr_ext(i)  when (i >= 2 and bgtype(i) = 3) else 0;
    end generate;
 
+   -- bgp_data comes from ipal_bg's port B: the address is registered at the
+   -- same edge the valid flag is set, so data and valid still land together
    process (clk)
    begin
       if rising_edge(clk) then
          pal_serve_cnt <= pal_serve_cnt + 1;
-         bgp_data  <= palram(bgp_addr(to_integer(pal_serve_cnt)));
          bgep_data <= bgep_shadow(bgep_addr(to_integer(pal_serve_cnt)));
          bgp_valid  <= (others => '0');
          bgep_valid <= (others => '0');
@@ -828,59 +915,152 @@ begin
    end process;
 
    -- ================= line buffers =================
+   -- BG write-port mux (mirrors the old per-BG if-chain); the clear write is
+   -- suppressed on a same-cycle same-index pixel write - the pixel wins,
+   -- exactly the old single-process resolution
+   process (all)
+      variable we : std_logic;
+      variable wa : integer range 0 to 255;
+      variable wd : std_logic_vector(15 downto 0);
+   begin
+      for i in 0 to 3 loop
+         we := '0';
+         wa := 0;
+         wd := (others => '0');
+         if (i < 2 or bgtype(i) = 1) then
+            we := pix_we_text(i);
+            wa := pixx_text(i);
+            wd := pix_text(i);
+         elsif (bgtype(i) = 2) then
+            we := pix_we_aff(i);
+            wa := pixx_aff(i);
+            wd := pix_aff(i);
+         elsif (bgtype(i) = 3) then
+            we := pix_we_ext(i);
+            wa := pixx_ext(i);
+            wd := pix_ext(i);
+         end if;
+         lb_we(i) <= we;
+         lb_wa(i) <= wa;
+         lb_wd(i) <= wd;
+         if (clear_addr < 256 and not (we = '1' and wa = clear_addr)) then
+            lb_clrwe(i) <= '1';
+         else
+            lb_clrwe(i) <= '0';
+         end if;
+      end loop;
+   end process;
+
+   -- port B carries the clear sweep during LDRAW, the merge read during
+   -- LMERGE (disjoint: LMERGE requires clear_addr = 256)
+   lb_baddr <= clear_addr when clear_addr < 256 else merge_x mod 256;
+
+   gen_lb : for i in 0 to 3 generate
+   begin
+      -- SyncRamDualByteEnable, not SyncRamDual: the latter's shared-array
+      -- dual-port process is un-inferable for Quartus 17 (falls back to
+      -- ~4.1K flops + 5.8K ALUTs per buffer); this one instantiates
+      -- altsyncram directly on Cyclone V. Its cyclone5 path only supports
+      -- BYTES=4, so the pixel sits in lanes 0-1 of a 32-bit word.
+      ilb : entity MEM.SyncRamDualByteEnable
+      generic map ( is_simu => is_simu, is_cyclone5 => '1',
+                    BYTE_WIDTH => 8, ADDR_WIDTH => 8, BYTES => 4 )
+      port map
+      (
+         clk       => clk,
+         ce_a      => '1',
+         addr_a    => lb_wa(i),
+         datain_a0 => lb_wd(i)(7 downto 0),
+         datain_a1 => lb_wd(i)(15 downto 8),
+         datain_a2 => x"00", datain_a3 => x"00",
+         dataout_a => open,
+         we_a      => lb_we(i),
+         be_a      => "0011",
+         ce_b      => '1',
+         addr_b    => lb_baddr,
+         datain_b0 => x"00",
+         datain_b1 => x"80",
+         datain_b2 => x"00", datain_b3 => x"00",
+         dataout_b => lb_bg_q32(i),
+         we_b      => lb_clrwe(i),
+         be_b      => "0011"
+      );
+      lb_bg(i) <= lb_bg_q32(i)(15 downto 0);
+   end generate;
+
+   -- OBJ buffer writes: drawer only, no clear traffic (validity is tracked
+   -- in the flop bitmasks below)
+   objcol_we   <= obj_we_color;
+   objset_we   <= obj_we_settings;
+   objb_wa_col <= (linecounter_obj mod 2) * 256 + obj_x;
+   objb_wa_set <= (linecounter_obj mod 2) * 256 + obj_x;
+   objcol_wd   <= obj_color;
+   objset_wd   <= obj_settings;
+
+   objb_ra <= (cur_y mod 2) * 256 + (merge_x mod 256);
+
+   -- col in lanes 0-1, set in lane 2 of one 32-bit store: one BRAM instead
+   -- of two, and the BYTES=4-only cyclone5 path is satisfied
+   iobjbuf : entity MEM.SyncRamDualByteEnable
+   generic map ( is_simu => is_simu, is_cyclone5 => '1',
+                 BYTE_WIDTH => 8, ADDR_WIDTH => 9, BYTES => 4 )
+   port map
+   (
+      clk       => clk,
+      ce_a      => '1',
+      addr_a    => objb_wa_col,
+      datain_a0 => objcol_wd(7 downto 0),
+      datain_a1 => objcol_wd(15 downto 8),
+      datain_a2 => objset_wd,
+      datain_a3 => x"00",
+      dataout_a => open,
+      we_a      => objcol_we or objset_we,
+      be_a      => '0' & objset_we & objcol_we & objcol_we,
+      ce_b      => '1',
+      addr_b    => objb_ra,
+      datain_b0 => x"00", datain_b1 => x"00",
+      datain_b2 => x"00", datain_b3 => x"00",
+      dataout_b => obj_q32,
+      we_b      => '0',
+      be_b      => "0000"
+   );
+   objcol_q <= obj_q32(15 downto 0);
+   objset_q <= obj_q32(23 downto 16);
+
+   -- merge-side data: BRAM q gated by the valid masks - an invalid pixel
+   -- reads as the old clear values (transparent color, zero settings). The
+   -- mask read is registered on the same edge that latches the BRAM q, so
+   -- both arrive together (the old registered-read timing).
+   mrg_objcol_eff <= objcol_q when mrg_objcolv = '1' else x"8000";
+   mrg_objset_eff <= objset_q when mrg_objsetv = '1' else x"00";
+   mrg_obj        <= mrg_objset_eff & mrg_objcol_eff;
+
+   -- objwnd + the col/set valid masks: flop double buffers (3 x 512 bits),
+   -- one-cycle row clear on drawObj (per-element loop - the Quartus-safe
+   -- shape for a dynamically-indexed row clear), registered merge reads
    process (clk)
    begin
       if rising_edge(clk) then
-         -- clear pass runs right after drawline, concurrent with the drawers;
-         -- the clear index (1/cycle from drawline) always leads any drawer's
-         -- write index (first write needs a fetch round trip), and a same-
-         -- cycle same-index collision resolves to the pixel write below
-         if (clear_addr < 256) then
-            for i in 0 to 3 loop
-               linebuf_bg(i)(clear_addr) <= x"8000";
-            end loop;
-         end if;
-         for i in 0 to 3 loop
-            if (i < 2 or bgtype(i) = 1) then
-               if (pix_we_text(i) = '1') then
-                  linebuf_bg(i)(pixx_text(i)) <= pix_text(i);
-               end if;
-            elsif (bgtype(i) = 2) then
-               if (pix_we_aff(i) = '1') then
-                  linebuf_bg(i)(pixx_aff(i)) <= pix_aff(i);
-               end if;
-            elsif (bgtype(i) = 3) then
-               if (pix_we_ext(i) = '1') then
-                  linebuf_bg(i)(pixx_ext(i)) <= pix_ext(i);
-               end if;
-            end if;
-         end loop;
-
-         -- OBJ double buffers: clear the parity buffer on drawObj, then
-         -- collect (the OBJ drawer spends >256 cycles in OAM scan first)
          if (drawObj = '1') then
-            linebuf_objcol(linecounter_obj mod 2) <= (others => x"8000");
-            linebuf_objset(linecounter_obj mod 2) <= (others => x"00");
-            linebuf_objwnd(linecounter_obj mod 2) <= (others => '0');
+            for i in 0 to 255 loop
+               linebuf_objwnd(linecounter_obj mod 2)(i)  <= '0';
+               linebuf_objcolv(linecounter_obj mod 2)(i) <= '0';
+               linebuf_objsetv(linecounter_obj mod 2)(i) <= '0';
+            end loop;
          else
-            if (obj_we_color = '1') then
-               linebuf_objcol(linecounter_obj mod 2)(obj_x) <= obj_color;
-            end if;
-            if (obj_we_settings = '1') then
-               linebuf_objset(linecounter_obj mod 2)(obj_x) <= obj_settings;
-            end if;
             if (obj_objwnd = '1') then
                linebuf_objwnd(linecounter_obj mod 2)(obj_x) <= '1';
             end if;
+            if (obj_we_color = '1') then
+               linebuf_objcolv(linecounter_obj mod 2)(obj_x) <= '1';
+            end if;
+            if (obj_we_settings = '1') then
+               linebuf_objsetv(linecounter_obj mod 2)(obj_x) <= '1';
+            end if;
          end if;
-
-         -- registered merge-side reads
-         for i in 0 to 3 loop
-            lb_bg(i) <= linebuf_bg(i)(merge_x mod 256);
-         end loop;
-         mrg_obj    <= linebuf_objset(cur_y mod 2)(merge_x mod 256)
-                       & linebuf_objcol(cur_y mod 2)(merge_x mod 256);
-         mrg_objwnd <= linebuf_objwnd(cur_y mod 2)(merge_x mod 256);
+         mrg_objwnd  <= linebuf_objwnd(cur_y mod 2)(merge_x mod 256);
+         mrg_objcolv <= linebuf_objcolv(cur_y mod 2)(merge_x mod 256);
+         mrg_objsetv <= linebuf_objsetv(cur_y mod 2)(merge_x mod 256);
       end if;
    end process;
 

@@ -48,6 +48,7 @@ set_global_assignment -name VHDL_FILE rtl/nds_bios9.vhd
 set_global_assignment -name VHDL_FILE rtl/nds_top.vhd
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ddram.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/nds_fb_ddr3.sv
 set_global_assignment -name VHDL_FILE nds_port_wrap.vhd
 set_global_assignment -name SYSTEMVERILOG_FILE NDS.sv
 set_global_assignment -name SDC_FILE NDS.sdc

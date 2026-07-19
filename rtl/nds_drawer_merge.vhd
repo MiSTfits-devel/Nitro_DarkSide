@@ -102,6 +102,13 @@ end entity;
 
 architecture arch of nds_drawer_merge is
 
+   -- the blend/brightness products here are 6x5-bit — force them into ALM
+   -- logic: DSP blocks are over budget chip-wide (map wants 117 of 112) and
+   -- these are the cheapest 9-per-engine to reclaim (Quartus attribute;
+   -- ignored by nvc)
+   attribute multstyle : string;
+   attribute multstyle of arch : architecture is "logic";
+
    constant BG0 : integer := 0;
    constant BG1 : integer := 1;
    constant BG2 : integer := 2;

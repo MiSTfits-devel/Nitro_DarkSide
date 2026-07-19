@@ -36,9 +36,14 @@ entity nds_spi is
 
       irq_spi     : out std_logic := '0';   -- one-cycle pulse (ARM7 IRQ bit 23)
 
-      -- firmware image read port (128 KB, word addressed; the integration
-      -- serves it combinationally or with 1-cycle latency)
-      fw_addr     : out unsigned(16 downto 2) := (others => '0');
+      -- firmware image read port (256 KB, word addressed). fw_req pulses
+      -- one cycle with a fresh fw_addr; the backing store answers with
+      -- fw_done + valid fw_data any number of cycles later (BRAM: 1 cycle,
+      -- DDR3 pager: tens). The SPI byte busy window stretches until the
+      -- word arrives, so any latency is architecturally invisible.
+      fw_addr     : out unsigned(17 downto 2) := (others => '0');
+      fw_req      : out std_logic := '0';
+      fw_done     : in  std_logic;
       fw_data     : in  std_logic_vector(31 downto 0)
    );
 end entity;
@@ -79,8 +84,7 @@ architecture arch of nds_spi is
    signal fw_a       : unsigned(23 downto 0) := (others => '0');
    signal fw_out     : std_logic_vector(7 downto 0) := (others => '0');
    signal fw_status  : std_logic_vector(7 downto 0) := (others => '0');
-   signal fw_fetch   : std_logic := '0';   -- byte fetch pending during busy window
-   signal fw_fetch_1 : std_logic := '0';
+   signal fw_pend    : std_logic := '0';   -- word fetch outstanding (holds busy)
    signal fw_lane    : unsigned(1 downto 0) := (others => '0');
 
    -- touchscreen
@@ -121,18 +125,19 @@ begin
             fw_hold    <= '0';
             fw_status  <= (others => '0');
             fw_out     <= (others => '0');
-            fw_fetch   <= '0';
-            fw_fetch_1 <= '0';
+            fw_pend    <= '0';
+            fw_req     <= '0';
             tsc_ctrl   <= (others => '0');
             tsc_data   <= (others => '0');
             tsc_conv   <= (others => '0');
          else
 
-            -- firmware byte fetch: address was registered at transfer start,
-            -- data lands two cycles later (well inside the busy window)
-            fw_fetch_1 <= fw_fetch;
-            fw_fetch   <= '0';
-            if (fw_fetch_1 = '1') then
+            -- firmware word fetch: request issued at transfer start, byte
+            -- lane latched whenever the backing store answers (the busy
+            -- window below waits for fw_pend to clear)
+            fw_req <= '0';
+            if (fw_pend = '1' and fw_done = '1') then
+               fw_pend <= '0';
                case fw_lane is
                   when "00" => fw_out <= fw_data( 7 downto  0);
                   when "01" => fw_out <= fw_data(15 downto  8);
@@ -141,9 +146,9 @@ begin
                end case;
             end if;
 
-            -- transfer completion
+            -- transfer completion (held while a firmware fetch is in flight)
             if (cnt(7) = '1') then
-               if (delay_cnt = 0) then
+               if (delay_cnt = 0 and fw_pend = '0') then
                   cnt(7) <= '0';
                   if (cnt(14) = '1') then
                      irq_spi <= '1';
@@ -233,10 +238,12 @@ begin
                                     fw_a   <= fw_a(15 downto 0) & unsigned(wval);
                                     fw_out <= (others => '0');
                                  else
-                                    -- serve fw[addr & 0x1FFFF], addr++
-                                    fw_addr  <= fw_a(16 downto 2);
+                                    -- serve fw[addr & 0x3FFFF], addr++ (2 Mbit
+                                    -- chip mirror-wraps at 256 KB)
+                                    fw_addr  <= fw_a(17 downto 2);
                                     fw_lane  <= fw_a(1 downto 0);
-                                    fw_fetch <= '1';
+                                    fw_req   <= '1';
+                                    fw_pend  <= '1';
                                     fw_a     <= fw_a + 1;
                                  end if;
                                  if (fw_datapos /= 7) then

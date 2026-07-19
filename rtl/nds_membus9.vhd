@@ -23,6 +23,10 @@ use IEEE.numeric_std.all;
 use work.pProc_bus_gba.all;
 
 entity nds_membus9 is
+   generic
+   (
+      is_simu : std_logic := '0'
+   );
    port
    (
       clk            : in  std_logic;
@@ -61,18 +65,20 @@ entity nds_membus9 is
       cpu_din        : out std_logic_vector(31 downto 0);
       cpu_done       : out std_logic;
 
-      -- ITCM store (32 KB)
-      itcm_addr      : out unsigned(14 downto 2) := (others => '0');
-      itcm_we        : out std_logic := '0';
-      itcm_be        : out std_logic_vector(3 downto 0) := (others => '0');
-      itcm_writedata : out std_logic_vector(31 downto 0) := (others => '0');
+      -- ITCM store (32 KB): sync-read BRAM, addr/write presented
+      -- combinationally in the accept cycle (the store registers the
+      -- address; read data valid in the FINISH cycle)
+      itcm_addr      : out unsigned(14 downto 2);
+      itcm_we        : out std_logic;
+      itcm_be        : out std_logic_vector(3 downto 0);
+      itcm_writedata : out std_logic_vector(31 downto 0);
       itcm_readdata  : in  std_logic_vector(31 downto 0);
 
-      -- DTCM store (16 KB)
-      dtcm_addr      : out unsigned(13 downto 2) := (others => '0');
-      dtcm_we        : out std_logic := '0';
-      dtcm_be        : out std_logic_vector(3 downto 0) := (others => '0');
-      dtcm_writedata : out std_logic_vector(31 downto 0) := (others => '0');
+      -- DTCM store (16 KB): same timing contract as the ITCM store
+      dtcm_addr      : out unsigned(13 downto 2);
+      dtcm_we        : out std_logic;
+      dtcm_be        : out std_logic_vector(3 downto 0);
+      dtcm_writedata : out std_logic_vector(31 downto 0);
       dtcm_readdata  : in  std_logic_vector(31 downto 0);
 
       -- boot ROM store (32 KB at 0xFFFF0000, read-only)
@@ -148,6 +154,10 @@ architecture arch of nds_membus9 is
    signal wdata      : std_logic_vector(31 downto 0);
    signal be         : std_logic_vector(3 downto 0);
 
+   signal accept_now : std_logic;
+   signal itcm_sel   : std_logic;
+   signal dtcm_sel   : std_logic;
+
    signal din_unrot  : std_logic_vector(31 downto 0);
 
    -- cache <-> CPU-request side (main RAM only; the cache owns the mr_* port)
@@ -164,6 +174,10 @@ architecture arch of nds_membus9 is
 begin
 
    icache : entity work.nds_cache9
+   generic map
+   (
+      is_simu => is_simu
+   )
    port map
    (
       clk           => clk,
@@ -189,6 +203,31 @@ begin
       op_addr       => cache_op_addr,
       op_busy       => cache_op_busy
    );
+
+   -- ================= request accept (combinational mirror of can_accept) =================
+   accept_now <= '1' when reset = '0' and
+                          (state = IDLE or state = FINISH or
+                           (state = W_WRAMSH and wsh_done   = '1') or
+                           (state = W_VRAM   and vram_done  = '1') or
+                           (state = W_MAIN   and cresp_done = '1')) else '0';
+
+   -- ================= TCM store drive =================
+   -- Presented in the accept cycle so the BRAM's internal address register
+   -- takes the role of the old registered itcm_addr/dtcm_addr: read data is
+   -- valid in the FINISH cycle, writes land at the accept edge (one cycle
+   -- earlier than the old external write process - unobservable, the next
+   -- request is accepted no earlier than the FINISH edge).
+   itcm_sel       <= '1' when (accept_now = '1' and cpu_ena = '1' and dec_target = T_ITCM) else '0';
+   itcm_addr      <= unsigned(cpu_adr(14 downto 2));
+   itcm_we        <= itcm_sel and not cpu_rnw;
+   itcm_be        <= be;
+   itcm_writedata <= wdata;
+
+   dtcm_sel       <= '1' when (accept_now = '1' and cpu_ena = '1' and dec_target = T_DTCM) else '0';
+   dtcm_addr      <= unsigned(cpu_adr(13 downto 2));
+   dtcm_we        <= dtcm_sel and not cpu_rnw;
+   dtcm_be        <= be;
+   dtcm_writedata <= wdata;
 
    -- ================= TCM decode =================
    process (all)
@@ -288,8 +327,6 @@ begin
          wsh_ena  <= '0';
          vram_ena <= '0';
          creq_ena <= '0';
-         itcm_we  <= '0';
-         dtcm_we  <= '0';
          pal_we   <= '0';
          oam_we   <= '0';
          io_bus.ena <= '0';
@@ -298,14 +335,7 @@ begin
          if (reset = '1') then
             state <= IDLE;
          else
-            case state is
-               when IDLE       => can_accept := true;
-               when FINISH     => can_accept := true;
-               when W_WRAMSH   => can_accept := (wsh_done  = '1');
-               when W_VRAM     => can_accept := (vram_done = '1');
-               when W_MAIN     => can_accept := (cresp_done = '1');
-               when W_IO_ALIGN => can_accept := false;
-            end case;
+            can_accept := (accept_now = '1');
 
             if (state = W_IO_ALIGN) then
                if (io_ce_next = '1') then
@@ -322,22 +352,10 @@ begin
                   case dec_target is
 
                      when T_ITCM =>
-                        itcm_addr <= unsigned(cpu_adr(14 downto 2));
-                        if (cpu_rnw = '0') then
-                           itcm_we        <= '1';
-                           itcm_be        <= be;
-                           itcm_writedata <= wdata;
-                        end if;
-                        state <= FINISH;
+                        state <= FINISH;   -- store drive is combinational above
 
                      when T_DTCM =>
-                        dtcm_addr <= unsigned(cpu_adr(13 downto 2));
-                        if (cpu_rnw = '0') then
-                           dtcm_we        <= '1';
-                           dtcm_be        <= be;
-                           dtcm_writedata <= wdata;
-                        end if;
-                        state <= FINISH;
+                        state <= FINISH;   -- store drive is combinational above
 
                      when T_BROM =>
                         brom_addr <= unsigned(cpu_adr(14 downto 2));

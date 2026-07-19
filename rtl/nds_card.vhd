@@ -119,6 +119,15 @@ architecture arch of nds_card is
    -- later via generics + HPS save loading. Fresh save = 0xFF fill.
    type t_sram is array (0 to 8191) of std_logic_vector(7 downto 0);
    signal sram        : t_sram := (others => (others => '1'));
+   -- dedicated M10K access ports (the array must not be touched anywhere
+   -- else, or Quartus falls back to registers): registered read at the
+   -- current sram_addr - stable for the whole >= 64-cycle SPI busy window
+   -- before any use, so sram_q always equals the old asynchronous read.
+   -- Writes are staged one cycle (also invisible behind the busy window).
+   signal sram_q      : std_logic_vector(7 downto 0);
+   signal sram_we_r   : std_logic := '0';
+   signal sram_wa_r   : integer range 0 to 8191 := 0;
+   signal sram_wd_r   : std_logic_vector(7 downto 0) := (others => '0');
    signal spi_data    : std_logic_vector(7 downto 0) := (others => '0');  -- AUXSPIDATA readback
    signal spi_hold    : std_logic := '0';
    signal spi_pos     : unsigned(15 downto 0) := (others => '0');
@@ -162,6 +171,21 @@ begin
                             bus7.Adr = ADR_CMD0 or bus7.Adr = ADR_CMD4 or
                             bus7.Adr(27 downto 4) = x"00001B" or bus7.Adr = ADR_DATA) else '0';
 
+   -- ================= backup store (M10K) =================
+   -- Canonical simple-dual-port template (write, then registered read) so
+   -- Quartus infers block RAM; the 0xFF initial fill (fresh save) is carried
+   -- by the signal initial value. Write and read never target the same
+   -- address on the same edge (sram_addr has always advanced past sram_wa_r).
+   process (clk)
+   begin
+      if rising_edge(clk) then
+         if (sram_we_r = '1') then
+            sram(sram_wa_r) <= sram_wd_r;
+         end if;
+         sram_q <= sram(to_integer(sram_addr(12 downto 0)));
+      end if;
+   end process;
+
    -- ================= state =================
    process (clk)
       variable wval      : std_logic_vector(31 downto 0);
@@ -184,6 +208,7 @@ begin
          dma9_card <= '0';
          dma7_card <= '0';
          card_ena  <= '0';
+         sram_we_r <= '0';
 
          if (reset = '1') then
 
@@ -278,7 +303,9 @@ begin
                                  sram_addr <= sram_addr(7 downto 0) & unsigned(v_spival);
                               else
                                  if (sram_status(1) = '1') then
-                                    sram(to_integer(sram_addr(12 downto 0))) <= v_spival;
+                                    sram_we_r <= '1';
+                                    sram_wa_r <= to_integer(sram_addr(12 downto 0));
+                                    sram_wd_r <= v_spival;
                                  end if;
                                  sram_addr <= sram_addr + 1;
                               end if;
@@ -289,7 +316,7 @@ begin
                               if (v_spipos <= 2) then
                                  sram_addr <= sram_addr(7 downto 0) & unsigned(v_spival);
                               else
-                                 spi_data  <= sram(to_integer(sram_addr(12 downto 0)));
+                                 spi_data  <= sram_q;
                                  sram_addr <= sram_addr + 1;
                               end if;
                            when others =>                         -- incl. 9F JEDEC: EEPROM answers FF

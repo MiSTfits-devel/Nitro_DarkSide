@@ -18,14 +18,27 @@
 --     data - architecturally intended. op_busy is combinationally high from
 --     the op_ena pulse until the op retires; the CPU stalls on it.
 --
--- The line stores are plain signal arrays (fine for nvc; the BRAM knife-fight
--- happens in M9).
+-- Storage (the M9 BRAM pass): line DATA lives in per-way M10K blocks
+-- (4 x I + 4 x D SyncRamDualByteEnable instances; port A is a free-running
+-- registered-address read fed by req_addr - or the writeback cursor during
+-- WB states - port B takes fill/write-hit writes). Tags, valid, dirty and
+-- round-robin state stay in flops (~8.6 Kbit) so the 4-way parallel compare
+-- and every maintenance-op path keep their exact single-cycle behavior.
+-- Cycle timing is unchanged on all hit/miss/fill/bypass paths; the only
+-- difference is one extra cycle (WB_PREP) at the start of each line
+-- writeback, to let the first beat's registered read land.
 
 library IEEE;
 use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
 
+library MEM;
+
 entity nds_cache9 is
+   generic
+   (
+      is_simu : std_logic := '0'
+   );
    port
    (
       clk         : in  std_logic;
@@ -65,21 +78,49 @@ architecture arch of nds_cache9 is
    -- D: 4 ways x 32 sets x 8 words, tag = addr(31 downto 10)
    type t_itags is array (0 to 255) of std_logic_vector(20 downto 0);  -- way*64+set
    type t_dtags is array (0 to 127) of std_logic_vector(21 downto 0);  -- way*32+set
-   type t_idata is array (0 to 2047) of std_logic_vector(31 downto 0); -- (way*64+set)*8+word
-   type t_ddata is array (0 to 1023) of std_logic_vector(31 downto 0); -- (way*32+set)*8+word
    type t_rr6   is array (0 to 63) of unsigned(1 downto 0);
    type t_rr5   is array (0 to 31) of unsigned(1 downto 0);
 
    signal itags   : t_itags := (others => (others => '0'));
    signal ivalid  : std_logic_vector(255 downto 0) := (others => '0');
-   signal idata   : t_idata := (others => (others => '0'));
    signal irr     : t_rr6 := (others => "00");
 
    signal dtags   : t_dtags := (others => (others => '0'));
    signal dvalid  : std_logic_vector(127 downto 0) := (others => '0');
    signal ddirty  : std_logic_vector(127 downto 0) := (others => '0');
-   signal ddata   : t_ddata := (others => (others => '0'));
    signal drr     : t_rr5 := (others => "00");
+
+   -- per-way line data stores (M10K): port A read, port B write
+   type t_wayq is array (0 to 3) of std_logic_vector(31 downto 0);
+   signal id_raddr : integer range 0 to 511;
+   signal dd_raddr : integer range 0 to 255;
+   signal id_q     : t_wayq;
+   signal dd_q     : t_wayq;
+   signal id_we    : std_logic_vector(3 downto 0);
+   signal dd_we    : std_logic_vector(3 downto 0);
+   signal id_waddr : integer range 0 to 511;
+   signal dd_waddr : integer range 0 to 255;
+   signal dd_wdata : std_logic_vector(31 downto 0);
+   signal dd_wbe   : std_logic_vector(3 downto 0);
+
+   -- response routing: on a hit the data comes off the way BRAM output
+   -- (captured at the lookup edge), on a fill/bypass it comes from resp_hold
+   signal resp_way   : integer range 0 to 3 := 0;
+   signal resp_use_i : std_logic := '0';
+   signal resp_use_d : std_logic := '0';
+
+   -- D write hit: the BRAM write commits during HIT_RESP (one cycle after
+   -- the lookup - invisible, the next lookup's read capture is >= 2 edges
+   -- later, and resp_done timing is unchanged)
+   signal dwr_pend : std_logic := '0';
+   signal dwr_way  : integer range 0 to 3 := 0;
+   signal dwr_addr : integer range 0 to 255 := 0;
+   signal dwr_be   : std_logic_vector(3 downto 0) := (others => '0');
+   signal dwr_data : std_logic_vector(31 downto 0) := (others => '0');
+
+   -- writeback read cursor (port A of the victim way during WB states)
+   signal wb_way   : integer range 0 to 3 := 0;
+   signal wb_raddr : integer range 0 to 255 := 0;
 
    type t_state is
    (
@@ -87,6 +128,7 @@ architecture arch of nds_cache9 is
       HIT_RESP,      -- registered hit / end of fill: put data on resp
       BYPASS_ISSUE,  -- uncachable or D write miss: single memory beat
       BYPASS_WAIT,
+      WB_PREP,       -- one cycle so the victim way's beat-0 read lands
       WB_BEAT,       -- write back one dirty line (victim or clean op)
       WB_WAIT,
       FILL_BEAT,     -- fill one line from memory
@@ -124,13 +166,108 @@ begin
 
    op_busy <= op_ena or op_pending or op_active;
 
+   -- ================= line data stores =================
+   -- Port A: free-running registered-address read. It follows the incoming
+   -- request's set/word (the membus holds req_addr stable until resp_done,
+   -- so the capture at the lookup edge is the wanted word of every way);
+   -- during WB states it follows the writeback cursor instead.
+   id_raddr <= to_integer(unsigned(req_addr(10 downto 2)));
+   dd_raddr <= wb_raddr when (state = WB_PREP or state = WB_BEAT or state = WB_WAIT)
+          else to_integer(unsigned(req_addr(9 downto 2)));
+
+   -- Port B: writes. A pended write hit (during HIT_RESP) or a fill beat.
+   process (all)
+   begin
+      dd_we    <= (others => '0');
+      dd_waddr <= dwr_addr;
+      dd_wdata <= dwr_data;
+      dd_wbe   <= dwr_be;
+      if (dwr_pend = '1') then
+         dd_we(dwr_way) <= '1';
+      elsif (state = FILL_WAIT and mem_done = '1' and r_code = '0') then
+         dd_we(fill_way) <= '1';
+         dd_waddr <= to_integer(unsigned(r_addr(9 downto 5))) * 8 + to_integer(beat);
+         dd_wdata <= mem_rdata;
+         dd_wbe   <= "1111";
+      end if;
+   end process;
+
+   process (all)
+   begin
+      id_we    <= (others => '0');
+      id_waddr <= to_integer(unsigned(r_addr(10 downto 5))) * 8 + to_integer(beat);
+      if (state = FILL_WAIT and mem_done = '1' and r_code = '1') then
+         id_we(fill_way) <= '1';
+      end if;
+   end process;
+
+   gways : for w in 0 to 3 generate
+   begin
+      iidata : entity MEM.SyncRamDualByteEnable
+      generic map
+      (
+         is_simu     => is_simu,
+         is_cyclone5 => '1',
+         BYTE_WIDTH  => 8,
+         ADDR_WIDTH  => 9,
+         BYTES       => 4
+      )
+      port map
+      (
+         clk       => clk,
+         ce_a      => '1',
+         addr_a    => id_raddr,
+         datain_a0 => x"00", datain_a1 => x"00", datain_a2 => x"00", datain_a3 => x"00",
+         dataout_a => id_q(w),
+         we_a      => '0',
+         be_a      => "0000",
+         ce_b      => '1',
+         addr_b    => id_waddr,
+         datain_b0 => mem_rdata( 7 downto  0),
+         datain_b1 => mem_rdata(15 downto  8),
+         datain_b2 => mem_rdata(23 downto 16),
+         datain_b3 => mem_rdata(31 downto 24),
+         dataout_b => open,
+         we_b      => id_we(w),
+         be_b      => "1111"
+      );
+
+      iddata : entity MEM.SyncRamDualByteEnable
+      generic map
+      (
+         is_simu     => is_simu,
+         is_cyclone5 => '1',
+         BYTE_WIDTH  => 8,
+         ADDR_WIDTH  => 8,
+         BYTES       => 4
+      )
+      port map
+      (
+         clk       => clk,
+         ce_a      => '1',
+         addr_a    => dd_raddr,
+         datain_a0 => x"00", datain_a1 => x"00", datain_a2 => x"00", datain_a3 => x"00",
+         dataout_a => dd_q(w),
+         we_a      => '0',
+         be_a      => "0000",
+         ce_b      => '1',
+         addr_b    => dd_waddr,
+         datain_b0 => dd_wdata( 7 downto  0),
+         datain_b1 => dd_wdata(15 downto  8),
+         datain_b2 => dd_wdata(23 downto 16),
+         datain_b3 => dd_wdata(31 downto 24),
+         dataout_b => open,
+         we_b      => dd_we(w),
+         be_b      => dd_wbe
+      );
+   end generate;
+
    process (clk)
       variable iset, dset  : integer range 0 to 63;
       variable ihit, dhit  : boolean;
       variable hway        : integer range 0 to 3;
       variable iline       : integer range 0 to 255;
       variable dline       : integer range 0 to 127;
-      variable widx        : integer range 0 to 2047;
       variable a           : std_logic_vector(31 downto 0);
       variable v_op        : std_logic_vector(3 downto 0);
       variable v_opaddr    : std_logic_vector(31 downto 0);
@@ -140,6 +277,7 @@ begin
 
          mem_ena   <= '0';
          resp_done <= '0';
+         dwr_pend  <= '0';
 
          if (reset = '1') then
             state       <= IDLE;
@@ -233,6 +371,8 @@ begin
                            else
                               -- clean (+invalidate) of a dirty line: write it back
                               wb_line       <= dline;
+                              wb_way        <= dline / 32;
+                              wb_raddr      <= (dline mod 32) * 8;
                               wb_addrbase   <= dtags(dline)(11 downto 0) & std_logic_vector(to_unsigned(dline mod 32, 5));
                               beat          <= (others => '0');
                               after_wb_fill <= '0';
@@ -240,7 +380,7 @@ begin
                               if (v_op = "0111" or v_op = "1000") then
                                  op_invalidate_after <= '1';
                               end if;
-                              state <= WB_BEAT;
+                              state <= WB_PREP;
                            end if;
 
                         when others =>
@@ -268,8 +408,11 @@ begin
                            end if;
                         end loop;
                         if (ihit) then
-                           resp_hold <= idata((hway*64 + iset)*8 + to_integer(unsigned(req_addr(4 downto 2))));
-                           state     <= HIT_RESP;
+                           -- data comes off the way BRAMs, captured this edge
+                           resp_way   <= hway;
+                           resp_use_i <= '1';
+                           resp_use_d <= '0';
+                           state      <= HIT_RESP;
                         else
                            fill_way <= to_integer(irr(iset));
                            beat     <= (others => '0');
@@ -287,16 +430,21 @@ begin
                         end loop;
 
                         if (dhit) then
-                           widx := (hway*32 + dset)*8 + to_integer(unsigned(req_addr(4 downto 2)));
                            if (req_rnw = '1') then
-                              resp_hold <= ddata(widx);
+                              -- data comes off the way BRAMs, captured this edge
+                              resp_way   <= hway;
+                              resp_use_d <= '1';
+                              resp_use_i <= '0';
                            else
-                              for i in 0 to 3 loop
-                                 if (req_be(i) = '1') then
-                                    ddata(widx)(i*8+7 downto i*8) <= req_wdata(i*8+7 downto i*8);
-                                 end if;
-                              end loop;
+                              -- BRAM write commits during HIT_RESP (port B)
+                              dwr_pend <= '1';
+                              dwr_way  <= hway;
+                              dwr_addr <= dset*8 + to_integer(unsigned(req_addr(4 downto 2)));
+                              dwr_be   <= req_be;
+                              dwr_data <= req_wdata;
                               ddirty(hway*32 + dset) <= '1';
+                              resp_use_i <= '0';
+                              resp_use_d <= '0';
                            end if;
                            state <= HIT_RESP;
                         elsif (req_rnw = '0') then
@@ -309,9 +457,11 @@ begin
                            beat     <= (others => '0');
                            if (dvalid(hway*32 + dset) = '1' and ddirty(hway*32 + dset) = '1') then
                               wb_line       <= hway*32 + dset;
+                              wb_way        <= hway;
+                              wb_raddr      <= dset*8;
                               wb_addrbase   <= dtags(hway*32 + dset)(11 downto 0) & req_addr(9 downto 5);
                               after_wb_fill <= '1';
-                              state         <= WB_BEAT;
+                              state         <= WB_PREP;
                            else
                               state <= FILL_BEAT;
                            end if;
@@ -321,8 +471,14 @@ begin
 
                when HIT_RESP =>
                   resp_done  <= '1';
-                  resp_rdata <= resp_hold;
-                  state      <= IDLE;
+                  if (resp_use_i = '1') then
+                     resp_rdata <= id_q(resp_way);
+                  elsif (resp_use_d = '1') then
+                     resp_rdata <= dd_q(resp_way);
+                  else
+                     resp_rdata <= resp_hold;
+                  end if;
+                  state <= IDLE;
 
                when BYPASS_ISSUE =>
                   mem_ena   <= '1';
@@ -339,13 +495,22 @@ begin
                      state      <= IDLE;
                   end if;
 
+               when WB_PREP =>
+                  -- beat 0's registered read (wb_raddr on port A) lands here
+                  state <= WB_BEAT;
+
                when WB_BEAT =>
                   mem_ena   <= '1';
                   mem_rnw   <= '0';
                   mem_addr  <= wb_addrbase & std_logic_vector(beat);
                   mem_be    <= "1111";
-                  mem_wdata <= ddata(wb_line*8 + to_integer(beat));
-                  state     <= WB_WAIT;
+                  mem_wdata <= dd_q(wb_way);
+                  -- advance the read cursor to the next beat; its data is
+                  -- captured at the next edge and holds through WB_WAIT
+                  if (beat /= 7) then
+                     wb_raddr <= wb_raddr + 1;
+                  end if;
+                  state <= WB_WAIT;
 
                when WB_WAIT =>
                   if (mem_done = '1') then
@@ -376,13 +541,8 @@ begin
 
                when FILL_WAIT =>
                   if (mem_done = '1') then
-                     if (r_code = '1') then
-                        iset := to_integer(unsigned(r_addr(10 downto 5)));
-                        idata((fill_way*64 + iset)*8 + to_integer(beat)) <= mem_rdata;
-                     else
-                        dset := to_integer(unsigned(r_addr(9 downto 5)));
-                        ddata((fill_way*32 + dset)*8 + to_integer(beat)) <= mem_rdata;
-                     end if;
+                     -- the beat lands in the way BRAM via port B (see the
+                     -- id_we/dd_we processes); only the bookkeeping is here
                      if (beat = to_integer(unsigned(r_addr(4 downto 2)))) then
                         resp_hold <= mem_rdata;
                      end if;
@@ -399,6 +559,8 @@ begin
                            ddirty(fill_way*32 + dset) <= '0';
                            drr(dset) <= drr(dset) + 1;
                         end if;
+                        resp_use_i <= '0';   -- fill returns via resp_hold
+                        resp_use_d <= '0';
                         state <= HIT_RESP;
                      else
                         beat  <= beat + 1;

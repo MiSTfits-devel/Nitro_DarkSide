@@ -80,20 +80,24 @@ architecture arch of nds_bios7 is
         f.write('      x"%08X"%s  -- 0x%02X  %s\n' % (w, sep, i * 4, note))
     f.write("""   );
 
+   -- Quartus 17 constraints (validated on the synth-diag branch): its
+   -- std.textio only has the bit_vector hread, and its elaborator can't
+   -- bound-prove a file-driven while loop - so bit_vector + a for/exit loop.
    impure function init_rom return t_rom is
       file f      : text;
       variable st : file_open_status;
       variable l  : line;
-      variable w  : std_logic_vector(31 downto 0);
+      variable w  : bit_vector(31 downto 0);
       variable m  : t_rom := (others => (others => '0'));
       variable i  : integer := 0;
    begin
       file_open(st, f, "sim/tests/bios7_retail.hex", read_mode);
       if (st = open_ok) then
-         while not endfile(f) and i <= t_rom'high loop
+         for k in t_rom'range loop
+            exit when endfile(f);
             readline(f, l);
             hread(l, w);
-            m(i) := w;
+            m(k) := to_stdlogicvector(w);
             i := i + 1;
          end loop;
          file_close(f);

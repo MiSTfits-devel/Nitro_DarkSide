@@ -296,7 +296,10 @@ wire [15:0] joy;
 wire [21:0] gamma_bus;
 wire [15:0] joystick_analog_0;
 
-hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
+// Keep the DE10 HPS transport behind a dedicated boundary. Its current
+// implementation is the proven framework hps_io; the boundary is the switch
+// point for the Clash command engine once file/SD transactions are covered.
+nds_hps_io_boundary #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 (
 	.clk_sys(clk_sys),
 	.HPS_BUS(HPS_BUS),
@@ -313,7 +316,7 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 	.ioctl_wr(ioctl_wr),
 	.ioctl_download(ioctl_download),
 	.ioctl_index(ioctl_index),
-	.ioctl_wait(1'b0),
+	.ioctl_wait(fw_ioctl_wait),
 
 	.sd_lba('{sd_lba}),
 	.sd_rd(sd_rd),
@@ -339,9 +342,8 @@ reg cart_download, fw_download;
 always @(posedge clk_sys) begin
 	cart_download <= ioctl_download & (ioctl_index == 1);
 	// firmware image: boot0.rom auto-load (index 0) or the OSD "Load
-	// Firmware" entry (index 2). Only the first 128 KB is staged - that is
-	// the window nds_spi's fw_addr port can address (user settings live at
-	// the image top in a real 256 KB firmware; the sim image is 128 KB).
+	// Firmware" entry (index 2). Full 256 KB staged so a retail image's
+	// user settings (top of the image) are addressable via nds_spi.
 	fw_download   <= ioctl_download & ((ioctl_index == 0) || (ioctl_index == 2));
 end
 
@@ -364,20 +366,69 @@ end
 
 /////////////////////////  FIRMWARE IMAGE  //////////////////////////////
 
-// SPI firmware flash backing store: 128 KB BRAM, written 16 bits at a time
-// from the ioctl stream, read one word per clk1x by nds_spi (1-cycle port).
-reg [31:0] fw_ram[0:32767];
-reg [31:0] fw_data;
-reg [15:0] fw_lo;
+// The firmware image lives in DDR3 (M10K eviction, FITTING.md round 2): the
+// ioctl stream stages it through ddram ch1 (16-bit write lanes match the
+// ioctl beat), and nds_spi reads words back through the same channel with
+// the fw_req/fw_done handshake. SPI reads are byte-paced and sequential;
+// ddram caches the last 64-bit beat per channel, so most reads never reach
+// DDR3, and ch1 writes invalidate that cache (download/read coherency).
+// 0x0FF00000 sits far above the card image window (cd_addr tops out at 128MB).
+localparam [27:1] FW_HW_BASE = 27'h7F80000;   // byte address 0x0FF00000 >> 1
 
-wire [14:0] fw_addr;
+wire [15:0] fw_addr;   // word address from the wrapper (byte addr 17:2)
+wire        fw_req;
+reg         fw_done;
+reg  [31:0] fw_data;
+
+reg         fwc_busy  = 0;
+reg         fwc_req   = 0;
+reg         fwc_rnw   = 1;
+reg  [27:1] fwc_addr;
+reg  [15:0] fwc_din;
+reg         fwc_isread = 0;
+reg         fwc_word;
+reg         fwr_pend  = 0;    // fw_req is a 1-cycle pulse - latch one that lands mid-write
+reg  [15:0] fwr_pend_addr;
+wire        fwc_ready;
+wire [63:0] fwc_dout;
+
+wire        fw_ioctl_wait = fw_download & fwc_busy;
 
 always @(posedge clk_sys) begin
-	if (fw_download & ioctl_wr) begin
-		if (~ioctl_addr[1]) fw_lo <= ioctl_dout;
-		else if (ioctl_addr < 27'h20000) fw_ram[ioctl_addr[16:2]] <= {ioctl_dout, fw_lo};
+	fw_done <= 0;
+	fwc_req <= 0;
+	if (fwc_busy & fw_req) begin
+		fwr_pend      <= 1;
+		fwr_pend_addr <= fw_addr;
 	end
-	fw_data <= fw_ram[fw_addr];
+	if (!fwc_busy) begin
+		if (fw_download & ioctl_wr) begin
+			fwc_addr   <= FW_HW_BASE + ioctl_addr[26:1];
+			fwc_din    <= ioctl_dout;
+			fwc_rnw    <= 0;
+			fwc_isread <= 0;
+			fwc_req    <= 1;
+			fwc_busy   <= 1;
+		end
+		else if (fw_req | fwr_pend) begin
+			// beat-aligned read; the addressed 32-bit word is muxed from
+			// the 64-bit beat on completion
+			fwc_addr   <= FW_HW_BASE + {10'd0, (fwr_pend ? fwr_pend_addr[15:1] : fw_addr[15:1]), 2'b00};
+			fwc_word   <= fwr_pend ? fwr_pend_addr[0] : fw_addr[0];
+			fwr_pend   <= 0;
+			fwc_rnw    <= 1;
+			fwc_isread <= 1;
+			fwc_req    <= 1;
+			fwc_busy   <= 1;
+		end
+	end
+	else if (fwc_ready) begin
+		fwc_busy <= 0;
+		if (fwc_isread) begin
+			fw_data <= fwc_word ? fwc_dout[63:32] : fwc_dout[31:0];
+			fw_done <= 1;
+		end
+	end
 end
 
 ////////////////////////////  CARD PAGER  ///////////////////////////////
@@ -438,16 +489,22 @@ always @(posedge clk_sys) begin
 	end
 end
 
+// DDR3 framebuffer window (machinery in the VIDEO section below): 32bpp
+// {14'b0, BGR666}, line = 1 KB, screen s at +s*0x40000; [0x0FE00000,
+// 0x0FF00000) sits below the firmware image, above the card ceiling.
+localparam [27:1] FB_HW_BASE = 27'h7F00000;  // byte address 0x0FE00000 >> 1
+localparam  [7:0] FB_BURST   = 8'd128;       // beats per command (any divisor of 128)
+
 ddram ddram
 (
 	.*,
 
-	.ch1_addr(27'd0),
-	.ch1_din(16'd0),
-	.ch1_req(1'b0),
-	.ch1_rnw(1'b1),
-	.ch1_dout(),
-	.ch1_ready(),
+	.ch1_addr(fwc_addr),
+	.ch1_din(fwc_din),
+	.ch1_req(fwc_req),
+	.ch1_rnw(fwc_rnw),
+	.ch1_dout(fwc_dout),
+	.ch1_ready(fwc_ready),
 
 	.ch2_addr({1'b0, cd_addr, 1'b0}),  // word address -> byte addr [27:1]
 	.ch2_din(32'd0),
@@ -471,10 +528,20 @@ ddram ddram
 	.ch4_dout(),
 	.ch4_ready(),
 
-	.ch5_addr(27'd0),
-	.ch5_din(64'd0),
-	.ch5_req(1'b0),
-	.ch5_ready()
+	// ch5/ch6: DDR3 framebuffer (write bursts / scanout prefetch), see VIDEO
+	.ch5_addr(fb5_addr),
+	.ch5_din(fb5_din),
+	.ch5_req(fb5_req),
+	.ch5_burst(FB_BURST),
+	.ch5_next(fb5_next),
+	.ch5_ready(fb5_ready),
+
+	.ch6_addr(fb6_addr),
+	.ch6_burst(FB_BURST),
+	.ch6_req(fb6_req),
+	.ch6_dout(fb6_dout),
+	.ch6_valid(fb6_valid),
+	.ch6_ready(fb6_ready)
 );
 
 ////////////////////////////  SDRAM  ////////////////////////////////////
@@ -695,6 +762,8 @@ nds_port_wrap nds
 	.card_done(card_done),
 
 	.fw_addr(fw_addr),
+	.fw_req(fw_req),
+	.fw_done(fw_done),
 	.fw_data(fw_data),
 
 	.mainram_allow(mainram_allow),
@@ -742,17 +811,47 @@ assign AUDIO_R = NDS_AUDIO_R;
 ////////////////////////////  VIDEO  ////////////////////////////////////
 
 // v1 decision: dual 256x192 screens stacked vertically (like a real DS held
-// open), one BRAM framebuffer per screen, single-buffered. The core writes
-// pixels at its own frame cadence; the scanout below free-runs at ~59.8 Hz,
-// so an occasional tear is possible - the DDR3 compose stage with layout
-// options (side-by-side, single+swap) replaces this later.
-reg [17:0] fb_top[0:49151];
-reg [17:0] fb_bot[0:49151];
+// open), single-buffered, free-running ~59.8 Hz scanout - an occasional
+// tear is accepted (per-line atomicity makes it a horizontal seam only).
+// The framebuffers live in DDR3 (M10K eviction, FITTING.md): each engine's
+// merge drain (256 consecutive clk_sys writes per line, both engines at
+// once) lands in a per-engine line accumulator, a drain FSM bursts finished
+// lines to DDR3 through ddram ch5, and the scanout prefetches display line
+// N+1 through ddram ch6 into a double-banked line buffer while line N
+// shows. Pixels are 32bpp {14'b0, BGR666} - full 18-bit DS fidelity, two
+// per 64-bit beat. FB_HW_BASE/FB_BURST are declared above the ddram
+// instance they feed; the machinery lives in rtl/nds_fb_ddr3.sv.
+reg        pf_tgl = 0;                // prefetch request toggle (CLK_VIDEO)
+reg        pf_scr;
+reg  [7:0] pf_line;
+reg        pf_bank;
+wire [35:0] lb_q;
+wire [27:1] fb5_addr, fb6_addr;
+wire [63:0] fb5_din, fb6_dout;
+wire        fb5_req, fb5_next, fb5_ready;
+wire        fb6_req, fb6_valid, fb6_ready;
 
-always @(posedge clk_sys) begin
-	if (pix_we)  fb_top[{pix_y,  pix_x }] <= pix_d;
-	if (pixb_we) fb_bot[{pixb_y, pixb_x}] <= pixb_d;
-end
+nds_fb_ddr3 #(.FB_HW_BASE(FB_HW_BASE), .FB_BURST(FB_BURST)) fb_ddr3
+(
+	.clk_sys(clk_sys),
+	.CLK_VIDEO(CLK_VIDEO),
+
+	.pix_x(pix_x),   .pix_y(pix_y),   .pix_d(pix_d),   .pix_we(pix_we),
+	.pixb_x(pixb_x), .pixb_y(pixb_y), .pixb_d(pixb_d), .pixb_we(pixb_we),
+
+	.pf_tgl(pf_tgl),
+	.pf_scr(pf_scr),
+	.pf_line(pf_line),
+	.pf_bank(pf_bank),
+	.lb_raddr({vcnt[0], hcnt[7:1]}),
+	.lb_q(lb_q),
+
+	.fb5_addr(fb5_addr), .fb5_din(fb5_din), .fb5_req(fb5_req),
+	.fb5_next(fb5_next), .fb5_ready(fb5_ready),
+
+	.fb6_addr(fb6_addr), .fb6_req(fb6_req), .fb6_dout(fb6_dout),
+	.fb6_valid(fb6_valid), .fb6_ready(fb6_ready)
+);
 
 // scanout timing: 256x384 active in a 533x526 frame, pixel ce = CLK_VIDEO/4
 // = 16.757 MHz -> 59.77 Hz
@@ -771,17 +870,18 @@ reg  [1:0] ce_cnt = 0;
 reg        ce_pix = 0;
 reg        hs, vs, hbl, vbl;
 reg  [7:0] r_out, g_out, b_out;
-reg [17:0] fbq_top, fbq_bot;
-reg        fbq_bot_sel;
+reg        lbq_sel;
 
-wire [7:0] vline = (vcnt < 192) ? vcnt[7:0] : vcnt[7:0] - 8'd192;
-wire [15:0] fb_raddr = {vline, hcnt[7:0]};
+// vnext = the line about to start at the wrap; vpf = the one to prefetch
+// while vnext displays. Bank parity is vpf[0], so the prefetch target is
+// always the opposite bank of the line being read.
+wire [9:0] vnext = (vcnt == V_TOTAL-1) ? 10'd0 : vcnt + 10'd1;
+wire [9:0] vpf   = (vnext == V_TOTAL-1) ? 10'd0 : vnext + 10'd1;
 
 always @(posedge CLK_VIDEO) begin
-	// fetch runs every clock; the addressed pixel is stable 4 clocks per dot
-	fbq_top     <= fb_top[fb_raddr];
-	fbq_bot     <= fb_bot[fb_raddr];
-	fbq_bot_sel <= (vcnt >= 192);
+	// the pair fetch runs every clock inside nds_fb_ddr3 (lb_raddr -> lb_q);
+	// lbq_sel tracks it with the same one-clock lag
+	lbq_sel <= hcnt[0];
 
 	ce_cnt <= ce_cnt + 1'd1;
 	ce_pix <= (ce_cnt == 2'd3);
@@ -794,14 +894,22 @@ always @(posedge CLK_VIDEO) begin
 		hs  <= (hcnt >= HS_BEG && hcnt < HS_END);
 		vs  <= (vcnt >= VS_BEG && vcnt < VS_END);
 
-		// BGR666 -> RGB888 (B in [17:12])
-		{b_out, g_out, r_out} <= fbq_bot_sel ?
-			{fbq_bot[17:12], fbq_bot[17:16], fbq_bot[11:6], fbq_bot[11:10], fbq_bot[5:0], fbq_bot[5:4]} :
-			{fbq_top[17:12], fbq_top[17:16], fbq_top[11:6], fbq_top[11:10], fbq_top[5:0], fbq_top[5:4]};
+		// BGR666 -> RGB888 (B in [17:12]); pair half picked by x parity
+		{b_out, g_out, r_out} <= lbq_sel ?
+			{lb_q[35:30], lb_q[35:34], lb_q[29:24], lb_q[29:28], lb_q[23:18], lb_q[23:22]} :
+			{lb_q[17:12], lb_q[17:16], lb_q[11:6],  lb_q[11:10], lb_q[5:0],   lb_q[5:4]};
 
 		if (hcnt == H_TOTAL-1) begin
 			hcnt <= 0;
-			vcnt <= (vcnt == V_TOTAL-1) ? 10'd0 : vcnt + 1'd1;
+			vcnt <= vnext;
+			// request the prefetch of vpf into bank vpf[0] for the line
+			// starting now; blanking lines (vpf >= 384) fetch nothing
+			if (vpf < V_ACTIVE) begin
+				pf_scr  <= (vpf >= 10'd192);
+				pf_line <= (vpf >= 10'd192) ? (vpf[7:0] - 8'd192) : vpf[7:0];
+				pf_bank <= vpf[0];
+				pf_tgl  <= ~pf_tgl;
+			end
 		end
 		else hcnt <= hcnt + 1'd1;
 	end
@@ -813,7 +921,9 @@ assign VGA_SL = sl[1:0];
 wire [2:0] scale = status[4:2];
 wire [2:0] sl = scale ? scale - 1'd1 : 3'd0;
 
-video_mixer #(.LINE_LENGTH(600), .GAMMA(1)) video_mixer
+// Clash port of the NDS-active video_mixer branch. Gamma RAM stays in the
+// wrapper; NDS ties the non-portable scandoubler/HQ2x/freeze branches low.
+nds_clash_video_mixer #(.LINE_LENGTH(600), .GAMMA(1)) video_mixer
 (
 	.*,
 	.scandoubler(1'b0),
