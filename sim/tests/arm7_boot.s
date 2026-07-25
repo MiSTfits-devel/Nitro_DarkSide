@@ -92,6 +92,29 @@ pp_loop:
    orr  r9, r9, #16            @ bit 4: ping-pong served
    str  r9, [r10]
 
+@ ==== collide one SWP with ARM9 on the shared SDK lock mirror ====
+   ldr  r4, =0x02FFFFE8
+   mov  r0, #1
+   str  r0, [r4, #8]           @ ARM7 ready
+1: ldr  r0, [r4, #4]
+   cmp  r0, #1
+   bne  1b
+   mov  r0, #0x80
+   swp  r0, r0, [r4]
+   str  r0, [r4, #16]
+2: ldr  r1, [r4, #12]
+   cmn  r1, #1                 @ wait while ARM9 result is 0xFFFFFFFF
+   beq  2b
+   cmp  r1, #0
+   cmpeq r0, #0x40
+   beq  swp7_ok
+   cmp  r0, #0
+   cmpeq r1, #0x80
+   bne  report_fail
+swp7_ok:
+   orr  r9, r9, #32            @ bit 5: cross-CPU SWP was atomic
+   str  r9, [r10]
+
 @ ==== done ====
    ldr  r0, =0xBEEF7777
    str  r0, [r10, #4]          @ 0x02FFFF14

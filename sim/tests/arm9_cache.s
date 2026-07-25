@@ -197,6 +197,67 @@ reset:
    orr  r9, r9, #64
    str  r9, [r10]
 
+@ ---- test 8: NitroSDK-style SWP spinlock traffic ----
+@ First reproduce MI_SwapWord literally on the SDK's highest-priority,
+@ uncached 0x027FF000 MPU region: Rd=Rm is intentional. Then repeat through a
+@ cached alias and prove the final clean wrote the same physical RAM line.
+   ldr  r7, =0x027FFFE8        @ real SDK lock word (uncached region 7)
+   mov  r5, #0
+   str  r5, [r7]
+   str  r5, [r7, #4]
+   mov  r6, #32
+5: ldrh r4, [r7, #4]
+   cmp  r4, #0
+   bne  report_fail
+   mov  r0, #0x40
+   swp  r0, r0, [r7]          @ exact MI_SwapWord register alias
+   cmp  r0, #0
+   bne  report_fail
+   mov  r2, #0x40
+   strh r2, [r7, #4]
+   ldrh r4, [r7, #4]
+   cmp  r4, r2
+   bne  report_fail
+   mov  r0, #0
+   swp  r0, r0, [r7]
+   cmp  r0, r2
+   bne  report_fail
+   strh r5, [r7, #4]
+   subs r6, r6, #1
+   bne  5b
+
+   ldr  r0, =0x0225FFE8        @ cached lock word
+   ldr  r1, =0x0265FFE8        @ uncached alias
+   str  r5, [r1]
+   str  r5, [r1, #4]
+   mov  r6, #32
+6: mov  r2, #0x66
+   ldrh r4, [r0, #4]          @ owner initially free
+   cmp  r4, #0
+   bne  report_fail
+   swp  r3, r2, [r0]          @ acquire: old lockFlag must be zero
+   cmp  r3, #0
+   bne  report_fail
+   strh r2, [r0, #4]          @ publish ownerID
+   ldrh r4, [r0, #4]
+   cmp  r4, r2
+   bne  report_fail
+   swp  r3, r5, [r0]          @ release: recover previous lock ID
+   cmp  r3, r2
+   bne  report_fail
+   strh r5, [r0, #4]
+   subs r6, r6, #1
+   bne  6b
+   mcr  p15, 0, r0, c7, c14, 1 @ clean+invalidate lock line
+   ldr  r3, [r1]
+   cmp  r3, #0
+   bne  report_fail
+   ldrh r4, [r1, #4]
+   cmp  r4, #0
+   bne  report_fail
+   orr  r9, r9, #128
+   str  r9, [r10]
+
 @ ---- all passed ----
    ldr  r1, =0xCAFEBABE
    str  r1, [r10, #4]

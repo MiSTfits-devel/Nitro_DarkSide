@@ -245,8 +245,10 @@ parameter CONF_STR = {
 	// v1 decision: the .nds image is staged straight into DDR3 by the HPS
 	// (load-address form, donor GBA pattern) - the card interface pages it
 	// from there, no SDRAM copy of the ROM.
-	"FS1,NDS,Load,30000000;",
-	"F2,BIN,Load Firmware;",
+	"FS3,NDS,Load,30000000;",
+	"F4,BINROM,Load Firmware;",
+	"F1,BINROM,Load ARM7 BIOS;",
+	"F2,BINROM,Load ARM9 BIOS;",
 	"-;",
 	"P1,Video & Audio;",
 	"P1-;",
@@ -258,12 +260,9 @@ parameter CONF_STR = {
 
 	"P4,Credits;",
 	"P4-;",
-	"P4-,Robert Peip;",
-	"P4-,(FPGAzumSpass);",
-	"P4-,GBA donor core;",
-	"P4-;",
-	"P4-,The awesome hackers;",
-	"P4-,of MiSTer-FPGA;",
+	"P4-,Sarah Aronson;",
+	"P4-,(Heni, Luigi & Co);",
+	"P4-,ko-fi.com/heni;",
 
 	"- ;",
 	"R0,Reset;",
@@ -290,7 +289,7 @@ wire        ioctl_download;
 wire [26:0] ioctl_addr;
 wire [15:0] ioctl_dout;
 wire        ioctl_wr;
-wire  [7:0] ioctl_index;
+wire [15:0] ioctl_index;
 
 wire [15:0] joy;
 wire [21:0] gamma_bus;
@@ -339,20 +338,106 @@ nds_hps_io_boundary #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 //////////////////////////  ROM DETECT  /////////////////////////////////
 
 reg cart_download, fw_download;
+// OSD F1/F2 transfers use indices 1/2. Automatic bootN files are encoded
+// differently by MiSTer: boot1.rom is 0x40 and boot2.rom is 0x80 (the boot
+// file number lives above ioctl_index[5:0], whose value remains zero).
+// Accept both forms so startup auto-load and later manual replacement share
+// the same atomic BIOS write path.
+wire bios7_download = ioctl_download & ((ioctl_index[5:0] == 6'h01) ||
+	                                     (ioctl_index == 16'h0040));
+wire bios9_download = ioctl_download & ((ioctl_index[5:0] == 6'h02) ||
+	                                     (ioctl_index == 16'h0080));
 always @(posedge clk_sys) begin
-	cart_download <= ioctl_download & (ioctl_index == 1);
-	// firmware image: boot0.rom auto-load (index 0) or the OSD "Load
-	// Firmware" entry (index 2). Full 256 KB staged so a retail image's
-	// user settings (top of the image) are addressable via nds_spi.
-	fw_download   <= ioctl_download & ((ioctl_index == 0) || (ioctl_index == 2));
+	// Same dual-form match as the BIOS lines above. An .mgl <file index="N">
+	// arrives as N<<6, not N, so the old exact `== 3` only ever matched an OSD
+	// menu load and a cart launched from an .mgl was silently never loaded -
+	// the core sat at shellstat 0xC0 (BIOSes in, no cart, CPUs held).
+	cart_download <= ioctl_download & ((ioctl_index[5:0] == 6'h03) ||
+	                                  (ioctl_index == 16'h00C0));
+	// firmware image: boot0.rom auto-load (index 0), the OSD "Load Firmware"
+	// entry (index 4), or the same entry from an .mgl (4<<6 = 0x100). Full
+	// 256 KB staged so a retail image's user settings (top of the image) are
+	// addressable via nds_spi.
+	fw_download   <= ioctl_download & ((ioctl_index == 0) ||
+	                                  (ioctl_index[5:0] == 6'h04) ||
+	                                  (ioctl_index == 16'h0100));
 end
+
+// Retail CPU BIOS images are writable M10Ks inside nds_top. MiSTer
+// auto-loads games/NDS/boot1.rom and boot2.rom as indices 0x40 and 0x80; the
+// matching OSD F1/F2 entries use indices 1 and 2. A complete file
+// is activated only after its last halfword arrives. Both CPUs remain reset
+// for the transfer and one settling cycle, so they never execute a partial
+// image.
+reg bios7_download_d = 0;
+reg bios9_download_d = 0;
+reg fw_download_d    = 0;
+reg bios7_loaded = 0;
+reg bios9_loaded = 0;
+reg bios7_seen_last = 0;
+reg bios9_seen_last = 0;
+
+always @(posedge clk_sys) begin
+	bios7_download_d <= bios7_download;
+	bios9_download_d <= bios9_download;
+	fw_download_d    <= fw_download;
+
+	if (bios7_download) begin
+		bios7_loaded <= 0;
+		if (!bios7_download_d) bios7_seen_last <= 0;
+		if (ioctl_wr && ioctl_addr == 27'd16382) bios7_seen_last <= 1;
+	end
+	else if (bios7_download_d) begin
+		bios7_loaded <= bios7_seen_last;
+	end
+
+	if (bios9_download) begin
+		bios9_loaded <= 0;
+		if (!bios9_download_d) bios9_seen_last <= 0;
+		if (ioctl_wr && ioctl_addr == 27'd4094) bios9_seen_last <= 1;
+	end
+	else if (bios9_download_d) begin
+		bios9_loaded <= bios9_seen_last;
+	end
+end
+
+// The firmware download must hold the core in reset too, not just the two BIOS
+// images. ARM7 reads the SPI firmware through the DDR3 pager (see FIRMWARE
+// IMAGE below), and while fw_download is active that pager's ioctl-write branch
+// has priority over its read branch. A fw_req landing in the same cycle as an
+// ioctl_wr while the channel is idle is dropped outright: the pend latch only
+// arms when fwc_busy is already set, so nothing remembers the request, fw_done
+// never arrives, and nds_spi holds SPI busy forever - wedging ARM7 and, through
+// the stalled ARM7, leaving ARM9 parked in the NitroSDK idle thread. boot0.rom
+// auto-loads at index 0 exactly while ARM7 is running its init, so this window
+// is live on real hardware and invisible in simulation (no ioctl there).
+// Holding reset also stops ARM7 from reading a half-written image.
+wire bios_load_reset = bios7_download | bios9_download |
+	                     bios7_download_d | bios9_download_d |
+	                     fw_download | fw_download_d;
+wire bios7_load_we = bios7_download & ioctl_wr & (ioctl_addr < 27'd16384);
+wire bios9_load_we = bios9_download & ioctl_wr & (ioctl_addr < 27'd4096);
+wire [31:0] bios_load_data = {ioctl_dout, ioctl_dout};
+wire [3:0]  bios_load_be = ioctl_addr[1] ? 4'b1100 : 4'b0011;
 
 reg cart_loaded = 0;
 reg flush_req   = 0;   // displace ddram.sv's read cache after the HPS re-wrote DDR3 behind it
+wire cart_force;       // mailbox op 0x0B, driven from the DEBUG MAILBOX section below
 always @(posedge clk_sys) begin
 	reg old_download;
 	old_download <= cart_download;
 	if (old_download & ~cart_download) begin
+		cart_loaded <= 1;
+		flush_req   <= 1;
+	end
+	// Mailbox op 0x0B: declare the card image already present in DDR3. The OSD is
+	// the only thing that can produce a cart_download edge and it needs a human;
+	// DDR3 itself survives FPGA reconfiguration, and the HPS can write
+	// 0x30000000 directly. With this, deploy -> declare -> softreset boots with
+	// no OSD interaction, so a build can be tested unattended. Raise flush_req
+	// exactly as a real download does: the bytes under ddram.sv's read cache
+	// have changed.
+	if (cart_force) begin
 		cart_loaded <= 1;
 		flush_req   <= 1;
 	end
@@ -397,7 +482,14 @@ wire        fw_ioctl_wait = fw_download & fwc_busy;
 always @(posedge clk_sys) begin
 	fw_done <= 0;
 	fwc_req <= 0;
-	if (fwc_busy & fw_req) begin
+	// Latch every fw_req, not just ones that land while the channel is busy.
+	// fw_req is a single cycle and nds_spi holds SPI busy until fw_done, so a
+	// dropped request stalls ARM7 permanently - and the ioctl-write branch
+	// below outranks the read branch, so an idle-channel request could be lost
+	// with nothing remembering it. When the read is issued in this same cycle
+	// the branch below re-clears fwr_pend, and its address mux reads the old
+	// (still zero) value, so it correctly uses fw_addr directly.
+	if (fw_req) begin
 		fwr_pend      <= 1;
 		fwr_pend_addr <= fw_addr;
 	end
@@ -489,6 +581,121 @@ always @(posedge clk_sys) begin
 	end
 end
 
+/////////////////////////  DEBUG MAILBOX  ///////////////////////////////
+
+// Transport for nds_debug (the IS-NITRO-style unit in rtl/nds_debug.vhd): two
+// 64-bit DDR3 beats the HPS drives with devmem, no JTAG and no host Quartus.
+// FPGA 0x0FFF0000 == HPS 0x3FFF0000 (see the ddram RAM base), which is above
+// the firmware image, the framebuffer window and the 128 MB card ceiling.
+//
+//   command beat @ 0x3FFF0000   {16'hDB90, seq[7:0], op[7:0], arg[31:0]}
+//   response beat @ 0x3FFF0008  {16'hDB91, ack[7:0], 8'h00,   data[31:0]}
+//
+// The HPS bumps `seq` to fire a command and spins until `ack` matches it. The
+// magic word means an all-zero (uninitialised) beat is never mistaken for
+// command 0x00, so the debugger stays quiet until it is deliberately poked.
+//
+// ch4 is the only ddram channel with no beat cache (`cached` is [2:1] in
+// rtl/ddram.sv:114), so re-reading one address always reaches DDR3 and sees the
+// HPS write - none of the cache-displacement dance ch1/ch2 need. ch4 also
+// outranks only the framebuffer in the grant chain, so the poll is throttled to
+// one read per 4096 clk_sys cycles (~122us at 33.5 MHz): invisible to ch5/ch6
+// bandwidth, and instant next to a human typing devmem commands.
+localparam [27:1] DBG_CMD_ADDR = 27'h7FF8000;   // byte 0x0FFF0000 >> 1
+localparam [27:1] DBG_RSP_ADDR = 27'h7FF8004;   // byte 0x0FFF0008 >> 1
+
+wire [31:0] dbg_rsp_data;
+wire        dbg_rsp_stb;
+reg         dbg_cmd_stb = 0;
+reg   [7:0] dbg_cmd_op;
+reg  [31:0] dbg_cmd_arg;
+
+reg  [27:1] mb_addr;
+reg  [63:0] mb_din;
+reg   [7:0] mb_be;
+reg         mb_req = 0;
+reg         mb_rnw = 1;
+wire        mb_ready;
+wire [63:0] mb_dout;
+
+reg   [1:0] mb_state = 0;     // 0 poll, 1 await read, 2 await nds_debug, 3 write
+reg  [11:0] mb_tmr   = 0;
+reg   [7:0] mb_seq   = 0;     // last sequence number acted on
+reg   [7:0] mb_ack;
+reg  [31:0] mb_answer;
+// Outer timeout, deliberately 4x nds_debug's own 16-bit PEEK timeout: that unit
+// must always be the one to give up first, or its late rsp_stb would land on the
+// *next* command and answer it with the wrong data.
+reg  [17:0] mb_watchdog;
+reg         mb_issued = 0;    // response write posted, waiting on ch4 ready
+
+// Op 0x0B (FORCE_CART) is answered by NDS.sv, not nds_debug: cart_loaded lives
+// here. nds_debug still sees the strobe and falls through to its STATUS reply,
+// so the host gets an ack like any other command.
+assign cart_force = dbg_cmd_stb && (dbg_cmd_op == 8'h0B);
+
+always @(posedge clk_sys) begin
+	mb_req      <= 0;
+	dbg_cmd_stb <= 0;
+	mb_tmr      <= mb_tmr + 1'd1;
+
+	case (mb_state)
+		2'd0: if (mb_tmr == 0) begin
+			mb_addr  <= DBG_CMD_ADDR;
+			mb_rnw   <= 1;
+			mb_req   <= 1;
+			mb_state <= 2'd1;
+		end
+
+		2'd1: if (mb_ready) begin
+			if ((mb_dout[63:48] == 16'hDB90) && (mb_dout[47:40] != mb_seq)) begin
+				dbg_cmd_op  <= mb_dout[39:32];
+				dbg_cmd_arg <= mb_dout[31:0];
+				dbg_cmd_stb <= 1;
+				mb_ack      <= mb_dout[47:40];
+				mb_watchdog <= 0;
+				mb_state    <= 2'd2;
+			end
+			else mb_state <= 2'd0;
+		end
+
+		2'd2: begin
+			// nds_debug answers every command with exactly one rsp_stb, except
+			// that PEEK waits on the ARM9 bus - an unmapped address would never
+			// complete. Answer for it rather than stranding the channel.
+			mb_watchdog <= mb_watchdog + 1'd1;
+			if (dbg_rsp_stb) begin
+				mb_answer <= dbg_rsp_data;
+				mb_state  <= 2'd3;
+			end
+			else if (mb_watchdog == 18'h3FFFF) begin
+				mb_answer <= 32'hBADACCE5;
+				mb_state  <= 2'd3;
+			end
+		end
+
+		2'd3: begin
+			// One request only: mb_req is re-cleared at the top of the block
+			// every cycle, so an unguarded assert here would post a fresh write
+			// on each pass while waiting for ready.
+			mb_addr <= DBG_RSP_ADDR;
+			mb_din  <= {16'hDB91, mb_ack, 8'h00, mb_answer};
+			mb_be   <= 8'hFF;
+			mb_rnw  <= 0;
+			if (!mb_issued) begin
+				mb_req    <= 1;
+				mb_issued <= 1;
+			end
+			else if (mb_ready) begin
+				// advance the acked sequence only once the beat is posted
+				mb_seq    <= mb_ack;
+				mb_issued <= 0;
+				mb_state  <= 2'd0;
+			end
+		end
+	endcase
+end
+
 // DDR3 framebuffer window (machinery in the VIDEO section below): 32bpp
 // {14'b0, BGR666}, line = 1 KB, screen s at +s*0x40000; [0x0FE00000,
 // 0x0FF00000) sits below the firmware image, above the card ceiling.
@@ -520,13 +727,14 @@ ddram ddram
 	.ch3_dout(),
 	.ch3_ready(),
 
-	.ch4_addr(27'd0),
-	.ch4_din(64'd0),
-	.ch4_req(1'b0),
-	.ch4_rnw(1'b1),
-	.ch4_be(8'd0),
-	.ch4_dout(),
-	.ch4_ready(),
+	// ch4: nds_debug mailbox (uncached channel, see DEBUG MAILBOX above)
+	.ch4_addr(mb_addr),
+	.ch4_din(mb_din),
+	.ch4_req(mb_req),
+	.ch4_rnw(mb_rnw),
+	.ch4_be(mb_be),
+	.ch4_dout(mb_dout),
+	.ch4_ready(mb_ready),
 
 	// ch5/ch6: DDR3 framebuffer (write bursts / scanout prefetch), see VIDEO
 	.ch5_addr(fb5_addr),
@@ -716,11 +924,17 @@ sdram sdram
 ////////////////////////////  SYSTEM  ///////////////////////////////////
 
 wire        boot_error;
+wire        boot_done;
 wire [15:0] NDS_AUDIO_L, NDS_AUDIO_R;
 
 wire  [7:0] pix_x,  pix_y,  pixb_x, pixb_y;
 wire [17:0] pix_d,  pixb_d;
 wire        pix_we, pixb_we;
+wire [31:0] dbg_pc9, dbg_pc7;
+wire [31:0] dbg_r0_9, dbg_lr9, dbg_cpsr9;
+wire [17:0] dbg_vfy_bad;
+wire [31:0] dbg_vfy_addr;
+wire [17:0] dbg_hwstat;
 
 // touchscreen v1: left analog stick as the pen, "Touch" button as pen-down
 wire [7:0] touch_x = {~joystick_analog_0[7],  joystick_analog_0[6:0]};
@@ -731,7 +945,7 @@ nds_port_wrap nds
 	.clk1x(clk_sys),
 	.clkMem(clk_mem),
 	.clkMemIndex(clkMemIndex),
-	.reset(reset),
+	.reset(reset | bios_load_reset),
 	.nds_on(nds_on),
 	.direct_boot(1'b1),          // firmware boot menu = never (docs/ARCHITECTURE.md)
 
@@ -753,7 +967,7 @@ nds_port_wrap nds
 	.touch_x(touch_x),
 	.touch_y(touch_y),
 
-	.boot_done(),
+	.boot_done(boot_done),
 	.boot_error(boot_error),
 
 	.card_ena(card_ena),
@@ -765,6 +979,17 @@ nds_port_wrap nds
 	.fw_req(fw_req),
 	.fw_done(fw_done),
 	.fw_data(fw_data),
+
+	.bios7_load_addr(ioctl_addr[13:2]),
+	.bios7_load_data(bios_load_data),
+	.bios7_load_be(bios_load_be),
+	.bios7_load_we(bios7_load_we),
+	.bios7_load_done(bios7_loaded),
+	.bios9_load_addr(ioctl_addr[11:2]),
+	.bios9_load_data(bios_load_data),
+	.bios9_load_be(bios_load_be),
+	.bios9_load_we(bios9_load_we),
+	.bios9_load_done(bios9_loaded),
 
 	.mainram_allow(mainram_allow),
 	.mainram_active(mainram_active),
@@ -802,7 +1027,23 @@ nds_port_wrap nds
 	.vblank_out(),
 
 	.sound_out_left(NDS_AUDIO_L),
-	.sound_out_right(NDS_AUDIO_R)
+	.sound_out_right(NDS_AUDIO_R),
+
+	.dbg_pc9(dbg_pc9),
+	.dbg_pc7(dbg_pc7),
+	.dbg_r0_9(dbg_r0_9),
+	.dbg_lr9(dbg_lr9),
+	.dbg_cpsr9(dbg_cpsr9),
+	.dbg_vfy_bad(dbg_vfy_bad),
+	.dbg_vfy_addr(dbg_vfy_addr),
+
+	.dbg_cmd_stb(dbg_cmd_stb),
+	.dbg_cmd_op(dbg_cmd_op),
+	.dbg_cmd_arg(dbg_cmd_arg),
+	.dbg_rsp_data(dbg_rsp_data),
+	.dbg_rsp_stb(dbg_rsp_stb),
+
+	.dbg_hwstat(dbg_hwstat)
 );
 
 assign AUDIO_L = NDS_AUDIO_L;
@@ -831,6 +1072,14 @@ wire [63:0] fb5_din, fb6_dout;
 wire        fb5_req, fb5_next, fb5_ready;
 wire        fb6_req, fb6_valid, fb6_ready;
 
+// Temporary live-hardware telemetry. The DDR writer periodically stores twelve
+// raw state words where SSH/devmem can read them without depending on rendering:
+//   x0/x1 PC9, x2/x3 ARM9 r0, x4/x5 ARM9 lr, x6 ARM9 CPSR,
+//   x7/x8 PC7, x9 reserved, x10 core status, x11 shell status.
+wire [17:0] dbg_shellstat = {10'b0, bios9_loaded, bios7_loaded, cart_loaded,
+	                         nds_on, reset, bios9_download, bios7_download,
+	                         boot_done};
+
 nds_fb_ddr3 #(.FB_HW_BASE(FB_HW_BASE), .FB_BURST(FB_BURST)) fb_ddr3
 (
 	.clk_sys(clk_sys),
@@ -838,6 +1087,17 @@ nds_fb_ddr3 #(.FB_HW_BASE(FB_HW_BASE), .FB_BURST(FB_BURST)) fb_ddr3
 
 	.pix_x(pix_x),   .pix_y(pix_y),   .pix_d(pix_d),   .pix_we(pix_we),
 	.pixb_x(pixb_x), .pixb_y(pixb_y), .pixb_d(pixb_d), .pixb_we(pixb_we),
+	// Lanes 2..5 and 9 now carry the main-RAM verify result instead of ARM9
+	// r0/lr: r0 reads 0 and lr is a known constant in the idle thread, so they
+	// tell us nothing further, whereas nothing has ever observed whether SDRAM
+	// main RAM reads back what the loader wrote. dbg9 mirrors the mismatch
+	// count so a single beat at 0x3FE2FC20 answers the question.
+	.dbg0(dbg_pc9[17:0]), .dbg1({4'b0, dbg_pc9[31:18]}),
+	.dbg2(dbg_vfy_bad), .dbg3(18'd0),
+	.dbg4(dbg_vfy_addr[17:0]), .dbg5({4'b0, dbg_vfy_addr[31:18]}),
+	.dbg6(dbg_cpsr9[17:0]), .dbg7(dbg_pc7[17:0]),
+	.dbg8({4'b0, dbg_pc7[31:18]}), .dbg9(dbg_vfy_bad),
+	.dbg10(dbg_hwstat), .dbg11(dbg_shellstat),
 
 	.pf_tgl(pf_tgl),
 	.pf_scr(pf_scr),
@@ -898,7 +1158,6 @@ always @(posedge CLK_VIDEO) begin
 		{b_out, g_out, r_out} <= lbq_sel ?
 			{lb_q[35:30], lb_q[35:34], lb_q[29:24], lb_q[29:28], lb_q[23:18], lb_q[23:22]} :
 			{lb_q[17:12], lb_q[17:16], lb_q[11:6],  lb_q[11:10], lb_q[5:0],   lb_q[5:4]};
-
 		if (hcnt == H_TOTAL-1) begin
 			hcnt <= 0;
 			vcnt <= vnext;

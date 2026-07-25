@@ -24,7 +24,12 @@ entity gba_cpu is
 -- synthesis translate_on 
       
       error_cpu        : out   std_logic := '0';
-      
+      dbg_pc           : out   std_logic_vector(31 downto 0) := (others => '0');
+      -- Full architectural register read-back for nds_debug: 0..15 select
+      -- r0..r15 in the CPU's current mode, 16 selects CPSR.
+      dbg_regsel       : in    unsigned(4 downto 0) := (others => '0');
+      dbg_regval       : out   std_logic_vector(31 downto 0) := (others => '0');
+
       savestate_bus    : in    proc_bus_gb_type;
       ss_wired_out     : out   std_logic_vector(proc_buswidth-1 downto 0) := (others => '0');
       ss_wired_done    : out   std_logic;
@@ -38,6 +43,7 @@ entity gba_cpu is
       gb_bus_dout      : out   std_logic_vector(31 downto 0);
       gb_bus_din       : in    std_logic_vector(31 downto 0);
       gb_bus_done      : in    std_logic;
+      gb_bus_lock      : out   std_logic := '0';
         
       bus_lowbits      : out   std_logic_vector(1 downto 0) := "00";
         
@@ -136,6 +142,7 @@ architecture arch of gba_cpu is
    signal gb_bus_saved_seq    : std_logic;
    signal gb_bus_saved_acc    : std_logic_vector(1 downto 0);
    signal gb_bus_saved_dout   : std_logic_vector(31 downto 0);
+   signal gb_bus_lock_active  : std_logic := '0';
    
    signal dma_on_1            : std_logic := '0';
    
@@ -411,6 +418,35 @@ architecture arch of gba_cpu is
 -- synthesis translate_on  
      
 begin  
+
+   -- Synthesizable one-wire-bundle tap for temporary live-hardware
+   -- diagnosis. Unlike cpu_export, this remains present when is_simu='0'.
+   dbg_pc <= std_logic_vector(regs(15));
+   -- regsel(4) set selects CPSR, otherwise the low four bits index the visible
+   -- register file. Cheaper than an equality compare against 16.
+   dbg_regval <= std_logic_vector(CPSR) when dbg_regsel(4) = '1' else
+                 std_logic_vector(regs(to_integer(dbg_regsel(3 downto 0))));
+   -- Assert only for the two data-bus transfers belonging to SWP. Decode may
+   -- advance to SWP while the preceding load is still in flight, so the raw
+   -- decode bit is deliberately not exposed as the bus lock.
+   gb_bus_lock <= gb_bus_lock_active or
+                  (execute_RW_ena and decode_datatransfer_swap);
+
+   process (clk)
+   begin
+      if rising_edge(clk) then
+         if (reset = '1') then
+            gb_bus_lock_active <= '0';
+         elsif (ce = '1') then
+            if (execute_RW_ena = '1' and decode_datatransfer_swap = '1') then
+               gb_bus_lock_active <= '1';
+            elsif (gb_bus_lock_active = '1' and gb_bus_done = '1' and
+                   execute_RW_State = DATARW_SWAPWRITE) then
+               gb_bus_lock_active <= '0';
+            end if;
+         end if;
+      end if;
+   end process;
 
    CPSR(3 downto 0)  <= unsigned(cpu_mode);
    CPSR(4)           <= '1';
@@ -2816,8 +2852,5 @@ begin
    
    
 end architecture;
-
-
-
 
 

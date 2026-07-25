@@ -134,7 +134,12 @@ entity nds_membus9 is
       io_ce_next     : in  std_logic := '1';
       io_bus         : out proc_bus_gb_type := ((others => '0'), (others => '0'), '1', '0', "00", "0000", '0');
       io_wired_out   : in  std_logic_vector(31 downto 0);
-      io_wired_done  : in  std_logic
+      io_wired_done  : in  std_logic;
+
+      -- diagnostic export for the ch4 debug mailbox:
+      -- {cpu_ena, cpu_done, membus state[2:0]} and the cache's own word
+      dbg_mb         : out std_logic_vector(7 downto 0) := (others => '0');
+      dbg_cache      : out std_logic_vector(7 downto 0) := (others => '0')
    );
 end entity;
 
@@ -173,6 +178,10 @@ architecture arch of nds_membus9 is
 
 begin
 
+   -- BIOS9 uses a synchronous hot-loadable RAM in hardware. Drive its read
+   -- address in the accept cycle so the registered word is ready in FINISH.
+   brom_addr <= unsigned(cpu_adr(14 downto 2));
+
    icache : entity work.nds_cache9
    generic map
    (
@@ -201,8 +210,14 @@ begin
       op_ena        => cache_op_ena,
       op            => cache_op,
       op_addr       => cache_op_addr,
-      op_busy       => cache_op_busy
+      op_busy       => cache_op_busy,
+      dbg_state     => dbg_cache
    );
+
+   -- cpu_done is an out port (unreadable in VHDL-93), so export the terms that
+   -- decide it instead: whichever target the current state is waiting on.
+   dbg_mb <= cpu_ena & accept_now & cresp_done & mr_done & "0" &
+             std_logic_vector(to_unsigned(t_state'pos(state), 3));
 
    -- ================= request accept (combinational mirror of can_accept) =================
    accept_now <= '1' when reset = '0' and
@@ -358,7 +373,6 @@ begin
                         state <= FINISH;   -- store drive is combinational above
 
                      when T_BROM =>
-                        brom_addr <= unsigned(cpu_adr(14 downto 2));
                         state     <= FINISH; -- writes are no-ops
 
                      when T_WRAMSH =>

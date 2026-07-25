@@ -35,6 +35,7 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_ipc.vhd \
    rtl/nds_syscnt.vhd \
    rtl/nds_loader.vhd \
+   rtl/nds_debug.vhd \
    rtl/nds_mainram.vhd \
    rtl/nds_membus7.vhd \
    rtl/nds_membus9.vhd \

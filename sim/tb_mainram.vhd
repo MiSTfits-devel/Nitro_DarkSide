@@ -30,12 +30,12 @@ architecture sim of tb_mainram is
 
    signal arm7_priority : std_logic := '0';
 
-   signal mem9_ena, mem9_rnw, mem9_done : std_logic := '0';
+   signal mem9_ena, mem9_lock, mem9_rnw, mem9_done : std_logic := '0';
    signal mem9_addr : std_logic_vector(21 downto 2) := (others => '0');
    signal mem9_be   : std_logic_vector(3 downto 0) := (others => '0');
    signal mem9_writedata, mem9_readdata : std_logic_vector(31 downto 0) := (others => '0');
 
-   signal mem7_ena, mem7_rnw, mem7_done : std_logic := '0';
+   signal mem7_ena, mem7_lock, mem7_rnw, mem7_done : std_logic := '0';
    signal mem7_addr : std_logic_vector(21 downto 2) := (others => '0');
    signal mem7_be   : std_logic_vector(3 downto 0) := (others => '0');
    signal mem7_writedata, mem7_readdata : std_logic_vector(31 downto 0) := (others => '0');
@@ -84,9 +84,11 @@ begin
    (
       clk1x => clk1x, clkMem => clkMem, clkMemIndex => clkMemIndex, reset => reset,
       arm7_priority => arm7_priority,
-      mem9_ena => mem9_ena, mem9_rnw => mem9_rnw, mem9_addr => mem9_addr, mem9_be => mem9_be,
+      mem9_ena => mem9_ena, mem9_lock => mem9_lock,
+      mem9_rnw => mem9_rnw, mem9_addr => mem9_addr, mem9_be => mem9_be,
       mem9_writedata => mem9_writedata, mem9_done => mem9_done, mem9_readdata => mem9_readdata,
-      mem7_ena => mem7_ena, mem7_rnw => mem7_rnw, mem7_addr => mem7_addr, mem7_be => mem7_be,
+      mem7_ena => mem7_ena, mem7_lock => mem7_lock,
+      mem7_rnw => mem7_rnw, mem7_addr => mem7_addr, mem7_be => mem7_be,
       mem7_writedata => mem7_writedata, mem7_done => mem7_done, mem7_readdata => mem7_readdata,
       mainram_allow => model_allow, mainram_active => mainram_active, mainram_busy => mainram_busy,
       mr_sdram_ena => sdram_ena, mr_sdram_rnw => sdram_rnw, mr_sdram_Adr => sdram_Adr,
@@ -175,6 +177,7 @@ begin
       variable exp        : std_logic_vector(31 downto 0);
       variable got9, got7 : boolean;
       variable seqops, conops : integer := 0;
+      variable old9, old7 : std_logic_vector(31 downto 0);
 
       procedure apply_write(variable wa : in integer; variable be : in std_logic_vector(3 downto 0);
                             variable d : in std_logic_vector(31 downto 0)) is
@@ -282,6 +285,51 @@ begin
          if not rnw7 then apply_write(w7, be7, d7); end if;
          conops := conops + 1;
       end loop;
+
+      -- ============ phase 3: deterministic SWP collision ============
+      -- ARM9 wins the first read. ARM7's read is already pending when the
+      -- ARM9 write half arrives, and ordinary priority changes to ARM7. The
+      -- lock must keep the ARM9 read/write pair indivisible.
+      w := 16#3FFFA#;
+      mem9_addr <= std_logic_vector(to_unsigned(w, 20));
+      mem9_be <= "1111"; mem9_writedata <= x"00000000"; mem9_rnw <= '0';
+      wait until rising_edge(clk1x);
+      mem9_ena <= '1'; wait until rising_edge(clk1x); mem9_ena <= '0';
+      wait until rising_edge(clk1x) and mem9_done = '1' for 20 us;
+      assert mem9_done = '1' report "phase3: lock initialization timeout" severity failure;
+
+      arm7_priority <= '0';
+      mem9_addr <= std_logic_vector(to_unsigned(w, 20));
+      mem9_be <= "1111"; mem9_rnw <= '1'; mem9_lock <= '1';
+      mem7_addr <= std_logic_vector(to_unsigned(w, 20));
+      mem7_be <= "1111"; mem7_rnw <= '1'; mem7_lock <= '1';
+      wait until rising_edge(clk1x);
+      mem9_ena <= '1'; mem7_ena <= '1';
+      wait until rising_edge(clk1x);
+      mem9_ena <= '0'; mem7_ena <= '0';
+
+      wait until rising_edge(clk1x) and mem9_done = '1' for 20 us;
+      assert mem9_done = '1' report "phase3: ARM9 locked read timeout" severity failure;
+      old9 := mem9_readdata;
+      arm7_priority <= '1';
+      mem9_rnw <= '0'; mem9_writedata <= x"00000040";
+      wait until rising_edge(clk1x);
+      mem9_ena <= '1'; wait until rising_edge(clk1x); mem9_ena <= '0';
+
+      wait until rising_edge(clk1x) and mem7_done = '1' for 20 us;
+      assert mem7_done = '1' report "phase3: ARM7 locked read timeout" severity failure;
+      old7 := mem7_readdata;
+      mem7_rnw <= '0'; mem7_writedata <= x"00000080";
+      wait until rising_edge(clk1x);
+      mem7_ena <= '1'; wait until rising_edge(clk1x); mem7_ena <= '0';
+      wait until rising_edge(clk1x) and mem7_done = '1' for 20 us;
+      assert mem7_done = '1' report "phase3: ARM7 locked write timeout" severity failure;
+      mem9_lock <= '0'; mem7_lock <= '0';
+
+      assert old9 = x"00000000" and old7 = x"00000040"
+         report "phase3: SWP pair was split: ARM9 old=" & to_hstring(old9) &
+                " ARM7 old=" & to_hstring(old7)
+         severity failure;
 
       report "tb_mainram: PASS  sequential=" & integer'image(seqops) &
              " concurrent_pairs=" & integer'image(conops) severity note;

@@ -117,6 +117,11 @@ architecture arch of nds_membus7 is
 
 begin
 
+   -- BIOS is now a synchronous hot-loadable RAM in hardware. Present the
+   -- request address during the accept cycle so its registered data is ready
+   -- in FINISH, matching the TCM/WRAM store timing below.
+   bios_addr <= unsigned(cpu_adr(13 downto 2));
+
    -- ================= request accept (combinational mirror of can_accept) =================
    accept_now <= '1' when reset = '0' and
                           (state = IDLE or state = FINISH or
@@ -230,7 +235,6 @@ begin
                   case dec_target is
 
                      when T_BIOS =>
-                        bios_addr <= unsigned(cpu_adr(13 downto 2));
                         state     <= FINISH;   -- writes fall through as no-ops
 
                      when T_WRAM7 =>

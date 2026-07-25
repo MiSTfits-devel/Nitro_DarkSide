@@ -18,15 +18,13 @@
 --     data - architecturally intended. op_busy is combinationally high from
 --     the op_ena pulse until the op retires; the CPU stalls on it.
 --
--- Storage (the M9 BRAM pass): line DATA lives in per-way M10K blocks
--- (4 x I + 4 x D SyncRamDualByteEnable instances; port A is a free-running
--- registered-address read fed by req_addr - or the writeback cursor during
--- WB states - port B takes fill/write-hit writes). Tags, valid, dirty and
--- round-robin state stay in flops (~8.6 Kbit) so the 4-way parallel compare
--- and every maintenance-op path keep their exact single-cycle behavior.
--- Cycle timing is unchanged on all hit/miss/fill/bypass paths; the only
--- difference is one extra cycle (WB_PREP) at the start of each line
--- writeback, to let the first beat's registered read land.
+-- Storage (the M9 BRAM passes): line DATA and tags live in independent
+-- per-way SyncRamDualByteEnable blocks. All four tags for a set are read in
+-- parallel, then compared in an explicit lookup cycle. Valid, dirty and RR
+-- state remain as small flop arrays so invalidate-all stays atomic. Cacheable
+-- requests and address-based maintenance gain one cycle; associativity,
+-- replacement and write-back behavior are unchanged. WB_PREP lets the first
+-- data beat's registered read land before a writeback starts.
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -68,7 +66,12 @@ entity nds_cache9 is
       op_ena        : in  std_logic;
       op            : in  std_logic_vector(3 downto 0);
       op_addr       : in  std_logic_vector(31 downto 0);
-      op_busy       : out std_logic
+      op_busy       : out std_logic;
+
+      -- diagnostic export: {r_code, beat[2:0], state[3:0]}. Read out through the
+      -- ch4 debug mailbox so a wedged ARM9 can be told apart from a slow one
+      -- without a waveform. Costs a 8-bit encoder; leave it wired.
+      dbg_state     : out std_logic_vector(7 downto 0) := (others => '0')
    );
 end entity;
 
@@ -76,22 +79,26 @@ architecture arch of nds_cache9 is
 
    -- I: 4 ways x 64 sets x 8 words, tag = addr(31 downto 11)
    -- D: 4 ways x 32 sets x 8 words, tag = addr(31 downto 10)
-   type t_itags is array (0 to 255) of std_logic_vector(20 downto 0);  -- way*64+set
-   type t_dtags is array (0 to 127) of std_logic_vector(21 downto 0);  -- way*32+set
    type t_rr6   is array (0 to 63) of unsigned(1 downto 0);
    type t_rr5   is array (0 to 31) of unsigned(1 downto 0);
 
-   signal itags   : t_itags := (others => (others => '0'));
    signal ivalid  : std_logic_vector(255 downto 0) := (others => '0');
    signal irr     : t_rr6 := (others => "00");
 
-   signal dtags   : t_dtags := (others => (others => '0'));
    signal dvalid  : std_logic_vector(127 downto 0) := (others => '0');
    signal ddirty  : std_logic_vector(127 downto 0) := (others => '0');
    signal drr     : t_rr5 := (others => "00");
 
-   -- per-way line data stores (M10K): port A read, port B write
+   -- per-way tag and line-data stores: port A read, port B write
    type t_wayq is array (0 to 3) of std_logic_vector(31 downto 0);
+   signal it_raddr : integer range 0 to 63;
+   signal dt_raddr : integer range 0 to 31;
+   signal it_q     : t_wayq;
+   signal dt_q     : t_wayq;
+   signal it_we    : std_logic_vector(3 downto 0);
+   signal dt_we    : std_logic_vector(3 downto 0);
+   signal it_waddr : integer range 0 to 63;
+   signal dt_waddr : integer range 0 to 31;
    signal id_raddr : integer range 0 to 511;
    signal dd_raddr : integer range 0 to 255;
    signal id_q     : t_wayq;
@@ -125,6 +132,8 @@ architecture arch of nds_cache9 is
    type t_state is
    (
       IDLE,
+      REQ_LOOKUP,    -- synchronous per-way tags are now valid; resolve hit
+      OP_LOOKUP,     -- resolve an address/index maintenance operation
       HIT_RESP,      -- registered hit / end of fill: put data on resp
       BYPASS_ISSUE,  -- uncachable or D write miss: single memory beat
       BYPASS_WAIT,
@@ -137,12 +146,32 @@ architecture arch of nds_cache9 is
    );
    signal state : t_state := IDLE;
 
+   function state_code (s : t_state) return std_logic_vector is
+   begin
+      case s is
+         when IDLE         => return x"0";
+         when REQ_LOOKUP   => return x"1";
+         when OP_LOOKUP    => return x"2";
+         when HIT_RESP     => return x"3";
+         when BYPASS_ISSUE => return x"4";
+         when BYPASS_WAIT  => return x"5";
+         when WB_PREP      => return x"6";
+         when WB_BEAT      => return x"7";
+         when WB_WAIT      => return x"8";
+         when FILL_BEAT    => return x"9";
+         when FILL_WAIT    => return x"A";
+         when OP_FINISH    => return x"B";
+      end case;
+   end function;
+
    -- latched CPU request
    signal r_rnw   : std_logic := '1';
    signal r_code  : std_logic := '0';
    signal r_addr  : std_logic_vector(31 downto 0) := (others => '0');
    signal r_be    : std_logic_vector(3 downto 0) := (others => '0');
    signal r_wdata : std_logic_vector(31 downto 0) := (others => '0');
+   signal r_op     : std_logic_vector(3 downto 0) := (others => '0');
+   signal r_opaddr : std_logic_vector(31 downto 0) := (others => '0');
 
    -- fill/writeback bookkeeping
    signal beat        : unsigned(2 downto 0) := (others => '0');
@@ -166,7 +195,35 @@ begin
 
    op_busy <= op_ena or op_pending or op_active;
 
-   -- ================= line data stores =================
+   dbg_state <= r_code & std_logic_vector(beat) & state_code(state);
+
+   -- ================= tag and line-data stores =================
+   -- At IDLE, select the address of the operation that wins arbitration.
+   -- The per-way synchronous tag outputs are consumed in REQ_LOOKUP or
+   -- OP_LOOKUP on the following edge.
+   it_raddr <= to_integer(unsigned(op_addr(10 downto 5))) when (state = IDLE and op_ena = '1') else
+               to_integer(unsigned(p_addr(10 downto 5))) when (state = IDLE and op_pending = '1') else
+               to_integer(unsigned(req_addr(10 downto 5)));
+   dt_raddr <= to_integer(unsigned(op_addr(9 downto 5))) when (state = IDLE and op_ena = '1') else
+               to_integer(unsigned(p_addr(9 downto 5))) when (state = IDLE and op_pending = '1') else
+               to_integer(unsigned(req_addr(9 downto 5)));
+
+   it_waddr <= to_integer(unsigned(r_addr(10 downto 5)));
+   dt_waddr <= to_integer(unsigned(r_addr(9 downto 5)));
+
+   process (all)
+   begin
+      it_we <= (others => '0');
+      dt_we <= (others => '0');
+      if (state = FILL_WAIT and mem_done = '1' and beat = 7) then
+         if (r_code = '1') then
+            it_we(fill_way) <= '1';
+         else
+            dt_we(fill_way) <= '1';
+         end if;
+      end if;
+   end process;
+
    -- Port A: free-running registered-address read. It follows the incoming
    -- request's set/word (the membus holds req_addr stable until resp_done,
    -- so the capture at the lookup edge is the wanted word of every way);
@@ -203,6 +260,64 @@ begin
 
    gways : for w in 0 to 3 generate
    begin
+      iitag : entity MEM.SyncRamDualByteEnable
+      generic map
+      (
+         is_simu     => is_simu,
+         is_cyclone5 => '1',
+         BYTE_WIDTH  => 8,
+         ADDR_WIDTH  => 6,
+         BYTES       => 4
+      )
+      port map
+      (
+         clk       => clk,
+         ce_a      => '1',
+         addr_a    => it_raddr,
+         datain_a0 => x"00", datain_a1 => x"00", datain_a2 => x"00", datain_a3 => x"00",
+         dataout_a => it_q(w),
+         we_a      => '0',
+         be_a      => "0000",
+         ce_b      => '1',
+         addr_b    => it_waddr,
+         datain_b0 => r_addr(18 downto 11),
+         datain_b1 => r_addr(26 downto 19),
+         datain_b2 => "000" & r_addr(31 downto 27),
+         datain_b3 => x"00",
+         dataout_b => open,
+         we_b      => it_we(w),
+         be_b      => "1111"
+      );
+
+      idtag : entity MEM.SyncRamDualByteEnable
+      generic map
+      (
+         is_simu     => is_simu,
+         is_cyclone5 => '1',
+         BYTE_WIDTH  => 8,
+         ADDR_WIDTH  => 5,
+         BYTES       => 4
+      )
+      port map
+      (
+         clk       => clk,
+         ce_a      => '1',
+         addr_a    => dt_raddr,
+         datain_a0 => x"00", datain_a1 => x"00", datain_a2 => x"00", datain_a3 => x"00",
+         dataout_a => dt_q(w),
+         we_a      => '0',
+         be_a      => "0000",
+         ce_b      => '1',
+         addr_b    => dt_waddr,
+         datain_b0 => r_addr(17 downto 10),
+         datain_b1 => r_addr(25 downto 18),
+         datain_b2 => "00" & r_addr(31 downto 26),
+         datain_b3 => x"00",
+         dataout_b => open,
+         we_b      => dt_we(w),
+         be_b      => "1111"
+      );
+
       iidata : entity MEM.SyncRamDualByteEnable
       generic map
       (
@@ -266,9 +381,7 @@ begin
       variable iset, dset  : integer range 0 to 63;
       variable ihit, dhit  : boolean;
       variable hway        : integer range 0 to 3;
-      variable iline       : integer range 0 to 255;
       variable dline       : integer range 0 to 127;
-      variable a           : std_logic_vector(31 downto 0);
       variable v_op        : std_logic_vector(3 downto 0);
       variable v_opaddr    : std_logic_vector(31 downto 0);
       variable run_op      : boolean;
@@ -322,13 +435,9 @@ begin
                            state  <= OP_FINISH;
 
                         when "0001" =>                    -- invalidate I line MVA
-                           iset := to_integer(unsigned(v_opaddr(10 downto 5)));
-                           for w in 0 to 3 loop
-                              if (ivalid(w*64 + iset) = '1' and itags(w*64 + iset) = v_opaddr(31 downto 11)) then
-                                 ivalid(w*64 + iset) <= '0';
-                              end if;
-                           end loop;
-                           state <= OP_FINISH;
+                           r_op     <= v_op;
+                           r_opaddr <= v_opaddr;
+                           state    <= OP_LOOKUP;
 
                         when "0010" =>                    -- invalidate D all
                            dvalid <= (others => '0');
@@ -336,52 +445,9 @@ begin
                            state  <= OP_FINISH;
 
                         when "0011" | "0100" | "0101" | "0110" | "0111" | "1000" =>
-                           -- D line ops: resolve the target line
-                           dhit := false;
-                           if (v_op = "0100" or v_op = "0110" or v_op = "1000") then
-                              -- by set/index: addr = way(31:30), set(9:5)
-                              dset  := to_integer(unsigned(v_opaddr(9 downto 5)));
-                              hway  := to_integer(unsigned(v_opaddr(31 downto 30)));
-                              dline := hway*32 + dset;
-                              dhit  := dvalid(dline) = '1';
-                           else
-                              -- by MVA
-                              dset := to_integer(unsigned(v_opaddr(9 downto 5)));
-                              for w in 0 to 3 loop
-                                 if (dvalid(w*32 + dset) = '1' and dtags(w*32 + dset) = v_opaddr(31 downto 10)) then
-                                    dline := w*32 + dset;
-                                    dhit  := true;
-                                 end if;
-                              end loop;
-                           end if;
-
-                           if (not dhit) then
-                              state <= OP_FINISH;
-                           elsif (v_op = "0011" or v_op = "0100") then
-                              -- invalidate without clean: dirty data is dropped
-                              dvalid(dline) <= '0';
-                              ddirty(dline) <= '0';
-                              state <= OP_FINISH;
-                           elsif (ddirty(dline) = '0') then
-                              -- clean of a clean line: only the +invalidate part remains
-                              if (v_op = "0111" or v_op = "1000") then
-                                 dvalid(dline) <= '0';
-                              end if;
-                              state <= OP_FINISH;
-                           else
-                              -- clean (+invalidate) of a dirty line: write it back
-                              wb_line       <= dline;
-                              wb_way        <= dline / 32;
-                              wb_raddr      <= (dline mod 32) * 8;
-                              wb_addrbase   <= dtags(dline)(11 downto 0) & std_logic_vector(to_unsigned(dline mod 32, 5));
-                              beat          <= (others => '0');
-                              after_wb_fill <= '0';
-                              op_invalidate_after <= '0';
-                              if (v_op = "0111" or v_op = "1000") then
-                                 op_invalidate_after <= '1';
-                              end if;
-                              state <= WB_PREP;
-                           end if;
+                           r_op     <= v_op;
+                           r_opaddr <= v_opaddr;
+                           state    <= OP_LOOKUP;
 
                         when others =>
                            state <= OP_FINISH;
@@ -397,75 +463,136 @@ begin
 
                      if (req_cacheable = '0') then
                         state <= BYPASS_ISSUE;
-                     elsif (req_code = '1') then
-                        -- I-cache lookup
-                        iset := to_integer(unsigned(req_addr(10 downto 5)));
-                        ihit := false;
-                        for w in 0 to 3 loop
-                           if (ivalid(w*64 + iset) = '1' and itags(w*64 + iset) = req_addr(31 downto 11)) then
-                              hway := w;
-                              ihit := true;
-                           end if;
-                        end loop;
-                        if (ihit) then
-                           -- data comes off the way BRAMs, captured this edge
-                           resp_way   <= hway;
-                           resp_use_i <= '1';
-                           resp_use_d <= '0';
-                           state      <= HIT_RESP;
-                        else
-                           fill_way <= to_integer(irr(iset));
-                           beat     <= (others => '0');
-                           state    <= FILL_BEAT;
-                        end if;
                      else
-                        -- D-cache lookup
-                        dset := to_integer(unsigned(req_addr(9 downto 5)));
-                        dhit := false;
+                        state <= REQ_LOOKUP;
+                     end if;
+                  end if;
+
+               when REQ_LOOKUP =>
+                  if (r_code = '1') then
+                     iset := to_integer(unsigned(r_addr(10 downto 5)));
+                     ihit := false;
+                     for w in 0 to 3 loop
+                        if (ivalid(w*64 + iset) = '1' and it_q(w)(20 downto 0) = r_addr(31 downto 11)) then
+                           hway := w;
+                           ihit := true;
+                        end if;
+                     end loop;
+                     if (ihit) then
+                        -- I-cache read hit: answer in THIS cycle instead of
+                        -- spending a HIT_RESP cycle. id_q is already valid here
+                        -- (id_raddr is a free-running read off req_addr, which
+                        -- the membus holds stable until resp_done), and hway is
+                        -- resolved combinationally just above, so the way mux can
+                        -- move into this cycle. Saves one cycle on every fetch
+                        -- that hits, which is the dominant ARM9 memory event:
+                        -- measured CPI was 2.65 against the ARM7's 1.12.
+                        -- Reads only - a D-cache *write* hit still needs
+                        -- HIT_RESP, where the line update is issued.
+                        resp_done  <= '1';
+                        resp_rdata <= id_q(hway);
+                        resp_use_i <= '0';
+                        resp_use_d <= '0';
+                        state      <= IDLE;
+                     else
+                        fill_way <= to_integer(irr(iset));
+                        beat     <= (others => '0');
+                        state    <= FILL_BEAT;
+                     end if;
+                  else
+                     dset := to_integer(unsigned(r_addr(9 downto 5)));
+                     dhit := false;
+                     for w in 0 to 3 loop
+                        if (dvalid(w*32 + dset) = '1' and dt_q(w)(21 downto 0) = r_addr(31 downto 10)) then
+                           hway := w;
+                           dhit := true;
+                        end if;
+                     end loop;
+
+                     if (dhit) then
+                        if (r_rnw = '1') then
+                           resp_way   <= hway;
+                           resp_use_d <= '1';
+                           resp_use_i <= '0';
+                        else
+                           dwr_pend <= '1';
+                           dwr_way  <= hway;
+                           dwr_addr <= dset*8 + to_integer(unsigned(r_addr(4 downto 2)));
+                           dwr_be   <= r_be;
+                           dwr_data <= r_wdata;
+                           ddirty(hway*32 + dset) <= '1';
+                           resp_use_i <= '0';
+                           resp_use_d <= '0';
+                        end if;
+                        state <= HIT_RESP;
+                     elsif (r_rnw = '0') then
+                        state <= BYPASS_ISSUE;
+                     else
+                        hway     := to_integer(drr(dset));
+                        fill_way <= hway;
+                        beat     <= (others => '0');
+                        if (dvalid(hway*32 + dset) = '1' and ddirty(hway*32 + dset) = '1') then
+                           wb_line       <= hway*32 + dset;
+                           wb_way        <= hway;
+                           wb_raddr      <= dset*8;
+                           wb_addrbase   <= dt_q(hway)(11 downto 0) & r_addr(9 downto 5);
+                           after_wb_fill <= '1';
+                           state         <= WB_PREP;
+                        else
+                           state <= FILL_BEAT;
+                        end if;
+                     end if;
+                  end if;
+
+               when OP_LOOKUP =>
+                  if (r_op = "0001") then
+                     iset := to_integer(unsigned(r_opaddr(10 downto 5)));
+                     for w in 0 to 3 loop
+                        if (ivalid(w*64 + iset) = '1' and it_q(w)(20 downto 0) = r_opaddr(31 downto 11)) then
+                           ivalid(w*64 + iset) <= '0';
+                        end if;
+                     end loop;
+                     state <= OP_FINISH;
+                  else
+                     dhit := false;
+                     dset := to_integer(unsigned(r_opaddr(9 downto 5)));
+                     if (r_op = "0100" or r_op = "0110" or r_op = "1000") then
+                        hway  := to_integer(unsigned(r_opaddr(31 downto 30)));
+                        dline := hway*32 + dset;
+                        dhit  := dvalid(dline) = '1';
+                     else
                         for w in 0 to 3 loop
-                           if (dvalid(w*32 + dset) = '1' and dtags(w*32 + dset) = req_addr(31 downto 10)) then
-                              hway := w;
-                              dhit := true;
+                           if (dvalid(w*32 + dset) = '1' and dt_q(w)(21 downto 0) = r_opaddr(31 downto 10)) then
+                              hway  := w;
+                              dline := w*32 + dset;
+                              dhit  := true;
                            end if;
                         end loop;
+                     end if;
 
-                        if (dhit) then
-                           if (req_rnw = '1') then
-                              -- data comes off the way BRAMs, captured this edge
-                              resp_way   <= hway;
-                              resp_use_d <= '1';
-                              resp_use_i <= '0';
-                           else
-                              -- BRAM write commits during HIT_RESP (port B)
-                              dwr_pend <= '1';
-                              dwr_way  <= hway;
-                              dwr_addr <= dset*8 + to_integer(unsigned(req_addr(4 downto 2)));
-                              dwr_be   <= req_be;
-                              dwr_data <= req_wdata;
-                              ddirty(hway*32 + dset) <= '1';
-                              resp_use_i <= '0';
-                              resp_use_d <= '0';
-                           end if;
-                           state <= HIT_RESP;
-                        elsif (req_rnw = '0') then
-                           -- write miss: no allocate, straight to memory
-                           state <= BYPASS_ISSUE;
-                        else
-                           -- read miss: evict (write back if dirty), then fill
-                           hway     := to_integer(drr(dset));
-                           fill_way <= hway;
-                           beat     <= (others => '0');
-                           if (dvalid(hway*32 + dset) = '1' and ddirty(hway*32 + dset) = '1') then
-                              wb_line       <= hway*32 + dset;
-                              wb_way        <= hway;
-                              wb_raddr      <= dset*8;
-                              wb_addrbase   <= dtags(hway*32 + dset)(11 downto 0) & req_addr(9 downto 5);
-                              after_wb_fill <= '1';
-                              state         <= WB_PREP;
-                           else
-                              state <= FILL_BEAT;
-                           end if;
+                     if (not dhit) then
+                        state <= OP_FINISH;
+                     elsif (r_op = "0011" or r_op = "0100") then
+                        dvalid(dline) <= '0';
+                        ddirty(dline) <= '0';
+                        state <= OP_FINISH;
+                     elsif (ddirty(dline) = '0') then
+                        if (r_op = "0111" or r_op = "1000") then
+                           dvalid(dline) <= '0';
                         end if;
+                        state <= OP_FINISH;
+                     else
+                        wb_line       <= dline;
+                        wb_way        <= hway;
+                        wb_raddr      <= dset * 8;
+                        wb_addrbase   <= dt_q(hway)(11 downto 0) & std_logic_vector(to_unsigned(dset, 5));
+                        beat          <= (others => '0');
+                        after_wb_fill <= '0';
+                        op_invalidate_after <= '0';
+                        if (r_op = "0111" or r_op = "1000") then
+                           op_invalidate_after <= '1';
+                        end if;
+                        state <= WB_PREP;
                      end if;
                   end if;
 
@@ -549,12 +676,10 @@ begin
                      if (beat = 7) then
                         if (r_code = '1') then
                            iset := to_integer(unsigned(r_addr(10 downto 5)));
-                           itags(fill_way*64 + iset)  <= r_addr(31 downto 11);
                            ivalid(fill_way*64 + iset) <= '1';
                            irr(iset) <= irr(iset) + 1;
                         else
                            dset := to_integer(unsigned(r_addr(9 downto 5)));
-                           dtags(fill_way*32 + dset)  <= r_addr(31 downto 10);
                            dvalid(fill_way*32 + dset) <= '1';
                            ddirty(fill_way*32 + dset) <= '0';
                            drr(dset) <= drr(dset) + 1;

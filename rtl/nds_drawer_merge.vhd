@@ -102,12 +102,13 @@ end entity;
 
 architecture arch of nds_drawer_merge is
 
-   -- the blend/brightness products here are 6x5-bit — force them into ALM
-   -- logic: DSP blocks are over budget chip-wide (map wants 117 of 112) and
-   -- these are the cheapest 9-per-engine to reclaim (Quartus attribute;
-   -- ignored by nvc)
+   -- The blend/brightness products are 6x5-bit.  They were forced into ALMs
+   -- when the core needed 117 of 112 DSP blocks, but later divider removal
+   -- and the shared sound master-volume multiplier leave room for both merge
+   -- engines again.  Put these products back in DSPs: LAB routing, not DSPs,
+   -- is now the limiting resource (Quartus attribute; ignored by nvc).
    attribute multstyle : string;
-   attribute multstyle of arch : architecture is "logic";
+   attribute multstyle of arch : architecture is "dsp";
 
    constant BG0 : integer := 0;
    constant BG1 : integer := 1;

@@ -66,16 +66,19 @@ architecture sim of tb_dual_boot is
    constant card : t_card := load_hex(HEXFILE);
 
    signal ld_start, ld_busy, ld_done, ld_error : std_logic;
-   signal arm9_entry, arm7_entry : std_logic_vector(31 downto 0);
+   signal arm9_entry, arm7_entry, ld_cartid : std_logic_vector(31 downto 0);
    signal card_ena, card_done : std_logic := '0';
    signal card_addr  : std_logic_vector(26 downto 2);
    signal card_rdata : std_logic_vector(31 downto 0) := (others => '0');
    signal ld_wr_ena  : std_logic;
+   signal ld_wr_rnw  : std_logic;
+   signal ld_vfy_bad : std_logic_vector(17 downto 0);
+   signal ld_vfy_addr : std_logic_vector(31 downto 0);
    signal ld_wr_addr, ld_wr_data : std_logic_vector(31 downto 0);
 
    -- ================= ARM9 side =================
    signal cpu9_adr      : std_logic_vector(31 downto 0);
-   signal cpu9_rnw, cpu9_ena, cpu9_code, cpu9_done : std_logic;
+   signal cpu9_rnw, cpu9_ena, cpu9_code, cpu9_done, cpu9_lock : std_logic;
    signal cpu9_acc      : std_logic_vector(1 downto 0);
    signal cpu9_dout, cpu9_din, cpu9_lastread : std_logic_vector(31 downto 0);
    signal cpu9_lowbits  : std_logic_vector(1 downto 0);
@@ -136,7 +139,7 @@ architecture sim of tb_dual_boot is
 
    -- ================= ARM7 side =================
    signal cpu7_adr      : std_logic_vector(31 downto 0);
-   signal cpu7_rnw, cpu7_ena, cpu7_done : std_logic;
+   signal cpu7_rnw, cpu7_ena, cpu7_done, cpu7_lock : std_logic;
    signal cpu7_acc      : std_logic_vector(1 downto 0);
    signal cpu7_dout, cpu7_din, cpu7_lastread : std_logic_vector(31 downto 0);
    signal cpu7_lowbits  : std_logic_vector(1 downto 0);
@@ -249,8 +252,17 @@ begin
       wait until rising_edge(clk1x) and ld_busy = '0';
       assert ld_error = '0' report "nds_loader flagged load_error" severity failure;
       assert ld_done  = '1' report "nds_loader neither done nor error" severity failure;
+      -- The behavioural SDRAM here is perfect, so the loader's post-copy verify
+      -- must come back clean. A non-zero count in simulation means the verify
+      -- logic itself is wrong (addressing, rd_data timing), which would make it
+      -- useless as a hardware measurement - so gate on it here.
+      assert unsigned(ld_vfy_bad) = 0
+         report "loader main-RAM verify reported " & to_hstring(ld_vfy_bad) &
+                " mismatches, first at " & to_hstring(ld_vfy_addr) &
+                " - the verify pass itself is suspect" severity failure;
       report "loader done: arm9_entry=" & to_hstring(arm9_entry) &
-             " arm7_entry=" & to_hstring(arm7_entry) severity note;
+             " arm7_entry=" & to_hstring(arm7_entry) &
+             " verify clean" severity note;
       preset_pc(ss_bus9, arm9_entry);
       preset_pc(ss_bus7, arm7_entry);
       resetCpu <= '0';
@@ -263,11 +275,14 @@ begin
    (
       clk => clk1x, reset => reset,
       start => ld_start, busy => ld_busy, done => ld_done, load_error => ld_error,
-      arm9_entry => arm9_entry, arm7_entry => arm7_entry,
+      direct => '1',
+      arm9_entry => arm9_entry, arm7_entry => arm7_entry, cart_id => ld_cartid,
       card_ena => card_ena, card_addr => card_addr,
       card_done => card_done, card_rdata => card_rdata,
-      wr_ena => ld_wr_ena, wr_addr => ld_wr_addr, wr_data => ld_wr_data,
-      wr_done => mem9_done
+      wr_ena => ld_wr_ena, wr_rnw => ld_wr_rnw,
+      wr_addr => ld_wr_addr, wr_data => ld_wr_data,
+      wr_done => mem9_done, rd_data => mem9_readdata,
+      vfy_bad => ld_vfy_bad, vfy_addr => ld_vfy_addr
    );
 
    p_card : process (clk1x)
@@ -275,7 +290,14 @@ begin
       if rising_edge(clk1x) then
          card_done <= '0';
          if (card_ena = '1') then
-            card_rdata <= card(to_integer(unsigned(card_addr(15 downto 2))));
+            -- Exercise the direct-boot chip-ID calculation with Kirby's
+            -- actual used-ROM-size header word (0x03159E2C -> 64 MiB
+            -- power-of-two envelope -> chip ID 0x00003FC2).
+            if (unsigned(card_addr) = 16#20#) then
+               card_rdata <= x"03159E2C";
+            else
+               card_rdata <= card(to_integer(unsigned(card_addr(15 downto 2))));
+            end if;
             card_done  <= '1';
          end if;
       end if;
@@ -284,7 +306,9 @@ begin
    -- loader owns the main-RAM port 9 while busy; both targets (ARM9 at
    -- 0x02000000, ARM7 at 0x02380000) live in main RAM for this image
    mem9_ena       <= ld_wr_ena when ld_busy = '1' else mr9_ena;
-   mem9_rnw       <= '0'       when ld_busy = '1' else mr9_rnw;
+   -- mirrors nds_top: the loader's verify pass drives wr_rnw='1' to read main
+   -- RAM back, so this must follow it rather than forcing a write
+   mem9_rnw       <= ld_wr_rnw when ld_busy = '1' else mr9_rnw;
    mem9_addr      <= ld_wr_addr(21 downto 2) when ld_busy = '1' else mr9_addr;
    mem9_be        <= "1111"    when ld_busy = '1' else mr9_be;
    mem9_writedata <= ld_wr_data when ld_busy = '1' else mr9_writedata;
@@ -294,8 +318,20 @@ begin
    p_ldcheck : process (clk1x)
    begin
       if rising_edge(clk1x) then
-         assert not (ld_wr_ena = '1' and ld_wr_addr(31 downto 24) /= x"02")
+         -- only real writes are checked; the verify pass reuses this port with
+         -- wr_rnw='1' for read-back and leaves wr_data holding a stale word
+         assert not (ld_wr_ena = '1' and ld_wr_rnw = '0' and ld_wr_addr(31 downto 24) /= x"02")
             report "loader write outside main RAM: " & to_hstring(ld_wr_addr) severity failure;
+         if (ld_wr_ena = '1' and ld_wr_rnw = '0' and ld_wr_addr = x"02FFF800") then
+            assert ld_wr_data = x"00003FC2"
+               report "loader direct-boot cartridge ID mismatch: " &
+                      to_hstring(ld_wr_data) severity failure;
+            -- the exported cart_id feeds nds_card's B8 answer in nds_top, so
+            -- it has to be the same word that lands in the env block
+            assert ld_wr_data = ld_cartid
+               report "cart_id " & to_hstring(ld_cartid) & " disagrees with the " &
+                      "env-block chip ID " & to_hstring(ld_wr_data) severity failure;
+         end if;
       end if;
    end process;
 
@@ -310,6 +346,10 @@ begin
       cpu_export_done => open,
       cpu_export      => open,
       error_cpu       => error_cpu9,
+      dbg_pc          => open,
+      dbg_r0          => open,
+      dbg_lr          => open,
+      dbg_cpsr        => open,
       savestate_bus   => ss_bus9,
       ss_wired_out    => open,
       ss_wired_done   => open,
@@ -322,6 +362,7 @@ begin
       gb_bus_dout     => cpu9_dout,
       gb_bus_din      => cpu9_din,
       gb_bus_done     => cpu9_done,
+      gb_bus_lock     => cpu9_lock,
       bus_lowbits     => cpu9_lowbits,
       dma_on          => '0',
       done            => open,
@@ -417,6 +458,7 @@ begin
       cpu_export_done => open,
       cpu_export      => open,
       error_cpu       => error_cpu7,
+      dbg_pc          => open,
       savestate_bus   => ss_bus7,
       ss_wired_out    => open,
       ss_wired_done   => open,
@@ -429,6 +471,7 @@ begin
       gb_bus_dout     => cpu7_dout,
       gb_bus_din      => cpu7_din,
       gb_bus_done     => cpu7_done,
+      gb_bus_lock     => cpu7_lock,
       bus_lowbits     => cpu7_lowbits,
       dma_on          => '0',
       done            => open,
@@ -570,9 +613,12 @@ begin
    (
       clk1x => clk1x, clkMem => clkMem, clkMemIndex => clkMemIndex, reset => reset,
       arm7_priority => exmem_prio7,
-      mem9_ena => mem9_ena, mem9_rnw => mem9_rnw, mem9_addr => mem9_addr, mem9_be => mem9_be,
+      mem9_ena => mem9_ena,
+      mem9_lock => cpu9_lock and not bus_cacheable_d and not ld_busy,
+      mem9_rnw => mem9_rnw, mem9_addr => mem9_addr, mem9_be => mem9_be,
       mem9_writedata => mem9_writedata, mem9_done => mem9_done, mem9_readdata => mem9_readdata,
-      mem7_ena => mr7_ena, mem7_rnw => mr7_rnw, mem7_addr => mr7_addr, mem7_be => mr7_be,
+      mem7_ena => mr7_ena, mem7_lock => cpu7_lock,
+      mem7_rnw => mr7_rnw, mem7_addr => mr7_addr, mem7_be => mr7_be,
       mem7_writedata => mr7_writedata, mem7_done => mr7_done, mem7_readdata => mr7_readdata,
       mainram_allow => model_allow, mainram_active => mainram_active, mainram_busy => mainram_busy,
       mr_sdram_ena => sdram_ena, mr_sdram_rnw => sdram_rnw, mr_sdram_Adr => sdram_Adr,
@@ -606,7 +652,6 @@ begin
          assert (a >= MAINRAM_BASE and a < MAINRAM_BASE + 4194304)
             report "sdram op outside main-RAM window: " & integer'image(a) severity failure;
          w := (a - MAINRAM_BASE) / 4;
-
          if (v_rnw = '1') then
             for k in 1 to 6 loop wait until rising_edge(clkMem); end loop;
             sdram_Dout   <= mem(w);

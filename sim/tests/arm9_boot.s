@@ -119,6 +119,35 @@ pp_loop:
    orr  r9, r9, #16            @ bit 4: ping-pong
    str  r9, [r10]
 
+@ ==== shared SWP atomicity: collide with ARM7 on the SDK lock mirror ====
+   ldr  r4, =0x02FFFFE8        @ same physical word as HW_CTRDG_LOCK_BUF
+   mov  r0, #0
+   str  r0, [r4]               @ lock word
+   str  r0, [r4, #4]           @ ARM9 ready
+   mvn  r0, #0
+   str  r0, [r4, #12]          @ ARM9 old value (sentinel)
+   str  r0, [r4, #16]          @ ARM7 old value (sentinel)
+   mov  r0, #1
+   str  r0, [r4, #4]
+1: ldr  r0, [r4, #8]
+   cmp  r0, #1
+   bne  1b
+   mov  r0, #0x40
+   swp  r0, r0, [r4]
+   str  r0, [r4, #12]
+2: ldr  r1, [r4, #16]
+   cmn  r1, #1                 @ wait while ARM7 result is 0xFFFFFFFF
+   beq  2b
+   cmp  r0, #0
+   cmpeq r1, #0x40             @ ARM9 won, ARM7 observed ARM9's write
+   beq  swp9_ok
+   cmp  r1, #0
+   cmpeq r0, #0x80             @ ARM7 won, ARM9 observed ARM7's write
+   bne  report_fail
+swp9_ok:
+   orr  r9, r9, #64            @ bit 6: cross-CPU SWP was atomic
+   str  r9, [r10]
+
 @ ==== wait for the ARM7's done word ====
    ldr  r2, =0x02FFFF14
    ldr  r3, =0xBEEF7777

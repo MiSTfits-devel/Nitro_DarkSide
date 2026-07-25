@@ -41,6 +41,14 @@ entity nds_cpu9 is
 -- synthesis translate_on 
       
       error_cpu        : out   std_logic := '0';
+      dbg_pc           : out   std_logic_vector(31 downto 0) := (others => '0');
+      dbg_r0           : out   std_logic_vector(31 downto 0) := (others => '0');
+      dbg_lr           : out   std_logic_vector(31 downto 0) := (others => '0');
+      dbg_cpsr         : out   std_logic_vector(31 downto 0) := (others => '0');
+      -- Full architectural register read-back for nds_debug: 0..15 select
+      -- r0..r15 in the CPU's current mode, 16 selects CPSR.
+      dbg_regsel       : in    unsigned(4 downto 0) := (others => '0');
+      dbg_regval       : out   std_logic_vector(31 downto 0) := (others => '0');
       
       savestate_bus    : in    proc_bus_gb_type;
       ss_wired_out     : out   std_logic_vector(proc_buswidth-1 downto 0) := (others => '0');
@@ -55,6 +63,7 @@ entity nds_cpu9 is
       gb_bus_dout      : out   std_logic_vector(31 downto 0);
       gb_bus_din       : in    std_logic_vector(31 downto 0);
       gb_bus_done      : in    std_logic;
+      gb_bus_lock      : out   std_logic := '0';
         
       bus_lowbits      : out   std_logic_vector(1 downto 0) := "00";
         
@@ -128,16 +137,26 @@ architecture arch of nds_cpu9 is
 
    -- ############# CP15 ##############
    -- control register: bits 3..6 read as 1 on the 946E-S
-   signal cp15_control     : std_logic_vector(31 downto 0) := x"00000078";
-   signal cp15_dtcm_reg    : std_logic_vector(31 downto 0) := (others => '0'); -- c9,c1,0
-   signal cp15_itcm_reg    : std_logic_vector(31 downto 0) := (others => '0'); -- c9,c1,1
+   -- Power-up values must match the synchronous reset below: see the comment
+   -- there. These are the post-ARM9-BIOS state that HLE direct boot skips.
+   signal cp15_control     : std_logic_vector(31 downto 0) := x"00012078";
+   signal cp15_dtcm_reg    : std_logic_vector(31 downto 0) := x"0300000A"; -- c9,c1,0
+   signal cp15_itcm_reg    : std_logic_vector(31 downto 0) := x"00000020"; -- c9,c1,1
    type t_cp15_regions is array (0 to 7) of std_logic_vector(31 downto 0);
-   signal cp15_pu_region   : t_cp15_regions := (others => (others => '0'));   -- c6,cN,0
-   signal cp15_pu_dcache   : std_logic_vector(31 downto 0) := (others => '0'); -- c2,c0,0
-   signal cp15_pu_icache   : std_logic_vector(31 downto 0) := (others => '0'); -- c2,c0,1
-   signal cp15_pu_wbuf     : std_logic_vector(31 downto 0) := (others => '0'); -- c3,c0,0
-   signal cp15_pu_dperm    : std_logic_vector(31 downto 0) := (others => '0'); -- c5,c0,2 (extended)
-   signal cp15_pu_iperm    : std_logic_vector(31 downto 0) := (others => '0'); -- c5,c0,3 (extended)
+   type t_cp15_masks   is array (0 to 7) of unsigned(31 downto 0);
+   -- per-region "bits above the size code" mask, derived from the region
+   -- registers only so it stays off the address path (see the PU compare below)
+   signal cp15_pu_mask : t_cp15_masks;
+   signal cp15_pu_region   : t_cp15_regions :=                                -- c6,cN,0
+   (
+      0 => x"04000033", 1 => x"0200002B", 2 => x"00000000", 3 => x"08000035",
+      4 => x"0300001B", 5 => x"00000000", 6 => x"FFFF001D", 7 => x"027FF017"
+   );
+   signal cp15_pu_dcache   : std_logic_vector(31 downto 0) := x"00000042"; -- c2,c0,0
+   signal cp15_pu_icache   : std_logic_vector(31 downto 0) := x"00000042"; -- c2,c0,1
+   signal cp15_pu_wbuf     : std_logic_vector(31 downto 0) := x"00000002"; -- c3,c0,0
+   signal cp15_pu_dperm    : std_logic_vector(31 downto 0) := x"15111011"; -- c5,c0,2 (extended)
+   signal cp15_pu_iperm    : std_logic_vector(31 downto 0) := x"05100011"; -- c5,c0,3 (extended)
    signal cp15_dcache_lock : std_logic_vector(31 downto 0) := (others => '0'); -- c9,c0,0
    signal cp15_icache_lock : std_logic_vector(31 downto 0) := (others => '0'); -- c9,c0,1
    signal cp15_trace_pid   : std_logic_vector(31 downto 0) := (others => '0'); -- c13 (stored)
@@ -202,6 +221,7 @@ architecture arch of nds_cpu9 is
    signal gb_bus_saved_seq    : std_logic;
    signal gb_bus_saved_acc    : std_logic_vector(1 downto 0);
    signal gb_bus_saved_dout   : std_logic_vector(31 downto 0);
+   signal gb_bus_lock_active  : std_logic := '0';
    
    signal dma_on_1            : std_logic := '0';
    
@@ -520,6 +540,38 @@ architecture arch of nds_cpu9 is
      
 begin  
 
+   -- Synthesizable one-wire-bundle tap for temporary live-hardware
+   -- diagnosis. Unlike cpu_export, this remains present when is_simu='0'.
+   dbg_pc <= std_logic_vector(regs(15));
+   dbg_r0 <= std_logic_vector(regs(0));
+   dbg_lr <= std_logic_vector(regs(14));
+   dbg_cpsr <= std_logic_vector(CPSR);
+   -- regsel(4) set selects CPSR, otherwise the low four bits index the visible
+   -- register file. Cheaper than an equality compare against 16.
+   dbg_regval <= std_logic_vector(CPSR) when dbg_regsel(4) = '1' else
+                 std_logic_vector(regs(to_integer(dbg_regsel(3 downto 0))));
+   -- Assert only for the two data-bus transfers belonging to SWP. Decode may
+   -- advance to SWP while the preceding load is still in flight, so the raw
+   -- decode bit is deliberately not exposed as the bus lock.
+   gb_bus_lock <= gb_bus_lock_active or
+                  (execute_RW_ena and decode_datatransfer_swap);
+
+   process (clk)
+   begin
+      if rising_edge(clk) then
+         if (reset = '1') then
+            gb_bus_lock_active <= '0';
+         elsif (ce = '1') then
+            if (execute_RW_ena = '1' and decode_datatransfer_swap = '1') then
+               gb_bus_lock_active <= '1';
+            elsif (gb_bus_lock_active = '1' and gb_bus_done = '1' and
+                   execute_RW_State = DATARW_SWAPWRITE) then
+               gb_bus_lock_active <= '0';
+            end if;
+         end if;
+      end if;
+   end process;
+
    CPSR(3 downto 0)  <= unsigned(cpu_mode);
    CPSR(4)           <= '1';
    CPSR(5)           <= thumbmode;
@@ -560,9 +612,35 @@ begin
    -- PU cachability lookup for the current bus address. Highest-numbered
    -- matching region wins; PU disabled or no region hit = uncachable.
    -- Region reg: bit 0 enable, bits 5:1 size code (2^(N+1) bytes), 31:12 base.
+   -- The region-size compare used to be `shift_right(a xor base, sz+1) = 0`,
+   -- which put the *address* through eight 32-bit variable barrel shifters. That
+   -- cost ~5.5 ns and made this the second-biggest term on the worst clk_sys
+   -- path; 36 of the 50 worst paths in a 98% build ended at the flop this feeds
+   -- (nds_membus9|creq_cacheable), 16 of them through these shifters.
+   --
+   -- shift_right(x, sz+1) = 0  <->  bits [31:sz+1] of x are all zero
+   --                           <->  (x and mask) = 0, mask(i)='1' iff i > sz
+   -- The mask depends only on cp15_pu_region, which is a register, so building
+   -- it here keeps the shift entirely off the address path: the address now sees
+   -- just xor -> and -> zero-detect. Identical Boolean function, same cycle, and
+   -- it replaces eight barrel shifters with eight decoders (frees ALMs, which is
+   -- the binding constraint on this design). sz=31 gives an all-zero mask, which
+   -- matches shift_right(x,32)=0 always being true.
    process (all)
-      variable a  : unsigned(31 downto 0);
       variable sz : integer range 0 to 31;
+   begin
+      for r in 0 to 7 loop
+         sz := to_integer(unsigned(cp15_pu_region(r)(5 downto 1)));
+         for i in 0 to 31 loop
+            if (i > sz) then cp15_pu_mask(r)(i) <= '1';
+            else             cp15_pu_mask(r)(i) <= '0';
+            end if;
+         end loop;
+      end loop;
+   end process;
+
+   process (all)
+      variable a : unsigned(31 downto 0);
    begin
       bus_cacheable_i <= '0';
       bus_cacheable_d <= '0';
@@ -570,8 +648,8 @@ begin
       if (cp15_control(0) = '1') then
          for r in 0 to 7 loop
             if (cp15_pu_region(r)(0) = '1') then
-               sz := to_integer(unsigned(cp15_pu_region(r)(5 downto 1)));
-               if (shift_right(a xor unsigned(std_logic_vector'(cp15_pu_region(r)(31 downto 12) & x"000")), sz + 1) = 0) then
+               if (((a xor unsigned(std_logic_vector'(cp15_pu_region(r)(31 downto 12) & x"000")))
+                    and cp15_pu_mask(r)) = 0) then
                   bus_cacheable_i <= cp15_control(12) and cp15_pu_icache(r);
                   bus_cacheable_d <= cp15_control(2)  and cp15_pu_dcache(r);
                end if;
@@ -2864,15 +2942,30 @@ begin
             execute_stall    <= '0';
             Flag_Q_Sticky     <= '0';
             execute_dsp_carry <= '0';
-            cp15_control      <= x"00000078";
-            cp15_dtcm_reg     <= (others => '0');
-            cp15_itcm_reg     <= (others => '0');
-            cp15_pu_region    <= (others => (others => '0'));
-            cp15_pu_dcache    <= (others => '0');
-            cp15_pu_icache    <= (others => '0');
-            cp15_pu_wbuf      <= (others => '0');
-            cp15_pu_dperm     <= (others => '0');
-            cp15_pu_iperm     <= (others => '0');
+            -- Post-BIOS CP15 state. HLE direct boot jumps straight to the
+            -- cart's ARM9 entry, so the ARM9 BIOS never runs and never
+            -- programs any of this - but NitroSDK's very 4th instruction is
+            -- `mrc p15,0,r0,c1,c0,0` followed by a read-modify-write, so
+            -- whatever is missing here stays missing for the whole boot.
+            -- Values are melonDS's SetupDirectBoot (src/NDS.cpp), which is the
+            -- oracle these were differentially matched against; 0x78 alone
+            -- loses bit 13 (V, high exception vectors) and bit 16 (DTCM enable).
+            cp15_control      <= x"00012078";   -- c1,c0,0
+            cp15_dtcm_reg     <= x"0300000A";   -- c9,c1,0  base 0x03000000, 16 KB
+            cp15_itcm_reg     <= x"00000020";   -- c9,c1,1  32 KB at 0
+            cp15_pu_region(0) <= x"04000033";   -- c6,c0
+            cp15_pu_region(1) <= x"0200002B";   -- c6,c1
+            cp15_pu_region(2) <= x"00000000";   -- c6,c2
+            cp15_pu_region(3) <= x"08000035";   -- c6,c3
+            cp15_pu_region(4) <= x"0300001B";   -- c6,c4
+            cp15_pu_region(5) <= x"00000000";   -- c6,c5
+            cp15_pu_region(6) <= x"FFFF001D";   -- c6,c6
+            cp15_pu_region(7) <= x"027FF017";   -- c6,c7
+            cp15_pu_dcache    <= x"00000042";   -- c2,c0,0
+            cp15_pu_icache    <= x"00000042";   -- c2,c0,1
+            cp15_pu_wbuf      <= x"00000002";   -- c3,c0,0
+            cp15_pu_dperm     <= x"15111011";   -- c5,c0,2
+            cp15_pu_iperm     <= x"05100011";   -- c5,c0,3
             cp15_dcache_lock  <= (others => '0');
             cp15_icache_lock  <= (others => '0');
             cp15_trace_pid    <= (others => '0');
@@ -3567,8 +3660,4 @@ begin
    
    
 end architecture;
-
-
-
-
 

@@ -12,11 +12,16 @@
 -- (0x037xxxxx) targets; anything else is an error (secure-area/ITCM-loading
 -- images are out of scope until real card emulation).
 --
+-- The cartridge chip ID is derived from the header's used-ROM-size word
+-- (+0x80) with the melonDS size formula and exported on cart_id: the same
+-- value goes into the direct-boot env block below and answers nds_card's B8
+-- command, so NitroSDK's CARDi_CheckPulledOut sees what it booted with.
+--
 -- direct='1' additionally synthesizes the firmware direct-boot environment
 -- (M7, spec = melonDS SetupDirectBoot; calico's bootstubs do their own CP15
 -- and stack setup so only the memory image matters):
 --   0x02FFFE00  header copy (0x170 bytes from card offset 0)
---   0x02FFF800/C00 blocks: chip ID x2 (melonDS size formula), header +
+--   0x02FFF800/C00 blocks: chip ID x2 (cart_id), header +
 --     secure-area CRC16 (read from the header itself), boot flags,
 --     user-settings mirror words for melonDS's generated default firmware
 --   0x02FFFC80  0x70-byte default user settings (version 5, all defaults)
@@ -44,6 +49,7 @@ entity nds_loader is
 
       arm9_entry  : out std_logic_vector(31 downto 0) := (others => '0');
       arm7_entry  : out std_logic_vector(31 downto 0) := (others => '0');
+      cart_id     : out std_logic_vector(31 downto 0) := (others => '0');  -- valid from done
 
       -- card image read port (word addressed into the staged .nds)
       card_ena    : out std_logic := '0';
@@ -51,11 +57,26 @@ entity nds_loader is
       card_done   : in  std_logic;
       card_rdata  : in  std_logic_vector(31 downto 0);
 
-      -- destination write port (full CPU byte address, word writes)
+      -- destination write port (full CPU byte address, word writes). wr_rnw='1'
+      -- turns an access into a read that answers on rd_data - used only by the
+      -- post-copy verify pass below.
       wr_ena      : out std_logic := '0';
+      wr_rnw      : out std_logic := '0';
       wr_addr     : out std_logic_vector(31 downto 0) := (others => '0');
       wr_data     : out std_logic_vector(31 downto 0) := (others => '0');
-      wr_done     : in  std_logic
+      wr_done     : in  std_logic;
+      rd_data     : in  std_logic_vector(31 downto 0) := (others => '0');
+
+      -- main-RAM verify results. After the copy (and env) pass, both CPU
+      -- binaries are re-read from the card and compared against what main RAM
+      -- actually returns. This is the only way to observe the SDRAM main-RAM
+      -- path on real hardware: the simulator substitutes a perfect behavioural
+      -- model, so a fault in SDRAM itself, in the clkMemIndex=0 issue gate, in
+      -- the VRAM-borrow park/resume handshake, or in the CPU-channel mux is
+      -- invisible to every existing gate. Non-zero vfy_bad means main RAM does
+      -- not read back what was written, and vfy_addr is the first such address.
+      vfy_bad     : out std_logic_vector(17 downto 0) := (others => '0');
+      vfy_addr    : out std_logic_vector(31 downto 0) := (others => '0')
    );
 end entity;
 
@@ -64,11 +85,15 @@ architecture arch of nds_loader is
    type t_state is
    (
       IDLE,
-      HDR_REQ, HDR_WAIT,     -- read the 8 header words at 0x20..0x3C
+      CLR_WR, CLR_WR_WAIT,   -- zero all 4 MB of main RAM before anything is staged
+      HDR_REQ, HDR_WAIT,     -- read the 8 header words at 0x20..0x3C, + 0x80
       CP_RD, CP_RD_WAIT,     -- copy loop: card read ...
       CP_WR, CP_WR_WAIT,     -- ... destination write
       NEXT_CPU,
+      CARTID_CALC,           -- one round-up-to-power-of-two step per cycle
       ENV_SET, ENV_WR, ENV_WR_WAIT,   -- direct-boot env table
+      VF_RD, VF_RD_WAIT,     -- verify pass: re-read the card word ...
+      VF_MEM, VF_MEM_WAIT,   -- ... then read main RAM back and compare
       FINISHED
    );
    signal state : t_state := IDLE;
@@ -77,34 +102,42 @@ architecture arch of nds_loader is
    signal hdr     : t_hdr := (others => (others => '0'));
    signal hdr_i   : integer range 0 to 8 := 0;
 
+   -- Main RAM must be ZERO before the CPUs run. NitroSDK's MI_LockByWord does
+   -- `swp r0,r0,[0x027FFFE8]` with lock id 0x40: SWP always writes the id and
+   -- returns the OLD word, so acquisition succeeds only if that word was 0.
+   -- The loader stages only the ARM9/ARM7 images, so 0x023FFFE8 (the mirror of
+   -- 0x027FFFE8) was left at whatever the SDRAM powered up holding. Simulation
+   -- hid this completely - its behavioral SDRAM starts all-zero, so the sim
+   -- always acquired the lock on the first try and booted, while real SDRAM
+   -- comes up with garbage, the first SWP fails, and every retry then reads
+   -- back its own 0x40 and fails forever: both CPUs spin, no IRQ is ever
+   -- enabled, and the screen stays white. Real hardware gets this clearing from
+   -- the firmware boot we skip in direct boot.
+   signal clr_i   : unsigned(19 downto 0) := (others => '0');   -- 0..1048575 words = 4 MB
+
    signal cpu_sel : integer range 0 to 2 := 0;         -- 0 = ARM9, 1 = ARM7, 2 = header env copy
    signal src     : unsigned(26 downto 2) := (others => '0');
    signal dst     : unsigned(31 downto 0) := (others => '0');
    signal words   : unsigned(21 downto 0) := (others => '0');
 
-   -- direct-boot env: values captured during the header copy pass
+   -- chip-ID input, read in the header pass so cart_id is produced whether or
+   -- not the direct-boot env block is written
    signal env_size   : unsigned(31 downto 0) := (others => '0');       -- hdr+0x80 used ROM size
+   -- direct-boot env: values captured during the header copy pass
    signal env_hdrcrc : std_logic_vector(15 downto 0) := (others => '0'); -- hdr+0x15E
    signal env_seccrc : std_logic_vector(15 downto 0) := (others => '0'); -- hdr+0x6C
+   signal cart_p     : unsigned(31 downto 0) := to_unsigned(512, 32);
+   signal cart_iter  : integer range 9 to 28 := 9;
    signal cartid     : std_logic_vector(31 downto 0) := (others => '0');
    signal crcword    : std_logic_vector(31 downto 0) := (others => '0');
    signal env_i      : integer range 0 to 41 := 0;
 
-   -- melonDS chip-ID formula: 0xC2 | size byte (pow2-padded ROM)
-   function cart_id(size : unsigned(31 downto 0)) return std_logic_vector is
-      variable p  : unsigned(31 downto 0) := to_unsigned(512, 32);
-      variable id : unsigned(31 downto 0) := x"000000C2";
-   begin
-      for i in 9 to 27 loop
-         if (p < size) then p := shift_left(p, 1); end if;
-      end loop;
-      if (p >= x"00100000") then
-         id := id or shift_left(resize(shift_right(p, 20) - 1, 32), 8);
-      else
-         id := id or x"00010000";                      -- melonDS: 0x100 - (sz>>28)
-      end if;
-      return std_logic_vector(id);
-   end function;
+   -- post-copy main-RAM verify
+   signal verifying  : std_logic := '0';
+   signal vfy_exp    : std_logic_vector(31 downto 0) := (others => '0');
+   signal vfy_cnt    : unsigned(17 downto 0) := (others => '0');
+   signal vfy_seen   : std_logic := '0';   -- first mismatch address latched
+   signal vfy_at     : std_logic_vector(31 downto 0) := (others => '0');
 
    -- table entries 0..12, then the 0x70-byte default user settings block
    -- (melonDS LoadDefaultFirmware: version 5, defaults, name empty)
@@ -130,6 +163,10 @@ architecture arch of nds_loader is
 
 begin
 
+   cart_id  <= cartid;
+   vfy_bad  <= std_logic_vector(vfy_cnt);
+   vfy_addr <= vfy_at;
+
    process (clk)
       variable romoff, loadaddr, size : std_logic_vector(31 downto 0);
    begin
@@ -143,6 +180,10 @@ begin
             busy       <= '0';
             done       <= '0';
             load_error <= '0';
+            verifying  <= '0';
+            vfy_cnt    <= (others => '0');
+            vfy_seen   <= '0';
+            wr_rnw     <= '0';
          else
             case state is
 
@@ -151,23 +192,50 @@ begin
                      busy  <= '1';
                      done  <= '0';
                      hdr_i <= 0;
-                     state <= HDR_REQ;
+                     clr_i <= (others => '0');
+                     state <= CLR_WR;
+                  end if;
+
+               -- Zero main RAM first, then stage the images over the top of it.
+               -- ~1M word writes; at clk1x this costs a fraction of a second
+               -- once, at boot, and it is what makes the cartridge lock (and any
+               -- other read-before-write the SDK does) behave like real hardware.
+               when CLR_WR =>
+                  wr_ena  <= '1';
+                  wr_rnw  <= '0';
+                  wr_addr <= x"02" & "00" & std_logic_vector(clr_i) & "00";
+                  wr_data <= (others => '0');
+                  state   <= CLR_WR_WAIT;
+
+               when CLR_WR_WAIT =>
+                  if (wr_done = '1') then
+                     if (clr_i = to_unsigned(1048575, clr_i'length)) then
+                        state <= HDR_REQ;
+                     else
+                        clr_i <= clr_i + 1;
+                        state <= CLR_WR;
+                     end if;
                   end if;
 
                when HDR_REQ =>
-                  card_ena  <= '1';
-                  card_addr <= std_logic_vector(to_unsigned(8 + hdr_i, 25)); -- word 8 = byte 0x20
-                  state     <= HDR_WAIT;
+                  card_ena <= '1';
+                  if (hdr_i = 8) then                                        -- one extra word:
+                     card_addr <= std_logic_vector(to_unsigned(16#20#, 25)); -- byte 0x80, used ROM size
+                  else
+                     card_addr <= std_logic_vector(to_unsigned(8 + hdr_i, 25)); -- word 8 = byte 0x20
+                  end if;
+                  state <= HDR_WAIT;
 
                when HDR_WAIT =>
                   if (card_done = '1') then
-                     hdr(hdr_i) <= card_rdata;
-                     if (hdr_i = 7) then
-                        cpu_sel <= 0;
-                        state   <= NEXT_CPU;
+                     if (hdr_i = 8) then
+                        env_size <= unsigned(card_rdata);
+                        cpu_sel  <= 0;
+                        state    <= NEXT_CPU;
                      else
-                        hdr_i <= hdr_i + 1;
-                        state <= HDR_REQ;
+                        hdr(hdr_i) <= card_rdata;
+                        hdr_i      <= hdr_i + 1;
+                        state      <= HDR_REQ;
                      end if;
                   end if;
 
@@ -189,7 +257,11 @@ begin
                      else
                         words <= unsigned(size(23 downto 2)) + 1;
                      end if;
-                     state <= CP_RD;
+                     if (verifying = '1') then
+                        state <= VF_RD;
+                     else
+                        state <= CP_RD;
+                     end if;
                   end if;
 
                when CP_RD =>
@@ -203,15 +275,17 @@ begin
                         dst     <= x"02FFFE00";
                         words   <= to_unsigned(16#5C#, words'length);
                         state   <= CP_RD;
-                     elsif (cpu_sel = 2) then
-                        cartid  <= cart_id(env_size);
+                     else
+                        -- melonDS chip-ID formula starts by rounding the
+                        -- used ROM size up from 512 bytes to a power of two.
+                        -- Do the 19 shifts over 19 clocks: the former VHDL
+                        -- function unrolled into a 49-logic-level path that
+                        -- missed this clock by more than 16 ns in Quartus.
+                        cart_p    <= to_unsigned(512, cart_p'length);
+                        cart_iter <= 9;
                         crcword <= env_seccrc & env_hdrcrc;
                         env_i   <= 0;
-                        state   <= ENV_SET;
-                     else
-                        busy  <= '0';
-                        done  <= '1';
-                        state <= FINISHED;
+                        state   <= CARTID_CALC;
                      end if;
                   else
                      card_ena  <= '1';
@@ -226,8 +300,6 @@ begin
                      if (cpu_sel = 2) then             -- env values ride along
                         if (src = 16#1B#) then         -- byte 0x6C: secure-area CRC16
                            env_seccrc <= card_rdata(15 downto 0);
-                        elsif (src = 16#20#) then      -- byte 0x80: used ROM size
-                           env_size <= unsigned(card_rdata);
                         elsif (src = 16#57#) then      -- byte 0x15C: header CRC16 in [31:16]
                            env_hdrcrc <= card_rdata(31 downto 16);
                         end if;
@@ -247,11 +319,38 @@ begin
                      state <= CP_RD;
                   end if;
 
+               when CARTID_CALC =>
+                  if (cart_iter <= 27) then
+                     if (cart_p < env_size) then
+                        cart_p <= shift_left(cart_p, 1);
+                     end if;
+                     cart_iter <= cart_iter + 1;
+                  else
+                     if (cart_p >= x"00100000") then
+                        cartid <= std_logic_vector(
+                           x"000000C2" or
+                           shift_left(resize(shift_right(cart_p, 20) - 1, 32), 8));
+                     else
+                        cartid <= x"000100C2"; -- melonDS small-ROM encoding
+                     end if;
+                     if (direct = '1') then
+                        state <= ENV_SET;
+                     else
+                        -- busy stays high: nds_top only muxes this port onto
+                        -- the ARM9 main-RAM channel while ld_busy is set, and
+                        -- the verify pass needs that mux.
+                        verifying <= '1';
+                        cpu_sel   <= 0;
+                        state     <= NEXT_CPU;
+                     end if;
+                  end if;
+
                when ENV_SET =>
                   if (env_i = 41) then
-                     busy  <= '0';
-                     done  <= '1';
-                     state <= FINISHED;
+                     -- busy stays high through the verify pass (see above)
+                     verifying <= '1';
+                     cpu_sel   <= 0;
+                     state     <= NEXT_CPU;
                   else
                      dst <= env_addr(env_i);
                      case env_i is
@@ -282,6 +381,63 @@ begin
                   if (wr_done = '1') then
                      env_i <= env_i + 1;
                      state <= ENV_SET;
+                  end if;
+
+               -- ============ post-copy main-RAM verify ============
+               -- Walks both CPU binaries again: read the card word, read the
+               -- destination back through the real ARM9 main-RAM channel, and
+               -- compare. Only 0x02xxxxxx targets are checked; ARM7-WRAM writes
+               -- are acknowledged by a synthetic pulse in nds_top and have no
+               -- read path here, so those words are skipped rather than counted
+               -- as failures.
+               when VF_RD =>
+                  if (words = 0) then
+                     if (cpu_sel = 0) then
+                        cpu_sel <= 1;
+                        state   <= NEXT_CPU;
+                     else
+                        busy  <= '0';
+                        done  <= '1';
+                        state <= FINISHED;
+                     end if;
+                  elsif (dst(31 downto 24) /= x"02") then
+                     src   <= src + 1;
+                     dst   <= dst + 4;
+                     words <= words - 1;
+                  else
+                     card_ena  <= '1';
+                     card_addr <= std_logic_vector(src);
+                     state     <= VF_RD_WAIT;
+                  end if;
+
+               when VF_RD_WAIT =>
+                  if (card_done = '1') then
+                     vfy_exp <= card_rdata;
+                     state   <= VF_MEM;
+                  end if;
+
+               when VF_MEM =>
+                  wr_ena  <= '1';
+                  wr_rnw  <= '1';
+                  wr_addr <= std_logic_vector(dst);
+                  state   <= VF_MEM_WAIT;
+
+               when VF_MEM_WAIT =>
+                  if (wr_done = '1') then
+                     wr_rnw <= '0';
+                     if (rd_data /= vfy_exp) then
+                        if (vfy_cnt /= 2#111111111111111111#) then
+                           vfy_cnt <= vfy_cnt + 1;
+                        end if;
+                        if (vfy_seen = '0') then
+                           vfy_seen <= '1';
+                           vfy_at   <= std_logic_vector(dst);
+                        end if;
+                     end if;
+                     src   <= src + 1;
+                     dst   <= dst + 4;
+                     words <= words - 1;
+                     state <= VF_RD;
                   end if;
 
                when FINISHED =>

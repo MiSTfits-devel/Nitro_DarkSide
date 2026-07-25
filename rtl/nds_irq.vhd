@@ -14,7 +14,8 @@ use work.pProc_bus_gba.all;
 use work.pRegmap_gba.all;
 
 package pReg_nds_irq is
-   constant NDS_IME : regmap_type := (16#000208#, 31, 0, 1, 0, readwrite);
+   -- IME is a one-bit register.  Bits 31:1 read as zero and ignore writes.
+   constant NDS_IME : regmap_type := (16#000208#, 0, 0, 1, 0, readwrite);
    constant NDS_IE  : regmap_type := (16#000210#, 31, 0, 1, 0, readwrite);
    constant NDS_IF  : regmap_type := (16#000214#, 31, 0, 1, 0, readonly);
 end package;
@@ -40,13 +41,19 @@ entity nds_irq is
 
       irq_in     : in  std_logic_vector(31 downto 0);  -- one-cycle pulses
       cpu_irq    : out std_logic := '0';
-      cpu_unhalt : out std_logic := '0'
+      cpu_unhalt : out std_logic := '0';
+
+      -- Temporary live-hardware diagnostic taps. These expose state only;
+      -- they do not participate in interrupt delivery.
+      dbg_ime    : out std_logic_vector(31 downto 0) := (others => '0');
+      dbg_ie     : out std_logic_vector(31 downto 0) := (others => '0');
+      dbg_if     : out std_logic_vector(31 downto 0) := (others => '0')
    );
 end entity;
 
 architecture arch of nds_irq is
 
-   signal REG_IME     : std_logic_vector(31 downto 0);
+   signal REG_IME     : std_logic_vector(0 downto 0);
    signal REG_IE      : std_logic_vector(31 downto 0);
    signal IF_written  : std_logic;
    signal IF_writeval : std_logic_vector(31 downto 0);
@@ -58,6 +65,10 @@ architecture arch of nds_irq is
    signal reg_wired_done : std_logic_vector(0 to 2);
 
 begin
+
+   dbg_ime <= (31 downto 1 => '0') & REG_IME;
+   dbg_ie  <= REG_IE;
+   dbg_if  <= IRPFLags;
 
    iIME : entity work.eProcReg_gba generic map (NDS_IME)
       port map (clk, gb_bus, reg_wired_or(0), reg_wired_done(0), REG_IME, REG_IME);

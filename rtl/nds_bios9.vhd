@@ -14,11 +14,25 @@ use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
 use std.textio.all;
 
+library MEM;
+
 entity nds_bios9 is
+   generic
+   (
+      is_simu : std_logic := '0';
+      use_cyclone5_primitive : std_logic := '0'
+   );
    port
    (
+      clk       : in  std_logic;
       brom_addr : in  unsigned(14 downto 2);
-      brom_data : out std_logic_vector(31 downto 0)
+      brom_data : out std_logic_vector(31 downto 0);
+
+      load_addr   : in unsigned(11 downto 2) := (others => '0');
+      load_data   : in std_logic_vector(31 downto 0) := (others => '0');
+      load_be     : in std_logic_vector(3 downto 0) := (others => '0');
+      load_we     : in std_logic := '0';
+      load_done   : in std_logic := '0'
    );
 end entity;
 
@@ -142,11 +156,79 @@ architecture arch of nds_bios9 is
       return m;
    end function;
 
-   constant ROM : t_rom := init_rom;
+   signal hot_q   : std_logic_vector(31 downto 0) := (others => '0');
+   signal hle_q   : std_logic_vector(31 downto 0) := HLE(0);
+   signal hot_valid_q : std_logic := '1';
 
 begin
 
-   brom_data <= ROM(to_integer(brom_addr)) when (to_integer(brom_addr) <= t_rom'high)
-                else x"00000000";
+   gsim : if is_simu = '1' generate
+      constant ROM : t_rom := init_rom;
+   begin
+      -- Registered to match the hardware M10K and the membus accept-cycle
+      -- address contract (notably exception-vector fetches).
+      process (clk)
+      begin
+         if rising_edge(clk) then
+            if to_integer(brom_addr) <= t_rom'high then
+               brom_data <= ROM(to_integer(brom_addr));
+            else
+               brom_data <= x"00000000";
+            end if;
+         end if;
+      end process;
+   end generate;
+
+   ghot : if is_simu = '0' generate
+   begin
+      ihot : entity MEM.SyncRamDualByteEnable
+      generic map
+      (
+         is_simu     => not use_cyclone5_primitive,
+         is_cyclone5 => use_cyclone5_primitive,
+         BYTE_WIDTH  => 8,
+         ADDR_WIDTH  => 10,
+         BYTES       => 4
+      )
+      port map
+      (
+         clk       => clk,
+         ce_a      => '1',
+         addr_a    => to_integer(brom_addr(11 downto 2)),
+         datain_a0 => x"00", datain_a1 => x"00", datain_a2 => x"00", datain_a3 => x"00",
+         dataout_a => hot_q,
+         we_a      => '0',
+         be_a      => "0000",
+         ce_b      => '1',
+         addr_b    => to_integer(load_addr),
+         datain_b0 => load_data(7 downto 0),
+         datain_b1 => load_data(15 downto 8),
+         datain_b2 => load_data(23 downto 16),
+         datain_b3 => load_data(31 downto 24),
+         dataout_b => open,
+         we_b      => load_we,
+         be_b      => load_be
+      );
+
+      process (clk)
+      begin
+         if rising_edge(clk) then
+            if to_integer(brom_addr) <= t_rom'high then
+               hot_valid_q <= '1';
+            else
+               hot_valid_q <= '0';
+            end if;
+            if to_integer(brom_addr) <= t_hle'high then
+               hle_q <= HLE(to_integer(brom_addr));
+            else
+               hle_q <= (others => '0');
+            end if;
+         end if;
+      end process;
+
+      brom_data <= hle_q when load_done = '0'
+                   else hot_q when hot_valid_q = '1'
+                   else x"00000000";
+   end generate;
 
 end architecture;

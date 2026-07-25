@@ -180,6 +180,7 @@ begin
       cpu_export_done => open,
       cpu_export      => open,
       error_cpu       => error_cpu,
+      dbg_pc          => open,
       savestate_bus   => ss_bus,
       ss_wired_out    => open,
       ss_wired_done   => open,
@@ -226,7 +227,13 @@ begin
    );
 
    -- ================= BIOS + private WRAM stores =================
-   bios_data <= bios(to_integer(bios_addr));
+   -- The hot-loadable hardware BIOS is an M10K with a registered read port.
+   process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         bios_data <= bios(to_integer(bios_addr));
+      end if;
+   end process;
 
    -- sync-read store model (matches the M10K in nds_top: the membus now
    -- presents the address combinationally in the accept cycle, the store
