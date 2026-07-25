@@ -136,8 +136,24 @@ begin
          off := to_integer(unsigned(gb_bus.Adr) - ADR_BASE) / 4;
          if (off < 12) then
             reg_hit    <= '1';
-            regsel_ch  <= off / 3;
-            regsel_reg <= off mod 3;
+            -- Four channels, three words each. An arithmetic /3 and mod 3
+            -- here makes Quartus build two full combinational dividers for a
+            -- twelve-value MMIO decode; spell out the exact fixed mapping.
+            case off is
+               when 0  => regsel_ch <= 0; regsel_reg <= 0;
+               when 1  => regsel_ch <= 0; regsel_reg <= 1;
+               when 2  => regsel_ch <= 0; regsel_reg <= 2;
+               when 3  => regsel_ch <= 1; regsel_reg <= 0;
+               when 4  => regsel_ch <= 1; regsel_reg <= 1;
+               when 5  => regsel_ch <= 1; regsel_reg <= 2;
+               when 6  => regsel_ch <= 2; regsel_reg <= 0;
+               when 7  => regsel_ch <= 2; regsel_reg <= 1;
+               when 8  => regsel_ch <= 2; regsel_reg <= 2;
+               when 9  => regsel_ch <= 3; regsel_reg <= 0;
+               when 10 => regsel_ch <= 3; regsel_reg <= 1;
+               when 11 => regsel_ch <= 3; regsel_reg <= 2;
+               when others => null;
+            end case;
          else
             fill_hit  <= '1';
             regsel_ch <= off mod 4;

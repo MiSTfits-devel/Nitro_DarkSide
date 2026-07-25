@@ -33,7 +33,12 @@ spec:
         sleep infinity
     resources:
       requests:
-        cpu: "1"
+        # No cpu request on purpose: the node runs at ~98% of its cores
+        # *requested* while most of those pods sit idle, so a 1-core request
+        # made sims unschedulable for no real reason. With no request nvc is
+        # best-effort on CPU - it still gets the idle cycles, and several sims
+        # can queue up together. Memory is what actually needs reserving (the
+        # full 64 MB card image alone is a few GB of nvc heap).
         memory: 2Gi
       limits:
         memory: 12Gi

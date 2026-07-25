@@ -17,6 +17,7 @@ use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
 use std.textio.all;
 use work.pexport.all;
+use work.pProc_bus_gba.all;
 
 entity tb_top_frame is
    generic
@@ -27,6 +28,7 @@ entity tb_top_frame is
                                          -- is auto-preferred - same pattern as the retail BIOS)
       DUMPFILE   : string  := "top_frame_fb.txt";
       DUMPFILE_B : string  := "top_frame_fb_b.txt";
+      DUMP_START_FRAME : integer := 0;    -- skip expensive text dumps before this frame
       CARD_WORDS : integer := 1048576;   -- 4 MB staging window
       GPUCEDIV   : integer := 3;         -- render clocks per dot (1 = full-rate video,
                                          -- ~110 dropped lines/frame with line server v1:
@@ -39,7 +41,25 @@ entity tb_top_frame is
       DBG_TRIGPC : integer := 0;         -- alternative: trigger on decode_PC (dumps 256 cycles before, 768 after)
       TRACEFILE  : string  := "";        -- non-empty: ARM9 retired-instruction trace (TRACE_DIFF format)
       TRACEFILE7 : string  := "";        -- non-empty: ARM7 retired-instruction trace (same format)
-      MAXINSTR   : integer := 20000000   -- trace line cap (per CPU)
+      TRACE_START_FRAME  : integer := 0;  -- defer ARM9 trace until this dump-frame interval
+      TRACE7_START_FRAME : integer := 0;  -- defer ARM7 trace until this dump-frame interval
+      DUMP_STATE : integer := 0;          -- dump final raw VRAM/palette/OAM/register state
+      MAXINSTR   : integer := 20000000;  -- trace line cap (per CPU)
+      -- Card/firmware read latency injection. The donor models answer in one
+      -- clk1x cycle, but on hardware both ports go through DDR3 (card = ddram
+      -- ch2, firmware = ch1) at tens of variable cycles, contending with each
+      -- other and the framebuffer. 0 keeps the original one-cycle behaviour so
+      -- every existing gate is unchanged; >0 adds that many clk1x cycles plus
+      -- 0..15 cycles of deterministic jitter before the done pulse.
+      CARD_LAT   : integer := 0;
+      FW_LAT     : integer := 0;
+      -- Main-RAM (SDRAM) latency injection. The behavioral model answers every
+      -- op in a fixed 6 (read) / 3 (write) clkMem cycles, which is both far
+      -- faster and far more regular than the real ddram ch2 path. Every arbiter
+      -- race in nds_mainram / nds_cache9 that needs a long, *variable* main-RAM
+      -- op to open its window is therefore unreachable in simulation. >0 adds
+      -- that many clkMem cycles plus 0..15 of jitter to each op.
+      MEM_LAT    : integer := 0
    );
 end entity;
 
@@ -118,7 +138,7 @@ architecture sim of tb_top_frame is
    signal fw_addr : unsigned(17 downto 2);
    signal fw_req  : std_logic;
    signal fw_done : std_logic := '0';
-   signal fw_data : std_logic_vector(31 downto 0);
+   signal fw_data : std_logic_vector(31 downto 0) := (others => '0');
 
    -- ================= nds_top interface =================
    signal boot_done, boot_error : std_logic;
@@ -157,11 +177,18 @@ architecture sim of tb_top_frame is
    signal dbg_export9      : cpu_export_type;
    signal dbg_export7_done : std_logic;
    signal dbg_export7      : cpu_export_type;
+   signal dbg_pc9_s, dbg_irq_ie9_s, dbg_irq_if9_s : std_logic_vector(31 downto 0);
+   signal dbg_irq_live9_s, dbg_irq_src9_s : std_logic_vector(31 downto 0);
 
    -- ================= collectors =================
    type t_frame is array (0 to 49151) of std_logic_vector(17 downto 0);
    signal framebuf   : t_frame := (others => (others => '0'));
    signal framebuf_b : t_frame := (others => (others => '0'));
+
+   type t_shadow256 is array (0 to 255) of std_logic_vector(31 downto 0);
+   type t_gpu_regs is array (0 to 21) of std_logic_vector(31 downto 0);
+   signal pal_shadow, oam_shadow : t_shadow256 := (others => (others => '0'));
+   signal gpu_regs_shadow : t_gpu_regs := (others => (others => '0'));
 
    -- VRAM banks A..D backing store (512 KB)
    type t_banks is array (0 to 131071) of std_logic_vector(31 downto 0);
@@ -169,8 +196,54 @@ architecture sim of tb_top_frame is
 
    signal drops      : integer := 0;
    signal tests_done : boolean := false;
+   -- Interval currently being rendered: 0 is the interval ending at dump
+   -- frame 0.  This makes TRACE*_START_FRAME match melonds_fbdump, which
+   -- enables its trace immediately before RunFrame(n).
+   signal dump_frame_index : integer := -1;
 
 begin
+
+   -- Shadow CPU-visible engine-A state for late-frame differential dumps.
+   -- These observe the same committed write strobes consumed by nds_gpu2d.
+   p_state_shadow : process (clk1x)
+      alias a_pal_we   is << signal .tb_top_frame.idut.pal_we_a : std_logic >>;
+      alias a_pal_addr is << signal .tb_top_frame.idut.pal_addr_lo : integer range 0 to 255 >>;
+      alias a_pal_din  is << signal .tb_top_frame.idut.pal_din : std_logic_vector(31 downto 0) >>;
+      alias a_pal_be   is << signal .tb_top_frame.idut.pal_be : std_logic_vector(3 downto 0) >>;
+      alias a_oam_we   is << signal .tb_top_frame.idut.oam_we_a : std_logic >>;
+      alias a_oam_addr is << signal .tb_top_frame.idut.oam_addr_lo : integer range 0 to 255 >>;
+      alias a_oam_din  is << signal .tb_top_frame.idut.oam_din : std_logic_vector(31 downto 0) >>;
+      alias a_oam_be   is << signal .tb_top_frame.idut.oam_be : std_logic_vector(3 downto 0) >>;
+      alias a_io       is << signal .tb_top_frame.idut.io_bus9 : proc_bus_gb_type >>;
+      variable off : integer;
+   begin
+      if rising_edge(clk1x) then
+         if (a_pal_we = '1') then
+            for j in 0 to 3 loop
+               if (a_pal_be(j) = '1') then
+                  pal_shadow(a_pal_addr)(j*8 + 7 downto j*8) <= a_pal_din(j*8 + 7 downto j*8);
+               end if;
+            end loop;
+         end if;
+         if (a_oam_we = '1') then
+            for j in 0 to 3 loop
+               if (a_oam_be(j) = '1') then
+                  oam_shadow(a_oam_addr)(j*8 + 7 downto j*8) <= a_oam_din(j*8 + 7 downto j*8);
+               end if;
+            end loop;
+         end if;
+         if (a_io.ena = '1' and a_io.rnw = '0') then
+            off := to_integer(unsigned(a_io.Adr(11 downto 2)));
+            if (off <= 21) then
+               for j in 0 to 3 loop
+                  if (a_io.bEna(j) = '1') then
+                     gpu_regs_shadow(off)(j*8 + 7 downto j*8) <= a_io.Din(j*8 + 7 downto j*8);
+                  end if;
+               end loop;
+            end if;
+         end if;
+      end if;
+   end process;
 
    -- ================= clocks (3 clkMem phases per clk1x, tb_dual_boot idiom) =================
    clkMem <= not clkMem after 5 ns when not tests_done else '0';
@@ -235,18 +308,57 @@ begin
       dbg_line_drop => dbg_line_drop, dbg_line_busy => dbg_line_busy,
       dbg_cpu_err9 => dbg_cpu_err9, dbg_cpu_err7 => dbg_cpu_err7,
       dbg_export9_done => dbg_export9_done, dbg_export9 => dbg_export9,
-      dbg_export7_done => dbg_export7_done, dbg_export7 => dbg_export7
+      dbg_export7_done => dbg_export7_done, dbg_export7 => dbg_export7,
+      dbg_pc9 => dbg_pc9_s,
+      dbg_r0_9 => dbg_irq_ie9_s, dbg_lr9 => dbg_irq_if9_s,
+      dbg_cpsr9 => dbg_irq_live9_s, dbg_pc7 => dbg_irq_src9_s
    );
 
-   -- SPI firmware flash image: combinational data, done one cycle after the
-   -- request (matches the old fixed-latency behavior cycle-exactly)
-   fw_data <= fwimg(to_integer(fw_addr));
-   process (clk1x)
-   begin
-      if rising_edge(clk1x) then
-         fw_done <= fw_req;
-      end if;
-   end process;
+   -- SPI firmware flash image. FW_LAT = 0 keeps the original behaviour
+   -- cycle-exactly: combinational data, done one cycle after the request.
+   g_fw_fast : if FW_LAT = 0 generate
+      fw_data <= fwimg(to_integer(fw_addr));
+      process (clk1x)
+      begin
+         if rising_edge(clk1x) then
+            fw_done <= fw_req;
+         end if;
+      end process;
+   end generate;
+
+   -- FW_LAT > 0 models the real ddram ch1 path instead: the word is captured at
+   -- the request and only presented together with the done pulse, FW_LAT plus
+   -- 0..15 cycles later. Note this also drops the combinational-data crutch -
+   -- on hardware fw_data is a register that is only valid at fw_done, so any
+   -- reliance on it tracking fw_addr shows up here. nds_spi holds SPI busy
+   -- until fw_done, so a lost done pulse stalls ARM7 outright.
+   g_fw_slow : if FW_LAT /= 0 generate
+      process (clk1x)
+         variable cnt  : integer := 0;
+         variable pend : std_logic := '0';
+         variable lfsr : unsigned(15 downto 0) := x"BEEF";
+         variable hold : std_logic_vector(31 downto 0) := (others => '0');
+      begin
+         if rising_edge(clk1x) then
+            fw_done <= '0';
+            if (fw_req = '1') then
+               hold := fwimg(to_integer(fw_addr));
+               pend := '1';
+               lfsr := lfsr(14 downto 0) &
+                       (lfsr(15) xor lfsr(13) xor lfsr(12) xor lfsr(10));
+               cnt  := FW_LAT + to_integer(lfsr(3 downto 0));
+            elsif (pend = '1') then
+               if (cnt <= 0) then
+                  pend    := '0';
+                  fw_data <= hold;
+                  fw_done <= '1';
+               else
+                  cnt := cnt - 1;
+               end if;
+            end if;
+         end if;
+      end process;
+   end generate;
 
    -- ARM9 pipeline debug (same as tb_arm9_trace): per-cycle handshake dump
    -- into pipe_debug.log between DBG_T0 and DBG_T1 (microseconds)
@@ -378,7 +490,7 @@ begin
          file_open(tf, TRACEFILE, write_mode);
          loop
             wait until rising_edge(clk1x);
-            if (dbg_export9_done = '1') then
+            if (dbg_export9_done = '1' and dump_frame_index >= TRACE_START_FRAME) then
                write(l, to_hstring(dbg_export9.pc));
                write(l, ' ');
                write(l, to_hstring(dbg_export9.opcode));
@@ -413,7 +525,7 @@ begin
          file_open(tf, TRACEFILE7, write_mode);
          loop
             wait until rising_edge(clk1x);
-            if (dbg_export7_done = '1') then
+            if (dbg_export7_done = '1' and dump_frame_index >= TRACE7_START_FRAME) then
                write(l, to_hstring(dbg_export7.pc));
                write(l, ' ');
                write(l, to_hstring(dbg_export7.opcode));
@@ -435,20 +547,79 @@ begin
       end process;
    end generate;
 
+   g_state_dump : if DUMP_STATE /= 0 generate
+   begin
+      p_state_dump : process
+         file fv : text open write_mode is "rtl_state_banks.hex";
+         file fp : text open write_mode is "rtl_state_pal.hex";
+         file fo : text open write_mode is "rtl_state_oam.hex";
+         file fr : text open write_mode is "rtl_state_gpu_regs.hex";
+         variable l : line;
+         alias a_vramcnt is << signal .tb_top_frame.idut.vramcnt : std_logic_vector(71 downto 0) >>;
+      begin
+         wait until tests_done;
+         for i in 0 to 131071 loop
+            write(l, to_hstring(banks(i)));
+            writeline(fv, l);
+         end loop;
+         for i in 0 to 255 loop
+            write(l, to_hstring(pal_shadow(i)));
+            writeline(fp, l);
+            write(l, to_hstring(oam_shadow(i)));
+            writeline(fo, l);
+         end loop;
+         for i in 0 to 21 loop
+            write(l, to_hstring(gpu_regs_shadow(i)));
+            writeline(fr, l);
+         end loop;
+         report "STATE vramcnt(A..I low->high)=" & to_hstring(a_vramcnt);
+         file_close(fv); file_close(fp); file_close(fo); file_close(fr);
+         wait;
+      end process;
+   end generate;
+
    -- ================= behavioral card =================
    p_card : process (clk1x)
+      variable cnt    : integer := 0;
+      variable pend   : std_logic := '0';
+      variable lfsr   : unsigned(15 downto 0) := x"ACE1";
+      variable warned : boolean := false;
    begin
       if rising_edge(clk1x) then
          card_done <= '0';
          if (card_ena = '1') then
             -- reads beyond the staged window return zero (real carts mirror,
-            -- but nothing sane reads past its own ROM end)
+            -- but nothing sane reads past its own ROM end). To the game this is
+            -- indistinguishable from a core bug, so say so once: a truncated
+            -- CARD_WORDS silently stalled every integrated Kirby run for days.
             if (to_integer(unsigned(card_addr)) < CARD_WORDS) then
                card_rdata <= card(to_integer(unsigned(card_addr)));
             else
                card_rdata <= (others => '0');
+               if not warned then
+                  warned := true;
+                  report "tb_top_frame: CARD READ PAST STAGED WINDOW at word " &
+                         to_hstring(card_addr) & " (CARD_WORDS=" &
+                         integer'image(CARD_WORDS) & ") - returning zeros. " &
+                         "Raise CARD_WORDS and use a full-size image."
+                         severity warning;
+               end if;
             end if;
-            card_done  <= '1';
+            if (CARD_LAT = 0) then
+               card_done <= '1';
+            else
+               pend := '1';
+               lfsr := lfsr(14 downto 0) &
+                       (lfsr(15) xor lfsr(13) xor lfsr(12) xor lfsr(10));
+               cnt  := CARD_LAT + to_integer(lfsr(3 downto 0));
+            end if;
+         elsif (pend = '1') then
+            if (cnt <= 0) then
+               pend      := '0';
+               card_done <= '1';
+            else
+               cnt := cnt - 1;
+            end if;
          end if;
       end if;
    end process;
@@ -463,6 +634,8 @@ begin
       variable v_rnw : std_logic;
       variable v_din : std_logic_vector(31 downto 0);
       variable v_be  : std_logic_vector(3 downto 0);
+      variable lfsr  : unsigned(15 downto 0) := x"7A5C";
+      variable extra : integer;
    begin
       wait until rising_edge(clkMem);
       refresh_cnt := refresh_cnt + 1;
@@ -479,6 +652,14 @@ begin
          assert (a >= MAINRAM_BASE and a < MAINRAM_BASE + 4194304)
             report "sdram op outside main-RAM window: " & integer'image(a) severity failure;
          w := (a - MAINRAM_BASE) / 4;
+
+         if (MEM_LAT = 0) then
+            extra := 0;
+         else
+            lfsr  := (lfsr(14 downto 0) & (lfsr(15) xor lfsr(13) xor lfsr(12) xor lfsr(10)));
+            extra := MEM_LAT + to_integer(lfsr(3 downto 0));
+         end if;
+         for k in 1 to extra loop wait until rising_edge(clkMem); end loop;
 
          if (v_rnw = '1') then
             for k in 1 to 6 loop wait until rising_edge(clkMem); end loop;
@@ -579,6 +760,7 @@ begin
 
       -- skip the partial frame the cadence may be mid-way through
       wait until rising_edge(clk1x) and vblank_out = '1';
+      dump_frame_index <= 0;
 
       while n < FRAMES loop
          wait until rising_edge(clk1x) and vblank_out = '1';
@@ -587,21 +769,30 @@ begin
             wait until rising_edge(clk1x);
          end loop;
          for k in 1 to 100 loop wait until rising_edge(clk1x); end loop;
-         write(fdl, string'("frame ") & integer'image(n));
-         writeline(fdump, fdl);
-         for i in 0 to 49151 loop
-            write(fdl, to_hstring("00" & framebuf(i)));
+         if n >= DUMP_START_FRAME then
+            write(fdl, string'("frame ") & integer'image(n));
             writeline(fdump, fdl);
-         end loop;
-         write(fdl, string'("frame ") & integer'image(n));
-         writeline(fdumpb, fdl);
-         for i in 0 to 49151 loop
-            write(fdl, to_hstring("00" & framebuf_b(i)));
+            for i in 0 to 49151 loop
+               write(fdl, to_hstring("00" & framebuf(i)));
+               writeline(fdump, fdl);
+            end loop;
+            write(fdl, string'("frame ") & integer'image(n));
             writeline(fdumpb, fdl);
-         end loop;
+            for i in 0 to 49151 loop
+               write(fdl, to_hstring("00" & framebuf_b(i)));
+               writeline(fdumpb, fdl);
+            end loop;
+         end if;
          report "frame " & integer'image(n) & " dumped, drops so far " &
                 integer'image(drops) severity note;
+         report "irq9 frame=" & integer'image(n) &
+                " pc=" & to_hstring(dbg_pc9_s) &
+                " ie=" & to_hstring(dbg_irq_ie9_s) &
+                " if=" & to_hstring(dbg_irq_if9_s) &
+                " live=" & to_hstring(dbg_irq_live9_s) &
+                " src=" & to_hstring(dbg_irq_src9_s) severity note;
          n := n + 1;
+         dump_frame_index <= n;
       end loop;
 
       report "tb_top_frame: DONE  " & integer'image(FRAMES) & " frames, " &

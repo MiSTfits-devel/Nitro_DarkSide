@@ -72,10 +72,27 @@ int main(int argc, char** argv)
     printf("arm9: off=%08X entry=%08X load=%08X size=%u\n", a9off, a9entry, a9load, a9size);
     printf("arm7: off=%08X entry=%08X load=%08X size=%u\n", a7off, a7entry, a7load, a7size);
 
-    // default NDSArgs: FreeBIOS, generated firmware, software renderer
+    // Default NDSArgs uses FreeBIOS. BIOS9/BIOS7 optionally replace those
+    // images so differential traces can execute the exact ROMs served by RTL.
     // (heap-allocated: the 1.1 NDS object is far too large for the stack)
     auto nds_holder = std::make_unique<NDS>();
     NDS& nds = *nds_holder;
+    auto loadBIOS = [](const char* envname, auto image, auto setter) -> bool
+    {
+        const char* path = getenv(envname);
+        if (!path) return true;
+        FILE* bf = fopen(path, "rb");
+        if (!bf) { fprintf(stderr, "cannot open %s=%s\n", envname, path); return false; }
+        bool ok = fread(image.data(), 1, image.size(), bf) == image.size();
+        int extra = fgetc(bf);
+        fclose(bf);
+        if (!ok || extra != EOF) { fprintf(stderr, "%s has wrong size\n", path); return false; }
+        setter(image);
+        printf("loaded %s from %s\n", envname, path);
+        return true;
+    };
+    if (!loadBIOS("BIOS9", nds.GetARM9BIOS(), [&](const auto& v) { nds.SetARM9BIOS(v); })) return 1;
+    if (!loadBIOS("BIOS7", nds.GetARM7BIOS(), [&](const auto& v) { nds.SetARM7BIOS(v); })) return 1;
     nds.Reset();
 
     if (direct)
@@ -146,14 +163,37 @@ int main(int argc, char** argv)
         if (!db) { fprintf(stderr, "cannot open %s\n", dumppathb); return 1; }
     }
 
+    const char* snapshotPrefix = getenv("SNAPSHOT_PREFIX");
+    std::unique_ptr<u32[]> snapBG, snapOBJ, snapPAL, snapOAM;
+    u32 snapRegs[22] = {};
+    int lastfb = 0;
     for (int n = 0; n < frames; n++)
     {
         if (trace9path && n == trace9start && !ARM9TraceFile)
             ARM9TraceFile = fopen(trace9path, "w");
         if (trace7path && n == trace7start && !ARM7TraceFile)
             ARM7TraceFile = fopen(trace7path, "w");
+        // dump-frame -> hardware-time map: RunFrame coalesces frames while
+        // the LCD is off, so dump indices are NOT 60Hz hardware frames.
+        // FRAMEMAP=1 prints the game's own vblank counter per dump frame.
+        if (getenv("FRAMEMAP"))
+            fprintf(stderr, "FRAMEMAP %d vb=%u\n", n, nds.ARM9Read32(0x02FFFF08));
+        // Capture the inputs immediately before the final rendered frame;
+        // games commonly update palettes at VBlank, so an end-of-run state
+        // dump is one animation step newer than the displayed front buffer.
+        if (snapshotPrefix && n == frames - 1)
+        {
+            snapBG.reset(new u32[131072]); snapOBJ.reset(new u32[65536]);
+            snapPAL.reset(new u32[256]);   snapOAM.reset(new u32[256]);
+            for (u32 i = 0; i < 131072; i++) snapBG[i] = nds.ARM9Read32(0x06000000 + i*4);
+            for (u32 i = 0; i <  65536; i++) snapOBJ[i] = nds.ARM9Read32(0x06400000 + i*4);
+            for (u32 i = 0; i <    256; i++) snapPAL[i] = nds.ARM9Read32(0x05000000 + i*4);
+            for (u32 i = 0; i <    256; i++) snapOAM[i] = nds.ARM9Read32(0x07000000 + i*4);
+            for (u32 i = 0; i <     22; i++) snapRegs[i] = nds.ARM9Read32(0x04000000 + i*4);
+        }
         nds.RunFrame();
         int fb = nds.GPU.FrontBuffer;
+        lastfb = fb;
         u32* top = nds.GPU.Framebuffer[fb][0].get();
         fprintf(d, "frame %d\n", n);
         for (int i = 0; i < 256 * 192; i++)
@@ -180,6 +220,18 @@ int main(int argc, char** argv)
            nds.ARM9Read32(0x05000000), nds.ARM9Read32(0x05000004),
            nds.ARM9Read32(0x06000020), nds.ARM9Read32(0x06002000),
            nds.ARM9Read32(0x07000000));
+    printf("BG0CNT..BG3CNT=%04X %04X %04X %04X MASTER_BRIGHT=%04X\n",
+           nds.ARM9Read16(0x04000008), nds.ARM9Read16(0x0400000A),
+           nds.ARM9Read16(0x0400000C), nds.ARM9Read16(0x0400000E),
+           nds.ARM9Read16(0x0400006C));
+    printf("BG2PA..PD=%04X %04X %04X %04X BG2X/Y=%08X/%08X\n",
+           nds.ARM9Read16(0x04000020), nds.ARM9Read16(0x04000022),
+           nds.ARM9Read16(0x04000024), nds.ARM9Read16(0x04000026),
+           nds.ARM9Read32(0x04000028), nds.ARM9Read32(0x0400002C));
+    printf("BG3PA..PD=%04X %04X %04X %04X BG3X/Y=%08X/%08X\n",
+           nds.ARM9Read16(0x04000030), nds.ARM9Read16(0x04000032),
+           nds.ARM9Read16(0x04000034), nds.ARM9Read16(0x04000036),
+           nds.ARM9Read32(0x04000038), nds.ARM9Read32(0x0400003C));
     // sub-engine / console probes
     {
         int nzc = 0;
@@ -192,6 +244,53 @@ int main(int argc, char** argv)
         printf("subpal[0..3]=%08X %08X vram6200000=%08X %08X\n",
                nds.ARM9Read32(0x05000400), nds.ARM9Read32(0x05000404),
                nds.ARM9Read32(0x06200000), nds.ARM9Read32(0x06200004));
+    }
+    // SNAPSHOT_PREFIX=<path> emits a directly consumable tb_gpu2d snapshot.
+    // The boot card uses main BG3 + standard palette; the other stores are
+    // included so the same hook remains useful for later 2D divergences.
+    if (const char* prefix = snapshotPrefix)
+    {
+        auto dumpWords = [&](const char* suffix, const u32* data, u32 words)
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s_%s.hex", prefix, suffix);
+            FILE* f = fopen(path, "w");
+            if (!f) { fprintf(stderr, "cannot open snapshot %s\n", path); exit(1); }
+            for (u32 i = 0; i < words; i++) fprintf(f, "%08X\n", data[i]);
+            fclose(f);
+        };
+        auto dumpZeros = [&](const char* suffix, u32 words)
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s_%s.hex", prefix, suffix);
+            FILE* f = fopen(path, "w");
+            if (!f) { fprintf(stderr, "cannot open snapshot %s\n", path); exit(1); }
+            for (u32 i = 0; i < words; i++) fprintf(f, "00000000\n");
+            fclose(f);
+        };
+        dumpWords("bgvram",  snapBG.get(),  131072);
+        dumpWords("objvram", snapOBJ.get(),  65536);
+        dumpWords("pal",     snapPAL.get(),    256);
+        dumpWords("oam",     snapOAM.get(),    256);
+        dumpZeros("bgep", 8192);
+        dumpZeros("objep", 2048);
+
+        char framepath[1024];
+        snprintf(framepath, sizeof(framepath), "%s_frames.hex", prefix);
+        FILE* f = fopen(framepath, "w");
+        if (!f) { fprintf(stderr, "cannot open snapshot %s\n", framepath); return 1; }
+        fprintf(f, "00000001\n");
+        for (u32 i = 0; i < 22; i++) fprintf(f, "%08X\n", snapRegs[i]);
+        for (u32 i = 22; i < 32; i++) fprintf(f, "00000000\n");
+        u32* top = nds.GPU.Framebuffer[lastfb][0].get();
+        for (u32 i = 0; i < 256*192; i++)
+        {
+            u32 p = top[i];
+            u32 r = (p >> 16) & 0xFF, g = (p >> 8) & 0xFF, b = (p >> 0) & 0xFF;
+            fprintf(f, "%08X\n", (r >> 2) | ((g >> 2) << 6) | ((b >> 2) << 12));
+        }
+        fclose(f);
+        printf("snapshot dumped with prefix %s\n", prefix);
     }
     printf("dumped %d frames to %s\n", frames, dumppath);
     return 0;

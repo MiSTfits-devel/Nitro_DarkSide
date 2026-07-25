@@ -101,6 +101,19 @@ entity nds_top is
       fw_done          : in  std_logic;
       fw_data          : in  std_logic_vector(31 downto 0);
 
+      -- Runtime-loadable retail CPU BIOS images. Hardware writes these
+      -- while reset is asserted, then switches atomically on *_load_done.
+      bios7_load_addr  : in unsigned(13 downto 2) := (others => '0');
+      bios7_load_data  : in std_logic_vector(31 downto 0) := (others => '0');
+      bios7_load_be    : in std_logic_vector(3 downto 0) := (others => '0');
+      bios7_load_we    : in std_logic := '0';
+      bios7_load_done  : in std_logic := '0';
+      bios9_load_addr  : in unsigned(11 downto 2) := (others => '0');
+      bios9_load_data  : in std_logic_vector(31 downto 0) := (others => '0');
+      bios9_load_be    : in std_logic_vector(3 downto 0) := (others => '0');
+      bios9_load_we    : in std_logic := '0';
+      bios9_load_done  : in std_logic := '0';
+
       -- main RAM: nds_mainram SDRAM request port + scheduler handshake
       mainram_allow    : in  std_logic;
       mainram_active   : out std_logic;
@@ -158,7 +171,22 @@ entity nds_top is
       dbg_line_drop    : out std_logic;   -- drawline landed while gpu2d was still busy
       dbg_line_busy    : out std_logic;
       dbg_cpu_err9     : out std_logic;
-      dbg_cpu_err7     : out std_logic
+      dbg_cpu_err7     : out std_logic;
+      dbg_pc9          : out std_logic_vector(31 downto 0);
+      dbg_pc7          : out std_logic_vector(31 downto 0);
+      dbg_r0_9         : out std_logic_vector(31 downto 0);
+      dbg_lr9          : out std_logic_vector(31 downto 0);
+      dbg_cpsr9        : out std_logic_vector(31 downto 0);
+      -- main-RAM verify results from nds_loader (see its port comment)
+      dbg_vfy_bad      : out std_logic_vector(17 downto 0);
+      dbg_vfy_addr     : out std_logic_vector(31 downto 0);
+      -- nds_debug mailbox, driven by the ddram ch4 pager in NDS.sv
+      dbg_cmd_stb      : in  std_logic := '0';
+      dbg_cmd_op       : in  std_logic_vector(7 downto 0) := (others => '0');
+      dbg_cmd_arg      : in  std_logic_vector(31 downto 0) := (others => '0');
+      dbg_rsp_data     : out std_logic_vector(31 downto 0);
+      dbg_rsp_stb      : out std_logic;
+      dbg_hwstat       : out std_logic_vector(17 downto 0)
    );
 end entity;
 
@@ -183,7 +211,32 @@ architecture arch of nds_top is
    signal ld_start, ld_busy, ld_done, ld_error : std_logic;
    signal preset_direct : std_logic := '0';
    signal arm9_entry, arm7_entry : std_logic_vector(31 downto 0);
+   signal ld_cartid  : std_logic_vector(31 downto 0);  -- header-size chip ID -> nds_card B8
+   -- on-FPGA debug unit (nds_debug): CPU hold/release, register read-back and
+   -- a main-RAM peek muxed onto the ARM9 channel the same way the loader is
+   signal pc9_s, pc7_s         : std_logic_vector(31 downto 0);
+   signal dbg_hold9, dbg_rel9  : std_logic;
+   signal dbg_hold7, dbg_rel7  : std_logic;
+   signal dbg_boot_rst         : std_logic;   -- debugger-requested boot restart
+   signal dbg_regsel_s         : unsigned(4 downto 0);
+   signal dbg_regval9, dbg_regval7 : std_logic_vector(31 downto 0);
+   signal dbg_pk_ena, dbg_pk_act, dbg_pk_sel : std_logic;
+
+   -- Everything the CPUs' resetCpu does not cover, but which a from-reset probe
+   -- must still start clean. nds_mainram in particular latches req9/req7_pending
+   -- and lock_pair: a SOFTRESET landing mid-op leaves the arbiter waiting on a
+   -- request no one will re-issue, which kills the ARM9's main-RAM channel from
+   -- t=0 while the ARM7 keeps running out of its private WRAM. These three
+   -- cannot take resetCpu instead - the loader stages main RAM through them
+   -- while resetCpu is still asserted.
+   signal reset_boot : std_logic;
+   signal dbg_mb9, dbg_cache9, dbg_mr_s      : std_logic_vector(7 downto 0);
+   signal dbg_probe                          : std_logic_vector(31 downto 0);
+   signal dbg_pk_addr_s        : std_logic_vector(31 downto 0);
+   signal dbg_pk_done_s        : std_logic;
+
    signal ld_wr_ena  : std_logic;
+   signal ld_wr_rnw  : std_logic;
    signal ld_wr_addr, ld_wr_data : std_logic_vector(31 downto 0);
    signal ld_wr_done : std_logic;
    signal ld_w7_done : std_logic := '0';
@@ -193,12 +246,13 @@ architecture arch of nds_top is
 
    -- ================= ARM9 side =================
    signal cpu9_adr      : std_logic_vector(31 downto 0);
-   signal cpu9_rnw, cpu9_ena, cpu9_code, cpu9_done : std_logic;
+   signal cpu9_rnw, cpu9_ena, cpu9_code, cpu9_done, cpu9_lock : std_logic;
    signal cpu9_acc      : std_logic_vector(1 downto 0);
    signal cpu9_dout, cpu9_din, cpu9_lastread : std_logic_vector(31 downto 0);
    signal cpu9_lowbits  : std_logic_vector(1 downto 0);
    signal error_cpu9    : std_logic;
-   signal cpu9_irq, cpu9_unhalt : std_logic;
+   signal cpu9_irq, cpu9_unhalt, cpu9_halt : std_logic;
+   signal cpu9_dbg_r0, cpu9_dbg_lr, cpu9_dbg_cpsr : std_logic_vector(31 downto 0);
 
    signal cp15_itcm_ena, cp15_itcm_load : std_logic;
    signal cp15_dtcm_ena, cp15_dtcm_load : std_logic;
@@ -270,6 +324,9 @@ architecture arch of nds_top is
    signal key_wired_out9 : std_logic_vector(31 downto 0);
    signal key_wired_done9 : std_logic;
    signal irq_in9    : std_logic_vector(31 downto 0);
+   signal irq9_dbg_ime, irq9_dbg_ie, irq9_dbg_if : std_logic_vector(31 downto 0);
+   signal irq7_dbg_ime, irq7_dbg_ie, irq7_dbg_if : std_logic_vector(31 downto 0);
+   signal irq9_any : std_logic;
    signal irp_timer9 : std_logic_vector(3 downto 0);
    signal ipc9_irq_sync, ipc9_irq_sendempty, ipc9_irq_recv : std_logic;
 
@@ -315,10 +372,24 @@ architecture arch of nds_top is
    signal ld_card_ena                        : std_logic;
    signal ld_card_addr                       : std_logic_vector(26 downto 2);
    signal irq9_vblank, irq9_hblank, irq9_vcount : std_logic;
+   signal dbg_vbl_ena9 : std_logic;
 
    -- ================= ARM7 side =================
    signal cpu7_adr      : std_logic_vector(31 downto 0);
-   signal cpu7_rnw, cpu7_ena, cpu7_done : std_logic;
+   signal cpu7_rnw, cpu7_ena, cpu7_done, cpu7_lock : std_logic;
+   -- MEASURED 2026-07-25: the DS clocks the ARM9 at 67.028 MHz and the ARM7 at
+   -- 33.514 - a 2:1 ratio. Both cores here run on clk1x with ce='1', so the ARM9
+   -- is at HALF its correct relative speed. That skew breaks the NitroSDK
+   -- IPCSYNC boot handshake: the ARM7 writes its nibble, delays 593
+   -- instructions, and reads back before the ARM9 reaches its echo loop, so the
+   -- countdown runs one step offset forever. Proven by slowing the ARM7: the
+   -- ARM9's echo-loop poll count went 8 -> 237 (melonDS oracle: 158).
+   -- Do NOT "fix" this by gating cpu7's ce alone: membus7 has no ce port and its
+   -- cpu_done is a state level, so the core misses done and dies after 2
+   -- instructions (measured). Gating the whole ARM7 subsystem would also
+   -- desynchronise it from its own timers, and nds_ipc/nds_wram are shared with
+   -- the ARM9. The correct fix is to clock the ARM9 domain at 2x; clk_sys Fmax
+   -- is currently 37.68 MHz, so that needs timing work in this domain first.
    signal cpu7_acc      : std_logic_vector(1 downto 0);
    signal cpu7_dout, cpu7_din, cpu7_lastread : std_logic_vector(31 downto 0);
    signal cpu7_lowbits  : std_logic_vector(1 downto 0);
@@ -452,7 +523,11 @@ begin
       if rising_edge(clk1x) then
          ld_start      <= '0';
          preset_direct <= '0';
-         if (reset = '1') then
+         -- dbg_boot_rst is the debugger's SOFTRESET: it re-enters the same
+         -- sequence as a real reset (loader, PC presets, CPU release) while the
+         -- cart image stays staged in DDR3, so a from-reset differential can be
+         -- repeated without reloading the core or the ROM.
+         if (reset = '1' or dbg_boot_rst = '1') then
             boot_state <= B_RESET;
             boot_cnt   <= 0;
             resetCpu   <= '1';
@@ -576,14 +651,16 @@ begin
    iloader : entity work.nds_loader
    port map
    (
-      clk => clk1x, reset => reset,
+      clk => clk1x, reset => reset_boot,
       start => ld_start, direct => direct_boot,
       busy => ld_busy, done => ld_done, load_error => ld_error,
-      arm9_entry => arm9_entry, arm7_entry => arm7_entry,
+      arm9_entry => arm9_entry, arm7_entry => arm7_entry, cart_id => ld_cartid,
       card_ena => ld_card_ena, card_addr => ld_card_addr,
       card_done => card_done, card_rdata => card_din,
-      wr_ena => ld_wr_ena, wr_addr => ld_wr_addr, wr_data => ld_wr_data,
-      wr_done => ld_wr_done
+      wr_ena => ld_wr_ena, wr_rnw => ld_wr_rnw,
+      wr_addr => ld_wr_addr, wr_data => ld_wr_data,
+      wr_done => ld_wr_done, rd_data => mem9_readdata,
+      vfy_bad => dbg_vfy_bad, vfy_addr => dbg_vfy_addr
    );
 
    -- card image port: the loader owns it during boot, the slot module after
@@ -596,6 +673,7 @@ begin
    (
       clk => clk1x, ce => '1', reset => resetCpu,
       card7 => exmem_card7_s,
+      chipid => ld_cartid,
       bus9 => io_bus9, wired_out9 => card_wired_out9, wired_done9 => card_wired_done9,
       bus7 => io_bus7, wired_out7 => card_wired_out7, wired_done7 => card_wired_done7,
       irq9_xfer => irq9_card, irq7_xfer => irq7_card,
@@ -609,13 +687,90 @@ begin
    ld_to_main  <= '1' when (ld_busy = '1' and ld_wr_addr(31 downto 24) = x"02") else '0';
    ld_to_wram7 <= '1' when (ld_busy = '1' and ld_wr_addr(31 downto 24) = x"03") else '0';
 
-   mem9_ena       <= (ld_wr_ena and ld_to_main) when ld_busy = '1' else mr9_ena;
-   mem9_rnw       <= '0'                        when ld_busy = '1' else mr9_rnw;
-   mem9_addr      <= ld_wr_addr(21 downto 2)    when ld_busy = '1' else mr9_addr;
-   mem9_be        <= "1111"                     when ld_busy = '1' else mr9_be;
+   -- ARM9 main-RAM channel has three possible owners, in priority order: the
+   -- loader (boot copy + its verify pass), the debug unit's peek, then the CPU.
+   -- dbg_pk_sel stays asserted for the whole peek so address/rnw hold until the
+   -- op completes; the CPU's own done is suppressed for both borrowed cases.
+   idbgpk : process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         if (reset = '1') then
+            dbg_pk_act <= '0';
+         elsif (dbg_pk_ena = '1') then
+            dbg_pk_act <= '1';
+         elsif (mem9_done = '1') then
+            dbg_pk_act <= '0';
+         end if;
+      end if;
+   end process;
+   dbg_pk_sel <= dbg_pk_ena or dbg_pk_act;
+
+   mem9_ena       <= (ld_wr_ena and ld_to_main) when ld_busy = '1' else
+                     dbg_pk_ena                 when dbg_pk_sel = '1' else mr9_ena;
+   mem9_rnw       <= ld_wr_rnw                  when ld_busy = '1' else
+                     '1'                        when dbg_pk_sel = '1' else mr9_rnw;
+   mem9_addr      <= ld_wr_addr(21 downto 2)    when ld_busy = '1' else
+                     dbg_pk_addr_s(21 downto 2) when dbg_pk_sel = '1' else mr9_addr;
+   mem9_be        <= "1111"                     when ld_busy = '1' else
+                     "1111"                     when dbg_pk_sel = '1' else mr9_be;
    mem9_writedata <= ld_wr_data                 when ld_busy = '1' else mr9_writedata;
-   mr9_done       <= mem9_done and not ld_busy;
+   mr9_done       <= mem9_done and not ld_busy and not dbg_pk_sel;
    mr9_readdata   <= mem9_readdata;
+   dbg_pk_done_s  <= mem9_done and dbg_pk_sel;
+
+   reset_boot <= reset or dbg_boot_rst;
+
+
+   -- out ports are write-only in VHDL-93; nds_debug reads the internals
+   dbg_pc9 <= pc9_s;
+   dbg_pc7 <= pc7_s;
+
+   -- PROBE word (mailbox op 0x0A). Byte 3 is the top-level mux state, which is
+   -- what decides whether a cache request ever reaches nds_mainram at all.
+   dbg_probe <= dma_bus_on & ld_busy & dbg_pk_sel & mem9_done &
+                mem9_ena & mr9_ena & mr9_done & cpu9_ena &
+                dbg_mr_s & dbg_mb9 & dbg_cache9;
+
+   idebug : entity work.nds_debug
+   generic map
+   (
+      -- '0' = play image: the cores boot on their own. Set to `not is_simu` for a
+      -- diagnostic image, which leaves both cores held out of reset so a
+      -- debugger can arm breakpoints before the first instruction retires
+      -- (without it the boot FSM's B_RUN drops resetCpu and the game is millions
+      -- of instructions in before a host can attach). Simulation must never
+      -- hold: it is the golden reference for that differential, and holding
+      -- there yields a boot_done with zero retired instructions and an empty
+      -- trace. The mailbox itself stays usable either way.
+      BOOT_HOLD => '0'
+   )
+   port map
+   (
+      clk      => clk1x,
+      reset    => reset,
+      cmd_stb  => dbg_cmd_stb,
+      cmd_op   => dbg_cmd_op,
+      cmd_arg  => dbg_cmd_arg,
+      rsp_data => dbg_rsp_data,
+      rsp_stb  => dbg_rsp_stb,
+      hold9    => dbg_hold9,
+      rel9     => dbg_rel9,
+      hold7    => dbg_hold7,
+      rel7     => dbg_rel7,
+      boot_rst => dbg_boot_rst,
+      regsel   => dbg_regsel_s,
+      regval9  => dbg_regval9,
+      regval7  => dbg_regval7,
+      pc9      => pc9_s,
+      pc7      => pc7_s,
+      probe    => dbg_probe,
+      irq9_ime => irq9_dbg_ime, irq9_ie => irq9_dbg_ie, irq9_if => irq9_dbg_if,
+      irq7_ime => irq7_dbg_ime, irq7_ie => irq7_dbg_ie, irq7_if => irq7_dbg_if,
+      pk_ena   => dbg_pk_ena,
+      pk_addr  => dbg_pk_addr_s,
+      pk_done  => dbg_pk_done_s,
+      pk_data  => mem9_readdata
+   );
 
    process (clk1x)
    begin
@@ -627,7 +782,22 @@ begin
 
    -- ================= ARM9 CPU + membus =================
    ibios9 : entity work.nds_bios9
-   port map ( brom_addr => brom_addr, brom_data => brom_data );
+   generic map
+   (
+      is_simu => is_simu,
+      use_cyclone5_primitive => not is_simu
+   )
+   port map
+   (
+      clk       => clk1x,
+      brom_addr => brom_addr,
+      brom_data => brom_data,
+      load_addr => bios9_load_addr,
+      load_data => bios9_load_data,
+      load_be   => bios9_load_be,
+      load_we   => bios9_load_we,
+      load_done => bios9_load_done
+   );
 
    icpu9 : entity work.nds_cpu9
    generic map ( is_simu => is_simu )
@@ -641,6 +811,12 @@ begin
       cpu_export      => dbg_export9,
 -- synthesis translate_on
       error_cpu       => error_cpu9,
+      dbg_pc          => pc9_s,
+      dbg_r0          => cpu9_dbg_r0,
+      dbg_lr          => cpu9_dbg_lr,
+      dbg_cpsr        => cpu9_dbg_cpsr,
+      dbg_regsel      => dbg_regsel_s,
+      dbg_regval      => dbg_regval9,
       savestate_bus   => ss_bus9,
       ss_wired_out    => open,
       ss_wired_done   => open,
@@ -653,17 +829,18 @@ begin
       gb_bus_dout     => cpu9_dout,
       gb_bus_din      => cpu9_din,
       gb_bus_done     => cpu9_done,
+      gb_bus_lock     => cpu9_lock,
       bus_lowbits     => cpu9_lowbits,
       dma_on          => dma_on,
       done            => open,
       CPU_bus_idle    => cpu9_bus_idle,
       PC_in_BIOS      => open,
-      cpu_halt        => open,
+      cpu_halt        => cpu9_halt,
       lastread        => cpu9_lastread,
       jump_out        => open,
       IRQ_in          => cpu9_irq,
-      unhalt          => cpu9_unhalt,
-      new_halt        => '0',
+      unhalt          => cpu9_unhalt or dbg_rel9,
+      new_halt        => dbg_hold9,
       cp15_vector_hi  => open,
       cp15_pu_enable  => open,
       cp15_icache_ena => open,
@@ -712,7 +889,8 @@ begin
       mr_ena => mr9_ena, mr_rnw => mr9_rnw, mr_addr => mr9_addr, mr_be => mr9_be,
       mr_writedata => mr9_writedata, mr_done => mr9_done, mr_readdata => mr9_readdata,
       io_ce_next => '1',
-      io_bus => io_bus9, io_wired_out => io_wired_out9, io_wired_done => io_wired_done9
+      io_bus => io_bus9, io_wired_out => io_wired_out9, io_wired_done => io_wired_done9,
+      dbg_mb => dbg_mb9, dbg_cache => dbg_cache9
    );
 
    -- ARM9 bus mux: the DMA owns the membus while dma_bus_on (CPU paused
@@ -824,6 +1002,9 @@ begin
       cpu_export      => dbg_export7,
 -- synthesis translate_on
       error_cpu       => error_cpu7,
+      dbg_pc          => pc7_s,
+      dbg_regsel      => dbg_regsel_s,
+      dbg_regval      => dbg_regval7,
       savestate_bus   => ss_bus7,
       ss_wired_out    => open,
       ss_wired_done   => open,
@@ -836,6 +1017,7 @@ begin
       gb_bus_dout     => cpu7_dout,
       gb_bus_din      => cpu7_din,
       gb_bus_done     => cpu7_done,
+      gb_bus_lock     => cpu7_lock,
       bus_lowbits     => cpu7_lowbits,
       dma_on          => cpu7_pause,
       done            => open,
@@ -845,12 +1027,27 @@ begin
       lastread        => cpu7_lastread,
       jump_out        => open,
       IRQ_in          => cpu7_irq,
-      unhalt          => cpu7_unhalt,
-      new_halt        => cpu7_newhalt
+      unhalt          => cpu7_unhalt or dbg_rel7,
+      new_halt        => cpu7_newhalt or dbg_hold7
    );
 
    ibios7 : entity work.nds_bios7
-   port map ( bios_addr => bios_addr, bios_data => bios7_data );
+   generic map
+   (
+      is_simu => is_simu,
+      use_cyclone5_primitive => not is_simu
+   )
+   port map
+   (
+      clk       => clk1x,
+      bios_addr => bios_addr,
+      bios_data => bios7_data,
+      load_addr => bios7_load_addr,
+      load_data => bios7_load_data,
+      load_be   => bios7_load_be,
+      load_we   => bios7_load_we,
+      load_done => bios7_load_done
+   );
 
    -- ARM7 bus mux: the DMA owns the membus while dma7_bus_on (CPU paused
    -- via cpu7_pause and drained via cpu7_bus_idle before the grant); the
@@ -984,6 +1181,11 @@ begin
                19 => irq7_card, 23 => irq7_spi,
                others => '0');
 
+   irq9_any <= '1' when irq_in9 /= x"00000000" else '0';
+   dbg_r0_9   <= cpu9_dbg_r0;
+   dbg_lr9    <= cpu9_dbg_lr;
+   dbg_cpsr9  <= cpu9_dbg_cpsr;
+
    -- KEYINPUT (0x130, both CPUs) + EXTKEYIN (0x136, ARM7): wired directly
    -- until a keypad module (KEYCNT/key IRQ) exists; active low, released = 1
    keyinput <= not (KeyL & KeyR & KeyDown & KeyUp & KeyLeft & KeyRight &
@@ -1002,7 +1204,8 @@ begin
    (
       clk => clk1x, ce => '1', reset => resetCpu,
       gb_bus => io_bus9, wired_out => irq_wired_out9, wired_done => irq_wired_done9,
-      irq_in => irq_in9, cpu_irq => cpu9_irq, cpu_unhalt => cpu9_unhalt
+      irq_in => irq_in9, cpu_irq => cpu9_irq, cpu_unhalt => cpu9_unhalt,
+      dbg_ime => irq9_dbg_ime, dbg_ie => irq9_dbg_ie, dbg_if => irq9_dbg_if
    );
 
    iirq7 : entity work.nds_irq
@@ -1010,7 +1213,8 @@ begin
    (
       clk => clk1x, ce => '1', reset => resetCpu,
       gb_bus => io_bus7, wired_out => irq_wired_out7, wired_done => irq_wired_done7,
-      irq_in => irq_in7, cpu_irq => cpu7_irq, cpu_unhalt => cpu7_unhalt
+      irq_in => irq_in7, cpu_irq => cpu7_irq, cpu_unhalt => cpu7_unhalt,
+      dbg_ime => irq7_dbg_ime, dbg_ie => irq7_dbg_ie, dbg_if => irq7_dbg_if
    );
 
    irtc : entity work.nds_rtc
@@ -1021,6 +1225,7 @@ begin
    );
 
    isound : entity work.nds_sound
+   generic map ( is_simu => is_simu )
    port map
    (
       clk => clk1x, ce => '1', reset => resetCpu,
@@ -1112,16 +1317,21 @@ begin
    generic map ( Softmap_NDS_MAINRAM_ADDR => Softmap_NDS_MAINRAM_ADDR )
    port map
    (
-      clk1x => clk1x, clkMem => clkMem, clkMemIndex => clkMemIndex, reset => reset,
+      clk1x => clk1x, clkMem => clkMem, clkMemIndex => clkMemIndex, reset => reset_boot,
       arm7_priority => exmem_prio7,
-      mem9_ena => mem9_ena, mem9_rnw => mem9_rnw, mem9_addr => mem9_addr, mem9_be => mem9_be,
+      mem9_ena => mem9_ena,
+      mem9_lock => cpu9_lock and not bus_cacheable_d and not dma_bus_on and not ld_busy,
+      mem9_rnw => mem9_rnw, mem9_addr => mem9_addr, mem9_be => mem9_be,
       mem9_writedata => mem9_writedata, mem9_done => mem9_done, mem9_readdata => mem9_readdata,
-      mem7_ena => mr7_ena, mem7_rnw => mr7_rnw, mem7_addr => mr7_addr, mem7_be => mr7_be,
+      mem7_ena => mr7_ena,
+      mem7_lock => cpu7_lock and not dma7_bus_on and not snd_bus_own,
+      mem7_rnw => mr7_rnw, mem7_addr => mr7_addr, mem7_be => mr7_be,
       mem7_writedata => mr7_writedata, mem7_done => mr7_done, mem7_readdata => mr7_readdata,
       mainram_allow => mainram_allow, mainram_active => mainram_active, mainram_busy => mainram_busy,
       mr_sdram_ena => sdram_ena, mr_sdram_rnw => sdram_rnw, mr_sdram_Adr => sdram_Adr,
       mr_sdram_Din => sdram_Din, mr_sdram_be => sdram_be,
-      sdram_Dout => sdram_Dout, sdram_done32 => sdram_done32
+      sdram_Dout => sdram_Dout, sdram_done32 => sdram_done32,
+      dbg_mr => dbg_mr_s
    );
 
    -- ================= VRAM + engine A render path =================
@@ -1129,7 +1339,7 @@ begin
    generic map ( is_simu => is_simu )
    port map
    (
-      clk => clk1x, reset => reset, vramcnt => vramcnt,
+      clk => clk1x, reset => reset_boot, vramcnt => vramcnt,
       cpu9_ena => vram9_ena, cpu9_rnw => vram9_rnw, cpu9_addr => vram9_addr,
       cpu9_be => vram9_be, cpu9_din => vram9_din, cpu9_dout => vram9_dout, cpu9_done => vram9_done,
       cpu7_ena => vram7_ena, cpu7_rnw => vram7_rnw, cpu7_addr => vram7_addr,
@@ -1197,7 +1407,8 @@ begin
       hblank_trigger  => hblank_trigger,
       vblank_trigger  => gpu_vblank,
       refpoint_update => refpoint_update,
-      vcount_out      => vcount_out
+      vcount_out      => vcount_out,
+      dbg_vbl_ena9    => dbg_vbl_ena9
    );
 
    r_bg_addr    <= to_unsigned(g_bg_addr, 17);
@@ -1303,6 +1514,11 @@ begin
    dbg_line_busy <= line_busy or line_busy_b;
    dbg_cpu_err9  <= error_cpu9;
    dbg_cpu_err7  <= error_cpu7;
+   dbg_hwstat    <= std_logic_vector(to_unsigned(t_boot'pos(boot_state), 4)) &
+                    resetCpu & ld_busy & ld_done & ld_error &
+                    error_cpu9 & error_cpu7 &
+                    cpu9_ena & cpu9_done & cpu7_ena & cpu7_done &
+                    gpu_vblank & line_busy & line_busy_b & preset_direct;
 
 
 end architecture;

@@ -111,6 +111,14 @@ architecture arch of nds_drawer_extended is
 
    signal xlim                 : integer range 128 to 1024;
    signal ylim                 : integer range 128 to 1024;
+   -- xlim/ylim only ever hold 128/256/512/1024, but as plain runtime
+   -- integers Quartus can't see that, so `mod xlim` / `* xlim` below
+   -- synthesize as full dividers/multipliers. xlim_sel/ylim_sel carry the
+   -- same value as a 2-bit index so those ops become literal-constant
+   -- case/when expressions (mask/shift), same pattern as nds_drawer_affine.
+   signal xlim_sel             : unsigned(1 downto 0) := (others => '0');
+   signal ylim_sel             : unsigned(1 downto 0) := (others => '0');
+   signal yyy_x_xlim           : integer := 0;
 
    signal palno                : std_logic_vector(3 downto 0) := (others => '0');
 
@@ -154,14 +162,28 @@ begin
    yyy_pre <= realY(realY'left downto realY'left - 19);
 
    xxx     <= xxx_pre           when (wrapping = '0') else
-              xxx_pre mod xlim;
+              xxx_pre mod 128   when (xlim_sel = "00") else
+              xxx_pre mod 256   when (xlim_sel = "01") else
+              xxx_pre mod 512   when (xlim_sel = "10") else
+              xxx_pre mod 1024;
    yyy     <= yyy_pre           when (wrapping = '0') else
-              yyy_pre mod ylim;
+              yyy_pre mod 128   when (ylim_sel = "00") else
+              yyy_pre mod 256   when (ylim_sel = "01") else
+              yyy_pre mod 512   when (ylim_sel = "10") else
+              yyy_pre mod 1024;
 
    -- variant 0: 16-bit map entry address (map is (xlim/8) entries wide);
    -- variants 1/2: bitmap pixel address
    map_entryaddr <=
       to_integer((xxx / 8) + shift_left(shift_right(yyy, 3), 4 + to_integer(screensize))) * 2;
+
+   -- to_integer(yyy) * xlim, as a mux of literal-constant multiplies (see
+   -- xlim_sel comment above) instead of one runtime-variable multiply.
+   yyy_x_xlim <=
+      to_integer(yyy) * 128    when (xlim_sel = "00") else
+      to_integer(yyy) * 256    when (xlim_sel = "01") else
+      to_integer(yyy) * 512    when (xlim_sel = "10") else
+      to_integer(yyy) * 1024;
 
    -- tile pixel address is combinational from tileentry (valid during
    -- EVALTILE, the RAM latch slot); bitmap addresses from the live xxx/yyy
@@ -172,8 +194,8 @@ begin
    pixeladdr <=
       to_integer(tilebase) + to_integer(unsigned(tileentry(9 downto 0))) * 64
          + to_integer(yyy_flip) * 8 + to_integer(xxx_flip)               when (variant = "00") else
-      to_integer(mapbase) + to_integer(yyy) * xlim + to_integer(xxx)     when (variant = "01") else
-      to_integer(mapbase) + (to_integer(yyy) * xlim + to_integer(xxx)) * 2;
+      to_integer(mapbase) + yyy_x_xlim + to_integer(xxx)                 when (variant = "01") else
+      to_integer(mapbase) + (yyy_x_xlim + to_integer(xxx)) * 2;
 
    VRAM_byteaddr <=
       to_unsigned((to_integer(mapbase) + map_entryaddr) mod 524288, VRAM_byteaddr'length)
@@ -216,14 +238,16 @@ begin
                   busy         <= '1';
                   vramfetch    <= CALCADDR;
                   if (variant = "00") then
-                     xlim <= 128 * (2 ** to_integer(screensize));
-                     ylim <= 128 * (2 ** to_integer(screensize));
+                     xlim     <= 128 * (2 ** to_integer(screensize));
+                     ylim     <= 128 * (2 ** to_integer(screensize));
+                     xlim_sel <= screensize;
+                     ylim_sel <= screensize;
                   else
                      case (to_integer(screensize)) is
-                        when 0      => xlim <= 128; ylim <= 128;
-                        when 1      => xlim <= 256; ylim <= 256;
-                        when 2      => xlim <= 512; ylim <= 256;
-                        when others => xlim <= 512; ylim <= 512;
+                        when 0      => xlim <= 128; ylim <= 128; xlim_sel <= "00"; ylim_sel <= "00";
+                        when 1      => xlim <= 256; ylim <= 256; xlim_sel <= "01"; ylim_sel <= "01";
+                        when 2      => xlim <= 512; ylim <= 256; xlim_sel <= "10"; ylim_sel <= "01";
+                        when others => xlim <= 512; ylim <= 512; xlim_sel <= "10"; ylim_sel <= "10";
                      end case;
                   end if;
                   x_cnt           <= 0;

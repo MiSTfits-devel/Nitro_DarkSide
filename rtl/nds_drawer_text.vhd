@@ -95,11 +95,11 @@ architecture arch of nds_drawer_text is
    signal y_scrolled           : integer range 0 to 1023;
    signal y_scrolled_mod       : integer range 0 to 511;
    signal offset_y             : integer range 0 to 1023;
-   signal scroll_x_mod         : integer range 256 to 512;
-   signal scroll_y_mod         : integer range 256 to 512;
-
-   signal x_flip_offset        : integer range 3 to 7;
-   signal x_div                : integer range 1 to 2;
+   -- Text BG dimensions are powers of two. Keep the captured 256/512 choice
+   -- explicit so Quartus sees literal-constant wrapping instead of inferring
+   -- a runtime divider for `mod scroll_[xy]_mod` in every drawer instance.
+   signal scroll_x_512         : std_logic := '0';
+   signal scroll_y_512         : std_logic := '0';
 
    signal x_scrolled           : unsigned(8 downto 0) := (others => '0');
 
@@ -118,7 +118,8 @@ architecture arch of nds_drawer_text is
 
 begin
 
-   x_scrolled <= to_unsigned((x_cnt + to_integer(scrollX)) mod scroll_x_mod, 9);
+   x_scrolled <= to_unsigned((x_cnt + to_integer(scrollX)) mod 512, 9) when (scroll_x_512 = '1') else
+                 to_unsigned((x_cnt + to_integer(scrollX)) mod 256, 9);
 
    VRAM_Drawer_addr    <= to_integer(VRAM_byteaddr(18 downto 2));
    PALETTE_Drawer_addr <= to_integer(unsigned(PALETTE_byteaddr(8 downto 2)));
@@ -130,7 +131,8 @@ begin
    y_scrolled <= ypos_mosaic + to_integer(scrollY) when (mosaic = '1') else
                  ypos + to_integer(scrollY);
 
-   y_scrolled_mod <= y_scrolled mod scroll_y_mod;
+   y_scrolled_mod <= y_scrolled mod 512 when (scroll_y_512 = '1') else
+                     y_scrolled mod 256;
 
    offset_y   <= ((y_scrolled mod 256) / 8) * 32;
 
@@ -139,6 +141,7 @@ begin
     variable tileindex_var   : integer range 0 to 4095;
     variable tileaddr_var    : integer range 0 to 4095;
     variable pixeladdr       : integer range 0 to 1048575;
+    variable pixel_x_in_tile : integer range 0 to 7;
     variable done_var        : std_logic;
    begin
       if rising_edge(clk) then
@@ -152,12 +155,12 @@ begin
                if (drawline = '1') then
                   busy            <= '1';
                   vramfetch       <= CALCBASE;
-                  scroll_x_mod <= 256;
-                  scroll_y_mod <= 256;
+                  scroll_x_512 <= '0';
+                  scroll_y_512 <= '0';
                   case (to_integer(screensize)) is
-                     when 1 => scroll_x_mod <= 512;
-                     when 2 => scroll_y_mod <= 512;
-                     when 3 => scroll_x_mod <= 512; scroll_y_mod <= 512;
+                     when 1 => scroll_x_512 <= '1';
+                     when 2 => scroll_y_512 <= '1';
+                     when 3 => scroll_x_512 <= '1'; scroll_y_512 <= '1';
                      when others => null;
                   end case;
                   x_cnt     <= 0;
@@ -168,13 +171,6 @@ begin
 
             when CALCBASE =>
                vramfetch  <= CALCADDR;
-               if (hicolor = '0') then
-                  x_flip_offset <= 3;
-                  x_div         <= 2;
-               else
-                  x_flip_offset <= 7;
-                  x_div         <= 1;
-               end if;
 
             when CALCADDR =>
                tileindex_var  := 0;
@@ -211,10 +207,19 @@ begin
 
             when CALCCOLORADDR =>
                vramfetch  <= WAITREAD_COLOR;
-               if (tileinfo(10) = '1') then -- hoz flip
-                  pixeladdr := pixeladdr_base + (x_flip_offset - (to_integer(x_scrolled(2 downto 0)) / x_div));
+               if (hicolor = '0') then
+                  pixel_x_in_tile := to_integer(x_scrolled(2 downto 1));
                else
-                  pixeladdr := pixeladdr_base + to_integer(x_scrolled(2 downto 0)) / x_div;
+                  pixel_x_in_tile := to_integer(x_scrolled(2 downto 0));
+               end if;
+               if (tileinfo(10) = '1') then -- hoz flip
+                  if (hicolor = '0') then
+                     pixeladdr := pixeladdr_base + (3 - pixel_x_in_tile);
+                  else
+                     pixeladdr := pixeladdr_base + (7 - pixel_x_in_tile);
+                  end if;
+               else
+                  pixeladdr := pixeladdr_base + pixel_x_in_tile;
                end if;
                if (tileinfo(11) = '1') then -- vert flip
                   if (hicolor = '0') then

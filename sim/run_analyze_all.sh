@@ -2,6 +2,13 @@
 # Smoke test: analyze every RTL file in the repo under nvc (three-library flow,
 # same shape as GBA_MiSTfits). Catches breakage in vendored files and skeletons
 # without needing a full testbench. CI-friendly.
+#
+# NOT a substitute for Quartus analysis. Every nvc call here passes --relaxed,
+# which waives VHDL-93 rules that Quartus enforces - notably reading an `out`
+# port, which Quartus rejects with error 10577/10600. "analyze-all: OK" has
+# passed on source that Quartus refuses to synthesise. Quartus's own
+# Analysis & Synthesis fails on that class in about 7 seconds, so it is the
+# cheaper gate for port-mode mistakes, not the more expensive one.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -44,6 +51,7 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_membus9.vhd \
    rtl/nds_syscnt.vhd \
    rtl/nds_loader.vhd \
+   rtl/nds_debug.vhd \
    rtl/nds_card.vhd \
    rtl/nds_rtc.vhd \
    rtl/nds_sound.vhd \
@@ -60,6 +68,7 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    sim/tb_arm9_trace.vhd \
    sim/tb_gpu_bg.vhd \
    sim/tb_gpu_obj.vhd \
+   sim/tb_card_chipid.vhd \
    rtl/nds_drawer_merge.vhd \
    rtl/nds_gpu2d.vhd \
    rtl/nds_gpu_timing.vhd \
@@ -88,5 +97,6 @@ nvc -H 1g -L "$WORK" --work="$WORK/work" -e tb_arm7_island
 nvc -H 1g -L "$WORK" --work="$WORK/work" -e tb_arm9_island
 nvc -H 1g -L "$WORK" --work="$WORK/work" -e tb_arm9_trace
 nvc -L "$WORK" --work="$WORK/work" -e tb_gpu_timing
+nvc -L "$WORK" --work="$WORK/work" -e tb_card_chipid
 
 echo "analyze-all: OK"

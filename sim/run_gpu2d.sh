@@ -7,10 +7,17 @@ set -eu
 cd "$(dirname "$0")/.."
 
 TIMEOUT_MS="${TIMEOUT_MS:-200}"
+BGVRAMFILE="${BGVRAMFILE:-sim/tests/gpu2d_bgvram.hex}"
+OBJVRAMFILE="${OBJVRAMFILE:-sim/tests/gpu2d_objvram.hex}"
+BGEPFILE="${BGEPFILE:-sim/tests/gpu2d_bgep.hex}"
+OBJEPFILE="${OBJEPFILE:-sim/tests/gpu2d_objep.hex}"
+PALFILE="${PALFILE:-sim/tests/gpu2d_pal.hex}"
+OAMFILE="${OAMFILE:-sim/tests/gpu2d_oam.hex}"
+FRAMEFILE="${FRAMEFILE:-sim/tests/gpu2d_frames.hex}"
 WORK=sim/nvc_work
 mkdir -p "$WORK"
 
-[ -f sim/tests/gpu2d_frames.hex ] || { echo "vectors missing: python3 sim/tests/gen_gpu2d.py"; exit 1; }
+[ -f "$FRAMEFILE" ] || { echo "vectors missing: $FRAMEFILE"; exit 1; }
 
 nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/export.vhd \
@@ -24,5 +31,8 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_gpu2d.vhd \
    sim/tb_gpu2d.vhd
 
-nvc -H 1g -L "$WORK" --work="$WORK/work" -e tb_gpu2d -gTIMEOUT_MS="$TIMEOUT_MS"
+nvc -H 1g -L "$WORK" --work="$WORK/work" -e tb_gpu2d -gTIMEOUT_MS="$TIMEOUT_MS" \
+   -gBGVRAMFILE="$BGVRAMFILE" -gOBJVRAMFILE="$OBJVRAMFILE" \
+   -gBGEPFILE="$BGEPFILE" -gOBJEPFILE="$OBJEPFILE" \
+   -gPALFILE="$PALFILE" -gOAMFILE="$OAMFILE" -gFRAMEFILE="$FRAMEFILE"
 nvc -H 2g -L "$WORK" --work="$WORK/work" -r tb_gpu2d --ieee-warnings=off --exit-severity=failure

@@ -22,8 +22,10 @@
 -- CmdEncMode=2, so only these are ever issued): B7 block read (contiguous
 -- from the image; reads below 0x8000 redirect to 0x8000+(addr&0x1FF) like
 -- real carts protect the secure area), B8 chip ID. Anything else returns FF.
--- Chip ID is Macronix NTR MROM, size byte from the image capacity would be
--- header-derived; 3FC2 covers the 64 MB retail class (melonDS formula).
+-- Chip ID is Macronix NTR MROM with the capacity byte derived from the staged
+-- image's header: the chipid input comes straight from nds_loader's cart_id,
+-- so B8 answers exactly what the direct-boot env block at 0x02FFF800 says.
+-- NitroSDK re-reads it from CARDi_CheckPulledOut, so the two must not differ.
 --
 -- Timing (33.514 MHz clk1x = melonDS system-cycle rate, applied 1:1):
 -- 8-bit parallel bus, xfercycle = 8 cycles/byte (ROMCTRL[27]) or 5;
@@ -50,6 +52,8 @@ entity nds_card is
       reset        : in  std_logic;
 
       card7        : in  std_logic;    -- EXMEMCNT[11]: '1' = ARM7 owns the slot
+
+      chipid       : in  std_logic_vector(31 downto 0);  -- nds_loader cart_id, B8 answer
 
       bus9         : in  proc_bus_gb_type;
       wired_out9   : out std_logic_vector(31 downto 0);
@@ -79,8 +83,6 @@ architecture arch of nds_card is
    constant ADR_CMD0    : std_logic_vector(27 downto 0) := x"00001A8";
    constant ADR_CMD4    : std_logic_vector(27 downto 0) := x"00001AC";
    constant ADR_DATA    : std_logic_vector(27 downto 0) := x"0100010";
-
-   constant CHIPID      : std_logic_vector(31 downto 0) := x"00003FC2";
 
    signal spicnt     : std_logic_vector(15 downto 0) := (others => '0');
    signal romctrl    : std_logic_vector(31 downto 0) := (others => '0'); -- stored bits, 23/31 live below
@@ -433,7 +435,7 @@ begin
                         state     <= FETCH;
                      else
                         if (cmd_b8 = '1') then
-                           romdata <= CHIPID;
+                           romdata <= chipid;
                         else
                            romdata <= (others => '1');
                         end if;
@@ -487,7 +489,7 @@ begin
                         state     <= FETCH;
                      else
                         if (cmd_b8 = '1') then
-                           romdata <= CHIPID;
+                           romdata <= chipid;
                         else
                            romdata <= (others => '1');
                         end if;

@@ -4,6 +4,109 @@ Shared between Agent A (top/sound/dma7/porting) and Agent B (Kirby stall root-ca
 Append entries with date + agent. Claim files before editing.
 
 ## File claims
+- 2026-07-24 sole agent (size-derived cartridge chip ID): rtl/nds_card.vhd,
+  rtl/nds_loader.vhd, rtl/nds_top.vhd, sim/tb_dual_boot.vhd,
+  sim/run_analyze_all.sh, plus new sim/tb_card_chipid.vhd and
+  sim/run_card_chipid.sh. Replace nds_card's hardcoded 64 MB chip-ID constant
+  with the loader's header-derived value so the B8 answer and the direct-boot
+  copy at 0x02FFF800 cannot disagree. Existing diagnostic/telemetry edits in
+  the shared files are retained untouched.
+- 2026-07-20 sole agent (durable end-of-session handoff): HANDOFF.md. Record
+  the complete fitting, cache, SWP, live MiSTer, artifact, verification, and
+  active post-SWP register-probe state for the next agent. User explicitly
+  requested this handoff document; keep it current through the active build.
+- 2026-07-20 sole agent (post-SWP live register discriminator):
+  rtl/nds_top.vhd and NDS.sv. The timing-clean SWP fix changes live lock
+  observations to zero but Kirby remains white with ARM9 in BIOS delay;
+  restore the existing DDR lanes to architectural r0/lr/CPSR so the exact
+  caller and delay argument can be identified without changing behavior.
+- 2026-07-20 sole agent (dual-CPU SWP atomicity): rtl/nds_cpu9.vhd,
+  rtl/gba_cpu.vhd, rtl/nds_top.vhd, rtl/nds_mainram.vhd,
+  sim/tb_mainram.vhd, sim/tb_dual_boot.vhd, sim/tests/arm9_boot.s,
+  sim/tests/arm7_boot.s, and generated sim/tests/arm9_boot.bin,
+  sim/tests/arm7_boot.bin, and sim/tests/nds_dual.hex. Live register telemetry
+  places Kirby in the uncached NitroSDK cartridge-lock SWP loop; add a
+  dual-CPU contention regression and preserve one CPU's read/write SWP pair
+  through main-RAM arbitration. Existing diagnostic edits in the shared RTL
+  files are retained.
+- 2026-07-20 sole agent (cartridge-spinlock/cache hardware discriminator):
+  rtl/nds_top.vhd, NDS.sv, sim/tests/arm9_cache.s, and its generated
+  sim/tests/arm9_cache.hex. Reuse existing DDR telemetry lanes to expose the
+  real ARM7 PC and ARM9 reads/writes of HW_CTRDG_LOCK_BUF; add the missing
+  cached SWP/halfword spinlock regression before changing cache RTL.
+- 2026-07-19 Codex (isolated DSP-fit measurement): build/remote-build.sh.
+  Add POD and ARTIFACT_DIR overrides so this measurement does not delete the
+  active shared Quartus pod or overwrite its reports.
+- 2026-07-19 Codex (DSP-for-ALM rebalance): rtl/nds_sound.vhd and
+  rtl/nds_drawer_merge.vhd. Time-share the sound master-volume multiply to
+  free two DSP blocks, then return both pixel-merge effect datapaths from
+  forced logic to DSPs. Arithmetic stays bit-identical; sample_valid moves
+  one 33.5 MHz clock later within the otherwise idle 1024-clock mix window.
+- 2026-07-19 sole agent (temporary diagnostic fitter seed): NDS.qsf seed only.
+  Seed 0 routed the one-bit DISPSTAT probe but sacrificed 100.5 MHz hold
+  timing; try seed 1 as a build-only override, then restore seed 0. No other
+  QSF setting is in scope.
+- 2026-07-19 sole agent (DISPSTAT VBlank-enable hardware discriminator):
+  rtl/nds_gpu_timing.vhd plus the already-claimed IRQ telemetry lane in
+  rtl/nds_top.vhd. Hardware proves VCOUNT crosses line 192 while ARM9 stays
+  halted with IE bit 0 set and IF bit 0 clear; expose the persistent ARM9
+  DISPSTAT VBlank-enable latch observationally to distinguish a lost register
+  write from pulse-generation failure.
+- 2026-07-19 sole agent (ARM9 WFI/IRQ hardware discriminator):
+  rtl/nds_irq.vhd plus the already-claimed telemetry path in rtl/nds_top.vhd,
+  nds_port_wrap.vhd, NDS.sv, rtl/nds_fb_ddr3.sv, and existing ARM island/boot
+  testbench IRQ instantiations. Live PC proves ARM9 remains in the NitroSDK
+  WFI idle loop while ARM7/GPU cadence continue; expose IME/IE/IF and
+  halt/irq/unhalt/event counts in the diagnostic-only DDR strip.
+- 2026-07-19 sole agent (temporary DDR-visible hardware telemetry):
+  rtl/nds_fb_ddr3.sv and NDS.sv. The first diagnostic probe only decorated
+  engine pixels, so a CPU/GPU stall could prevent its marker line from ever
+  reaching DDR. Add a low-rate diagnostic-only ch5 writer for line 191 so
+  live PC/status remains readable even while both 2D engines are stalled.
+- 2026-07-19 sole agent (temporary live-hardware PC/status telemetry):
+  rtl/nds_cpu9.vhd, rtl/gba_cpu.vhd, rtl/nds_top.vhd, nds_port_wrap.vhd,
+  NDS.sv, sim/tb_arm9_trace.vhd, sim/tb_arm9_island.vhd,
+  sim/tb_arm7_island.vhd, and sim/tb_dual_boot.vhd. The clean-timing RBF
+  still produces uniform-white live DDR framebuffers after a verified remote
+  MGL launch. Flatten the two current PCs plus boot/loader/bus state through
+  the wrapper and encode them only into reserved pixels of a diagnostic RBF;
+  remove the telemetry after hardware isolation. Prior agents are offline.
+- 2026-07-19 sole agent (Kirby hardware timing failure): rtl/nds_loader.vhd.
+  Replace the timing-failing 19-stage combinational cartridge-ID power-of-two
+  loop with an equivalent multi-cycle calculation before the direct-boot
+  environment writes. Current fitted path is env_size[16] -> cartid[16],
+  WNS -16.228 ns; simulation cannot model that hardware setup violation.
+- 2026-07-19 sole agent (loader timing regression): sim/tb_dual_boot.vhd.
+  Enable the loader's real direct-boot environment path and assert the
+  cartridge-ID word emitted after the new multi-cycle size calculation.
+- 2026-07-19 sole agent (Kirby late-frame differential trace):
+  sim/tb_top_frame.vhd, sim/run_top_frame.sh, and
+  sim/melonds_tracer/main_fbdump.cpp, plus sim/run_gpu2d.sh, generated
+  ignored `sim/tests/gpu2d_kirby135_*.hex` snapshot vectors, and
+  sim/run_biosfix_regression.sh. Prior Agent A/B
+  claims are offline per user direction. Add late-start ARM9/ARM7 trace
+  gating and a melonDS-to-RTL display snapshot test so the known frame-127
+  divergence can be isolated without enormous from-boot trace files.
+- 2026-07-19 sole agent (hot-load BIOS timing regression):
+  sim/tb_arm7_island.vhd and sim/tb_arm9_island.vhd. Update only the
+  behavioral BIOS read models to synchronous-read timing matching the new
+  hardware M10K BIOS entities; prior Fable claim is offline per user direction.
+- 2026-07-19 sole agent (hot-loadable retail BIOS): rtl/nds_bios7.vhd,
+  rtl/nds_bios9.vhd, rtl/nds_membus7.vhd, rtl/nds_membus9.vhd,
+  rtl/nds_top.vhd, nds_port_wrap.vhd, NDS.sv, sim/tb_bios_hotload.vhd and
+  sim/run_bios_hotload.sh. Prior A/B/C/Fable agents are offline per user
+  direction. Add atomic ioctl-loaded ARM7/ARM9 BIOS RAMs so BIOS changes no
+  longer require Quartus; preserve the existing retail-file simulation path
+  and HLE fallback.
+- 2026-07-19 sole agent (final DMA decode margin): rtl/nds_dma7.vhd and
+  rtl/nds_dma9.vhd (replace fixed 12-word register `/3`/`mod 3` decode with
+  an explicit case table; prior Agent A is offline per user direction).
+- 2026-07-19 sole agent (final fitter margin): rtl/nds_drawer_text.vhd
+  (replace the three per-instance runtime dividers with literal power-of-two
+  wrap/select logic; eight synthesized instances).
+- 2026-07-19 sole agent (cache9 ALM endgame): rtl/nds_cache9.vhd,
+  sim/tb_cache9_lookup.vhd and sim/run_cache9_lookup.sh (new targeted
+  synchronous-tag lookup/maintenance race regression).
 - Agent A: rtl/nds_top.vhd, rtl/nds_sound.vhd, rtl/nds_dma7.vhd, NDS.sv, files.qip,
   NDS.qsf, sim/run_top_frame.sh, sim/tb_top_frame.vhd, sim/run_analyze_all.sh
 - Agent B: rtl/nds_bios7.vhd, rtl/nds_bios9.vhd, sim/tests/hle_bios7/build.sh,
@@ -28,6 +131,227 @@ Append entries with date + agent. Claim files before editing.
 - nds-quartus-clash-9: Agent C (Clash integration compile; isolated fresh pod)
 
 ## Log
+- 2026-07-24 sole agent: **CARTRIDGE CHIP ID IS NOW SIZE-DERIVED IN nds_card
+  INSTEAD OF A 64 MB CONSTANT; SIM-ONLY, NO FIT AND NO HARDWARE CLAIM.**
+  `rtl/nds_card.vhd` hardcoded `CHIPID = 0x00003FC2`, which is melonDS's
+  `0xC2 | ((sizeMB - 1) << 8)` evaluated for a 64 MB cart: correct for the
+  Kirby test ROM and wrong for every other cart size. NitroSDK's
+  `CARDi_CheckPulledOut` re-reads B8 and compares it against the boot-time
+  copy at 0x02FFF800, so a disagreement reads as "cartridge pulled out".
+  * `nds_card` now takes a `chipid` input fed from `nds_loader`'s new
+    `cart_id` output via `nds_top`'s `ld_cartid`, so the B8 answer and the
+    direct-boot env block are the same word by construction rather than by
+    two formulas agreeing. The port has **no default** on purpose: an
+    unwired instantiation fails analysis instead of silently reverting to a
+    constant. Ordering is safe - the loader latches `cartid` and reaches
+    FINISHED while `resetCpu` is still asserted, before any ROMCTRL
+    transfer is possible.
+  * `nds_loader` now reads the used-ROM-size word (header +0x80) as a 9th
+    word in the header pass instead of capturing it opportunistically as it
+    flowed past in the direct-boot header copy, and `CARTID_CALC` runs
+    unconditionally; only the env-block writes stay gated on `direct`.
+    Previously the whole calculation sat inside the `direct='1'` branch, so a
+    `direct='0'` boot would have handed nds_card a chip ID of zero - worse
+    than the constant it replaces. `direct_boot` is hardwired `1'b1` in
+    NDS.sv, so that was latent, not live. The multi-cycle 19-shift structure
+    from the 2026-07-19 timing fix is unchanged.
+  * New `sim/tb_card_chipid.vhd` + `sim/run_card_chipid.sh` drive a real B8
+    transfer through nds_card's ARM9 register block (AUXSPICNT -> command
+    bytes -> ROMCTRL start -> word-ready poll -> data-port pop) and compare
+    the popped word against both the snooped 0x02FFF800 write and a
+    hand-written expected value, so the test is not just the design agreeing
+    with itself. Five sizes: 0x03159E2C -> 0x00003FC2 (64 MB, the value the
+    constant happened to get right), 0x00200000 -> 0x000001C2 (2 MB),
+    0x00200001 -> 0x000003C2 (4 MB), 0x08000000 -> 0x00007FC2 (128 MB), and
+    0x00080000 -> 0x000100C2 (512 KB small-ROM encoding). Registered in
+    `run_analyze_all.sh` for both analyze and elaborate.
+  * Test efficacy was checked, not assumed: with the constant reintroduced
+    into a scratch copy of nds_card, case 0 still passes and case 1 fails
+    with `size 00200000: B8 answered 00003FC2, expected 000001C2`.
+  * `tb_dual_boot` gained a `cart_id`-vs-env-write cross-check alongside its
+    existing 0x00003FC2 assertion.
+  * Remote PASS on `POD=nds-nvc-chipid DIRTY=1`, all exit 0: `dual_boot`
+    (arm9=0000007F arm7=0000003F), `analyze_all` (elaborates nds_top, so the
+    new port wiring is covered), and `card_chipid` (5/5 sizes). No Quartus
+    fit was run, no RBF was built or deployed, and no physical-hardware
+    result is claimed.
+  * Ops note: `slacker` is a single node and sat at ~98% CPU *requests*
+    behind `gba-quartus-build-gba`/`gba2p` and `nds-nvc-kirby-full`, so three
+    parallel `POD=` names scheduled **zero** pods (each sim pod requests
+    `cpu: "1"`). Remote sims had to run sequentially on one pod name; check
+    `kubectl describe node slacker` before fanning out.
+- 2026-07-19 Codex: **DSP-FOR-ALM REBALANCE ROUTES AT BOTH THE DEFAULT AND
+  DIAGNOSTIC SEEDS; CORE TIMING IS CLEAN.** Time-shared the left/right sound
+  master-volume product across mixer slots 16/17 (latched gain, bias, and the
+  completed left sample so stereo still publishes atomically), freeing two
+  DSPs. Returned both GPU merge effect datapaths to DSPs. The coherent map
+  changes from 40,988 to **40,682 estimated ALMs** (-306), 61,393 to **60,810
+  combinational ALUTs** (-583), and 95 to **111/112 DSPs**. The two merge
+  instances fall from 729/741 to 332/344 ALUTs while sound changes from 9 to
+  7 DSPs; the target hierarchy therefore confirms the mechanism rather than
+  relying on seed-sensitive fitter totals.
+  * Fresh full default-seed flow: **41,049/41,910 ALMs (98%)**, **4,189/4,191
+    LABs** (2 free), 43,883 fitted registers, 521/553 RAM blocks, 111/112
+    DSPs. Placement, routing, assembly, and TimeQuest completed with zero
+    errors. Peak total/H/V routing is 87.1/85.4/93.2%. Every core setup clock
+    passes (worst +0.722 ns) and all hold clocks pass (worst +0.213 ns); only
+    the independent HDMI setup clock misses at -0.240 ns / TNS -0.480.
+  * Fresh seed-420 confirmation: **41,061 ALMs**, **4,186 LABs** (5 free),
+    peak vertical routing 93.3%, worst core setup +0.637 ns, worst hold +0.233
+    ns, and HDMI setup -0.187 ns. This turns the prior 41,345-ALM/290-unrouted
+    diagnostic into a reproducible routed result, but does not yet constitute
+    comfortable fitter margin.
+  * PASS: exact 27-sample sound regression; gpu2d golden/timed/frame suite;
+    analyze-all; cache9 lookup; ARM9 cache/island; ARM7 island; and dual boot.
+    No RBF was deployed and no physical-hardware result is claimed.
+  * `build/remote-build.sh` now supports validated isolated pod, artifact-dir,
+    and seed overrides and clears only known outputs before fetching. This is
+    important because the old `build/artifacts` directory currently mixes a
+    newer failed fit/map with an older STA/RBF and must not be read as one run.
+  * Next measured structural target: `nds_fb_ddr3`'s two 256x36 async MLAB
+    accumulators cost **490.7 fitted ALMs and all 32 Memory LABs** in the
+    default-seed report. Two synchronous M10Ks plus a one-cycle/look-ahead
+    feeder should recover roughly 480-490 ALMs while using only 2 of 32 free
+    M10Ks. Repair the telemetry-stale pager test before editing that claimed
+    file. Secondary target: the four vertical-mosaic remainder dividers cost
+    about 155 ALMs and can become small synchronous ROMs. A bulk Clash rewrite
+    is not justified by the reports.
+  * Review caveat outside this optimization: the already-dirty sound fetch
+    pointer/remaining-count BRAM conversion still lacks a restart-during-fetch
+    interlock regression and may race a channel restart with an in-flight RAM
+    update. Do not land that separate sound hunk as proven by the mixer test.
+- 2026-07-19 sole agent: **HARDWARE IRQ TELEMETRY ISOLATES MISSING ARM9
+  VBLANK; FIRST DISPSTAT-LATCH PROBE FIT REJECTED ON HOLD TIMING.** Live DDR
+  capture with Kirby shows ARM9 fixed at architectural PC `0x0214FC10` (WFI),
+  `IME=1`, `IE=0x00040001`, `IF=0x00080000`, halt=1, irq/unhalt=0. Thus the
+  only pending flag is a disabled card IRQ; VBlank IF bit 0 never latched.
+  Rapid samples captured VCOUNT on both sides of 192 while ARM9 remained
+  halted, ruling out a frozen GPU counter. The framebuffer line normally
+  overwrites the diagnostic words with white (`0x3FFFF`), so reads explicitly
+  select the recurring non-white telemetry interval.
+  Added a one-bit observational export of persistent ARM9 DISPSTAT bit 3,
+  replacing the transient VBlank-pulse telemetry bit. Remote PASS:
+  arm9_cache 0x7F, arm9_island 0x7FF, dual_boot ARM9 0x3F / ARM7 0x1F,
+  analyze-all, and focused gpu_timing (4 frames). Seed-0 synthesis remained
+  exactly 84,983 device logic cells and the retry fitter succeeded at 41,330
+  / 41,910 ALMs, but that route is **rejected and not uploaded**: HDMI setup
+  WNS -0.045 ns and, critically, 100.5 MHz core hold WNS -0.403 ns / TNS
+  -0.890. Production and the installed IRQ probe remain unchanged.
+- 2026-07-19 sole agent: **LOADER TIMING FIX FITTED CLEANLY AND DEPLOYED;
+  HARDWARE RETEST PENDING.** Replaced the 49-level combinational cartridge-ID
+  size round-up in `rtl/nds_loader.vhd` with the exact same calculation over
+  19 loader clocks. Remote nvc PASS: direct-path `dual_boot` with Kirby's
+  0x03159E2C used-ROM size and asserted chip ID 0x00003FC2, `arm9_cache`,
+  `arm9_island`, and `analyze_all`. The production Quartus flow completed in
+  25m22s with **41,199 / 41,910 ALMs (98%)**, 43,901 registers, 3,816,677
+  memory bits, 521/553 RAM blocks, and 95/112 DSPs. TimeQuest is now fully
+  setup-clean: worst setup slack **+0.124 ns**, TNS 0, and 0/50 violated setup
+  paths (hold WNS +0.245 ns), versus -16.228 ns on the superseded hardware
+  build. `NDS.sv` now also permits `.rom` in each manual firmware/ARM7/ARM9
+  picker while masking MiSTer's extension-selector bits before decoding the
+  six-bit file index; automatic boot0/boot1/boot2 indices remain unchanged.
+  Deployed and SHA-256 verified on 192.168.1.244:
+  `/media/fat/_Console/NDS_20260719.rbf` =
+  `5a55cac344f7d2d56b244c0af18338c846d115c514ad59d8ffad4ae01457d8f6`.
+  The superseded RBF is preserved as
+  `/media/fat/_Console/NDS_pre_timingfix_20260719.rbf` (SHA-256 `3ec696...`).
+  boot0/boot1/boot2 `.rom` files and Kirby remain installed. This establishes
+  simulation, fit, timing, transfer, and hash verification only; no claim of
+  physical boot success until the user reloads the core and tests Kirby.
+- 2026-07-19 sole agent: **BOOT-INDEX RBF HARDWARE RESULT FALSIFIED THE
+  EARLIER ROOT-CAUSE CLAIM; LOADER TIMING FIX IN FLIGHT.** The deployed
+  3ec696... RBF still gives two uniform white screens (this time no audio
+  pop), including after manual ARM7/ARM9 BIOS replacement. HPS DDR readback
+  confirms the Kirby and firmware bytes are correct, so the remaining fault
+  is inside the FPGA execution path, not file placement or HDMI scanout.
+  Quartus reports a real hardware-only failure: nds_loader's combinational
+  `cart_id(env_size)` loop is a 49-logic-level env_size[16] -> cartid[16]
+  path with WNS -16.228 ns. Replaced it with the same 19 power-of-two
+  round-up steps over 19 loader clocks. The direct-loader dual-boot test now
+  injects Kirby's exact 0x03159E2C used-ROM size and asserts chip ID
+  0x00003FC2; dual_boot, analyze_all, arm9_cache and arm9_island pass remotely.
+  A corrected retail-BIOS first-frame trace strengthens the diagnosis: after
+  alignment, ARM9 is field-for-field identical to melonDS for all 175,569
+  captured instructions. ARM7 is identical for 104,997, then differs only
+  on the expected IPCSYNC polling interleave (0x0800 one poll before melonDS
+  sees 0x0808). Production measurement build is running; no hardware-success
+  claim until its RBF is deployed and tested.
+- 2026-07-19 sole agent: **MISTER BOOT1/BOOT2 BIOS AUTO-LOAD DECODER FIXED,
+  FITTED, AND DEPLOYED** (working tree, uncommitted per user convention).
+  * Root cause of the hardware/simulation mismatch: MiSTer encodes automatic
+    boot files above the six-bit OSD file index (`boot1.rom` = `0x0040`,
+    `boot2.rom` = `0x0080`). The first hot-BIOS RBF decoded only manual OSD
+    F1/F2 indices 1/2, so both correctly installed automatic BIOS transfers
+    were silently ignored and hardware stayed on the HLE fallback. This
+    supersedes the earlier log wording that called boot1/boot2 indices 1/2.
+  * `NDS.sv` now keeps the framework's full 16-bit `ioctl_index` and accepts
+    both automatic `0x0040`/`0x0080` and manual `0x0001`/`0x0002` forms. The
+    proven atomic write/activation and reset path is unchanged.
+  * Before the decoder discovery, the corrected synchronous retail-BIOS nvc
+    regression passed: bios_hotload, arm7_island, arm9_island, arm9_cache,
+    cache9_lookup, dual_boot, and analyze-all. The focused BIOS test now also
+    asserts the retail ARM7/ARM9 exception-vector words and registered-read
+    hold behavior. A corrected one-frame Kirby trace takes ARM7 SWI #3 through
+    retail vector `EA000B73` to `0x00002DE4`, matching melonDS; the old async
+    sim incorrectly selected the prefetch-abort vector one word late.
+  * Final Quartus flow successful: **41,112 / 41,910 ALMs (98%)** and
+    **4,181 / 4,191 LABs** (10 free), 43,746 registers, 3,816,677 block-memory
+    bits, 521 / 553 RAM blocks, 95 / 112 DSPs. Existing timing limitation
+    remains (50 reported setup paths, WNS -16.228 ns).
+  * Deployed and SHA-256 verified on 192.168.1.244:
+    `/media/fat/_Console/NDS_20260719.rbf` =
+    `3ec696e7dff3af5bfc8560707b295dc49079c5e0e4ed22da9c461c1395515a8a`.
+    Re-verified boot0/boot1/boot2 and Kirby hashes against the local inputs.
+- 2026-07-19 sole agent: **HOT-LOADABLE RETAIL BIOS RBF BUILT AND DEPLOYED**
+  (working tree, uncommitted per user convention).
+  * Added atomic HPS/ioctl loading for the retail ARM7/ARM9 BIOS images. The
+    hardware BIOS ports use the Quartus-proven `SyncRamDualByteEnable`
+    Cyclone-V primitive: map reports confirm 131,072-bit ARM7 and 32,768-bit
+    ARM9 `ALTSYNCRAM`s. HLE fallback and the ARM9 upper-window-zero decision
+    are registered too, eliminating the address/data combinational loops
+    exposed by the first diagnostic fits.
+  * Loader indices are contiguous: boot0/index 0 firmware, boot1/index 1
+    ARM7 BIOS, boot2/index 2 ARM9 BIOS, index 3 cartridge, index 4 manual
+    firmware. Added the focused `tb_bios_hotload` regression (atomic switch,
+    registered fallback, byte enables, ARM9 upper window).
+  * Remote nvc PASS: bios_hotload, arm7_island (0x7F), arm9_island (0x7FF),
+    arm9_cache (0x7F), cache9_lookup, dual_boot (ARM9 0x3F / ARM7 0x1F),
+    analyze-all.
+  * Final Quartus flow successful, RBF generated: **41,334 / 41,910 ALMs
+    (99%)**, **4,191 / 4,191 LABs (100%)**, 43,705 registers, 3,816,677
+    block-memory bits, **521 / 553 M10Ks (94%)**, 95 / 112 DSPs. No BIOS
+    combinational-loop warning. Flow time 23m21s (A&S 4m19s, Fitter 18m22s).
+    Existing unrelated timing limitation remains: 50 setup paths, WNS
+    -17.709 ns.
+  * Deployed and SHA-256 verified on 192.168.1.244:
+    `/media/fat/_Console/NDS_20260719.rbf` =
+    002ea956145e40831c96d642f292feb093c5a36994b406b6cd1bcebb90d3b96c;
+    `/media/fat/games/NDS/boot1.rom` (16 KiB ARM7) =
+    ba65f690eb04ec92db67c0e299e21ad71de087d6d5de8a9cb17a62eaab563c17;
+    `/media/fat/games/NDS/boot2.rom` (4 KiB ARM9) =
+    1693983a7707ae394786fa526c0552457888a51d4e410d715ef07acd5a540555.
+- 2026-07-19 sole agent: text-drawer measurement reached **41,826 ALMs**
+  (84 below the 41,910 device limit) but still required **4,223 LABs**, 32
+  above 4,191. This is -372 ALMs / -37 LABs from the post-cache result;
+  synthesis removed all 24 text-drawer lpm_divide instances. Claimed the two
+  DMA files for the next bounded step: their identical 12-word MMIO decoders
+  currently infer `/3` and `mod 3` dividers totaling about 1,882 ALUTs across
+  ARM7+ARM9. An explicit off=0..11 case table is exact register decode, with
+  no transfer-FSM or timing change, and should provide comfortable LAB margin.
+- 2026-07-19 sole agent: claimed rtl/nds_drawer_text.vhd for the bounded
+  post-cache fitter step. Fresh reports show eight instances at about 165-171
+  own ALMs each and three inferred lpm_divide blocks per instance. The runtime
+  divisors can only be 256/512 (scroll wrapping) or 1/2 (tile pixel selection),
+  so the intended rewrite is fixed masks/bit selections with identical state
+  timing and addresses, followed by the GPU golden-vector suite and full
+  mandatory regressions before another Quartus measurement.
+- 2026-07-19 sole agent: claimed the cache9 ALM-endgame files above. Prior
+  agents are offline per user direction. Design intent: move only the bulk
+  I/D tag words into four independent synchronous per-way RAMs, retain the
+  small valid/dirty/RR state in flops, and add explicit request/maintenance
+  lookup states. All four ways still compare in parallel after the registered
+  tag read; this adds one cache lookup cycle without changing associativity,
+  replacement, write-back, or atomic invalidate-all behavior.
 - 2026-07-18 Agent B: session start. Monitoring kirby_full traced run on nds-nvc-sim-2
   (FRAMES=8, MAXINSTR=8000000, TRACE9/TRACE7). Will analyze traces on-pod when done.
 - 2026-07-18 Agent A: confirmed, ownership table above matches my side. Note: the
@@ -350,6 +674,14 @@ Append entries with date + agent. Claim files before editing.
   4 LFSR seeds x 75,000 cycles = 300,000 exact output comparisons. The
   `nds-quartus-clash-9` dirty-tree build accepted all Clash SV units, passed
   analysis/synthesis, and is now in `quartus_fit`; it does not touch nvc pods.
+- 2026-07-19 Agent C: the Quartus artifacts from the completed dirty-tree
+  build include and elaborate `nds_clash_video_mixer`,
+  `nds_clash_video_mixer_core`, and `nds_hps_io_boundary` (no Clash parse or
+  elaboration error). The fitter reaches the pre-existing whole-core resource
+  wall: 49,238 / 41,910 ALMs (117%; needs 4,979 LABs, has 4,191). Per-entity
+  evidence: the mixer shell is 48.5 ALMs total, its Clash core 16.2 ALMs, and
+  the HPS boundary has 0 own ALMs (transparent wrapper). `nds-quartus-clash-9`
+  has completed and been cleaned up; its pod claim is released.
 - 2026-07-18 Agent A: ack both — B's firmware widening (fine, disjoint from my
   gpu2d fix) and the Agent C/Clash heads-up. Confirmed synth-diag (my rounds
   6-8, currently at 47a2103) branched off cf59e21, before any of B's firmware
@@ -725,3 +1057,698 @@ DESIGN DECISION YOU OWN (document rationale here before implementing):
   Remaining work = -10.5K ALMs: B's named candidates (sound diet 11.4K
   ALUTs was the buffer) + re-scan the fresh per-entity table in
   build/artifacts/NDS.fit.rpt for whatever now tops the list.
+- 2026-07-19 Fable (B-session): ALM endgame plan (need -10.4K ALMs; current
+  52,354/41,910):
+  1. **nds_sound state -> BRAM** (biggest: 11.3K ALUTs, est. -7 to -8K ALMs).
+     Structure is favorable: a serial per-channel fetch FSM already exists
+     (FSCAN/FGRANT/FISSUE); the ALUTs are chan(0..15) record-array dynamic-
+     index muxes. Plan: pack t_chan into a word, store in
+     SyncRamDualByteEnable (16 deep), read channel state one cycle before
+     use inside the existing FSM. NOT a datapath redesign. Gate: there is NO
+     dedicated sound tb — build a self-checking one first (drive channel
+     regs, compare mixed output vs a behavioral model / melonDS SPU tables;
+     ADPCM + PSG + noise cases). Verification also rides nds_dual + a Kirby
+     run.
+  2. **ext-drawer lpm_divide sharing** (~4K ALUTs across engines: 2 dividers
+     x 2 ext BGs x 2 engines; affine per-line setup is not per-pixel — one
+     shared divider with a small grant FSM, or a shift-subtract serial
+     divider, est. -2 to -3K ALMs).
+  3. Fallback/optional: Clash mixer GAMMA=0 (-2.6K ALUTs, feature cut, user
+     call); cache9 tag-compare serialization (-3 to -5K, HIGH RISK, touch
+     last).
+  Items 1+2 projected to land ALMs at ~41-44K — knife-edge; 3a closes it if
+  packing disappoints. Executing after the Kirby logo run lands (frames due
+  ~now; they double as Fable-2's color crosscheck).
+- 2026-07-19 sole agent (user-directed, prior agents offline): picked up the
+  ALM endgame. Executed a SCOPED version of items 1+2, working tree,
+  uncommitted per convention:
+  * **Item 2 (ext-drawer)**: rtl/nds_drawer_extended.vhd's `mod`/`*` against
+    the runtime-variable xlim/ylim signals (always 128/256/512/1024, but
+    Quartus can't see that) forced full dividers/multipliers. Added
+    xlim_sel/ylim_sel (2-bit index mirroring xlim/ylim's own assignment)
+    and rewrote both ops as literal-constant case/when, same pattern
+    nds_drawer_affine.vhd already used. Verified: tb_gpu_bg 28/28 cases,
+    full gpu2d-all suite (unit/frame/timed, 0 drops).
+  * **Item 1 (sound), SCOPED DOWN**: moved only fptr (next fetch word addr)
+    and frem (words left to fetch) into two new 16-deep SyncRamDualByteEnable
+    instances (is_cyclone5=>'1'), NOT the full t_chan record Fable's plan
+    considered. Rationale: fptr/frem are the only fields touched solely by
+    the dynamic-fch-indexed fetch FSM and dynamic-n CPU writes, never by the
+    per-channel unrolled tick/decode loop (which must stay flops - it reads
+    all 16 channels every cycle) and never CPU-readable (so port A only ever
+    WRITES them, sidestepping the SyncRamDualByteEnable same-port
+    read-during-write sim-vs-hardware mismatch entirely: sim's behavioral
+    process gets OLD data on a same-port RAW, but the real altsyncram config
+    - read_during_write_mode_port_a/b=NEW_DATA_NO_NBE_READ - gets NEW data).
+    volmul/voldiv/hold/pan stay flops: CPU reads them back (SOUNDxCNT), and
+    chasing that hazard for ~17 bits/channel wasn't worth it. FSCAN split
+    into FSCAN_ADDR/FSCAN_EVAL (one settle cycle whenever fch changes, since
+    frem's registered BRAM read now lags addr_b by a cycle where the old
+    flop read was combinational - worst-case round-robin scan 16->32
+    cycles, harmless per the file's existing fetch-underrun contract).
+    nds_sound gained an is_simu generic (threaded from nds_top, matching the
+    nds_cache9/membus9 convention) to select the SyncRamDualByteEnable path.
+  * **New verification harness**: no dedicated sound tb existed (per
+    Fable's plan gate). Built sim/tb_sound.vhd - drives PCM8/PCM16/ADPCM
+    (loop + one-shot)/PSG (all 8 duty settings)/noise concurrently,
+    overlapping in time so the fetch FSM's round-robin and mixer's 16-slot
+    window both see real contention, plus SOUNDCNT ch1/ch3 exclusion bits
+    and master enable/disable. Not a golden-vector check (no independent
+    oracle) - it's a DIFFERENTIAL regression: captured "SAMPLE" report
+    lines from a run against the pre-conversion nds_sound.vhd (git stash),
+    then against the converted version, diffed - **bit-exact match, 27/27
+    samples**, confirming the BRAM conversion preserves behavior exactly
+    for this stimulus. sim/run_sound.sh runs it going forward.
+  * One real bug caught by gpu2d-all (not tb_gpu_bg, which happened not to
+    exercise the failing path): yyy_x_xlim, a new signal, had no initial
+    value: at time-0/delta-0 a combinational reader saw its default
+    integer'left (-2147483648) before the real driver settled, and `*2`
+    overflowed nvc's bounds check. Sim-only artifact (combinational signals
+    have no synthesis-meaningful "default"), fixed with `:= 0`; re-verified
+    clean (gpu2d-all, tb_gpu_bg, dual_boot all re-passed after the fix).
+  * Full regression re-run clean on this working tree: analyze-all,
+    arm7_island, arm9_island, arm9_cache, dual_boot (x2), tb_gpu_bg,
+    gpu2d-all, tb_sound - all PASS.
+  **MEASUREMENT BUILD RESULT** (build/artifacts/, DIRTY tree): ALMs
+  52,354 -> **49,238 / 41,910 (117%)**, was 125%. Registers 50,351 ->
+  49,704. DSP 99 -> 95. Block mem bits ~unchanged (+784 bits, the two new
+  RAMs). Fitter still fails (needs 4,979 LABs, device has 4,191 = 119%) -
+  real progress (-3,116 ALMs) but short of Fable's ~41-44K projection,
+  expected given the sound scope-down (fptr+frem is ~49 of the ~109
+  dynamic-muxed bits/channel Fable's plan covered).
+  **Re-scanned the fresh per-entity table** (own-ALM column, NDS.fit.rpt
+  "Fitter Resource Utilization by Entity") for what tops the list now:
+    nds_cache9:icache   8,864.5  <- NEW #1, by a wide margin
+    nds_sound:isound    6,263.5  <- still #2 despite the fptr/frem move
+    nds_cpu9:icpu9      4,700.3
+    gba_cpu:icpu7       3,396.8
+    ascal:ascal         2,172.6  (MiSTer framework, not ours)
+    nds_gpu2d (x2)      ~1,634 / ~1,617
+    nds_drawer_obj (x2) ~1,425 / ~1,418
+  nds_cache9 is exactly Fable's flagged item 3 ("cache9 tag-compare
+  serialization, -3 to -5K, HIGH RISK, touch last") - the 4-way
+  set-associative tag/valid/dirty/rr arrays that round-1 deliberately left
+  in flops so the multi-way compare stayed byte-identical. It's now the
+  single biggest item, larger than everything else combined in the
+  top five minus sound. nds_sound's remaining 6,263.5 is the necessarily-
+  flop per-channel unrolled tick/decode loop (can't move without a serial
+  redesign) plus whatever volmul/voldiv/hold/pan's small dynamic muxes
+  still cost.
+  NOT continuing into cache9 without a steer - it's real cache coherency
+  logic (correctness-critical, not a mechanical BRAM swap), and the user
+  has other work queued behind this (Kirby frame-127 timing divergence).
+  Stopping here to report; artifacts are this build's (overwrote the
+  round-1/combined-measurement originals - FITTING.md and this log
+  preserve those numbers for reference).
+- 2026-07-19 sole agent: **CACHE9 TAG-BRAM RESTRUCTURE IMPLEMENTED AND
+  MEASURED** (working tree, uncommitted per user convention).
+  * `rtl/nds_cache9.vhd`: replaced the flat asynchronous I/D tag arrays with
+    four independent synchronous per-way `SyncRamDualByteEnable` stores per
+    cache. All four ways remain compared in parallel after an explicit
+    `REQ_LOOKUP`/`OP_LOOKUP` cycle; valid/dirty/RR remain small flop arrays,
+    preserving atomic invalidate-all, associativity, replacement, and
+    write-back behavior. Cacheable requests and address/index maintenance
+    gain one cycle.
+  * Added `sim/tb_cache9_lookup.vhd` + `sim/run_cache9_lookup.sh`: directly
+    verifies an invalidate arriving during the new request-lookup window and
+    another queued during an eight-beat fill; both must force the subsequent
+    fresh eight-beat refill.
+  * Remote nvc PASS: cache9_lookup, arm9_cache (bitmask 0x7F), arm9_island
+    (0x7FF), dual_boot (ARM9 0x3F / ARM7 0x1F), analyze-all.
+  * Quartus confirms eight tag `ALTSYNCRAM`s. Cache own ALMs fell from
+    8,864.5 to **1,882.6** (-6,981.9, 79%). Whole design: **49,238 -> 42,198
+    ALMs** and **4,979 -> 4,260 LABs**. Registers 49,704 -> 41,537; block
+    memory 3,652,837 bits (65%, 501/553 implemented M10Ks); DSP 95/112.
+    This is a 7,040-ALM / 719-LAB win, but Fitter still misses by **288 ALMs
+    and 69 LABs** (42,198/41,910; 4,260/4,191). Reports are the current
+    `build/artifacts/` set. No commit made.
+- 2026-07-19 sole agent: **M9 FITTER GAP CLOSED** (working tree,
+  uncommitted per user convention).
+  * `rtl/nds_drawer_text.vhd`: replaced runtime modulo/divide operations
+    whose divisors are fixed by captured mode bits with literal 256/512
+    wrapping and bit-selected 4bpp/8bpp tile X. Quartus removed all 24
+    text-drawer `lpm_divide` instances. Remote nvc PASS: gpu_bg (28 cases),
+    gpu2d_all, cache9_lookup, arm9_cache (0x7F), arm9_island (0x7FF),
+    dual_boot (ARM9 0x3F / ARM7 0x1F), analyze-all. Measurement moved the
+    post-cache result from 42,198 ALMs / 4,260 LABs to **41,826 ALMs /
+    4,223 LABs**, still 32 LABs over.
+  * `rtl/nds_dma7.vhd` and `rtl/nds_dma9.vhd`: replaced the fixed 12-word
+    MMIO register decode's runtime `/ 3` and `mod 3` with explicit
+    word-to-channel/register cases. This preserves the exact 0..11 decode
+    while eliminating the two wide divider networks in each DMA. Remote
+    nvc PASS after this rewrite: arm7_island (0x7F), arm9_island (0x7FF),
+    arm9_cache (0x7F), dual_boot (ARM9 0x3F / ARM7 0x1F), analyze-all.
+  * Final `DIRTY=1 build/remote-build.sh`: **Fitter successful**, placement
+    and routing successful, Assembler successful, and `NDS.rbf` generated.
+    Final utilization is **40,948 / 41,910 ALMs (98%)** and **4,191 / 4,191
+    LABs (100%)**: versus the ticket baseline, -8,290 ALMs and -788 LABs;
+    versus the post-text build, -878 ALMs and exactly the remaining 32
+    LABs. Cache own ALMs are 1,879.3; DMA7 555.8; DMA9 656.0. Memory is
+    3,652,837 bits (65%), 501/553 M10Ks (91%); DSPs 95/112 (85%). Clash
+    video wrappers and the HPS boundary replacement are included in this
+    integrated build.
+  * TimeQuest completed (0 tool errors) but the newly fit design is **not
+    timing-clean**: 50 reported setup paths, worst slack -18.127 ns / TNS
+    -493.435 ns on the 33.5 MHz clock. The reported paths are in the
+    existing `nds_loader` env_size-to-cartid combinational decode (49 logic
+    levels), not cache/DMA logic. Other clock-domain setup summaries are
+    non-negative. This could not be compared against the over-capacity
+    baseline because that design never reached a legal fit. Current reports
+    and RBF are in `build/artifacts/`. No commit made.
+- 2026-07-19 sole agent: **KIRBY WHITE-SCREEN DIFFERENTIAL IN PROGRESS**.
+  Hardware reproduces the earlier RTL symptom: brief audio thump, both
+  displays remain white. Existing 135-frame capture is white through frame
+  134, while melonDS begins the HAL Laboratory/Nintendo boot-card fade at
+  frame 120. This is not the unimplemented 3D path: reference DISPCNT is
+  0x80211810 (mode 0, BG3 text + OBJ; BG0-3D clear), BG3CNT is 0x4113.
+  Added matching late-start ARM9/ARM7 trace generics to `tb_top_frame` and
+  `run_top_frame.sh`; analyze-all passes. A current-tree hardware-equivalent
+  130-frame run is active on `nds-nvc-kirby-late`, tracing only frames
+  110-129; matching melonDS reference contains 3,857,400 ARM9 and 406,681
+  ARM7 instructions. A separate short from-reset trace is active on
+  `nds-nvc-kirby-boot` to catch an earlier initialization divergence.
+  More useful isolation already landed: `melonds_fbdump` can capture the
+  exact pre-frame BG/OBJ/palette/OAM/register state, and `run_gpu2d.sh` can
+  accept alternate vector files. The frame-134 Kirby snapshot passes the
+  current RTL 2D engine **pixel-exact (49,152/49,152)**. Therefore the white
+  screen is upstream of the BG3 drawer/merge implementation: focus next on
+  CPU execution and VRAM/palette initialization/mapping, not renderer or 3D.
+- 2026-07-19 sole agent: **LIVE HARDWARE CPU TELEMETRY / QUARTUS 25.1
+  DISCRIMINATORS** (diagnostic work, uncommitted).
+  * `/dev/MiSTer_cmd` writes did not visibly reload the FPGA; telemetry only
+    became valid after the user manually selected the diagnostic RBF. With
+    Kirby loaded, DDR framebuffer readback showed B_RUN, both BIOS images and
+    cart loaded, loader done, and no CPU error flags. ARM7 continued moving,
+    while ARM9 repeatedly sampled at `0xFFFF07D0/0xFFFF07D2`, the retail BIOS
+    Thumb delay-return routine. The routine's two callers load `r0=0x2000`, so
+    it should not remain observable for seconds.
+  * Added temporary synthesizable ARM9 `r0`, `lr`, and CPSR taps alongside
+    PC9/PC7/status, plus an independent periodic 12-word DDR telemetry burst
+    on top-screen line 191. Current remote nvc PASS: arm9_cache (0x7F),
+    arm9_island (0x7FF), dual_boot (ARM9 0x3F / ARM7 0x1F), analyze-all.
+  * Register-probe Quartus build completed successfully at **41,324 / 41,910
+    ALMs (99%)**, 521/553 RAM blocks, 95/112 DSPs. NDS clocks are positive;
+    diagnostic-only HDMI WNS is -0.161 ns. Artifact:
+    `build/artifacts/NDS_hwtelemetry_regs_20260719.rbf`, SHA-256
+    `8ff62e07f7d32cca625376f4ec7ce4e6d2b1ca48e76e2ca6cca543dc4d7732db`.
+    Uploaded and hash-verified at
+    `/media/fat/_Console/NDS_hwtelemetry_regs_20260719.rbf`; production
+    `/media/fat/_Console/NDS_20260719.rbf` remains SHA-256
+    `5a55cac344f7d2d56b244c0af18338c846d115c514ad59d8ffad4ae01457d8f6`.
+  * Tested official `alterafpga/quartus-std:25.1std-cyclonev` on a separate
+    standard-tier hostPath. It reports Quartus 25.1std but stops immediately
+    with Error (292025), no license file specified; the official image does
+    not fall back to Lite. `raetro/quartus` has no 25.1/25.1std tag (all
+    registry queries 404; published tags stop at 21.1.1). Removed the failed
+    25.1 pod, work directory, and 5.8 GB image. Cluster image audit found no
+    other unused digests: every remaining cached image backs a live pod.
+- 2026-07-19 sole agent: **ARM9 WFI / IRQ HARDWARE DISCRIMINATOR**
+  (diagnostic work, uncommitted).
+  * The register-probe hardware samples ARM9 architectural PC at
+    `0x0214FC10` (current instruction `0x0214FC08`, `MCR p15,c7,c0,4` / WFI),
+    with `r0=0`, `lr=0x0214DB8C`, and CPSR `0x0000001F`. Across 120 samples
+    over approximately 2.4 seconds, PC9 never moved while ARM7/GPU status did:
+    this is a normal SDK idle WFI that is not waking, not a BIOS delay loop.
+  * A full integrated nvc Kirby run using the real cart, retail firmware, and
+    both boot ROMs reaches VBlank IRQ by frame 2 at PC `0x01FFACA0`, with
+    `IME=0x04000001`, `IE=0x00040001`, `IF=0x00000001`, and two observed WFI
+    wakeups. Corrected IME storage to its implemented one-bit width; software
+    writes to ignored high bits no longer synthesize as state. Remote nvc
+    remains PASS: arm9_cache (0x7F), arm9_island (0x7FF), dual_boot (ARM9 0x3F
+    / ARM7 0x1F), and analyze-all. `git diff --check` passes.
+  * Added a compact, observational IRQ probe over the existing direct DDR
+    telemetry path: PC9, IE9, IF9, halt/irq/unhalt/IME/source state, raw IRQ9
+    inputs, and core/shell status. Removed the redundant screen-pixel telemetry
+    overlay, reducing synthesized device resources by 342. Two earlier probe
+    fits either failed placement/routing or had unsafe core timing and were not
+    uploaded.
+  * The lean diagnostic fits at **41,400 / 41,910 ALMs**. CPU9 100 MHz setup
+    slack is +1.335 ns, ARM7/memory setup +2.583 ns, HPS DDR setup +3.241 ns,
+    and CPU/memory hold slacks are positive. Diagnostic HDMI setup misses at
+    -1.179 ns, so display output may glitch; the core/telemetry clocks used by
+    this discriminator meet timing. Artifact
+    `build/artifacts/NDS_hwtelemetry_irq_20260719.rbf`, SHA-256
+    `41fd1b5433d45579d6286e22048121db92d1c29ddf651e020b3791dd8182130b`,
+    uploaded and hash-verified at
+    `/media/fat/_Console/NDS_hwtelemetry_irq_20260719.rbf`. Production remains
+    untouched at SHA-256
+    `5a55cac344f7d2d56b244c0af18338c846d115c514ad59d8ffad4ae01457d8f6`.
+  * Hardware IRQ-probe capture with Kirby loaded finds PC9 at WFI
+    (`0x0214FC10` architectural PC), `IE9=0x00040001`,
+    `IF9=0x00080000`, IME enabled, and no live enabled IRQ source. Across
+    1,200 rapid status samples the GPU VCOUNT crossed line 192 while ARM9
+    remained halted and VBlank IF bit 0 never latched. The IRQ controller is
+    therefore correctly refusing to wake ARM9 because `IE & IF = 0`; the next
+    discriminator is the persistent ARM9 DISPSTAT VBlank-enable state.
+  * Added one observational `dbg_vbl_ena9` tap from GPU timing into existing
+    telemetry bit 13. All fresh remote nvc gates pass: arm9_cache (0x7F),
+    arm9_island (0x7FF), dual_boot (ARM9 0x3F / ARM7 0x1F), analyze-all, and
+    gpu_timing (4 frames). Seed 0 fit at 41,330 ALMs routed only after retry,
+    but was rejected for CPU9 100 MHz hold slack -0.403 ns / TNS -0.890 ns.
+    Seed 1 was also rejected and produced no RBF: after 58:53 of fitting it
+    failed routing at 41,345 ALMs with 290 unrouted signals under severe
+    congestion. `NDS.qsf` is restored to seed 0; neither rejected build was
+    uploaded and production remains untouched.
+  * Additional user-requested fitter sweep: seed 67 failed routing at 41,384
+    ALMs (peak interconnect estimate 79%) and produced no RBF. Seed 420 used a
+    leaner synthesis mapping (84,479 logic cells and 111 DSPs versus 84,983
+    logic cells / 95 DSPs for seeds 0/1/67), routed successfully, and fit at
+    **41,061 / 41,910 ALMs (98%)**. Core timing is safe for the discriminator:
+    CPU9 setup +0.637 ns / hold +0.345 ns, ARM7/memory setup +0.840 ns / hold
+    +0.233 ns, and HPS DDR setup +1.316 ns / hold +0.331 ns. Diagnostic HDMI
+    setup alone misses by -0.187 ns / TNS -0.257 ns; HDMI may glitch.
+    Artifact `build/artifacts/NDS_hwtelemetry_dispstat_20260719.rbf`, SHA-256
+    `d4bf5cc0cf5bea1091a56d9b351263b421a83d03d71f30860439c3b22d182b07`,
+    uploaded, synced, and hash-verified at
+    `/media/fat/_Console/NDS_hwtelemetry_dispstat_20260719.rbf`. Production is
+    still untouched and re-verified at SHA-256
+    `5a55cac344f7d2d56b244c0af18338c846d115c514ad59d8ffad4ae01457d8f6`.
+    Local `NDS.qsf` is restored to seed 0. Seed 69 was not needed because 420
+    passed the core/DDR setup-and-hold gate.
+  * Hardware test of the seed-420/DSP-remapped image did not reach the intended
+    WFI discriminator. Shell status `0xF1` confirms BIOS9, BIOS7, cart, NDS-on,
+    and loader completion, but ARM9 remains at retail BIOS
+    `0xFFFF07D0/0xFFFF07D2`, with `IE9=0x00040000`, `IF9=0`, IME/halt clear,
+    and persistent VBlank-enable clear. Therefore this bit-13 sample cannot be
+    compared to the earlier WFI state. The user confirmed another authorized
+    agent concurrently remapped the merge multipliers from ALMs into DSPs to
+    reduce area; that explains the 111-DSP synthesis and is to be preserved.
+  * Installed a timing-safe seed-0 A/B image from that same DSP-remapped source
+    and persistent DISPSTAT tap: 41,049 ALMs; CPU9 setup +0.722 ns / hold
+    +0.416 ns; ARM7 setup +2.018 ns; HPS DDR setup +3.146 ns; HDMI-only setup
+    -0.240 ns. Artifact
+    `build/artifacts/NDS_hwtelemetry_dispstat_seed0_20260719.rbf`, SHA-256
+    `e67cdb882dbaf5a9dbdf65e93af0d073ee0bec8ab211d5070215468095ee4152`,
+    uploaded, synced, and hash-verified beside the seed-420 diagnostic and
+    untouched production core.
+- 2026-07-20 sole agent: **SEED-0 HARDWARE REACHES GAME CODE BUT SPINS IN THE
+  CARTRIDGE-LOCK PATH.** The user manually loaded the hash-verified seed-0
+  DSP-remapped diagnostic. Atomic PC samples repeatedly reconstruct in
+  Nintendo SDK code around `0x0213FC70`/`0x0214F8E4`; `IE9=0x00040000`,
+  `IF9=0`, `IME=1`, halt=0, and persistent ARM9 DISPSTAT VBlank-enable=0.
+  Disassembly matched the loop against the local NitroSDK source: it tests
+  `HW_CTRDG_LOCK_BUF` (`0x027FFFE8`) ownership and retries the shared
+  cartridge spinlock via `MI_SwapWord`, rather than waiting for VBlank or an
+  ARM7 startup flag. The existing cache tests cover fills, writeback, and
+  maintenance races but do not exercise cached ARM `SWP`/shared-lock traffic;
+  the next hardware discriminator captures both CPUs at that lock boundary.
+  * Added a focused NitroSDK-shaped regression to `arm9_cache`: 32 cached ARM
+    `SWP` acquire/release cycles on one line, interleaved ownerID halfword
+    loads/stores, followed by clean+invalidate and uncached-alias checks. Fresh
+    remote nvc PASS: arm9_cache bitmask **0xFF**, cache9_lookup, ARM9 island
+    0x7FF, dual_boot ARM9 0x3F / ARM7 0x1F, and analyze-all. The behavioral
+    RAM model therefore preserves the lock sequence; hardware telemetry now
+    exposes the real ARM7 PC plus ARM9's last observed lockFlag and
+    ownerID/extension values to isolate a Cyclone-V-only discrepancy.
+  * Seed-0 cartridge-lock telemetry fit completed successfully in 25:06 at
+    **41,101 / 41,910 ALMs (98%)**, **4,190 / 4,191 LABs**, 521 / 553 RAM
+    blocks, and 111 / 112 DSPs. All reported clocks pass setup and hold: the
+    tightest setup is HDMI at +0.179 ns, CPU9 setup is +0.653 ns, and the
+    tightest hold is +0.250 ns. Artifact
+    `build/artifacts-lockdiag-seed0/NDS.rbf`, SHA-256
+    `c7f98be8b31cb72ed5bc82eee392a16dfe77352a7cc29b6903e63cbb5ec416d4`,
+    was atomically uploaded, synced, and hash-verified at
+    `/media/fat/_Console/NDS_hwtelemetry_ctrdglock_20260719.rbf`. Production
+    remains untouched and re-verified at SHA-256
+    `5a55cac344f7d2d56b244c0af18338c846d115c514ad59d8ffad4ae01457d8f6`.
+  * Live hardware on that image rules out a persistently owned cartridge
+    lock: every valid ARM9 observation of both `lockFlag` and the
+    ownerID/extension word was zero. ARM7 executes in its BIOS wait code near
+    `0x00002F0C/0x00002F0E`. ARM9 is instead dominated by the Thumb `SVC 3`
+    trampoline at `0x02000088` and retail-BIOS delay loop
+    `0xFFFF07D0/0xFFFF07D2`, with only brief NitroSDK initialization PCs. The
+    next no-build discriminator is the already hash-verified register probe,
+    which exposes the delay argument (`r0`) and return address (`lr`).
+- 2026-07-20 sole agent: **KIRBY'S LOCK BUFFER IS NON-CACHEABLE; THE
+  REPRODUCED FAILURE IS MISSING DUAL-CPU SWP ATOMICITY IN MAIN RAM.** The
+  register probe repeatedly captures ARM9 in the NitroSDK cartridge-lock
+  retry path with `MI_SwapWord` returning `0x40`/`0x80`. Disassembly of the
+  game's MPU setup proves region 7 is `0x027FF000`, 4 KiB, highest priority,
+  while the D-cache bitmap enables only regions 1 and 6. Therefore
+  `0x027FFFE8` bypasses `nds_cache9`; the earlier cache-corruption theory was
+  wrong for this address.
+  * Extended arm9_cache with the exact uncached address and exact
+    `swp r0,r0,[r1]` alias. It passes, ruling out the CPU operand-alias path.
+    A new deterministic `tb_mainram` collision then failed before the fix:
+    ARM9 read zero, ARM7 was admitted before ARM9's write half, and ARM7 also
+    read zero. This is the missing condition in the single-CPU regression.
+  * Added a SWP-only lock output to both CPU implementations, qualified it so
+    ARM9 cache fills, loaders, DMA, and ARM7 sound traffic cannot claim the
+    lock, and taught `nds_mainram` to retain the selected CPU across exactly
+    the read/write pair. The qualifier is latched from the actual SWP data
+    request rather than raw pipelined decode; the raw decode version was
+    proven to incorrectly tag the preceding load.
+  * Added an end-to-end dual-boot collision at the physical mirror of
+    `HW_CTRDG_LOCK_BUF`. It now proves ARM9 old=`0`, ARM7 old=`0x40` (or the
+    symmetric winner order) and advances new progress bits. Fresh remote nvc
+    PASS: arm9_cache **0xFF**, ARM9 island **0x7FF**, ARM7 island **0x7F**,
+    dual boot ARM9 **0x7F** / ARM7 **0x3F**, cache9_lookup, analyze-all, and
+    the full main-RAM random soak (10,000 sequential + 10,000 concurrent
+    pairs plus the deterministic SWP collision). Seed-0 Quartus measurement
+    is in flight in isolated `build/artifacts-swp-seed0`.
+  * Seed-0 Quartus completed successfully in 26:26 at **41,059 / 41,910
+    ALMs (98%)**, 521 / 553 RAM blocks, and 111 / 112 DSPs. Placement and
+    routing succeeded, but TimeQuest failed setup by 0.064 ns on HDMI and
+    hold by 0.209 ns on the CPU9 clock (hold TNS -0.574 ns); this image is
+    retained only as measurement evidence and will not be deployed. An
+    isolated seed-67 build is in flight in `build/artifacts-swp-seed67` to
+    seek a timing-clean route without changing the verified RTL.
+  * Seed 67 also fit successfully at **41,155 ALMs**, with all hold checks
+    positive (tightest +0.250 ns), but HDMI setup missed by 0.350 ns (TNS
+    -0.718 ns). It is likewise not deployable. Proceeding to an isolated
+    seed-420 build with the same source snapshot.
+  * Seed 420 fit at **41,174 ALMs** and closed every setup check (tightest
+    HDMI +0.031 ns), but CPU9 hold missed by 0.151 ns (TNS -0.151 ns).
+    Therefore it is also retained only as evidence and not deployed. An
+    isolated seed-69 build is next, again with identical RTL.
+  * Seed 69 fit at **41,196 ALMs**, but HDMI setup missed by 0.234 ns (TNS
+    -1.136 ns, 11 failing paths) and CPU9 hold missed by 0.480 ns (TNS
+    -1.462 ns). It is not deployable. The requested 67 -> 420 -> 69 seed
+    sequence is exhausted; continuing with parallel isolated seeds against
+    the same verified source snapshot.
+  * Seed 1 is fully timing-clean at **41,095 / 41,910 ALMs (98%)**, 521 / 553
+    RAM blocks, and 111 / 112 DSPs. Worst setup is +0.237 ns and worst hold is
+    +0.158 ns, with zero negative TNS. Its RBF SHA-256 is
+    `0b3deed1322831e298b86ed63f8a4fb3373c0259f0132901b0a0619cb0c942d8`.
+    It was copied, synced, atomically renamed, and remotely hash-verified at
+    `/media/fat/_Console/NDS_swpfix_20260719.rbf`. The production rollback
+    core remains untouched and re-verified at SHA-256
+    `5a55cac344f7d2d56b244c0af18338c846d115c514ad59d8ffad4ae01457d8f6`.
+  * Seed 3 completed concurrently and independently closed timing at **41,111
+    ALMs**, worst setup +0.349 ns and worst hold +0.109 ns. Seed 1 remains the
+    deployed candidate because its smaller of the two timing margins is
+    better. The redundant seed-2 run was stopped and its temporary pod was
+    deleted. Physical Kirby validation remains pending manual core load.
+  * Physical Kirby on the timing-clean seed-1 SWP image remains white. Live
+    telemetry changed materially: both observed cartridge-lock words are now
+    zero, ARM9 is dominated by BIOS delay at `0xFFFF07D0/0xFFFF07D2`, and
+    ARM7 remains in BIOS wait near `0x00002F0C/0x00002F0E`. Thus the SWP bug
+    was real and changed hardware state, but it was not sufficient to finish
+    startup. Restored the existing DDR lanes to architectural ARM9 r0/lr/CPSR
+    for the post-fix caller discriminator. Fresh remote PASS: arm9_cache
+    **0xFF**, ARM9 island **0x7FF**, dual boot ARM9 **0x7F** / ARM7 **0x3F**,
+    cache9_lookup, analyze-all, and main-RAM 10,000 sequential + 10,000
+    concurrent pairs. An isolated seed-1 register-probe fit is next.
+  * The post-SWP register-probe seed 1 fit at **41,129 ALMs**, with every hold
+    check positive (worst +0.250 ns) and all NDS/core setup checks positive,
+    but HDMI setup missed by 0.204 ns (TNS -0.204 ns, one failing path). It is
+    retained only as evidence and was not uploaded. Proceeding to isolated
+    seed 3, which independently closed the preceding SWP source snapshot.
+  * Register-probe seed 3 fit at **40,997 ALMs**, but failed both setup and
+    hold: HDMI setup -0.546 ns (TNS -0.567), the 33.5 MHz CPU divider setup
+    -0.082 ns, and CPU9 hold -0.584 ns (TNS -2.754). It is not deployable and
+    was not uploaded. Both seed pods deleted normally; no register-probe build
+    remains active.
+- 2026-07-25 sole agent: **ROOT CAUSE OF THE WHITE SCREEN: MAIN RAM IS NEVER
+  ZEROED, SO NITROSDK'S SWP CARTRIDGE LOCK READS SDRAM GARBAGE. FIXED IN
+  `nds_loader`; VERIFIED ON HARDWARE. A SECOND, INDEPENDENT BLOCKER (NO IRQ IS
+  EVER DELIVERED) REMAINS AND IS NOW THE WHOLE PROBLEM.**
+  * The mechanism. NitroSDK acquires the cartridge lock at `0x0214D1EC` with
+    `swp r0, r0, [r1]`, r1 = `0x027FFFE8` (`HW_CTRDG_LOCK_BUF`), r0 = `0x40`.
+    SWP unconditionally *writes* the id and returns the **old** word, so the
+    lock is acquired only if that word was `0`. `nds_loader` stages only the
+    ARM9 image (`0x02000000`+`0x1886D8`) and the ARM7 image
+    (`0x02380000`+`0x286A0`); `0x023FFFE8`, the 4 MB mirror of `0x027FFFE8`,
+    was never written and held SDRAM power-up garbage. The first SWP therefore
+    fails **and has itself written `0x40`**, so every retry reads back its own
+    id and fails forever. ARM9 spins in `MI_LockByWord` (`0x0213FC70`), never
+    reaches the code that enables the VBlank IRQ, ARM7 waits on ARM9, both park
+    in BIOS `SWI 3 WaitByLoop`, DISPCNT stays display-off = white.
+  * **Why ten builds of simulation never showed it.** `sim/tb_top_frame.vhd`'s
+    behavioral SDRAM is `variable mem : t_mem := (others => (others => '0'))`.
+    The sim did not merely fail to reproduce the bug, it *supplied the
+    precondition for success* on every run: the first SWP always read 0 and the
+    lock was always acquired. melonDS zeroes main RAM on reset for the same
+    reason. Real hardware gets this clearing from the firmware boot that direct
+    boot skips. Treat "sim passes" as evidence about the RTL only, never about
+    power-up state.
+  * **Direct hardware proof, before either CPU executed an instruction.** With
+    the new `BOOT_HOLD` (below) both cores are held out of reset, so main RAM
+    can be read at a true t=0. Pre-fix: `0x02300000`=`0000FEE3`,
+    `0x0237FF00`=`566891CC`, `0x023F0000`=`E59F10FC`, `0x023FFF00`=`734D849F`,
+    `0x023FFFE8`=`00000040`, `0x023FFFEC`=`62680C1F`, with the control
+    `0x02000800`=`E3A0C301` matching the ROM (so the loader and PEEK are both
+    sound). Post-fix the same addresses read `00000000`, lock word included.
+    The only region that legitimately stays non-zero is `0x023FFE00`-
+    `0x023FFF5F`: that is the 0x160-byte ROM header copy the loader writes after
+    the clear (`0x023FFE00` = `4252494B` = "KIRB").
+  * Fix: new `CLR_WR`/`CLR_WR_WAIT` states in `rtl/nds_loader.vhd` zero all 4 MB
+    through the loader's existing write port before anything is staged, ~1M word
+    writes. Sim regression passes with it in place (`boot done` at 386 ms vs
+    227 ms; the 159 ms delta is the clear). `analyze-all: OK`.
+  * **Result: the failure moved a long way forward but Kirby still does not
+    boot.** ARM9 now completes `OS_Init` and reaches the NitroSDK idle thread
+    (`0x0214FC10`, the `mcr p15,0,r0,c7,c0,4` WFI in `OS_Halt`); ARM7 now runs
+    game code in WRAM (`0x037FC4xx`/`0x037FC9xx`) instead of BIOS. Golden-trace
+    depths that were 0/4 before the fix are 1/3, 2/3 and 1/3 after (idx 747k,
+    780k, 1043k). Some run-to-run non-determinism remains.
+  * **The remaining blocker is interrupt delivery.** With a passing control
+    (`0x0214FC10` reached), neither `0xFFFF0018` (ARM9) nor `0x00000018` (ARM7)
+    is ever reached, across repeated 5-6 s runs = hundreds of VBlank periods.
+    ARM9 blocks in the idle thread because no thread is ever made runnable. This
+    is consistent with the earlier dispstat-probe finding that ARM9's DISPSTAT
+    VBlank-enable is persistently clear, so the GPU never raises VBlank and
+    `IE & IF` stays 0. Next lead: DISPSTAT VBlank-enable, and/or a card/FS read
+    that never completes.
+  * **First off-hardware reproduction of a Kirby hang.** An A/B of
+    `run_top_frame` differing only in card/firmware latency: `CARD_LAT=0
+    FW_LAT=0` completes 8 frames (exit 0, ARM9 in game code at `0x0201093E`),
+    while `CARD_LAT=48 FW_LAT=48` **fails (exit 1)**. This is the latency gap
+    that was previously flagged as "not ruled out and not demonstrated" - it is
+    now demonstrated. A traced re-run (`nds-nvc-latfail`, `KEEP=1`) was still
+    going at handoff; diffing it against the passing golden trace with
+    `sim/tests/compare_trace.py` is the cheapest route to the IRQ bug.
+  * The dual-CPU SWP atomicity work from 2026-07-20 was a **real bug, correctly
+    fixed**, but it was never this one. Atomicity was fine; the initial value
+    was wrong. Steady-state evidence (`0x027FFFE8` = `0x40`) reads exactly like
+    "another owner holds the lock", which is what sent earlier sessions after
+    cache coherency and SWP races.
+- 2026-07-25 sole agent: **NEW HARDWARE DEBUG CAPABILITY (the instrument that
+  made the above findable).**
+  * The IS-NITRO mailbox from the previous session was **never in the
+    bitstream**. `build/remote-build.sh` tars the working tree *when it starts*;
+    the vfy3 build began 21:12:46 and the `DEBUG MAILBOX` block went into
+    `NDS.sv` at 21:27:32, so the deployed RBF had `ch4_req` Stuck at GND,
+    `ch4_dout`/`ch4_ready` Explicitly unconnected, and `nds_debug` optimized away
+    entirely (0 hits in `NDS.fit.rpt` vs 86 for `nds_card`). Hours of telemetry
+    were read from an instrument that did not exist. Always verify a new unit
+    survived: compare its hit count in `NDS.map.rpt` vs `NDS.fit.rpt` against a
+    peer entity, and check the `Port Connectivity Checks` table.
+  * `MISTER_DEBUG_NOHDMI=1` in `NDS.qsf` is what makes any of this fit: it drops
+    `ascal` + `pll_hdmi` for **-7,401 registers, -13 DSPs, -341k memory bits**,
+    taking the design from 41,210 ALMs (98%, failed routing) to ~36.2k ALMs
+    (86%) and removing the HDMI clock domain that had failed setup on nearly
+    every seed. Seed 3 gave the **first fully timing-clean build of the whole
+    effort**: zero negative slacks, worst setup +1.605 ns, worst hold +0.246 ns.
+    Diagnostic images only - there is no HDMI output.
+  * `nds_debug` gained a `BOOT_HOLD` generic (`nds_top` passes `not is_simu`):
+    both cores leave reset already held, so breakpoints can be armed before the
+    first instruction retires. Simulation must NOT hold - it is the golden
+    reference, and holding there yields `boot_done` with zero retired
+    instructions and an empty trace. Also new: mailbox op `0x09` SOFTRESET,
+    which restarts the boot FSM with the cart still staged in DDR3, so
+    from-reset probes repeat with no OSD interaction.
+  * Method that found the bug: `TRACE_START_FRAME=-1` on `run_top_frame` (it
+    defaults such that tracing starts only *after* `boot_done`, skipping all of
+    early boot) gives a full-system golden trace; take PCs by first-occurrence
+    depth and ask the hardware "do you ever execute this?" via
+    `nitrodbg.sh reach9`. Bisect on **reachability, not index** - timing-
+    dependent poll loops spin different counts on real DDR3 and index matching
+    drifts immediately.
+  * Two instrument traps that produced confidently wrong answers before controls
+    caught them. (1) PEEK of a *running* core wedges it:
+    `mr9_done <= mem9_done and not ld_busy and not dbg_pk_sel` means a peek
+    swallows the core's own bus completion, hanging it on its next load - this
+    faked an "ARM9 is stuck at 0x0214D7B8" for some time. Always halt first.
+    (2) `reach9 <arch pc>` tests the instruction at `arch pc - 8`, so probing a
+    function's entry value tests the instruction *before* it, which a `bl`
+    skips. Always run a positive and a negative control, and when a result is
+    non-deterministic measure a hit *rate* - a 2/4 means a race, it is not noise.
+  * `HANDOFF.md`'s claim that `0x02000088` is random padding is **wrong**: it is
+    the real `SVC_WaitByLoop` veneer. The lock retry loop does `blx 0x2000088`
+    at `0x0213FCD8`, and peeking it on hardware returns `4770DF03`
+    (`svc 3; bx lr`).
+  * Also fixed in passing: `ioctl_index` for the cart/firmware slots now accepts
+    the `N<<6` form an `.mgl` produces as well as the exact OSD value. Note this
+    does **not** make `.mgl` load the ROM - the cart is an `FS3`
+    direct-to-memory slot and MiSTer never drives the `ioctl_download` bracket
+    for it from an `.mgl`, so core + BIOS automate but the ROM still needs one
+    OSD load. `/dev/MiSTer_cmd` accepts only `fb_cmd`, `video_mode`, `load_core`,
+    `screenshot`, `scaled`, `volume`, `mute`, `unmute` - no ROM load.
+  * Cores deployed this session, all hash-verified, production
+    (`5a55cac3...`) untouched: `NDS_nitrodbg_20260725.rbf`,
+    `NDS_bisect_20260725.rbf`, and `NDS_ramclear_20260725.rbf` (SHA-256
+    `d977be1b7deae8fc652488a139903e126a9322ff6b711847dfca0553fe1a640d`, the
+    RAM-clear fix, currently loaded). A normal playable image - HDMI back on,
+    `BOOT_HOLD => '0'`, carrying only the loader fix - has not been built yet.
+- 2026-07-25 sole agent: **the ARM9 hard-wedges on an instruction fetch, ~50% of
+  boots.** This is the current front. Read the caveat at the end before trusting
+  any reach-probe result recorded above.
+  * Bisecting the golden trace against hardware after the RAM-clear fix landed
+    on a boundary between two *consecutive, non-branching* instructions
+    (`0213BA58` REACHED, `0213BA5C` not) - which is impossible for real code, and
+    was the tell. Breakpointing `0213BA58` confirmed the ARM9 arrives there with
+    **all 17 registers byte-identical to the golden sim**, and then never retires
+    `mov r4, r2`. 10,000,000 `step9` cycles do not move the PC. The staged
+    instruction bytes are correct (`0213BA50` reads `E1A04002`, matching golden),
+    no data access is outstanding, and the stall address sits exactly 8 bytes
+    below a 32-byte I-cache line boundary - an instruction-fetch fill that never
+    completes.
+  * `nds_mainram` was still serving PEEKs perfectly while the ARM9 was wedged,
+    which rules out an arbiter deadlock and puts the loss on the ARM9 channel.
+  * Reproducibility: 4/4 wedged runs sat at exactly this PC, and the state is
+    terminal - identical at 25 s and at 3 s. The other ~50% of boots park both
+    CPUs in the BIOS `SWI 3 WaitByLoop` instead, also terminally. Neither
+    outcome is the idle-thread park that the long-running cold boot showed.
+  * **Real robustness bug found while chasing this, fixed, but NOT established as
+    the cause.** `nds_loader`, `nds_mainram` and `nds_vram` took the *global*
+    `reset`, which `dbg_boot_rst` does not assert, so SOFTRESET was never
+    equivalent to a cold boot. They cannot take `resetCpu` instead - the loader
+    stages main RAM through them while `resetCpu` is still high. Fix:
+    `reset_boot <= reset or dbg_boot_rst` on those three. **However**, working the
+    timing through, a stale `nds_mainram` state cannot explain *this* wedge: if
+    the arbiter came up parked in `MR_LOCKWAIT` it would strand the loader's very
+    first staging write and nothing would boot at all, rather than running 723k
+    instructions correctly and then stopping. Do not record the wedge as a
+    debugger artifact - that was my first reading and it does not hold up.
+  * The simpler hypothesis, still unconfirmed: there is **one** nondeterministic
+    fault on the ARM9 fetch path; ~50% of boots hit it here, and the runs that
+    miss it go on to the idle thread. The single cold-boot observation from the
+    start of the session is consistent with having been one of the lucky runs -
+    it was one sample, on a core that had been left running, and it is not
+    evidence that cold boots are immune.
+  * Lesson for the ledger: a bisection boundary falling *inside a basic block*
+    means either an instrument bug or a genuine mid-block stall. Here it was the
+    latter, and the register-identical arrival is what proves the run up to that
+    point was correct.
+  * What decides it next: op 0x0A PROBE on a cold boot says which FSM is parked
+    (`FILL_WAIT` waiting on `mem_done` is the prediction), and the now-valid
+    softreset makes the reach-bisect trustworthy for the first time.
+- 2026-07-25 sole agent: **deploy-and-test no longer needs a human**, which
+  removes the constraint that shaped every previous session's method.
+  * The ROM does not need re-downloading after a core load, because **DDR3
+    survives FPGA reconfiguration**. After `load_core` the card image is still at
+    HPS physical `0x30000000` (`devmem 0x30000000 32` reads `0x4252494B` =
+    "KIRB"; HPS and FPGA see that region at the same address). Only the
+    `cart_loaded` flag is lost, so mailbox **op 0x0B** sets it (plus `flush_req`,
+    exactly as a real download does) directly in `NDS.sv`. `nds_on` rises and the
+    loader stages from the resident image. The `.mgl` already brings firmware
+    (idx 4) and both BIOSes (idx 1/2), so the whole cycle is scp -> `load_core`
+    -> `forcecart`. Note `dd if=/dev/mem` fails at that offset on this kernel
+    while `devmem` works.
+  * **PEEK cannot read IO space** and never could: it is muxed onto the ARM9
+    main-RAM channel, so `0x040001xx` is truncated into the 4 MB window and
+    returns a plausible-looking aliased RAM word. `peek9 04000208` (IME, a 1-bit
+    register) returned `0x2A73E9BD`. `dump7` of ARM7 WRAM returned all zeros for
+    a region the ARM7 was executing from. Only `0x02xxxxxx` peeks are real.
+    Interrupt state now comes from **op 0x0C** (`nitrodbg.sh irq`), which reads
+    `nds_irq`'s existing `dbg_ime`/`dbg_ie`/`dbg_if` exports for both CPUs -
+    ARM9's were already wired in `nds_top`, ARM7's were `open`. `IF` is the one
+    that settles "does a VBlank IRQ ever fire".
+  * New mailbox **op 0x0A PROBE** returns the ARM9 memory path's FSM state in one
+    word - `nds_cache9` state+beat+code, `nds_membus9` state + its accept/done
+    terms, `nds_mainram` state + `req9`/`req7`/`serving7`/`lock_pair`/`allow`,
+    and the `nds_top` mux terms (`ld_busy`, `dbg_pk_sel`, `dma_bus_on`,
+    `mem9_ena/done`). A CPU that stops retiring is either parked in one of those
+    waits or is not waiting on memory at all, and nothing else visible from the
+    host distinguishes the two.
+  * Main-RAM latency is the last unrealistic thing in the testbench, and it is
+    now a knob: `MEM_LAT` on `tb_top_frame` adds N clkMem cycles plus 0-15 of
+    jitter to every SDRAM op (the model otherwise answers every read in a fixed
+    6 cycles and every write in 3 - faster *and* far more regular than ddram
+    ch2, so arbiter races cannot be reached in simulation at all). Caveat
+    measured: `MEM_LAT=16` is so slow that 900 ms of sim time retires only 103k
+    ARM9 instructions against the golden run's 1.69M, so reproducing a
+    mid-boot race this way is not practical - reaching the same depth would take
+    tens of hours. Hardware probing is the cheaper instrument; the knob is still
+    the right way to *stress* short gates.
+- 2026-07-25 sole agent: **ROOT CAUSE #2 FOUND AND FIXED - the ARM9's CP15 is
+  never programmed, because that is the ARM9 BIOS's job and HLE direct boot skips
+  it.** Found by building a real oracle instead of trusting our own sim.
+  * The ARM9 diverges from melonDS at **retired instruction 4**:
+    `mrc p15,0,r0,c1,c0,0` reads `0x00000078` where the oracle reads
+    `0x00012078` - missing bit 13 (V, high vectors) and bit 16 (DTCM enable).
+    NitroSDK's 4th instruction read-modify-writes that register, so anything
+    absent at reset stays absent for the whole boot. `nds_top`'s boot FSM presets
+    exactly one thing: the PC. Fixed in `rtl/nds_cpu9.vhd` (both the declarations
+    and the synchronous reset - they must not drift) with melonDS's
+    `SetupDirectBoot` values from `src/NDS.cpp:369`: c1=0x00012078, c2/c0,0=0x42,
+    c2/c0,1=0x42, c3=0x02, c5/c0,2=0x15111011, c5/c0,3=0x05100011, the 8 c6
+    regions, c9/c1,0=0x0300000A, c9/c1,1=0x00000020.
+  * Same species as the main-RAM clear: **every bug so far has been something the
+    real boot ROM does that HLE direct boot silently skips.** Audit the rest of
+    `SetupDirectBoot()` against the boot FSM before chasing symptoms again.
+  * **The trace this effort had been calling "golden" was a non-booting run.**
+    Its 8 frames are 393,216 pixels of `0x3FFFF` - solid white. That is why
+    hardware "matched" it 10818/10819 rungs. But white at 8 frames is NOT a
+    failure signal: melonDS reports `DISPCNT=0` there too. A working boot turns
+    the display on between frame 8 and 60 and has real content by ~3 s (matches a
+    real DS, user-measured). Judge white only after ~600 frames.
+  * Use `sim/melonds_tracer/build/melonds_fbdump`, not `melonds_tracer` (that one
+    takes a flat ARM9 binary). fbdump boots a real .nds with the same HLE loader
+    semantics and the same BIOS binaries, with `TRACE7=`/`TRACE9=` emitting the
+    same TRACE_DIFF format. Diff on `pc,opcode,r0..r12` (skip cpsr flags and
+    r13/r14 - melonDS pre-sets SP/LR) to find the first divergence.
+- 2026-07-25 sole agent: **the remaining blocker, quantified.** The ARM9 is
+  ~10x too slow *relative to the ARM7*, which breaks the NitroSDK IPCSYNC boot
+  handshake. This is now a number, not a mystery.
+  * Real DS: ARM9 67.028 MHz, ARM7 33.514 - **2:1**. `nds_top` gives both
+    `clk => clk1x, ce => '1'` - **1:1**. And CPI is worse too: measured over an
+    identical 8-frame window, ARM9 2.65 vs ARM7 1.12.
+  * The handshake (`0x037FEB94` ARM7 / `0x0214FF20` ARM9) is a countdown 8->0
+    where the ARM9 echoes the ARM7's nibble via IPCSYNC bits[11:8]/[3:0]. The
+    ARM7 writes, delays **593 instructions** (identical count in both RTL and
+    oracle), then reads. Our ARM9 has not reached its echo loop by then, so the
+    first step misses, `movne r4,r6` restarts the count, and it runs permanently
+    one step offset - jamming at `0x0700`. Oracle: `0808 0707 ... 0101 0000`, all
+    matching, 9 clean steps.
+  * **Exact requirement:** at ARM7-instruction 231,344 the ARM9 must be at
+    536,612. Ratio needed **2.32**; measured **0.423**, and **0.564** after the
+    I-cache fix below. Still 4.1x short: ~2x from the clock, ~2x from CPI.
+  * **Do not gate the ARM7's `ce` to fake the ratio.** Measured twice wrong:
+    gating `cpu7` alone kills it (ARM7 retired **2 instructions**) because
+    `gb_bus_done` is consumed in ce-gated processes while `membus7`'s `cpu_done`
+    is a state level that advances anyway; gating the whole subsystem needs `ce`
+    added to `membus7`/`spi`/`dma7`/`syscnt`, desynchronises the ARM7 from its own
+    timers, and cannot cover `nds_ipc`/`nds_wram` which are shared. Also: an ARM9
+    poll-count jump (8 -> 237) after halving the ARM7 is NOT confirmation - the
+    ARM7 was dead, so it never advanced the handshake.
+  * **The ARM9 core is not what blocks 67 MHz.** A `-less_than_slack 14.92`
+    census found **0 blocking paths in icpu9**, 4 in `membus9`; the blockers are
+    `nds_gpu2d`/`nds_drawer_text` plus the `clkMemIndex` mod-3 contract (67 MHz
+    clk_sys needs clk_mem at 134 against a measured 111 MHz Fmax). Caveat: that
+    census filters on *slack*, so it swept in the whole clk_mem domain - restrict
+    `-to_clock general[2]` next time. Build now emits `NDS.paths_67mhz.rpt`.
+- 2026-07-25 sole agent: **two zero-risk speedups, both equivalence-proven.**
+  * `nds_cpu9` PU region compare: `shift_right(a xor base, sz+1) = 0` put the
+    *address* through eight 32-bit barrel shifters (~5.5 ns, and 36 of the 50
+    worst paths in a 98% build ended at the flop it feeds). Rewritten as
+    `(x and mask) = 0` with the mask derived from the region *registers*, so the
+    shift is off the address path. Provable identity. **ARM9 trace MD5 identical
+    over 1,692,024 instructions.** -131 ALMs, Fmax 37.68 -> 38.52 MHz.
+  * `nds_cache9` I-side read hit answers in `REQ_LOOKUP` instead of spending a
+    `HIT_RESP` cycle - `id_q` is already valid there (`id_raddr` free-runs off
+    `req_addr`, which the membus holds until `resp_done`). -177 ALMs, Fmax
+    -> 39.44 MHz, and **+33% ARM9 throughput**. Reads only: a D-cache write hit
+    still needs HIT_RESP, where the line update is issued.
+  * **Area is the binding constraint and that is literal:** at 98% ALM fill a
+    single interconnect hop measured 10.1 ns of pure routing; the same domain is
+    26.5 ns at 87% fill vs 32.7 ns at 98%. Freeing ALMs buys timing directly.
+  * Live core `NDS_ihit_20260725.rbf` carries every verified fix and is fully
+    timing-clean (setup +1.521, hold +0.244, 36,152 ALMs). Kirby still white -
+    the handshake needs the ratio, not these.
+- 2026-07-25 sole agent: **deploy-and-test needs no human any more.** DDR3
+  survives FPGA reconfiguration, so after `load_core` the card image is still at
+  HPS `0x30000000` (`devmem` reads `4252494B` = "KIRB"); only the `cart_loaded`
+  flag is lost, so mailbox **op 0x0B** sets it. Cycle: scp the rbf, write an .mgl
+  (it brings firmware idx4 + bios idx1/2), `echo "load_core <mgl>" >
+  /dev/MiSTer_cmd`, `nitrodbg.sh forcecart`. Note `dd if=/dev/mem` fails at that
+  offset on this kernel; `devmem` works. Also new: op **0x0A** PROBE (cache9 /
+  membus9 / mainram FSM state + the nds_top mux terms) and op **0x0C** IRQSTAT
+  (IME/IE/IF both CPUs) - needed because **PEEK cannot read IO space at all**: it
+  borrows the ARM9 main-RAM channel, so `0x040001xx` aliases into RAM and returns
+  convincing garbage (`peek9 04000208` returned `0x2A73E9BD` for a 1-bit
+  register). Only `0x02xxxxxx` peeks are real.
+  * `MISTER_DEBUG_NOHDMI` does NOT remove video - the analog path still outputs,
+    and the user can see those builds fine. It only drops ascal + pll_hdmi
+    (98% -> 87% ALMs). Earlier notes implying "no video" were wrong.

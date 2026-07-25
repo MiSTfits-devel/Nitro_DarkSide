@@ -25,9 +25,15 @@ library IEEE;
 use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
 
+library MEM;
+
 use work.pProc_bus_gba.all;
 
 entity nds_sound is
+   generic
+   (
+      is_simu     : std_logic := '0'
+   );
    port
    (
       clk         : in  std_logic;
@@ -87,8 +93,8 @@ architecture arch of nds_sound is
       nxtw     : std_logic_vector(31 downto 0);
       curv     : std_logic;
       nxtv     : std_logic;
-      fptr     : unsigned(24 downto 0);          -- next fetch, word address
-      frem     : unsigned(23 downto 0);          -- words left to fetch
+      -- fptr (next fetch word address) and frem (words left to fetch) live
+      -- in ram_fptr/ram_frem below, not here - see the comment there.
       -- runtime: decoders
       adhdr    : std_logic;                      -- curw is the ADPCM header
       adval    : signed(15 downto 0);
@@ -101,6 +107,38 @@ architecture arch of nds_sound is
    end record;
    type t_chans is array (0 to 15) of t_chan;
    signal chan : t_chans;
+
+   -- fptr/frem moved off the per-channel flop array into two small
+   -- dual-port BRAMs - by far the biggest ALM item in this file (16-deep
+   -- dynamic-index muxes over ~49 bits/channel, read from FSCAN/FISSUE/
+   -- FWAITDONE). Safe to move because neither field is ever touched by
+   -- the per-channel unrolled tick/decode loop below (that loop owns
+   -- remwords/subpos/curv, a related but distinct pair of counters), and
+   -- neither is CPU-readable (SAD/TMR/PNT/LEN read back as 0; fptr/frem
+   -- were never exposed at all). Port A (CPU, index n) only ever WRITES
+   -- them, once per channel start, computed combinationally from the
+   -- still-flopped sad/pnt/len - so port A never needs to read its own
+   -- write back and the well-known same-port BRAM read-during-write
+   -- sim-vs-hardware mismatch never comes up. Port B (fetch FSM, index
+   -- fch) is the sole reader; see the FSCAN_ADDR/FSCAN_EVAL split below
+   -- for why that needs one settle cycle whenever fch changes - the
+   -- registered BRAM read lags addr_b by a cycle, where the old flop
+   -- read was combinational.
+   signal fptr_a_addr : integer range 0 to 15 := 0;
+   signal fptr_a_din  : unsigned(24 downto 0) := (others => '0');
+   signal fptr_a_we   : std_logic := '0';
+   signal fptr_b_addr : integer range 0 to 15 := 0;
+   signal fptr_b_din  : unsigned(24 downto 0) := (others => '0');
+   signal fptr_b_dout : std_logic_vector(31 downto 0);
+   signal fptr_b_we   : std_logic := '0';
+
+   signal frem_a_addr : integer range 0 to 15 := 0;
+   signal frem_a_din  : unsigned(23 downto 0) := (others => '0');
+   signal frem_a_we   : std_logic := '0';
+   signal frem_b_addr : integer range 0 to 15 := 0;
+   signal frem_b_din  : unsigned(23 downto 0) := (others => '0');
+   signal frem_b_dout : std_logic_vector(31 downto 0);
+   signal frem_b_we   : std_logic := '0';
 
    signal soundcnt  : std_logic_vector(15 downto 0) := (others => '0');
    signal soundbias : std_logic_vector(9 downto 0)  := (others => '0');
@@ -115,9 +153,15 @@ architecture arch of nds_sound is
 
    signal tick2 : std_logic := '0';  -- 33.514/2 MHz channel-timer cadence
 
-   -- fetch FSM: one word per grant, round-robin over needy channels
-   type t_fstate is (FSCAN, FGRANT, FISSUE, FWAITDONE, FGAP);
-   signal fstate : t_fstate := FSCAN;
+   -- fetch FSM: one word per grant, round-robin over needy channels.
+   -- FSCAN_ADDR/FSCAN_EVAL split (instead of one FSCAN state): frem now
+   -- lives in the registered-read ram_frem, one cycle behind addr_b/fch,
+   -- so a cycle must pass after fch moves before its frem is trustworthy.
+   -- Worst-case round-robin scan across all 16 channels goes from 16 to
+   -- 32 cycles - harmless per this file's fetch-underrun contract (a
+   -- starved channel repeats its last sample, never hangs).
+   type t_fstate is (FSCAN_ADDR, FSCAN_EVAL, FGRANT, FISSUE, FWAITDONE, FGAP);
+   signal fstate : t_fstate := FSCAN_ADDR;
    signal fch    : integer range 0 to 15 := 0;
    signal fgapc  : unsigned(2 downto 0) := (others => '0');
 
@@ -126,6 +170,19 @@ architecture arch of nds_sound is
    signal mixcnt : unsigned(9 downto 0) := (others => '0');
    signal accl   : signed(31 downto 0) := (others => '0');
    signal accr   : signed(31 downto 0) := (others => '0');
+
+   -- The left and right master-volume products used to be evaluated in the
+   -- same clock, so Quartus needed two 32x9 multipliers (four Cyclone-V DSP
+   -- blocks).  Slots 17..1022 are otherwise idle: evaluate left in slot 16
+   -- and right in slot 17 through one explicitly shared multiplier.  Latch
+   -- the gain/bias with the left result so a same-time CPU write cannot make
+   -- the two channels observe different master settings.
+   signal master_gain_latch : std_logic_vector(6 downto 0) := (others => '0');
+   signal master_bias_latch : std_logic_vector(9 downto 0) := (others => '0');
+   signal master_left_latch : std_logic_vector(15 downto 0) := (others => '0');
+   signal master_acc_in     : signed(31 downto 0);
+   signal master_gain_in    : signed(8 downto 0);
+   signal master_product    : signed(40 downto 0);
 
    type t_adpcm_steps is array (0 to 88) of integer range 0 to 32767;
    constant ADPCM_STEP : t_adpcm_steps := (
@@ -176,6 +233,71 @@ architecture arch of nds_sound is
    end function;
 
 begin
+
+   master_acc_in <= accl when mixcnt = to_unsigned(16, mixcnt'length) else accr;
+   master_gain_in <= to_signed(vol128(soundcnt(6 downto 0)), master_gain_in'length)
+                     when mixcnt = to_unsigned(16, mixcnt'length) else
+                     to_signed(vol128(master_gain_latch), master_gain_in'length);
+   master_product <= master_acc_in * master_gain_in;
+
+   -- port A (CPU, write-only) addressed by n, port B (fetch FSM) by fch;
+   -- both driven combinationally below from whichever process needs them
+   -- this cycle. Unused byte lanes/outputs tied off (5 spare bits/word).
+   iram_fptr : entity MEM.SyncRamDualByteEnable
+   generic map (is_simu => is_simu, is_cyclone5 => '1', ADDR_WIDTH => 4)
+   port map
+   (
+      clk       => clk,
+      ce_a      => '1',
+      addr_a    => fptr_a_addr,
+      datain_a0 => std_logic_vector(fptr_a_din(7 downto 0)),
+      datain_a1 => std_logic_vector(fptr_a_din(15 downto 8)),
+      datain_a2 => std_logic_vector(fptr_a_din(23 downto 16)),
+      datain_a3 => "0000000" & fptr_a_din(24),
+      dataout_a => open,
+      we_a      => fptr_a_we,
+      be_a      => "1111",
+      ce_b      => '1',
+      addr_b    => fptr_b_addr,
+      datain_b0 => std_logic_vector(fptr_b_din(7 downto 0)),
+      datain_b1 => std_logic_vector(fptr_b_din(15 downto 8)),
+      datain_b2 => std_logic_vector(fptr_b_din(23 downto 16)),
+      datain_b3 => "0000000" & fptr_b_din(24),
+      dataout_b => fptr_b_dout,
+      we_b      => fptr_b_we,
+      be_b      => "1111"
+   );
+
+   iram_frem : entity MEM.SyncRamDualByteEnable
+   generic map (is_simu => is_simu, is_cyclone5 => '1', ADDR_WIDTH => 4)
+   port map
+   (
+      clk       => clk,
+      ce_a      => '1',
+      addr_a    => frem_a_addr,
+      datain_a0 => std_logic_vector(frem_a_din(7 downto 0)),
+      datain_a1 => std_logic_vector(frem_a_din(15 downto 8)),
+      datain_a2 => std_logic_vector(frem_a_din(23 downto 16)),
+      datain_a3 => x"00",
+      dataout_a => open,
+      we_a      => frem_a_we,
+      be_a      => "1111",
+      ce_b      => '1',
+      addr_b    => frem_b_addr,
+      datain_b0 => std_logic_vector(frem_b_din(7 downto 0)),
+      datain_b1 => std_logic_vector(frem_b_din(15 downto 8)),
+      datain_b2 => std_logic_vector(frem_b_din(23 downto 16)),
+      datain_b3 => x"00",
+      dataout_b => frem_b_dout,
+      we_b      => frem_b_we,
+      be_b      => "1111"
+   );
+
+   -- port B always tracks fch combinationally (not just while the fetch
+   -- FSM is actively servicing it) so the FSCAN_ADDR settle cycle above
+   -- lines up with the BRAMs' one-cycle registered-read latency exactly.
+   fptr_b_addr <= fch;
+   frem_b_addr <= fch;
 
    snd_enable <= soundcnt(15);
    gact : for i in 0 to 15 generate
@@ -261,8 +383,10 @@ begin
                chan(i).nxtw     <= (others => '0');
                chan(i).curv     <= '0';
                chan(i).nxtv     <= '0';
-               chan(i).fptr     <= (others => '0');
-               chan(i).frem     <= (others => '0');
+               -- fptr/frem live in ram_fptr/ram_frem; no reset-clear needed
+               -- (busy='0' above gates every read of them until the next
+               -- channel start rewrites both from scratch - see the RAM
+               -- declaration comment).
                chan(i).adhdr    <= '0';
                chan(i).adval    <= (others => '0');
                chan(i).adidx    <= 0;
@@ -278,16 +402,24 @@ begin
                cap(i).len <= (others => '0');
             end loop;
             tick2       <= '0';
-            fstate      <= FSCAN;
+            fstate      <= FSCAN_ADDR;
             fch         <= 0;
             snd_bus_req <= '0';
             snd_bus_own <= '0';
             mb_ena      <= '0';
+            fptr_a_we   <= '0';
+            frem_a_we   <= '0';
+            fptr_b_we   <= '0';
+            frem_b_we   <= '0';
 
          elsif (ce = '1') then
 
-            tick2  <= not tick2;
-            mb_ena <= '0';
+            tick2     <= not tick2;
+            mb_ena    <= '0';
+            fptr_a_we <= '0';
+            frem_a_we <= '0';
+            fptr_b_we <= '0';
+            frem_b_we <= '0';
 
             -- -------- register writes (ARM7) --------
             if (bus7.ena = '1' and bus7.rnw = '0' and
@@ -317,9 +449,13 @@ begin
                               chan(n).subpos <= (others => '0');
                               chan(n).curv <= '0';
                               chan(n).nxtv <= '0';
-                              chan(n).fptr <= unsigned(chan(n).sad(26 downto 2));
-                              chan(n).frem <= resize(unsigned(chan(n).pnt), 24) +
-                                              resize(unsigned(chan(n).len), 24);
+                              fptr_a_addr <= n;
+                              fptr_a_din  <= unsigned(chan(n).sad(26 downto 2));
+                              fptr_a_we   <= '1';
+                              frem_a_addr <= n;
+                              frem_a_din  <= resize(unsigned(chan(n).pnt), 24) +
+                                             resize(unsigned(chan(n).len), 24);
+                              frem_a_we   <= '1';
                               if (bus7.Din(30 downto 29) = "10") then
                                  chan(n).adhdr <= '1';
                               else
@@ -519,18 +655,27 @@ begin
             -- -------- sample fetch (ARM7 membus guest) --------
             case fstate is
 
-               when FSCAN =>
-                  -- one candidate per cycle, round-robin; a stopped channel
-                  -- with a fetch in flight still delivers (stale words in a
-                  -- dead buffer are harmless)
+               when FSCAN_ADDR =>
+                  -- one settle cycle: fptr_b_addr/frem_b_addr already show
+                  -- fch (concurrent assignment below), this just gives the
+                  -- BRAMs' registered outputs a cycle to catch up before
+                  -- FSCAN_EVAL trusts frem_b_dout
+                  fstate <= FSCAN_EVAL;
+
+               when FSCAN_EVAL =>
+                  -- one candidate per two cycles, round-robin; a stopped
+                  -- channel with a fetch in flight still delivers (stale
+                  -- words in a dead buffer are harmless)
                   if (chan(fch).busy = '1' and chan(fch).format /= "11" and
-                      chan(fch).frem /= 0 and chan(fch).nxtv = '0') then
+                      unsigned(frem_b_dout(23 downto 0)) /= 0 and chan(fch).nxtv = '0') then
                      snd_bus_req <= '1';
                      fstate      <= FGRANT;
                   elsif (fch = 15) then
-                     fch <= 0;
+                     fch    <= 0;
+                     fstate <= FSCAN_ADDR;
                   else
-                     fch <= fch + 1;
+                     fch    <= fch + 1;
+                     fstate <= FSCAN_ADDR;
                   end if;
 
                when FGRANT =>
@@ -541,7 +686,7 @@ begin
 
                when FISSUE =>
                   mb_ena <= '1';
-                  mb_adr <= x"0" & '0' & std_logic_vector(chan(fch).fptr) & "00";
+                  mb_adr <= x"0" & '0' & fptr_b_dout(24 downto 0) & "00";
                   fstate <= FWAITDONE;
 
                when FWAITDONE =>
@@ -550,18 +695,23 @@ begin
                      -- above moves it down when the play slot is empty
                      chan(fch).nxtw <= mb_din;
                      chan(fch).nxtv <= '1';
-                     if (chan(fch).frem = 1) then
+                     if (unsigned(frem_b_dout(23 downto 0)) = 1) then
                         if (chan(fch).repeatm = "01") then
                            -- wrap the fetch stream to the loop point
-                           chan(fch).fptr <= resize(unsigned(chan(fch).sad(26 downto 2)), 25) +
-                                             resize(unsigned(chan(fch).pnt), 25);
-                           chan(fch).frem <= resize(unsigned(chan(fch).len), 24);
+                           fptr_b_din <= resize(unsigned(chan(fch).sad(26 downto 2)), 25) +
+                                         resize(unsigned(chan(fch).pnt), 25);
+                           fptr_b_we  <= '1';
+                           frem_b_din <= resize(unsigned(chan(fch).len), 24);
+                           frem_b_we  <= '1';
                         else
-                           chan(fch).frem <= (others => '0');
+                           frem_b_din <= (others => '0');
+                           frem_b_we  <= '1';
                         end if;
                      else
-                        chan(fch).fptr <= chan(fch).fptr + 1;
-                        chan(fch).frem <= chan(fch).frem - 1;
+                        fptr_b_din <= unsigned(fptr_b_dout(24 downto 0)) + 1;
+                        fptr_b_we  <= '1';
+                        frem_b_din <= unsigned(frem_b_dout(23 downto 0)) - 1;
+                        frem_b_we  <= '1';
                      end if;
                      snd_bus_req <= '0';
                      snd_bus_own <= '0';
@@ -572,7 +722,7 @@ begin
                when FGAP =>
                   -- fixed gap between guest words so the CPU keeps moving
                   if (fgapc = 0) then
-                     fstate <= FSCAN;
+                     fstate <= FSCAN_ADDR;
                   else
                      fgapc <= fgapc - 1;
                   end if;
@@ -594,7 +744,6 @@ begin
       variable v_a   : signed(20 downto 0);
       variable v_b   : signed(29 downto 0);
       variable v_p   : signed(38 downto 0);
-      variable v_m   : signed(40 downto 0);
       variable v_o   : integer;
    begin
       if rising_edge(clk) then
@@ -603,6 +752,9 @@ begin
             mixcnt   <= (others => '0');
             accl     <= (others => '0');
             accr     <= (others => '0');
+            master_gain_latch <= (others => '0');
+            master_bias_latch <= (others => '0');
+            master_left_latch <= (others => '0');
             sample_l <= (others => '0');
             sample_r <= (others => '0');
          elsif (ce = '1') then
@@ -628,17 +780,22 @@ begin
             elsif (to_integer(mixcnt) = 16) then
                -- TODO SOUNDCNT bits 8-11: only the plain mixer output is
                -- produced; ch1/ch3-direct output selects are not modeled
-               v_m := resize(accl * to_signed(vol128(soundcnt(6 downto 0)), 9), 41);
-               v_o := to_integer(shift_right(v_m, 15)) +
+               v_o := to_integer(shift_right(master_product, 15)) +
                       to_integer(unsigned(soundbias)) * 64 - 32768;
                if (v_o < -32768) then v_o := -32768; end if;
                if (v_o >  32767) then v_o :=  32767; end if;
-               sample_l <= std_logic_vector(to_signed(v_o, 16));
-               v_m := resize(accr * to_signed(vol128(soundcnt(6 downto 0)), 9), 41);
-               v_o := to_integer(shift_right(v_m, 15)) +
-                      to_integer(unsigned(soundbias)) * 64 - 32768;
+               -- Hold the completed left value until right is ready so the
+               -- externally consumed stereo pair still changes atomically.
+               master_left_latch <= std_logic_vector(to_signed(v_o, 16));
+               master_gain_latch <= soundcnt(6 downto 0);
+               master_bias_latch <= soundbias;
+
+            elsif (to_integer(mixcnt) = 17) then
+               v_o := to_integer(shift_right(master_product, 15)) +
+                      to_integer(unsigned(master_bias_latch)) * 64 - 32768;
                if (v_o < -32768) then v_o := -32768; end if;
                if (v_o >  32767) then v_o :=  32767; end if;
+               sample_l <= master_left_latch;
                sample_r <= std_logic_vector(to_signed(v_o, 16));
                sample_valid <= '1';
 

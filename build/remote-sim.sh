@@ -36,10 +36,16 @@ kubectl -n "$NS" wait --for=condition=Ready "pod/$POD" --timeout=10m
 echo "== streaming source (${REF}, dirty=${DIRTY})"
 # NDS.sv/nds_port_wrap.vhd/files.qip live at repo root (M9 wrapper) and are
 # needed by sim/run_analyze_all.sh, which mirrors Quartus's file list.
+# The stream is gzipped on purpose. sim/tests carries very large ASCII hex
+# images (kirby_full.hex alone is 151 MB), and pushing that raw through the
+# kubectl exec websocket reliably kills it partway with "connection reset by
+# peer" + "tar: Write error" - a transfer failure that looks exactly like a
+# build failure. Hex text compresses several-fold, which shrinks the window
+# enough to be dependable. The pod image has gzip and tar -z.
 if [ "$DIRTY" = "1" ]; then
-   tar -c rtl sim NDS.sv nds_port_wrap.vhd files.qip | kubectl -n "$NS" exec -i "$POD" -- tar -x -C /work/src
+   tar -cz rtl sim NDS.sv nds_port_wrap.vhd files.qip | kubectl -n "$NS" exec -i "$POD" -- tar -xz -C /work/src
 else
-   git archive "$REF" rtl sim NDS.sv nds_port_wrap.vhd files.qip | kubectl -n "$NS" exec -i "$POD" -- tar -x -C /work/src
+   git archive "$REF" rtl sim NDS.sv nds_port_wrap.vhd files.qip | gzip | kubectl -n "$NS" exec -i "$POD" -- tar -xz -C /work/src
 fi
 # env overrides are baked into a wrapper so the pod's sh picks them up
 kubectl -n "$NS" exec -i "$POD" -- sh -c "cat > /work/src/sim/_wrapped.sh" <<EOF

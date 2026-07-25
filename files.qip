@@ -30,6 +30,9 @@ set_global_assignment -name VHDL_FILE rtl/nds_cache9.vhd
 set_global_assignment -name VHDL_FILE rtl/nds_membus9.vhd
 set_global_assignment -name VHDL_FILE rtl/nds_syscnt.vhd
 set_global_assignment -name VHDL_FILE rtl/nds_loader.vhd
+# nds_debug is a leaf (no work-library dependencies of its own) but must precede
+# nds_top, which instantiates it - Quartus analyses VHDL in the order listed.
+set_global_assignment -name VHDL_FILE rtl/nds_debug.vhd
 set_global_assignment -name VHDL_FILE rtl/nds_card.vhd
 set_global_assignment -name VHDL_FILE rtl/nds_rtc.vhd
 set_global_assignment -name VHDL_FILE rtl/nds_sound.vhd

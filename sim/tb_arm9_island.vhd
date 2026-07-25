@@ -195,6 +195,10 @@ begin
       cpu_export_done => open,
       cpu_export      => open,
       error_cpu       => error_cpu,
+      dbg_pc          => open,
+      dbg_r0          => open,
+      dbg_lr          => open,
+      dbg_cpsr        => open,
       savestate_bus   => ss_bus,
       ss_wired_out    => open,
       ss_wired_done   => open,
@@ -268,7 +272,13 @@ begin
    );
 
    -- ================= boot ROM + TCM stores =================
-   brom_data <= brom(to_integer(brom_addr));
+   -- The hot-loadable hardware BIOS is an M10K with a registered read port.
+   process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         brom_data <= brom(to_integer(brom_addr));
+      end if;
+   end process;
 
    process (clk1x)
    begin

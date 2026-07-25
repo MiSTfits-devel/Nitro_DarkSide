@@ -75,6 +75,12 @@ reg         pf_bank = 0;
 wire  [7:0] lb_raddr;
 wire [35:0] lb_q;
 
+// diagnostic telemetry words: distinct known values so the telemetry
+// burst's shared-feeder beat alignment is checkable at the DDR write side
+reg [17:0] dbg [0:11];
+integer dbi;
+initial for (dbi = 0; dbi < 12; dbi = dbi + 1) dbg[dbi] = 18'h10000 | dbi[17:0];
+
 wire [27:1] fb5_addr, fb6_addr;
 wire [63:0] fb5_din, fb6_dout;
 wire        fb5_req, fb5_next, fb5_ready;
@@ -87,6 +93,9 @@ nds_fb_ddr3 #(.FB_HW_BASE(FB_HW_BASE), .FB_BURST(FB_BURST)) u_fb
 	.pix_x(pix_x),   .pix_y(pix_y),   .pix_d(pix_d),   .pix_we(pix_we),
 	.pixb_x(pixb_x), .pixb_y(pixb_y), .pixb_d(pixb_d), .pixb_we(pixb_we),
 	.pf_tgl(pf_tgl), .pf_scr(pf_scr), .pf_line(pf_line), .pf_bank(pf_bank),
+	.dbg0(dbg[0]),   .dbg1(dbg[1]),   .dbg2(dbg[2]),   .dbg3(dbg[3]),
+	.dbg4(dbg[4]),   .dbg5(dbg[5]),   .dbg6(dbg[6]),   .dbg7(dbg[7]),
+	.dbg8(dbg[8]),   .dbg9(dbg[9]),   .dbg10(dbg[10]), .dbg11(dbg[11]),
 	.lb_raddr(lb_raddr), .lb_q(lb_q),
 	.fb5_addr(fb5_addr), .fb5_din(fb5_din), .fb5_req(fb5_req),
 	.fb5_next(fb5_next), .fb5_ready(fb5_ready),
@@ -203,23 +212,42 @@ wire [24:0] beat_idx = DDRAM_ADDR[24:0] - MEM_BASE_BEAT;
 task check_fb_beat(input [24:0] idx, input [63:0] din, input [7:0] be);
 	integer s, y, pair, f;
 	reg [24:0] fboff;
+	reg [35:0] tw;
 	begin
 		fboff = idx - FB_BEAT0;
 		s    = fboff[15];
 		y    = fboff[14:7];
 		pair = fboff[6:0];
-		if (y > 191) fail("fb write beyond line 191");
 		if (be != 8'hFF) fail("fb write with partial byte enables");
-		f = last_frame[s][y];
-		if (f < 0) fail("fb write for a line never drawn");
-		else begin
-			if (din !== {14'd0, px_hash(s[0], f, y, pair*2+1),
-			             14'd0, px_hash(s[0], f, y, pair*2)}) begin
-				$display("FAIL @%0t: fb beat data s=%0d y=%0d pair=%0d f=%0d got=%h",
-				         $time, s, y, pair, f, din);
+		if (u_fb.tjob) begin
+			// diagnostic telemetry burst (screen 0, line 191): the shared
+			// feeder must present the dbg words in the first 6 pairs, then
+			// all-ones. This exercises the registered telem_q alignment.
+			if (s != 0 || y != 191) fail("telemetry burst wrong target");
+			tw = (pair == 0) ? {dbg[1],  dbg[0]}  :
+			     (pair == 1) ? {dbg[3],  dbg[2]}  :
+			     (pair == 2) ? {dbg[5],  dbg[4]}  :
+			     (pair == 3) ? {dbg[7],  dbg[6]}  :
+			     (pair == 4) ? {dbg[9],  dbg[8]}  :
+			     (pair == 5) ? {dbg[11], dbg[10]} : {36{1'b1}};
+			if (din !== {14'd0, tw[35:18], 14'd0, tw[17:0]}) begin
+				$display("FAIL @%0t: telemetry beat pair=%0d got=%h", $time, pair, din);
 				failf;
 			end
-			if (pair == 127) landed[s][y] = f;   // whole line is one burst
+		end
+		else begin
+			if (y > 191) fail("fb write beyond line 191");
+			f = last_frame[s][y];
+			if (f < 0) fail("fb write for a line never drawn");
+			else begin
+				if (din !== {14'd0, px_hash(s[0], f, y, pair*2+1),
+				             14'd0, px_hash(s[0], f, y, pair*2)}) begin
+					$display("FAIL @%0t: fb beat data s=%0d y=%0d pair=%0d f=%0d got=%h",
+					         $time, s, y, pair, f, din);
+					failf;
+				end
+				if (pair == 127) landed[s][y] = f;   // whole line is one burst
+			end
 		end
 	end
 endtask

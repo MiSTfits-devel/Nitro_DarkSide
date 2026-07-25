@@ -14,11 +14,25 @@ use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
 use std.textio.all;
 
+library MEM;
+
 entity nds_bios7 is
+   generic
+   (
+      is_simu : std_logic := '0';
+      use_cyclone5_primitive : std_logic := '0'
+   );
    port
    (
+      clk       : in  std_logic;
       bios_addr : in  unsigned(13 downto 2);
-      bios_data : out std_logic_vector(31 downto 0)
+      bios_data : out std_logic_vector(31 downto 0);
+
+      load_addr   : in unsigned(13 downto 2) := (others => '0');
+      load_data   : in std_logic_vector(31 downto 0) := (others => '0');
+      load_be     : in std_logic_vector(3 downto 0) := (others => '0');
+      load_we     : in std_logic := '0';
+      load_done   : in std_logic := '0'
    );
 end entity;
 
@@ -155,10 +169,79 @@ architecture arch of nds_bios7 is
       return m;
    end function;
 
-   constant ROM : t_rom := init_rom;
+   signal hot_q   : std_logic_vector(31 downto 0) := (others => '0');
+   signal hle_q   : std_logic_vector(31 downto 0) := HLE(0);
 
 begin
 
-   bios_data <= ROM(to_integer(bios_addr));
+   -- Simulation keeps the existing retail-file oracle so the long Kirby
+   -- differential benches do not need host-ioctl plumbing.
+   gsim : if is_simu = '1' generate
+      constant ROM : t_rom := init_rom;
+   begin
+      -- Match the hot M10K's registered read exactly.  Keeping the retail
+      -- oracle asynchronous while nds_membus7 presents the live accept
+      -- address lets the CPU's following address select the returned word;
+      -- exception vectors then arrive one word late (SWI reads PAbort).
+      process (clk)
+      begin
+         if rising_edge(clk) then
+            bios_data <= ROM(to_integer(bios_addr));
+         end if;
+      end process;
+   end generate;
+
+   -- Hardware starts with the small built-in HLE BIOS, then atomically
+   -- switches to the writable M10K image after the HPS finishes boot1.rom
+   -- (or the OSD F1 transfer). The top level holds both CPUs in reset while
+   -- load_we can assert, so the single-clock read/write RAM has no live-code
+   -- collision to resolve.
+   ghot : if is_simu = '0' generate
+   begin
+      ihot : entity MEM.SyncRamDualByteEnable
+      generic map
+      (
+         is_simu     => not use_cyclone5_primitive,
+         is_cyclone5 => use_cyclone5_primitive,
+         BYTE_WIDTH  => 8,
+         ADDR_WIDTH  => 12,
+         BYTES       => 4
+      )
+      port map
+      (
+         clk       => clk,
+         ce_a      => '1',
+         addr_a    => to_integer(bios_addr),
+         datain_a0 => x"00", datain_a1 => x"00", datain_a2 => x"00", datain_a3 => x"00",
+         dataout_a => hot_q,
+         we_a      => '0',
+         be_a      => "0000",
+         ce_b      => '1',
+         addr_b    => to_integer(load_addr),
+         datain_b0 => load_data(7 downto 0),
+         datain_b1 => load_data(15 downto 8),
+         datain_b2 => load_data(23 downto 16),
+         datain_b3 => load_data(31 downto 24),
+         dataout_b => open,
+         we_b      => load_we,
+         be_b      => load_be
+      );
+
+      process (clk)
+      begin
+         if rising_edge(clk) then
+            if to_integer(bios_addr) <= t_hle'high then
+               hle_q <= HLE(to_integer(bios_addr));
+            else
+               hle_q <= (others => '0');
+            end if;
+         end if;
+      end process;
+
+      -- Keep the HLE fallback on the same registered read path as hot_ram.
+      -- An asynchronous bypass here creates a CPU address/data combinational
+      -- loop before boot1.rom has loaded.
+      bios_data <= hle_q when load_done = '0' else hot_q;
+   end generate;
 
 end architecture;

@@ -39,6 +39,21 @@ module nds_fb_ddr3 #(
 	input      [17:0] pixb_d,
 	input             pixb_we,
 
+	// Diagnostic-only words periodically forced into top line 191. This
+	// bypasses the engine streams so state remains visible if rendering stalls.
+	input      [17:0] dbg0,
+	input      [17:0] dbg1,
+	input      [17:0] dbg2,
+	input      [17:0] dbg3,
+	input      [17:0] dbg4,
+	input      [17:0] dbg5,
+	input      [17:0] dbg6,
+	input      [17:0] dbg7,
+	input      [17:0] dbg8,
+	input      [17:0] dbg9,
+	input      [17:0] dbg10,
+	input      [17:0] dbg11,
+
 	// scanout prefetch request (CLK_VIDEO): payload written with the toggle
 	input             pf_tgl,
 	input             pf_scr,
@@ -68,8 +83,14 @@ module nds_fb_ddr3 #(
 // MLAB (async read) so the ch5 burst feeder needs no read-latency
 // pipeline; per engine: 2 banks x 128 pixel pairs, 36 bits each. The
 // engine always writes the bank the drain is not reading.
-(* ramstyle = "MLAB, no_rw_check" *) reg [35:0] acc_a[0:255];
-(* ramstyle = "MLAB, no_rw_check" *) reg [35:0] acc_b[0:255];
+// Sync-read M10K (was MLAB): frees all 32 Memory LABs on the LAB-saturated
+// device — the headroom the HDMI setup path needs. The drain feeder reads
+// one word ahead (see feed_idx below) so the registered output holds
+// mem[widx] every cycle, exactly matching the old async-read feeder timing
+// into fb5_din. The engine always writes the bank the drain is not reading,
+// so read and write never alias the same address (no_rw_check).
+(* ramstyle = "M10K, no_rw_check" *) reg [35:0] acc_a[0:255];
+(* ramstyle = "M10K, no_rw_check" *) reg [35:0] acc_b[0:255];
 reg [17:0] hold_a, hold_b;            // even pixel awaiting its odd partner
 reg        bank_a = 0, bank_b = 0;
 reg        job_tgl_a = 0, job_tgl_b = 0;
@@ -109,19 +130,64 @@ reg  [7:0] dsent;                     // beats already commanded this line
 reg        drr = 0;                   // round-robin when both engines pend
 reg        ack_a = 0, ack_b = 0;
 reg        fb5_req_r = 0;
+reg        tjob = 0;
+reg [21:0] telem_ctr = 0;
+reg        telem_pending = 1;
 wire       pend_a = job_tgl_a != ack_a;
 wire       pend_b = job_tgl_b != ack_b;
 
-wire [35:0] acc_q = dscr ? acc_b[{dbank, widx}] : acc_a[{dbank, widx}];
+// Feeder reads one word ahead: fb5_next advances widx (drain FSM below) on
+// exactly the cycles a burst word is consumed, so feed_idx points at the
+// word fb5_din must present next cycle. The M10K registered outputs then
+// hold mem[widx] every cycle. telem_q is registered with the identical
+// scheme so telemetry bursts stay beat-aligned with the normal feeder.
+//
+// Base case (grant5 can fire the same cycle fb5_req is asserted): on a
+// job-start cycle, pre-read word[0] of the job being selected — feed_idx=0
+// and racc uses the selected bank — so the registered output holds word[0]
+// when the burst is granted next cycle. Zero added latency vs the old MLAB.
+wire        starting = !dbusy && (telem_pending || pend_a || pend_b);
+wire        sel_bank = telem_pending                    ? 1'b0 :
+                       (pend_a && (!pend_b || !drr))    ? job_bank_a : job_bank_b;
+wire  [6:0] feed_idx = starting ? 7'd0 : (widx + (fb5_next ? 7'd1 : 7'd0));
+wire  [7:0] racc     = {starting ? sel_bank : dbank, feed_idx};
+reg  [35:0] acc_a_q, acc_b_q, telem_q_r;
+
+always @(posedge clk_sys) begin
+	acc_a_q   <= acc_a[racc];
+	acc_b_q   <= acc_b[racc];
+	telem_q_r <= (feed_idx == 7'd0) ? {dbg1, dbg0} :
+	             (feed_idx == 7'd1) ? {dbg3, dbg2} :
+	             (feed_idx == 7'd2) ? {dbg5, dbg4} :
+	             (feed_idx == 7'd3) ? {dbg7, dbg6} :
+	             (feed_idx == 7'd4) ? {dbg9, dbg8} :
+	             (feed_idx == 7'd5) ? {dbg11, dbg10} : {36{1'b1}};
+end
+
+wire [35:0] acc_q = dscr ? acc_b_q : acc_a_q;
 
 assign fb5_req  = fb5_req_r;
-assign fb5_din  = {14'd0, acc_q[35:18], 14'd0, acc_q[17:0]};
+assign fb5_din  = tjob ? {14'd0, telem_q_r[35:18], 14'd0, telem_q_r[17:0]} :
+	                       {14'd0, acc_q[35:18],   14'd0, acc_q[17:0]};
 assign fb5_addr = FB_HW_BASE + {dscr, dy, 9'd0} + {17'd0, dsent, 2'd0};
 
 always @(posedge clk_sys) begin
+	telem_ctr <= telem_ctr + 1'd1;
+	if (&telem_ctr) telem_pending <= 1;
 	fb5_req_r <= 0;
 	if (!dbusy) begin
-		if (pend_a && (!pend_b || !drr)) begin
+		if (telem_pending) begin
+			dscr          <= 0;
+			dy            <= 8'd191;
+			dbank         <= 0;
+			widx          <= 0;
+			dsent         <= 0;
+			tjob          <= 1;
+			telem_pending <= 0;
+			fb5_req_r     <= 1;
+			dbusy         <= 1;
+		end
+		else if (pend_a && (!pend_b || !drr)) begin
 			dscr      <= 0;
 			dy        <= job_y_a;
 			dbank     <= job_bank_a;
@@ -131,6 +197,7 @@ always @(posedge clk_sys) begin
 			dsent     <= 0;
 			fb5_req_r <= 1;
 			dbusy     <= 1;
+			tjob      <= 0;
 		end
 		else if (pend_b) begin
 			dscr      <= 1;
@@ -142,6 +209,7 @@ always @(posedge clk_sys) begin
 			dsent     <= 0;
 			fb5_req_r <= 1;
 			dbusy     <= 1;
+			tjob      <= 0;
 		end
 	end
 	else begin

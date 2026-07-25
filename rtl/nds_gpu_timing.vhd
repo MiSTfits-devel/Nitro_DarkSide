@@ -70,7 +70,8 @@ entity nds_gpu_timing is
       vblank_trigger    : out std_logic := '0';
       refpoint_update   : out std_logic := '0';
 
-      vcount_out        : out unsigned(8 downto 0)   -- live line, for compose/debug
+      vcount_out        : out unsigned(8 downto 0);  -- live line, for compose/debug
+      dbg_vbl_ena9      : out std_logic := '0'       -- diagnostic-only persistent ARM9 DISPSTAT bit 3
    );
 end entity;
 
@@ -169,6 +170,7 @@ begin
    wired_done7 <= '0' when reg_wired_done(1) = 0 else '1';
 
    vcount_out <= vcnt;
+   dbg_vbl_ena9 <= R_vbl_irq_ena(0)(0);
 
    process (clk)
       variable newline : integer range 0 to 262;

@@ -58,6 +58,18 @@ entity nds_port_wrap is
       fw_done          : in  std_logic;
       fw_data          : in  std_logic_vector(31 downto 0);
 
+      -- hot-loadable ARM7/ARM9 BIOS RAM write ports
+      bios7_load_addr  : in std_logic_vector(13 downto 2);
+      bios7_load_data  : in std_logic_vector(31 downto 0);
+      bios7_load_be    : in std_logic_vector(3 downto 0);
+      bios7_load_we    : in std_logic;
+      bios7_load_done  : in std_logic;
+      bios9_load_addr  : in std_logic_vector(11 downto 2);
+      bios9_load_data  : in std_logic_vector(31 downto 0);
+      bios9_load_be    : in std_logic_vector(3 downto 0);
+      bios9_load_we    : in std_logic;
+      bios9_load_done  : in std_logic;
+
       -- main RAM SDRAM request port + scheduler handshake
       mainram_allow    : in  std_logic;
       mainram_active   : out std_logic;
@@ -98,7 +110,25 @@ entity nds_port_wrap is
 
       -- sound
       sound_out_left   : out std_logic_vector(15 downto 0);
-      sound_out_right  : out std_logic_vector(15 downto 0)
+      sound_out_right  : out std_logic_vector(15 downto 0);
+
+      -- Temporary live-hardware telemetry, flattened for SystemVerilog.
+      dbg_pc9           : out std_logic_vector(31 downto 0);
+      dbg_pc7           : out std_logic_vector(31 downto 0);
+      dbg_r0_9          : out std_logic_vector(31 downto 0);
+      dbg_lr9           : out std_logic_vector(31 downto 0);
+      dbg_cpsr9         : out std_logic_vector(31 downto 0);
+      dbg_vfy_bad       : out std_logic_vector(17 downto 0);
+      dbg_vfy_addr      : out std_logic_vector(31 downto 0);
+
+      -- IS-NITRO-style debug mailbox (ddram ch4 pager lives in NDS.sv)
+      dbg_cmd_stb       : in  std_logic := '0';
+      dbg_cmd_op        : in  std_logic_vector(7 downto 0) := (others => '0');
+      dbg_cmd_arg       : in  std_logic_vector(31 downto 0) := (others => '0');
+      dbg_rsp_data      : out std_logic_vector(31 downto 0);
+      dbg_rsp_stb       : out std_logic;
+
+      dbg_hwstat        : out std_logic_vector(17 downto 0)
    );
 end entity;
 
@@ -161,6 +191,17 @@ begin
       fw_done          => fw_done,
       fw_data          => fw_data,
 
+      bios7_load_addr  => unsigned(bios7_load_addr),
+      bios7_load_data  => bios7_load_data,
+      bios7_load_be    => bios7_load_be,
+      bios7_load_we    => bios7_load_we,
+      bios7_load_done  => bios7_load_done,
+      bios9_load_addr  => unsigned(bios9_load_addr),
+      bios9_load_data  => bios9_load_data,
+      bios9_load_be    => bios9_load_be,
+      bios9_load_we    => bios9_load_we,
+      bios9_load_done  => bios9_load_done,
+
       mainram_allow    => mainram_allow,
       mainram_active   => mainram_active,
       mainram_busy     => mainram_busy,
@@ -211,7 +252,20 @@ begin
       dbg_line_drop    => open,
       dbg_line_busy    => open,
       dbg_cpu_err9     => open,
-      dbg_cpu_err7     => open
+      dbg_cpu_err7     => open,
+      dbg_pc9          => dbg_pc9,
+      dbg_pc7          => dbg_pc7,
+      dbg_r0_9         => dbg_r0_9,
+      dbg_lr9          => dbg_lr9,
+      dbg_cpsr9        => dbg_cpsr9,
+      dbg_vfy_bad      => dbg_vfy_bad,
+      dbg_vfy_addr     => dbg_vfy_addr,
+      dbg_cmd_stb      => dbg_cmd_stb,
+      dbg_cmd_op       => dbg_cmd_op,
+      dbg_cmd_arg      => dbg_cmd_arg,
+      dbg_rsp_data     => dbg_rsp_data,
+      dbg_rsp_stb      => dbg_rsp_stb,
+      dbg_hwstat       => dbg_hwstat
    );
 
 end architecture;
