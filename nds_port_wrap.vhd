@@ -16,6 +16,7 @@ entity nds_port_wrap is
    port
    (
       clk1x            : in  std_logic;   -- 33.513982 MHz system clock
+      clk2x            : in  std_logic;   -- 67.027964 MHz (2x clk1x, same VCO): ARM9 island
       clkMem           : in  std_logic;   -- 100.541946 MHz (3x clk1x, phase-locked)
       clkMemIndex      : in  std_logic_vector(1 downto 0);  -- clkMem phase, 0 on clk1x rising edge
       reset            : in  std_logic;
@@ -154,6 +155,7 @@ begin
    port map
    (
       clk1x            => clk1x,
+      clk2x            => clk2x,
       clkMem           => clkMem,
       clkMemIndex      => unsigned(clkMemIndex),
       reset            => reset,

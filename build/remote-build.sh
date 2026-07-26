@@ -34,6 +34,10 @@ ARTIFACT_FILES=(
    # report only ever shows the worst ~31 ns family, which hid the whole
    # 15-26 ns population - i.e. most of the work needed to raise clk_sys.
    NDS.paths_67mhz.rpt
+   # ARM9-hierarchy-only paths. The global report is ranked by slack and caps
+   # out long before it reaches the CPU, so it cannot answer "would the ARM9
+   # close at 67 MHz" - this one is scoped to icpu9/imembus9 and can.
+   NDS.paths_cpu9.rpt
 )
 
 if [[ ! "$POD" =~ ^([a-z0-9]|[a-z0-9][-a-z0-9]{0,61}[a-z0-9])$ ]]; then
