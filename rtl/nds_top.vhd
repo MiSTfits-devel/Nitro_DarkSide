@@ -56,6 +56,12 @@ entity nds_top is
    port
    (
       clk1x            : in  std_logic;   -- 33.513982 MHz system clock
+      -- 67.027964 MHz, PLL outclk_1: EXACTLY 2x clk1x from the same VCO at 0 ps,
+      -- so rising edges coincide on every other clk2x cycle. Clocks only the
+      -- ARM9 island (icpu9 + imembus9 + cache9 + ITCM/DTCM) - the real DS runs
+      -- the ARM9 at 2x the ARM7, and having both on clk1x is what breaks the
+      -- NitroSDK IPCSYNC boot handshake. Tie to clk1x to disable the island.
+      clk2x            : in  std_logic;
       clkMem           : in  std_logic;   -- 100.542 MHz (3x clk1x, phase-locked)
       clkMemIndex      : in  unsigned(1 downto 0);  -- clkMem phase, 0 on clk1x rising edge
       reset            : in  std_logic;
@@ -230,6 +236,24 @@ architecture arch of nds_top is
    -- cannot take resetCpu instead - the loader stages main RAM through them
    -- while resetCpu is still asserted.
    signal reset_boot : std_logic;
+
+   -- ARM9 clk2x island <-> clk1x world bridge (see the process block below)
+   signal cdc_req_wsh, cdc_req_vram, cdc_req_mr   : std_logic := '0';
+   signal cdc_req_io,  cdc_req_pal,  cdc_req_oam  : std_logic := '0';
+   signal cdc_req_wsh_d, cdc_req_vram_d, cdc_req_mr_d  : std_logic := '0';
+   signal cdc_req_io_d,  cdc_req_pal_d,  cdc_req_oam_d : std_logic := '0';
+   signal cdc_wsh_done_d, cdc_vram_done_d         : std_logic := '0';
+   signal cdc_mr_done_d,  cdc_io_done_d           : std_logic := '0';
+   -- island side (clk2x): membus9's raw request pulses / narrowed dones
+   signal i9_wsh_ena, i9_vram_ena, i9_mr_ena, i9_io_ena : std_logic;
+   signal i9_pal_we,  i9_oam_we                         : std_logic;
+   signal i9_wsh_done, i9_vram_done, i9_mr_done, i9_io_done : std_logic;
+   -- island-side copy of the IO bus record: nds_top rebuilds io_bus9 from it with
+   -- the stretched enable substituted, since only .ena needs to cross
+   signal i9_io_bus : proc_bus_gb_type;
+   signal io9_ena   : std_logic := '0';   -- stretched io_bus9.ena, clk1x domain
+   signal cdc_dmab_ena_d, dmab_ena_i9   : std_logic := '0';
+   signal cdc_cpudone_tgl, cdc_cpudone_tgl_d, cpu9_done_1x : std_logic := '0';
    signal dbg_mb9, dbg_cache9, dbg_mr_s      : std_logic_vector(7 downto 0);
    signal dbg_probe                          : std_logic_vector(31 downto 0);
    signal dbg_pk_addr_s        : std_logic_vector(31 downto 0);
@@ -720,6 +744,113 @@ begin
 
    reset_boot <= reset or dbg_boot_rst;
 
+   -- ================= ARM9 67 MHz island: clk1x <-> clk2x bridge =================
+   -- clk2x is exactly 2x clk1x from one VCO at 0 ps, so this is a *related*-clock
+   -- crossing, not an asynchronous one - no metastability, but the pulse widths
+   -- still have to be reconciled: a 1-clk2x pulse is half a clk1x period and
+   -- clk1x would miss it, and a 1-clk1x pulse is two clk2x cycles and the island
+   -- would count it twice.
+   --
+   -- Only the pulses cross. membus9 holds address/data/byte-enables stable for the
+   -- whole transaction (nds_cache9's own comment relies on this: "the membus holds
+   -- them until resp_done"), and it has at most ONE external access in flight, so
+   -- the level signals are wired straight through.
+   --
+   -- Request handshake, clk2x -> clk1x, TOGGLE based. A sticky-bit stretch is
+   -- phase-dependent and silently drops half the requests: ph1x is high on the
+   -- island cycle right after a clk1x edge, so a sticky set in the *second* half
+   -- of a clk1x period is cleared before clk1x ever samples it. A toggle has no
+   -- such window - the island flips it once per request and it then sits stable
+   -- until the transaction completes (membus9 issues at most one external access
+   -- at a time and waits), so the clk1x edge-detector fires exactly once.
+   process (clk2x)
+   begin
+      if rising_edge(clk2x) then
+         if (resetCpu = '1') then
+            cdc_req_wsh  <= '0'; cdc_req_vram <= '0'; cdc_req_mr <= '0';
+            cdc_req_io   <= '0'; cdc_req_pal  <= '0'; cdc_req_oam <= '0';
+         else
+            if (i9_wsh_ena  = '1') then cdc_req_wsh  <= not cdc_req_wsh;  end if;
+            if (i9_vram_ena = '1') then cdc_req_vram <= not cdc_req_vram; end if;
+            if (i9_mr_ena   = '1') then cdc_req_mr   <= not cdc_req_mr;   end if;
+            if (i9_io_ena   = '1') then cdc_req_io   <= not cdc_req_io;   end if;
+            if (i9_pal_we   = '1') then cdc_req_pal  <= not cdc_req_pal;  end if;
+            if (i9_oam_we   = '1') then cdc_req_oam  <= not cdc_req_oam;  end if;
+         end if;
+      end if;
+   end process;
+
+   process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         cdc_req_wsh_d  <= cdc_req_wsh;
+         cdc_req_vram_d <= cdc_req_vram;
+         cdc_req_mr_d   <= cdc_req_mr;
+         cdc_req_io_d   <= cdc_req_io;
+         cdc_req_pal_d  <= cdc_req_pal;
+         cdc_req_oam_d  <= cdc_req_oam;
+         wsh9_ena  <= cdc_req_wsh  xor cdc_req_wsh_d;
+         vram9_ena <= cdc_req_vram xor cdc_req_vram_d;
+         mr9_ena   <= cdc_req_mr   xor cdc_req_mr_d;
+         io9_ena   <= cdc_req_io   xor cdc_req_io_d;
+         pal_we    <= cdc_req_pal  xor cdc_req_pal_d;
+         oam_we    <= cdc_req_oam  xor cdc_req_oam_d;
+      end if;
+   end process;
+
+   -- everything except .ena is a stable level for the whole transaction
+   io_bus9 <= (Din  => i9_io_bus.Din,  Adr  => i9_io_bus.Adr,
+               rnw  => i9_io_bus.rnw,  ena  => io9_ena,
+               acc  => i9_io_bus.acc,  bEna => i9_io_bus.bEna,
+               rst  => i9_io_bus.rst);
+
+   -- Done narrow, clk1x -> clk2x. A 1-clk1x done is high for two clk2x cycles;
+   -- edge-detect so the island's FSM sees exactly one.
+   process (clk2x)
+   begin
+      if rising_edge(clk2x) then
+         cdc_wsh_done_d  <= wsh9_done;
+         cdc_vram_done_d <= vram9_done;
+         cdc_mr_done_d   <= mr9_done;
+         cdc_io_done_d   <= io_wired_done9;
+      end if;
+   end process;
+   -- DMA9 masters the ARM9 membus while dma_bus_on, but nds_dma9 is a clk1x unit
+   -- talking to a clk2x membus, so its request pulse is two island cycles wide
+   -- (membus9 would accept it twice) and membus9's one-island-cycle done is only
+   -- half a clk1x period (nds_dma9 would miss it). Narrow one, stretch the other.
+   -- The CPU's own path needs neither: cpu9 is inside the island.
+   process (clk2x)
+   begin
+      if rising_edge(clk2x) then
+         cdc_dmab_ena_d <= dmab_ena;
+      end if;
+   end process;
+   dmab_ena_i9 <= dmab_ena and not cdc_dmab_ena_d;
+
+   -- membus9's cpu_done is one ISLAND cycle - half a clk1x period - so a clk1x
+   -- process sampling it directly would miss it half the time (the same defect
+   -- the request path had). Toggle in the island, edge-detect in clk1x.
+   process (clk2x)
+   begin
+      if rising_edge(clk2x) then
+         if (cpu9_done = '1') then cdc_cpudone_tgl <= not cdc_cpudone_tgl; end if;
+      end if;
+   end process;
+
+   process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         cdc_cpudone_tgl_d <= cdc_cpudone_tgl;
+         cpu9_done_1x      <= cdc_cpudone_tgl xor cdc_cpudone_tgl_d;
+      end if;
+   end process;
+
+   i9_wsh_done  <= wsh9_done       and not cdc_wsh_done_d;
+   i9_vram_done <= vram9_done      and not cdc_vram_done_d;
+   i9_mr_done   <= mr9_done        and not cdc_mr_done_d;
+   i9_io_done   <= io_wired_done9  and not cdc_io_done_d;
+
 
    -- out ports are write-only in VHDL-93; nds_debug reads the internals
    dbg_pc9 <= pc9_s;
@@ -803,7 +934,7 @@ begin
    generic map ( is_simu => is_simu )
    port map
    (
-      clk             => clk1x,
+      clk             => clk2x,
       ce              => '1',
       reset           => resetCpu,
 -- synthesis translate_off
@@ -864,7 +995,7 @@ begin
    generic map ( is_simu => is_simu )
    port map
    (
-      clk => clk1x, reset => resetCpu,
+      clk => clk2x, reset => resetCpu,
       bus_cacheable_i => bus_cacheable_i, bus_cacheable_d => bus_cacheable_d,
       cache_op_ena => cache_op_ena, cache_op => cache_op,
       cache_op_addr => cache_op_addr, cache_op_busy => cache_op_busy,
@@ -874,7 +1005,7 @@ begin
       dma_bus => dma_bus_on,
       cpu_adr => mbus_adr, cpu_rnw => mbus_rnw, cpu_ena => mbus_ena, cpu_code => mbus_code,
       cpu_acc => mbus_acc, cpu_dout => mbus_dout, cpu_lowbits => mbus_low,
-      cpu_lastread => cpu9_lastread, cpu_din => cpu9_din, cpu_done => cpu9_done,
+      cpu_lastread => cpu9_lastread, cpu_din => cpu9_din, cpu_done => cpu9_done_1x,
       itcm_addr => itcm_addr, itcm_we => itcm_we, itcm_be => itcm_be,
       itcm_writedata => itcm_writedata, itcm_readdata => itcm_readdata,
       dtcm_addr => dtcm_addr, dtcm_we => dtcm_we, dtcm_be => dtcm_be,
@@ -882,14 +1013,14 @@ begin
       brom_addr => brom_addr, brom_data => brom_data,
       wsh_ena => wsh9_ena, wsh_rnw => wsh9_rnw, wsh_addr => wsh9_addr, wsh_be => wsh9_be,
       wsh_din => wsh9_din, wsh_dout => wsh9_dout, wsh_done => wsh9_done, wsh_mapped => wsh9_mapped,
-      vram_ena => vram9_ena, vram_rnw => vram9_rnw, vram_addr => vram9_addr, vram_be => vram9_be,
-      vram_din => vram9_din, vram_dout => vram9_dout, vram_done => vram9_done,
-      pal_we => pal_we, pal_addr => pal_addr, pal_din => pal_din, pal_be => pal_be,
-      oam_we => oam_we, oam_addr => oam_addr, oam_din => oam_din, oam_be => oam_be,
-      mr_ena => mr9_ena, mr_rnw => mr9_rnw, mr_addr => mr9_addr, mr_be => mr9_be,
-      mr_writedata => mr9_writedata, mr_done => mr9_done, mr_readdata => mr9_readdata,
+      vram_ena => i9_vram_ena, vram_rnw => vram9_rnw, vram_addr => vram9_addr, vram_be => vram9_be,
+      vram_din => vram9_din, vram_dout => vram9_dout, vram_done => i9_vram_done,
+      pal_we => i9_pal_we, pal_addr => pal_addr, pal_din => pal_din, pal_be => pal_be,
+      oam_we => i9_oam_we, oam_addr => oam_addr, oam_din => oam_din, oam_be => oam_be,
+      mr_ena => i9_mr_ena, mr_rnw => mr9_rnw, mr_addr => mr9_addr, mr_be => mr9_be,
+      mr_writedata => mr9_writedata, mr_done => i9_mr_done, mr_readdata => mr9_readdata,
       io_ce_next => '1',
-      io_bus => io_bus9, io_wired_out => io_wired_out9, io_wired_done => io_wired_done9,
+      io_bus => i9_io_bus, io_wired_out => io_wired_out9, io_wired_done => i9_io_done,
       dbg_mb => dbg_mb9, dbg_cache => dbg_cache9
    );
 
@@ -897,7 +1028,7 @@ begin
    -- via dma_on and drained via CPU_bus_idle before the grant)
    mbus_adr  <= dmab_adr  when dma_bus_on = '1' else cpu9_adr;
    mbus_rnw  <= dmab_rnw  when dma_bus_on = '1' else cpu9_rnw;
-   mbus_ena  <= dmab_ena  when dma_bus_on = '1' else cpu9_ena;
+   mbus_ena  <= dmab_ena_i9 when dma_bus_on = '1' else cpu9_ena;
    mbus_code <= '0'       when dma_bus_on = '1' else cpu9_code;
    mbus_acc  <= dmab_acc  when dma_bus_on = '1' else cpu9_acc;
    mbus_dout <= dmab_dout when dma_bus_on = '1' else cpu9_dout;
@@ -942,7 +1073,7 @@ begin
    )
    port map
    (
-      clk       => clk1x,
+      clk       => clk2x,
       ce_a      => '1',
       addr_a    => to_integer(itcm_addr),
       datain_a0 => itcm_writedata( 7 downto  0),
@@ -971,7 +1102,7 @@ begin
    )
    port map
    (
-      clk       => clk1x,
+      clk       => clk2x,
       ce_a      => '1',
       addr_a    => to_integer(dtcm_addr),
       datain_a0 => dtcm_writedata( 7 downto  0),

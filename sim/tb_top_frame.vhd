@@ -59,7 +59,9 @@ entity tb_top_frame is
       -- race in nds_mainram / nds_cache9 that needs a long, *variable* main-RAM
       -- op to open its window is therefore unreachable in simulation. >0 adds
       -- that many clkMem cycles plus 0..15 of jitter to each op.
-      MEM_LAT    : integer := 0
+      MEM_LAT    : integer := 0;
+      -- >0: print a cumulative ARM9 memory-path cycle histogram every N clk1x
+      CYCLE_HIST : integer := 0
    );
 end entity;
 
@@ -73,6 +75,7 @@ architecture sim of tb_top_frame is
    end function;
 
    signal clk1x       : std_logic := '0';
+   signal clk2x       : std_logic := '0';
    signal clkMem      : std_logic := '0';
    signal clkMemIndex : unsigned(1 downto 0) := "10";
    signal reset       : std_logic := '1';
@@ -248,6 +251,24 @@ begin
    -- ================= clocks (3 clkMem phases per clk1x, tb_dual_boot idiom) =================
    clkMem <= not clkMem after 5 ns when not tests_done else '0';
 
+   -- clk2x: exactly 2x clk1x with COINCIDENT rising edges, matching the PLL on
+   -- hardware (outclk_1 = 2 x outclk_2, same VCO, 0 ps). clk1x rises at 5 ns and
+   -- every 30 ns after (3 clkMem phases of 10 ns), so clk2x rises at 5 ns and
+   -- every 15 ns. Not derivable from clkMem: 2x clk1x is 2/3 of clkMem.
+   p_clk2x : process
+   begin
+      clk2x <= '0';
+      wait for 5 ns;
+      while not tests_done loop
+         clk2x <= '1';
+         wait for 7500 ps;
+         clk2x <= '0';
+         wait for 7500 ps;
+      end loop;
+      clk2x <= '0';
+      wait;
+   end process;
+
    process (clkMem)
    begin
       if rising_edge(clkMem) then
@@ -280,7 +301,7 @@ begin
    )
    port map
    (
-      clk1x => clk1x, clkMem => clkMem, clkMemIndex => clkMemIndex,
+      clk1x => clk1x, clk2x => clk2x, clkMem => clkMem, clkMemIndex => clkMemIndex,
       reset => reset, nds_on => '1',
       direct_boot => itosl(DIRECT),
       KeyA => '0', KeyB => '0', KeySelect => '0', KeyStart => '0',
@@ -477,6 +498,49 @@ begin
       wait;
    end process;
 
+   -- ============ ARM9 memory-path cycle histogram (CYCLE_HIST /= 0) ============
+   -- Where do the ARM9's cycles actually go? Measured CPI is 2.65 against the
+   -- ARM7's 1.12, and guessing at which subsystem burns them has cost several
+   -- build rounds. This counts clk1x cycles per nds_cache9 state (and the
+   -- membus9 state) straight off nds_top's dbg_probe word, using the same
+   -- external-name trick as the palette/OAM taps above - so it is sim-only and
+   -- needs no RTL change. Prints a running cumulative table; the last one wins.
+   gcycles : if CYCLE_HIST /= 0 generate
+   begin
+      process
+         alias a_probe is << signal .tb_top_frame.idut.dbg_probe : std_logic_vector(31 downto 0) >>;
+         type t_hist is array (0 to 15) of natural;
+         variable ch, mh  : t_hist := (others => 0);
+         variable n       : natural := 0;
+         constant CNAME : string := "IDLE      REQ_LOOKUPOP_LOOKUP HIT_RESP  BYPASS_ISSBYPASS_WAIWB_PREP   WB_BEAT   WB_WAIT   FILL_BEAT FILL_WAIT OP_FINISH ";
+      begin
+         loop
+            -- island clock: cache9 and membus9 moved to clk2x with the ARM9
+            wait until rising_edge(clk2x);
+            ch(to_integer(unsigned(a_probe(3 downto 0))))  := ch(to_integer(unsigned(a_probe(3 downto 0)))) + 1;
+            mh(to_integer(unsigned(a_probe(10 downto 8)))) := mh(to_integer(unsigned(a_probe(10 downto 8)))) + 1;
+            n := n + 1;
+            if (n mod CYCLE_HIST = 0) then
+               report "=== ARM9 memory-path cycles after " & integer'image(n) & " clk1x ===";
+               for s in 0 to 11 loop
+                  if (ch(s) /= 0) then
+                     report "  cache9 " & CNAME(s*10 + 1 to s*10 + 10) & " " &
+                            integer'image(ch(s)) & "  (" &
+                            integer'image(ch(s) * 100 / n) & "%)";
+                  end if;
+               end loop;
+               for s in 0 to 5 loop
+                  if (mh(s) /= 0) then
+                     report "  membus9 state " & integer'image(s) & ": " &
+                            integer'image(mh(s)) & "  (" &
+                            integer'image(mh(s) * 100 / n) & "%)";
+                  end if;
+               end loop;
+            end if;
+         end loop;
+      end process;
+   end generate;
+
    -- ================= ARM9 trace writer (TRACEFILE /= "") =================
    -- Same line format as tb_arm9_trace / melonds_tracer (docs/TRACE_DIFF.md):
    -- <pc> <opcode> <cpsr> <r0>..<r14>, one line per retired instruction.
@@ -489,7 +553,10 @@ begin
       begin
          file_open(tf, TRACEFILE, write_mode);
          loop
-            wait until rising_edge(clk1x);
+            -- clk2x, not clk1x: the ARM9 is in the 67 MHz island, so half its
+            -- retires land on island cycles that clk1x never sees. Sampling on
+            -- clk1x here silently produced an EMPTY ARM9 trace.
+            wait until rising_edge(clk2x);
             if (dbg_export9_done = '1' and dump_frame_index >= TRACE_START_FRAME) then
                write(l, to_hstring(dbg_export9.pc));
                write(l, ' ');

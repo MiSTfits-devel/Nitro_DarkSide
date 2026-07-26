@@ -511,10 +511,17 @@ begin
 
                      if (dhit) then
                         if (r_rnw = '1') then
-                           resp_way   <= hway;
-                           resp_use_d <= '1';
+                           -- D-cache READ hit: same one-cycle answer as the
+                           -- I-side above. dd_q is valid here too (dd_raddr
+                           -- follows req_addr outside the writeback states).
+                           resp_done  <= '1';
+                           resp_rdata <= dd_q(hway);
                            resp_use_i <= '0';
+                           resp_use_d <= '0';
+                           state      <= IDLE;
                         else
+                           -- WRITE hit keeps HIT_RESP: that is the cycle in
+                           -- which dwr_pend drives the port-B line update.
                            dwr_pend <= '1';
                            dwr_way  <= hway;
                            dwr_addr <= dset*8 + to_integer(unsigned(r_addr(4 downto 2)));
@@ -523,8 +530,8 @@ begin
                            ddirty(hway*32 + dset) <= '1';
                            resp_use_i <= '0';
                            resp_use_d <= '0';
+                           state    <= HIT_RESP;
                         end if;
-                        state <= HIT_RESP;
                      elsif (r_rnw = '0') then
                         state <= BYPASS_ISSUE;
                      else

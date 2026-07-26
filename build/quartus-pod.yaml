@@ -41,6 +41,12 @@ spec:
           "update_timing_netlist" \
           "report_timing -setup -npaths 50 -detail full_path -file output_files/NDS.paths.rpt" \
           "report_timing -setup -npaths 3000 -less_than_slack 14.92 -detail summary -file output_files/NDS.paths_67mhz.rpt" \
+          "set a9 [get_registers {*icpu9*}]" \
+          "set m9 [get_registers {*imembus9*}]" \
+          "report_timing -setup -npaths 40 -detail summary -from \$a9 -to \$a9 -file output_files/NDS.paths_cpu9.rpt" \
+          "report_timing -setup -npaths 40 -detail summary -from \$m9 -to \$m9 -append -file output_files/NDS.paths_cpu9.rpt" \
+          "report_timing -setup -npaths 40 -detail summary -from \$a9 -to \$m9 -append -file output_files/NDS.paths_cpu9.rpt" \
+          "report_timing -setup -npaths 40 -detail summary -from \$m9 -to \$a9 -append -file output_files/NDS.paths_cpu9.rpt" \
           "project_close" > paths.tcl
         quartus_sta -t paths.tcl || true
         echo ${rc} > /work/exitcode

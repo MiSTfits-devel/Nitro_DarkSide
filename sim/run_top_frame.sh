@@ -32,6 +32,8 @@ FW_LAT="${FW_LAT:-0}"
 # Real ddram ch2 is longer and variable; arbiter races in nds_mainram/nds_cache9
 # need that variability to be reachable at all.
 MEM_LAT="${MEM_LAT:-0}"
+# >0: cumulative ARM9 memory-path cycle histogram every N clk1x cycles
+CYCLE_HIST="${CYCLE_HIST:-0}"
 NVCHEAP="${NVCHEAP:-2g}"
 NVCOPT="${NVCOPT:--O2}"
 GPUCEDIV="${GPUCEDIV:-3}"
@@ -94,7 +96,7 @@ TRACEGEN=""
 [ -n "$TRACEFILE7" ] && TRACEGEN="$TRACEGEN -gTRACEFILE7=$TRACEFILE7"
 
 nvc -H "$NVCHEAP" -L "$WORK" --work="$WORK/work" -e "$NVCOPT" tb_top_frame \
-   -gCARD_WORDS="$CARDWORDS" -gCARD_LAT="$CARD_LAT" -gFW_LAT="$FW_LAT" -gMEM_LAT="$MEM_LAT" \
+   -gCARD_WORDS="$CARDWORDS" -gCARD_LAT="$CARD_LAT" -gFW_LAT="$FW_LAT" -gMEM_LAT="$MEM_LAT" -gCYCLE_HIST="$CYCLE_HIST" \
    -gGPUCEDIV="$GPUCEDIV" -gHEXFILE="$HEXFILE" -gFWFILE="$FWFILE" -gFRAMES="$FRAMES" -gTIMEOUT_MS="$TIMEOUT_MS" \
    -gDUMPFILE="$DUMPFILE" -gDUMPFILE_B="$DUMPFILE_B" -gDUMP_START_FRAME="$DUMP_START_FRAME" -gDIRECT="$DIRECT" \
    -gMAXINSTR="$MAXINSTR" -gTRACE_START_FRAME="$TRACE_START_FRAME" -gTRACE7_START_FRAME="$TRACE7_START_FRAME" -gDUMP_STATE="$DUMP_STATE" \

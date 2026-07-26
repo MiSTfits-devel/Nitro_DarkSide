@@ -203,13 +203,15 @@ assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 wire pll_locked;
 wire clk_mem;
 wire clk_sys;
+wire clk_video_67;   // 67.027964 MHz: video output AND the ARM9 island clock
+assign CLK_VIDEO = clk_video_67;
 
 pll pll
 (
 	.refclk(CLK_50M),
 	.rst(0),
 	.outclk_0(clk_mem),
-	.outclk_1(CLK_VIDEO),
+	.outclk_1(clk_video_67),
 	.outclk_2(clk_sys),
 	.locked(pll_locked)
 );
@@ -943,6 +945,11 @@ wire [7:0] touch_y = {~joystick_analog_0[15], joystick_analog_0[14:8]};
 nds_port_wrap nds
 (
 	.clk1x(clk_sys),
+	// PLL outclk_1, exactly 2x clk_sys from the same VCO at 0 ps. Clocks only the
+	// ARM9 island inside nds_top (core + membus + cache + TCMs); the real DS runs
+	// the ARM9 at 2x the ARM7 and having both at clk_sys breaks the IPCSYNC
+	// boot handshake. Same net as CLK_VIDEO.
+	.clk2x(clk_video_67),
 	.clkMem(clk_mem),
 	.clkMemIndex(clkMemIndex),
 	.reset(reset | bios_load_reset),
