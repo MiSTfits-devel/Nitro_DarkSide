@@ -673,6 +673,7 @@ begin
    boot_error <= '1' when boot_state = B_ERROR else '0';
 
    iloader : entity work.nds_loader
+   generic map ( is_simu => is_simu )
    port map
    (
       clk => clk1x, reset => reset_boot,
@@ -773,7 +774,10 @@ begin
             if (i9_wsh_ena  = '1') then cdc_req_wsh  <= not cdc_req_wsh;  end if;
             if (i9_vram_ena = '1') then cdc_req_vram <= not cdc_req_vram; end if;
             if (i9_mr_ena   = '1') then cdc_req_mr   <= not cdc_req_mr;   end if;
-            if (i9_io_ena   = '1') then cdc_req_io   <= not cdc_req_io;   end if;
+            -- membus9's IO request is a record field, not the (never-driven)
+            -- standalone signal this used to test - which silently killed every
+            -- ARM9 IO access across the bridge, IPCSYNC included.
+            if (i9_io_bus.ena = '1') then cdc_req_io <= not cdc_req_io; end if;
             if (i9_pal_we   = '1') then cdc_req_pal  <= not cdc_req_pal;  end if;
             if (i9_oam_we   = '1') then cdc_req_oam  <= not cdc_req_oam;  end if;
          end if;
@@ -1005,14 +1009,17 @@ begin
       dma_bus => dma_bus_on,
       cpu_adr => mbus_adr, cpu_rnw => mbus_rnw, cpu_ena => mbus_ena, cpu_code => mbus_code,
       cpu_acc => mbus_acc, cpu_dout => mbus_dout, cpu_lowbits => mbus_low,
-      cpu_lastread => cpu9_lastread, cpu_din => cpu9_din, cpu_done => cpu9_done_1x,
+      -- cpu_done stays island-native: membus9 and icpu9 are both on clk2x, so the
+      -- CPU's own handshake needs no crossing. The clk1x stretch below is only for
+      -- nds_dma9, which lives outside the island.
+      cpu_lastread => cpu9_lastread, cpu_din => cpu9_din, cpu_done => cpu9_done,
       itcm_addr => itcm_addr, itcm_we => itcm_we, itcm_be => itcm_be,
       itcm_writedata => itcm_writedata, itcm_readdata => itcm_readdata,
       dtcm_addr => dtcm_addr, dtcm_we => dtcm_we, dtcm_be => dtcm_be,
       dtcm_writedata => dtcm_writedata, dtcm_readdata => dtcm_readdata,
       brom_addr => brom_addr, brom_data => brom_data,
-      wsh_ena => wsh9_ena, wsh_rnw => wsh9_rnw, wsh_addr => wsh9_addr, wsh_be => wsh9_be,
-      wsh_din => wsh9_din, wsh_dout => wsh9_dout, wsh_done => wsh9_done, wsh_mapped => wsh9_mapped,
+      wsh_ena => i9_wsh_ena, wsh_rnw => wsh9_rnw, wsh_addr => wsh9_addr, wsh_be => wsh9_be,
+      wsh_din => wsh9_din, wsh_dout => wsh9_dout, wsh_done => i9_wsh_done, wsh_mapped => wsh9_mapped,
       vram_ena => i9_vram_ena, vram_rnw => vram9_rnw, vram_addr => vram9_addr, vram_be => vram9_be,
       vram_din => vram9_din, vram_dout => vram9_dout, vram_done => i9_vram_done,
       pal_we => i9_pal_we, pal_addr => pal_addr, pal_din => pal_din, pal_be => pal_be,
@@ -1055,7 +1062,9 @@ begin
       mb_lowbits   => dmab_low,
       mb_dout      => dmab_dout,
       mb_din       => cpu9_din,
-      mb_done      => cpu9_done,
+      -- nds_dma9 is outside the island (clk1x), so it needs the stretched form of
+      -- membus9's one-island-cycle done, not the raw signal.
+      mb_done      => cpu9_done_1x,
       irq_dma      => irq_dma9
    );
 

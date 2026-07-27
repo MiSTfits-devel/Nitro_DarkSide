@@ -513,12 +513,67 @@ begin
          variable ch, mh  : t_hist := (others => 0);
          variable n       : natural := 0;
          constant CNAME : string := "IDLE      REQ_LOOKUPOP_LOOKUP HIT_RESP  BYPASS_ISSBYPASS_WAIWB_PREP   WB_BEAT   WB_WAIT   FILL_BEAT FILL_WAIT OP_FINISH ";
+         -- JOINT counters. Counting the two FSMs independently produced the
+         -- headline anomaly of the last round - membus9 in W_MAIN 78% of cycles
+         -- while cache9 was busy only 37%, i.e. ~41% of all cycles apparently
+         -- spent waiting on an idle cache. Independent histograms cannot tell
+         -- "the cache already answered and membus9 has not moved yet" from
+         -- "the request was never issued", because they never sample the same
+         -- cycle. jc(s) does: for membus9 state s, how many of those cycles had
+         -- cache9 IDLE. wm_* then splits the W_MAIN+IDLE cell by cresp_done
+         -- (probe bit 13), which is exactly the term W_MAIN waits on:
+         --   cresp_done=1 -> handoff latency (cache done, membus still parked)
+         --   cresp_done=0 -> the request is not in flight anywhere: a real hole
+         variable jc      : t_hist := (others => 0);
+         variable wm_done, wm_stuck : natural := 0;
+         variable wm_ena  : natural := 0;
+         -- "the ARM9 issued nothing at all" diagnostics. A membus9 that never
+         -- leaves IDLE means the CPU never presented a request, which is a
+         -- different failure from a slow CPU and is invisible in the state
+         -- histograms. These count the three things that can hold the core off
+         -- the bus: reset, the debug-mailbox halt, and the DMA stealing the
+         -- membus (mbus_ena is muxed to the DMA whenever dma_bus_on is high).
+         alias a_rstcpu is << signal .tb_top_frame.idut.resetCpu  : std_logic >>;
+         alias a_hold9  is << signal .tb_top_frame.idut.dbg_hold9 : std_logic >>;
+         variable n_rst, n_hold, n_dmaon, n_cpuena : natural := 0;
+         -- Where the boot FSM stalls, if it does. resetCpu is only released in
+         -- B_RUN, and two states before it are terminal traps: B_RESET spins until
+         -- nds_on, and B_ERROR is entered on ld_error and never left - both leave
+         -- resetCpu asserted forever, which is indistinguishable from "the ARM9 is
+         -- slow" in every other counter here.
+         alias a_ndson  is << signal .tb_top_frame.idut.nds_on   : std_logic >>;
+         alias a_ldbusy is << signal .tb_top_frame.idut.ld_busy  : std_logic >>;
+         alias a_lddone is << signal .tb_top_frame.idut.ld_done  : std_logic >>;
+         alias a_lderr  is << signal .tb_top_frame.idut.ld_error : std_logic >>;
+         variable n_on, n_ldb, n_ldd, n_lde : natural := 0;
       begin
          loop
             -- island clock: cache9 and membus9 moved to clk2x with the ARM9
             wait until rising_edge(clk2x);
             ch(to_integer(unsigned(a_probe(3 downto 0))))  := ch(to_integer(unsigned(a_probe(3 downto 0)))) + 1;
             mh(to_integer(unsigned(a_probe(10 downto 8)))) := mh(to_integer(unsigned(a_probe(10 downto 8)))) + 1;
+            if (a_probe(3 downto 0) = "0000") then
+               jc(to_integer(unsigned(a_probe(10 downto 8)))) :=
+                  jc(to_integer(unsigned(a_probe(10 downto 8)))) + 1;
+               -- W_MAIN is membus9 state 4
+               if (a_probe(10 downto 8) = "100") then
+                  if (a_probe(13) = '1') then wm_done  := wm_done  + 1;
+                  else                        wm_stuck := wm_stuck + 1;
+                  end if;
+                  -- mem9_ena (probe bit 27): is a main-RAM op live on the
+                  -- clk1x side while both island FSMs look idle? That is the
+                  -- signature of the bridge, not of either FSM.
+                  if (a_probe(27) = '1') then wm_ena := wm_ena + 1; end if;
+               end if;
+            end if;
+            if (a_rstcpu     = '1') then n_rst    := n_rst    + 1; end if;
+            if (a_hold9      = '1') then n_hold   := n_hold   + 1; end if;
+            if (a_probe(31)  = '1') then n_dmaon  := n_dmaon  + 1; end if;
+            if (a_probe(24)  = '1') then n_cpuena := n_cpuena + 1; end if;
+            if (a_ndson      = '1') then n_on  := n_on  + 1; end if;
+            if (a_ldbusy     = '1') then n_ldb := n_ldb + 1; end if;
+            if (a_lddone     = '1') then n_ldd := n_ldd + 1; end if;
+            if (a_lderr      = '1') then n_lde := n_lde + 1; end if;
             n := n + 1;
             if (n mod CYCLE_HIST = 0) then
                report "=== ARM9 memory-path cycles after " & integer'image(n) & " clk1x ===";
@@ -533,9 +588,24 @@ begin
                   if (mh(s) /= 0) then
                      report "  membus9 state " & integer'image(s) & ": " &
                             integer'image(mh(s)) & "  (" &
-                            integer'image(mh(s) * 100 / n) & "%)";
+                            integer'image(mh(s) * 100 / n) & "%)" &
+                            "  of which cache9 IDLE: " & integer'image(jc(s)) &
+                            "  (" & integer'image(jc(s) * 100 / n) & "% of all)";
                   end if;
                end loop;
+               report "  W_MAIN & cache9 IDLE split: cresp_done=1 (handoff) " &
+                      integer'image(wm_done) & "  cresp_done=0 (not in flight) " &
+                      integer'image(wm_stuck) & "  mem9_ena=1 (bridge in flight) " &
+                      integer'image(wm_ena);
+               report "  ARM9 off-bus holds: resetCpu " & integer'image(n_rst) &
+                      "  dbg_hold9 " & integer'image(n_hold) &
+                      "  dma_bus_on " & integer'image(n_dmaon) &
+                      "  cpu9_ena " & integer'image(n_cpuena) &
+                      "   (of " & integer'image(n) & " cycles)";
+               report "  boot: nds_on " & integer'image(n_on) &
+                      "  ld_busy " & integer'image(n_ldb) &
+                      "  ld_done " & integer'image(n_ldd) &
+                      "  ld_error " & integer'image(n_lde);
             end if;
          end loop;
       end process;

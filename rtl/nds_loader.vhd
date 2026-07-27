@@ -37,6 +37,17 @@ use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
 
 entity nds_loader is
+   generic
+   (
+      -- '1' skips the 4 MB main-RAM clear pass. That pass exists for hardware,
+      -- where SDRAM comes up holding garbage and the SDK's read-before-write
+      -- (the cartridge lock via SWP) then latches nonsense. Every simulation
+      -- main-RAM model already powers up all-zero, so in simulation the pass is
+      -- a no-op that costs ~1M word writes - well over a hundred milliseconds of
+      -- simulated time before the CPUs are even released, which is most of the
+      -- cost of every boot-length run. Skipping it changes no simulated state.
+      is_simu     : std_logic := '0'
+   );
    port
    (
       clk         : in  std_logic;
@@ -193,7 +204,11 @@ begin
                      done  <= '0';
                      hdr_i <= 0;
                      clr_i <= (others => '0');
-                     state <= CLR_WR;
+                     if (is_simu = '1') then
+                        state <= HDR_REQ;      -- model RAM is already zero
+                     else
+                        state <= CLR_WR;
+                     end if;
                   end if;
 
                -- Zero main RAM first, then stage the images over the top of it.

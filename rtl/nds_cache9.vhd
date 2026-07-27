@@ -50,6 +50,13 @@ entity nds_cache9 is
       req_addr      : in  std_logic_vector(31 downto 0);
       req_be        : in  std_logic_vector(3 downto 0);
       req_wdata     : in  std_logic_vector(31 downto 0);
+      -- The CPU's live address, one cycle AHEAD of req_addr: the membus
+      -- registers req_* on the edge it accepts, so req_addr only becomes valid
+      -- the cycle after the CPU presented it. Indexing the tag/data BRAMs off
+      -- this instead spends that otherwise-idle cycle on the lookup read, which
+      -- is what lets a read hit answer in 2 cycles instead of 3. Speculative and
+      -- unqualified on purpose - a wrong index just reads a line nobody uses.
+      spec_addr     : in  std_logic_vector(31 downto 0);
       resp_done     : out std_logic := '0';
       resp_rdata    : out std_logic_vector(31 downto 0) := (others => '0');
 
@@ -129,6 +136,26 @@ architecture arch of nds_cache9 is
    signal wb_way   : integer range 0 to 3 := 0;
    signal wb_raddr : integer range 0 to 255 := 0;
 
+   -- Speculative-index bookkeeping. spec_sel is the cycle in which the BRAM read
+   -- address came from spec_addr rather than from a request already in flight;
+   -- spec_ok is that fact delayed by one edge, i.e. "the tags now on it_q/dt_q
+   -- belong to whatever the CPU was presenting last cycle". Since the membus
+   -- registers req_addr from the same CPU address on the same edge, spec_ok = '1'
+   -- together with req_ena = '1' proves the latched tags are this request's.
+   signal spec_sel : std_logic := '0';
+   signal spec_ok  : std_logic := '0';
+
+   -- One shared 4-way comparator set, address-muxed between the early lookup
+   -- (IDLE, comparing req_addr) and the normal one (REQ_LOOKUP, comparing the
+   -- registered r_addr). Hoisted out of the FSM process deliberately: a second
+   -- private comparator in the IDLE branch would cost ALMs, and this device is
+   -- already the binding constraint.
+   signal cmp_addr : std_logic_vector(31 downto 0);
+   signal ihit_c   : std_logic;
+   signal dhit_c   : std_logic;
+   signal ihway_c  : integer range 0 to 3;
+   signal dhway_c  : integer range 0 to 3;
+
    type t_state is
    (
       IDLE,
@@ -201,12 +228,52 @@ begin
    -- At IDLE, select the address of the operation that wins arbitration.
    -- The per-way synchronous tag outputs are consumed in REQ_LOOKUP or
    -- OP_LOOKUP on the following edge.
+   -- spec_sel: IDLE with nothing already in flight, so the read port is free to
+   -- prefetch the tags of the address the CPU is presenting right now.
+   spec_sel <= '1' when (state = IDLE and op_ena = '0' and op_pending = '0' and
+                         req_ena = '0' and req_pending = '0') else '0';
+
    it_raddr <= to_integer(unsigned(op_addr(10 downto 5))) when (state = IDLE and op_ena = '1') else
                to_integer(unsigned(p_addr(10 downto 5))) when (state = IDLE and op_pending = '1') else
+               to_integer(unsigned(spec_addr(10 downto 5))) when (spec_sel = '1') else
                to_integer(unsigned(req_addr(10 downto 5)));
    dt_raddr <= to_integer(unsigned(op_addr(9 downto 5))) when (state = IDLE and op_ena = '1') else
                to_integer(unsigned(p_addr(9 downto 5))) when (state = IDLE and op_pending = '1') else
+               to_integer(unsigned(spec_addr(9 downto 5))) when (spec_sel = '1') else
                to_integer(unsigned(req_addr(9 downto 5)));
+
+   -- Shared hit resolution. In IDLE the candidate is the incoming req_addr (whose
+   -- tags spec_sel prefetched last cycle); everywhere else it is r_addr, which is
+   -- what REQ_LOOKUP has always compared.
+   cmp_addr <= req_addr when (state = IDLE) else r_addr;
+
+   process (all)
+      variable s : integer range 0 to 63;
+   begin
+      ihit_c  <= '0';
+      ihway_c <= 0;
+      s := to_integer(unsigned(cmp_addr(10 downto 5)));
+      for w in 0 to 3 loop
+         if (ivalid(w*64 + s) = '1' and it_q(w)(20 downto 0) = cmp_addr(31 downto 11)) then
+            ihit_c  <= '1';
+            ihway_c <= w;
+         end if;
+      end loop;
+   end process;
+
+   process (all)
+      variable s : integer range 0 to 31;
+   begin
+      dhit_c  <= '0';
+      dhway_c <= 0;
+      s := to_integer(unsigned(cmp_addr(9 downto 5)));
+      for w in 0 to 3 loop
+         if (dvalid(w*32 + s) = '1' and dt_q(w)(21 downto 0) = cmp_addr(31 downto 10)) then
+            dhit_c  <= '1';
+            dhway_c <= w;
+         end if;
+      end loop;
+   end process;
 
    it_waddr <= to_integer(unsigned(r_addr(10 downto 5)));
    dt_waddr <= to_integer(unsigned(r_addr(9 downto 5)));
@@ -228,8 +295,10 @@ begin
    -- request's set/word (the membus holds req_addr stable until resp_done,
    -- so the capture at the lookup edge is the wanted word of every way);
    -- during WB states it follows the writeback cursor instead.
-   id_raddr <= to_integer(unsigned(req_addr(10 downto 2)));
+   id_raddr <= to_integer(unsigned(spec_addr(10 downto 2))) when (spec_sel = '1')
+          else to_integer(unsigned(req_addr(10 downto 2)));
    dd_raddr <= wb_raddr when (state = WB_PREP or state = WB_BEAT or state = WB_WAIT)
+          else to_integer(unsigned(spec_addr(9 downto 2))) when (spec_sel = '1')
           else to_integer(unsigned(req_addr(9 downto 2)));
 
    -- Port B: writes. A pended write hit (during HIT_RESP) or a fill beat.
@@ -391,8 +460,10 @@ begin
          mem_ena   <= '0';
          resp_done <= '0';
          dwr_pend  <= '0';
+         spec_ok   <= spec_sel;
 
          if (reset = '1') then
+            spec_ok     <= '0';
             state       <= IDLE;
             ivalid      <= (others => '0');
             dvalid      <= (others => '0');
@@ -463,21 +534,44 @@ begin
 
                      if (req_cacheable = '0') then
                         state <= BYPASS_ISSUE;
+                     elsif (spec_ok = '1' and req_pending = '0' and
+                            ((req_code = '1' and ihit_c = '1') or
+                             (req_code = '0' and dhit_c = '1' and req_rnw = '1'))) then
+                        -- Early read hit: spec_sel prefetched this address's tags
+                        -- last cycle, so the lookup REQ_LOOKUP would have done next
+                        -- cycle is already resolvable. Answer now and stay in IDLE,
+                        -- which also leaves the read port free to prefetch the
+                        -- following access - back-to-back hits settle at 2 cycles
+                        -- per access instead of 3.
+                        --
+                        -- Hits only. A miss falls through to REQ_LOOKUP below and
+                        -- costs exactly what it always did (the mux re-presents
+                        -- req_addr this cycle, so its tags are valid there as
+                        -- before); duplicating the fill/writeback setup here would
+                        -- buy one cycle on misses for a lot of logic. Write hits
+                        -- likewise still take HIT_RESP, where the line update is
+                        -- issued on port B.
+                        resp_done  <= '1';
+                        resp_use_i <= '0';
+                        resp_use_d <= '0';
+                        if (req_code = '1') then
+                           resp_rdata <= id_q(ihway_c);
+                        else
+                           resp_rdata <= dd_q(dhway_c);
+                        end if;
                      else
                         state <= REQ_LOOKUP;
                      end if;
                   end if;
 
                when REQ_LOOKUP =>
+                  -- Hit resolution comes from the shared comparator above, which
+                  -- in this state compares r_addr - the same thing this branch
+                  -- used to compute inline with its own 4-way compare.
                   if (r_code = '1') then
                      iset := to_integer(unsigned(r_addr(10 downto 5)));
-                     ihit := false;
-                     for w in 0 to 3 loop
-                        if (ivalid(w*64 + iset) = '1' and it_q(w)(20 downto 0) = r_addr(31 downto 11)) then
-                           hway := w;
-                           ihit := true;
-                        end if;
-                     end loop;
+                     ihit := (ihit_c = '1');
+                     hway := ihway_c;
                      if (ihit) then
                         -- I-cache read hit: answer in THIS cycle instead of
                         -- spending a HIT_RESP cycle. id_q is already valid here
@@ -501,13 +595,8 @@ begin
                      end if;
                   else
                      dset := to_integer(unsigned(r_addr(9 downto 5)));
-                     dhit := false;
-                     for w in 0 to 3 loop
-                        if (dvalid(w*32 + dset) = '1' and dt_q(w)(21 downto 0) = r_addr(31 downto 10)) then
-                           hway := w;
-                           dhit := true;
-                        end if;
-                     end loop;
+                     dhit := (dhit_c = '1');
+                     hway := dhway_c;
 
                      if (dhit) then
                         if (r_rnw = '1') then
