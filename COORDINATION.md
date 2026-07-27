@@ -1752,3 +1752,81 @@ DESIGN DECISION YOU OWN (document rationale here before implementing):
   * `MISTER_DEBUG_NOHDMI` does NOT remove video - the analog path still outputs,
     and the user can see those builds fine. It only drops ascal + pll_hdmi
     (98% -> 87% ALMs). Earlier notes implying "no video" were wrong.
+- 2026-07-26 sole agent: **the IPCSYNC ratio blocker is cleared - 0.42 -> 2.86,
+  and both CPUs are instruction-exact against the oracle for ~1.29M / 231k
+  instructions.** The remaining failure is a *narrow timing miss at the handshake*,
+  not a throughput gap, and it is now located to a single instruction.
+  * **The island as committed in 663cb6c never compiled.** Quartus rejected it
+    (error 10028) and that commit's claim of "compiles and analyses clean" was
+    simply false - no fitter had ever run. Fixing it exposed two more bugs of the
+    same species, none of which nvc can see (`std_logic` resolves multiple drivers
+    silently; an undriven signal just reads `'U'`):
+      1. `imembus9`'s `wsh_ena`/`wsh_done` still bound to the clk1x
+         `wsh9_ena`/`wsh9_done`, so the bridge and the membus both drove
+         `wsh9_ena`. This was the reported error, and the ARM9's shared-WRAM path
+         was never bridged at all.
+      2. `cpu9_done` / `cpu9_done_1x` **ends swapped**: membus9 drove the clk1x
+         name while `icpu9`, `nds_dma9` and the toggle process all read the island
+         name, which nothing drove. The CPU would wait on `'U'` forever. Both
+         membus9 and icpu9 are on clk2x, so that handshake needs no crossing;
+         only `nds_dma9` needs the stretched form.
+      3. `i9_io_ena` declared and read by the bridge but never driven - the request
+         is the record field `i9_io_bus.ena`. **Every ARM9 IO access across the
+         bridge was silently dropped, IPCSYNC included.**
+    Found by auditing all ~25 crossing signals for exactly one driver, after the
+    first one cost a full build. Do that audit after any domain split; it is a
+    one-minute shell loop against a 25-minute fitter round trip.
+  * **`ld_busy` before conclusions.** A histogram showing `cache9 IDLE 100%` /
+    `membus9 IDLE 100%` over 4M cycles with `resetCpu` high throughout does NOT
+    mean a dead CPU - it means the loader is still copying, which is what a healthy
+    design does at 60 ms. I called the island dead on exactly that evidence and was
+    wrong. The joint histogram now prints `nds_on`/`ld_busy`/`ld_done`/`ld_error`
+    and the off-bus holds (`resetCpu`/`dbg_hold9`/`dma_bus_on`/`cpu9_ena`).
+  * **PRELOAD=1 (commit ffaf373) is what made any of this measurable.** The loader
+    stages 443,230 words (~70 ms of simulated time, ~1 hour of wall clock) before
+    the CPUs are released. The bench now writes those sections into the SDRAM model
+    directly and `nds_top`'s `skip_copy` generic skips the copy passes: loader busy
+    4.7M cycles -> 2,084, boot done at ~31 us. Steady-state memory timing is
+    untouched, so CPI/ratio numbers stay comparable. **`TRACE_START_FRAME=-1` is
+    required to trace from instruction 0** - the gate is `dump_frame_index >=
+    TRACE_START_FRAME` and that starts at -1, only reaching 0 after the first
+    vblank (~17 ms), so any shorter run silently writes an empty trace.
+  * **The joint histogram killed the old W_MAIN anomaly.** Sampling both FSMs on
+    the same edge shows the "membus9 in W_MAIN 78% while cache9 busy 37%" reading
+    was an artifact of two independent histograms that never observed one cycle
+    twice. `membus9` does not rest in W_MAIN (it falls to IDLE when no request is
+    pending, `nds_membus9.vhd:360`), so W_MAIN really is waiting - and the
+    W_MAIN+cache-IDLE cells split almost exactly 50/50 on `cresp_done`, which is
+    the signature of the normal 2-cycle hit handoff, not a lost request.
+  * **Speculative cache index** (`nds_cache9.spec_addr`): the tag/data BRAMs were
+    addressed off `req_addr`, which membus9 registers on the accept edge, so the
+    lookup started a cycle late and a read hit cost 3 cycles end to end. They now
+    index off the CPU's live address, so a hit answers in 2. Hits only - a miss
+    falls through to REQ_LOOKUP and costs what it always did, which avoids
+    duplicating the fill/writeback setup. The 4-way compare is hoisted out of the
+    FSM and shared, address-muxed, so this moves logic rather than adding a second
+    comparator.
+  * **Area is not the binding constraint, correcting the 1949f3d ledger line.** The
+    deployed core is **86% ALMs** (36,133 / 41,910), RAM 85%, DSP 84%. The "125%"
+    figure was a debug-export measurement build, fixed by cf59e21.
+  * **Where it still fails, exactly.** ARM7 instruction **231,344**,
+    `037febac ldrh r0,[r8]` with r8 = `0x04000180`: we read `0x0800`, the oracle
+    reads `0x0808`. Own out nibble matches (8); the ARM9's echo nibble is 0 where
+    it should be 8 - the ARM9 has not echoed yet at that instant. The ARM9 itself
+    is correct (1,293,260 instructions, zero divergence), so it does echo, just
+    later in simulated time. The ARM7 does **not** jam retrying: it never returns
+    to `037febac`, it leaves for an ARM7-BIOS delay loop at `0x00002F0C`.
+  * **Why the global ratio can be 2.67 and still miss.** The rates are not uniform.
+    The ARM9's crt0 bss clear (~27k stores over `0x0219EF98..0x02209560`) lands in
+    the pre-handshake window and runs entirely uncached, because a cacheable D
+    **write miss** correctly goes write-no-allocate to memory
+    (`nds_cache9.vhd:624`; ARM946E-S has no write-allocate) but **stalls the CPU
+    for the full ~11.5-cycle round trip**, where real hardware posts it through a
+    write buffer (`cp15_pu_wbuf`=0x02 enables buffering on main RAM). That is
+    ~310k cycles of pure stall in exactly the wrong place. Both CPUs are ~5x slower
+    than their true CPI here, and the ARM7 shares the blame path: its code lives at
+    `0x02380000`, so its fetches contend with the ARM9's uncached storm.
+  * Note the PU is on from the start, not later: oracle ARM9 instruction 48 writes
+    `cp15_control = 0x0005707D` (bit 0 PU, bit 2 D$, bit 12 I$). The boot value
+    `0x00012078` has bit 0 clear, and `bus_cacheable_*` is gated on it, which is
+    why the first ~48 instructions bypass everything.
