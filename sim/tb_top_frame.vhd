@@ -604,6 +604,16 @@ begin
          -- cycles with mem9_ena high are nds_mainram actually working (fix the
          -- memory path or post the writes instead of stalling on them).
          variable bw_tot, bw_mr_ena, bw_mem_ena, bw_mem_done, bw_idle : natural := 0;
+         -- Global main-RAM occupancy, split by which CPU it is serving, plus a
+         -- count of ops (MR_IDLE -> busy transitions). Divided by each CPU's
+         -- retired-instruction count from the traces this says whether the ARM7's
+         -- uncached fetch stream is issuing about one op per instruction (expected,
+         -- ARM7TDMI has no cache) or several (a fetch inefficiency worth fixing).
+         -- This is the term that decides the next optimisation: main RAM is busy
+         -- 70% of the ARM9's stall, so the path is bandwidth-bound, not latency-
+         -- bound, and only less traffic or more throughput helps.
+         variable mr_busy7, mr_busy9, mr_ops7, mr_ops9 : natural := 0;
+         variable mr_prev_busy : std_logic := '0';
       begin
          loop
             -- island clock: cache9 and membus9 moved to clk2x with the ARM9
@@ -632,15 +642,34 @@ begin
             if (a_ldbusy     = '1') then n_ldb := n_ldb + 1; end if;
             if (a_lddone     = '1') then n_ldd := n_ldd + 1; end if;
             if (a_lderr      = '1') then n_lde := n_lde + 1; end if;
-            -- cache9 BYPASS_WAIT is state code 5 in the low nibble
+            -- cache9 BYPASS_WAIT is state code 5 in the low nibble. Split by what
+            -- nds_mainram is doing on the same edge: probe(17:16) is its state
+            -- (MR_IDLE=0) and probe(19) is req9_pending. mem9_ena/mem9_done are
+            -- pulses, so counting "neither asserted" wrongly folds the SDRAM's own
+            -- latency into the bridge's - the mainram FSM state does not.
             if (a_probe(3 downto 0) = "0101") then
                bw_tot := bw_tot + 1;
-               if (a_probe(26) = '1') then bw_mr_ena   := bw_mr_ena   + 1; end if;
-               if (a_probe(27) = '1') then bw_mem_ena  := bw_mem_ena  + 1; end if;
-               if (a_probe(28) = '1') then bw_mem_done := bw_mem_done + 1; end if;
-               if (a_probe(27) = '0' and a_probe(25) = '0') then
-                  bw_idle := bw_idle + 1;   -- nothing in flight: bridge latency
+               if (a_probe(17 downto 16) /= "00") then
+                  bw_mem_ena := bw_mem_ena + 1;         -- mainram actually working
+               elsif (a_probe(19) = '1') then
+                  bw_mem_done := bw_mem_done + 1;       -- latched, awaiting arbitration
+               else
+                  bw_idle := bw_idle + 1;               -- mainram idle: bridge/protocol
                end if;
+               if (a_probe(21) = '1') then bw_mr_ena := bw_mr_ena + 1; end if;  -- serving7
+            end if;
+            if (a_probe(17 downto 16) /= "00") then
+               if (a_probe(21) = '1') then mr_busy7 := mr_busy7 + 1;
+               else                        mr_busy9 := mr_busy9 + 1;
+               end if;
+               if (mr_prev_busy = '0') then
+                  if (a_probe(21) = '1') then mr_ops7 := mr_ops7 + 1;
+                  else                        mr_ops9 := mr_ops9 + 1;
+                  end if;
+               end if;
+               mr_prev_busy := '1';
+            else
+               mr_prev_busy := '0';
             end if;
             n := n + 1;
             if (n mod CYCLE_HIST = 0) then
@@ -675,10 +704,14 @@ begin
                       "  ld_done " & integer'image(n_ldd) &
                       "  ld_error " & integer'image(n_lde);
                report "  BYPASS_WAIT split: total " & integer'image(bw_tot) &
-                      "  mr9_ena " & integer'image(bw_mr_ena) &
-                      "  mem9_ena " & integer'image(bw_mem_ena) &
-                      "  mem9_done " & integer'image(bw_mem_done) &
-                      "  nothing-in-flight(bridge) " & integer'image(bw_idle);
+                      "  mainram-working " & integer'image(bw_mem_ena) &
+                      "  latched-awaiting-arb " & integer'image(bw_mem_done) &
+                      "  mainram-IDLE(bridge/protocol) " & integer'image(bw_idle) &
+                      "  [serving7 " & integer'image(bw_mr_ena) & "]";
+               report "  mainram occupancy: arm7 " & integer'image(mr_busy7) &
+                      " cyc / " & integer'image(mr_ops7) & " ops   arm9 " &
+                      integer'image(mr_busy9) & " cyc / " & integer'image(mr_ops9) &
+                      " ops   (idle " & integer'image(n - mr_busy7 - mr_busy9) & ")";
             end if;
          end loop;
       end process;
