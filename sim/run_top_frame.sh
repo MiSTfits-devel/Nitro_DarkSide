@@ -34,10 +34,16 @@ FW_LAT="${FW_LAT:-0}"
 MEM_LAT="${MEM_LAT:-0}"
 # >0: cumulative ARM9 memory-path cycle histogram every N clk1x cycles
 CYCLE_HIST="${CYCLE_HIST:-0}"
+# 1: stage the ARM9/ARM7 main-RAM sections straight into the SDRAM model instead
+# of simulating nds_loader's word-by-word copy. Identical end state; removes
+# ~70 ms of simulated time (443k word copies for Kirby) from every boot.
+PRELOAD="${PRELOAD:-0}"
 NVCHEAP="${NVCHEAP:-2g}"
 NVCOPT="${NVCOPT:--O2}"
 GPUCEDIV="${GPUCEDIV:-3}"
-WORK=sim/nvc_work
+# overridable so a second run can analyse into its own library instead of
+# rewriting the one a long run in another shell is still executing from
+WORK="${WORK:-sim/nvc_work}"
 mkdir -p "$WORK"
 
 nvc --work="$WORK/altera_mf" -a --relaxed sim/altera_mf_stub.vhd
@@ -96,7 +102,7 @@ TRACEGEN=""
 [ -n "$TRACEFILE7" ] && TRACEGEN="$TRACEGEN -gTRACEFILE7=$TRACEFILE7"
 
 nvc -H "$NVCHEAP" -L "$WORK" --work="$WORK/work" -e "$NVCOPT" tb_top_frame \
-   -gCARD_WORDS="$CARDWORDS" -gCARD_LAT="$CARD_LAT" -gFW_LAT="$FW_LAT" -gMEM_LAT="$MEM_LAT" -gCYCLE_HIST="$CYCLE_HIST" \
+   -gCARD_WORDS="$CARDWORDS" -gCARD_LAT="$CARD_LAT" -gFW_LAT="$FW_LAT" -gMEM_LAT="$MEM_LAT" -gCYCLE_HIST="$CYCLE_HIST" -gPRELOAD="$PRELOAD" \
    -gGPUCEDIV="$GPUCEDIV" -gHEXFILE="$HEXFILE" -gFWFILE="$FWFILE" -gFRAMES="$FRAMES" -gTIMEOUT_MS="$TIMEOUT_MS" \
    -gDUMPFILE="$DUMPFILE" -gDUMPFILE_B="$DUMPFILE_B" -gDUMP_START_FRAME="$DUMP_START_FRAME" -gDIRECT="$DIRECT" \
    -gMAXINSTR="$MAXINSTR" -gTRACE_START_FRAME="$TRACE_START_FRAME" -gTRACE7_START_FRAME="$TRACE7_START_FRAME" -gDUMP_STATE="$DUMP_STATE" \
