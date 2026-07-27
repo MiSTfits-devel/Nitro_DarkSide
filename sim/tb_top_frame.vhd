@@ -597,6 +597,13 @@ begin
          alias a_lddone is << signal .tb_top_frame.idut.ld_done  : std_logic >>;
          alias a_lderr  is << signal .tb_top_frame.idut.ld_error : std_logic >>;
          variable n_on, n_ldb, n_ldd, n_lde : natural := 0;
+         -- Where do the ~11.5 cycles of a bypass access actually go? BYPASS_WAIT
+         -- is the single largest ARM9 cost once the PU is on, and the choice of
+         -- fix depends entirely on the split: cycles with mr9_ena/mr9_done low and
+         -- mem9_ena low are pure clk1x<->clk2x bridge latency (fix the bridge),
+         -- cycles with mem9_ena high are nds_mainram actually working (fix the
+         -- memory path or post the writes instead of stalling on them).
+         variable bw_tot, bw_mr_ena, bw_mem_ena, bw_mem_done, bw_idle : natural := 0;
       begin
          loop
             -- island clock: cache9 and membus9 moved to clk2x with the ARM9
@@ -625,6 +632,16 @@ begin
             if (a_ldbusy     = '1') then n_ldb := n_ldb + 1; end if;
             if (a_lddone     = '1') then n_ldd := n_ldd + 1; end if;
             if (a_lderr      = '1') then n_lde := n_lde + 1; end if;
+            -- cache9 BYPASS_WAIT is state code 5 in the low nibble
+            if (a_probe(3 downto 0) = "0101") then
+               bw_tot := bw_tot + 1;
+               if (a_probe(26) = '1') then bw_mr_ena   := bw_mr_ena   + 1; end if;
+               if (a_probe(27) = '1') then bw_mem_ena  := bw_mem_ena  + 1; end if;
+               if (a_probe(28) = '1') then bw_mem_done := bw_mem_done + 1; end if;
+               if (a_probe(27) = '0' and a_probe(25) = '0') then
+                  bw_idle := bw_idle + 1;   -- nothing in flight: bridge latency
+               end if;
+            end if;
             n := n + 1;
             if (n mod CYCLE_HIST = 0) then
                report "=== ARM9 memory-path cycles after " & integer'image(n) & " clk1x ===";
@@ -657,6 +674,11 @@ begin
                       "  ld_busy " & integer'image(n_ldb) &
                       "  ld_done " & integer'image(n_ldd) &
                       "  ld_error " & integer'image(n_lde);
+               report "  BYPASS_WAIT split: total " & integer'image(bw_tot) &
+                      "  mr9_ena " & integer'image(bw_mr_ena) &
+                      "  mem9_ena " & integer'image(bw_mem_ena) &
+                      "  mem9_done " & integer'image(bw_mem_done) &
+                      "  nothing-in-flight(bridge) " & integer'image(bw_idle);
             end if;
          end loop;
       end process;
