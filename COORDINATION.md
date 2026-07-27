@@ -1887,3 +1887,159 @@ DESIGN DECISION YOU OWN (document rationale here before implementing):
     executes **zero ADC/SBC**, so on its own it says nothing about the ALU change.
     `arm9_torture.hex` at 400,000 instructions covers it with 880 ADC/SBC-class
     and 7,185 LDM/STM retired. Both green.
+- 2026-07-27 sole agent (second pass): **the worst path was never an island path,
+  and the ARM9 datapath was carrying five barrel shifters it needed one of.**
+  Global worst −4.622 → **−2.499 ns**; island (clk2x) TNS −3838.2 → **−790.4**.
+  Every step trace-identical against HEAD on Kirby and on arm9_torture.
+  * **The handoff's timing section had the clocks backwards, and it mattered.**
+    `NDS.sta.summary` names PLL outputs, not clocks: `general[0]` is clkMem,
+    **`general[1]` is clk2x (67.028 MHz)** and **`general[2]` is clk1x (33.514)**
+    (`NDS.sv:213-215`). Quartus groups setup by the **latch** clock, so the
+    headline "−4.622 ns" was the *clk1x* domain — a clk2x → clk1x **crossing** —
+    while the island's own worst was −4.196 with **29x the TNS** (−3838 vs −133).
+    Reading it as "the ARM9 core misses by 4.6 ns" points at logic; reading it
+    correctly points at a CDC, which is what it was.
+  * **`mem9_lock` was 2,795 of the 2,999 failing endpoints — 93%, one wire.**
+    `nds_top.vhd` fed `cpu9_lock and not bus_cacheable_d` live from the island
+    into `nds_mainram`'s clk1x `req9_lock` flop, so a combinational path ran
+    register file → shifter → ALU → writeback mux → address mux → CP15 PU
+    compare → across the domain, 18.48 ns into a 14.915 ns relationship. It
+    never needed to: `req9_lock` only samples when `mem9_ena` is high, and that
+    is `mr9_ena`, the toggle edge-detect, which cannot fire until a clk1x edge
+    *after* the island raised `i9_mr_ena`. Latching the term in the island at
+    request launch gives the identical value with a full clk1x period to settle.
+    One flop. Domain worst −4.622 → −1.668, and the endpoint vanished.
+  * **Five shifters → one rotator.** LSL/LSR/ASR/ROR/RRX are all `v ror k` plus
+    an edge fill, and the amount, keep mask, fill source and carry index are
+    functions of `decode_shift_amount`/`_mode`/`_RRX` — registers — so none of
+    that decode belongs on the operand path. Worse, `decode_shift_amount` is
+    `integer range 0 to 255` (a register-specified shift may name any Rs[7:0])
+    and **Quartus sizes a variable shifter from the declared range, not the
+    reachable one**, so each of the four was EIGHT stages deep even though every
+    branch that uses one is guarded by `< 32`. Measured: shifter tail 4-5 LUT
+    levels → **2** (`RotateRight1~5/~9`), worst −3.400 → −2.499.
+  * **Proving a shifter rewrite is cheap — do it.** `sim/run_shifter_equiv.sh`
+    runs both formulations over amount 0..255 x 4 modes x RRX x carry-in x 72
+    values = **294,912 cases** in 0.3 s. It proves the algebra; the trace A/Bs
+    prove the RTL transcribes it. Neither alone is enough.
+  * **The PC-write address crossed four 32-bit muxes to reach the bus.**
+    `execute_writedata → execute_branchPC → branchPC_masked → bus_AddrFetch →
+    gb_bus_Adr`, 5.11 ns, 80% of it interconnect, every level re-selecting what
+    the one before it selected. Now it has a port on the last mux. Two traps:
+    the IRQ/software_interrupt exclusion (`execute_branch` puts the PC-write
+    case first, `execute_branchPC` puts the vectors first, so an exception that
+    also writes the PC must still take the vector), and **leaving the old term
+    in place buys nothing** — STA does not know the conditions are mutually
+    exclusive, so the long path is still reported and still routed. It had to
+    come out of `execute_branchPC`, with `bus_AddrFetch_eff` carrying the case
+    for `fetch_PC`'s advance and the savestate PC.
+  * **`dec_target = T_ITCM/T_DTCM` was an enum round trip on the live address.**
+    Quartus binary-encodes a 10-value combinational enum, so the region decode
+    encoded `itcm_hit`/`dtcm_hit` into 4 bits and `itcm_sel`/`dtcm_sel` decoded
+    them back. Second-worst endpoint in the design after `req9_lock` was the
+    DTCM store's M10K **write enable** at −4.196, reached exactly that way.
+    `dtcm_sel <= accept_now and cpu_ena and dtcm_hit and not itcm_hit` is the
+    same function by construction from the priority order.
+  * **Where the remaining time is** (build `artifacts-t2`, 16.672 ns): op2
+    register-file mux **5.67 ns split either side of the loop** (4.9 of it
+    interconnect), fetch_PC `+2/+4` adder 3.17, rotator + keep/fill 2.42, ALU
+    adder 2.08, `pcwrite_Addr`/`bus_AddrFetch_eff` 2.54, writedata mux 0.85.
+    The register file is now the biggest single item and it is a placement
+    problem, not a logic one — which makes **area the next lever**, and
+    `nds_sound` at 6,538 ALMs (larger than `nds_cpu9` at 5,676) the place to
+    look. Note build 2 is 91% ALMs *up* from build 1's 89%: the shifter merge
+    freed combinational area and retiming spent it on 784 more registers, which
+    was a good trade (TNS −2465 → −790).
+  * **An idea that is wrong, recorded so it is not tried again.** Moving the PU
+    cacheability compare onto the already-registered `creq_addr` looks free —
+    `creq_cacheable` is consumed the cycle *after* accept, so the value would be
+    identical. It is not free: `nds_cache9` uses `req_cacheable` to gate the
+    early-hit `resp_done` (`nds_cache9.vhd:535`), and `resp_done` feeds
+    `accept_now` → `cpu_done` → the CPU's whole execute stage. A 4-level cone in
+    front of it would add ~4.3 ns to the `cpu_done` family, i.e. trade one
+    failing family for a worse one. The compare stays on the live address;
+    only its width came down (bits 31:12, which is melonDS's own `PU_Map[addr >>
+    12]` granularity).
+  * **Two verification traps, both of which produced a green result that meant
+    nothing.** (a) `sim/run_arm9_trace.sh` defaults to `LOADADDR=0`, which means
+    "HEXFILE is the boot ROM at 0xFFFF0000". `arm9_torture.hex` is linked at
+    0x02000000, so without `LOADADDR=33554432` the run executes open-bus garbage
+    at 0x0000xxxx for all 400,000 instructions — and **both sides of an A/B
+    produce the same garbage and the same MD5**. Check the PC column spans the
+    ROM before believing a trace diff. (b) Even correctly loaded, the checked-in
+    torture ROM retired **2 register-specified shifts and zero PC writes** in
+    400k instructions — it could not see either of this session's cpu9 changes.
+    `gen_arm9_torture.py` now has `chunk_pcwrite` (mov/add/bx/ldr/ldm to PC,
+    including one through the shifter); the same 400k window then covers 26,667
+    register shifts, 17,777 RRX, 2,184 ALU→PC, 1,248 BX, 2,807 SWP, 34,944 Thumb.
+  * **`NDS.paths_cpu9.rpt` cannot tell you where a path spends its time** and
+    the handoff already said so. `build/quartus-pod.yaml` now also emits
+    `NDS.paths_fam.rpt`: the same four families with `-detail full_path`. It
+    paid for itself on the first read — the post-`req9_lock` worst path turned
+    out to run `cache9|resp_done → cpu_done → execute_writeback →
+    execute_writereg → pcwrite_fetch → gb_bus_Adr → dtcm_hit → dtcm_we → M10K`,
+    which no endpoint list would have shown, and 3.32 ns of it is the M10K's own
+    write-enable routing and setup.
+  * **Bundling fitter settings with RTL changes cost a build.** `artifacts-t3`
+    carried two RTL edits *and* `PLACEMENT_EFFORT_MULTIPLIER 3.0` +
+    `ROUTER_TIMING_OPTIMIZATION_LEVEL MAXIMUM`, and came out −2.499 → **−4.104**,
+    TNS −790 → −3356. The tell that it was the fitter and not the code: the new
+    worst endpoints were `dblsat` and `dsp_rb`, v5TE saturating-arithmetic logic
+    that no source change had been near. `artifacts-t4` reverted only the knobs
+    and recovered to −2.622. **More placer effort finds a different local
+    optimum, not a better one**, and at 91% utilisation the difference is 1.6 ns.
+    The QSF now carries that as a comment so it is not retried.
+  * **And the two RTL edits in t3 were themselves a wash.** t2 −2.499 / 37,971
+    ALMs vs t4 −2.622 / 38,306. The `adr_is_pcw` expansion - spelling out the
+    five-term AND instead of reusing `pcwrite_fetch`, to save a LUT level in
+    front of the address mux - duplicated the `execute_writereg = x"F"` compare,
+    and at 91% utilisation that is not free. Reverted. The TCM select
+    simplification is strictly less logic and was kept.
+  * **The clk1x domain was the same bug twice.** After `mem9_lock`, everything
+    still failing on clk1x was `io9_lat.Adr[5] -> nds_card|delay_cnt[*]` at
+    −1.959: `io9_lat` is a clk2x flop and the IO fabric was driven straight from
+    it, so every peripheral's address decode sat inside a clk2x → clk1x crossing
+    with 14.915 ns. Re-registering the payload onto clk1x before the fabric costs
+    no latency - `io9_ena` cannot rise before the clk1x edge that captures it -
+    and turns each peripheral decode back into a full-period clk1x path.
+    Verified with `bootreq` (`pass=0x5A5BDE7F`, unchanged) and the bench's
+    `IO9 path:` counter, which showed 363 island requests → 363 clk1x arrivals →
+    363 completions, none lost.
+  * **Result: two of three clock domains now pass.** `artifacts-t5` (seed 0, stock
+    settings): clk2x −2.535 / TNS −1415, **clk1x +1.584 / TNS 0**, clkMem +1.372 /
+    TNS 0. Baseline was clk2x −4.196 / −3838 and clk1x −4.622 / −133. Nothing
+    cross-domain remains in the failing set at all - the island's own datapath is
+    the whole of what is left.
+  * **The seed noise floor is ~0.5 ns.** Same netlist at seed 0 and seed 7:
+    −2.535 / TNS −1415 vs −3.046 / TNS −1612. So `t2`'s −2.499 and `t5`'s −2.535
+    are the same number, and no single-build comparison below half a nanosecond
+    means anything. Sweep seeds before believing a small win.
+  * **Next largest identifiable item, with a measurement behind it.** The worst
+    endpoint in t5 is the DTCM store's M10K write enable, 17.629 ns over 11
+    levels, and **3.46 ns of that is routing into the RAM plus its write-enable
+    setup** - 20% of the path, untouchable by logic work. Port B of both TCM
+    stores is unused (`ce_b => '0'`), so the write could move there registered,
+    buying a full cycle. The blocker is a read-after-write hazard: port A reads
+    combinationally off the live `cpu_adr`, membus9 accepts a new request in the
+    cycle it retires one, and mixed-port read-during-write on Cyclone V returns
+    old data. Needs a store-forward bypass (address compare + per-byte-enable
+    merge into the read data), which is a real piece of work.
+  * **CORRECTION to the two bullets above: the seed spread is 1.53 ns, and that
+    is larger than most of what was attributed.** `t5`'s identical netlist at
+    seeds 0 / 3 / 7 gives **−2.535 / −4.065 / −3.046**, TNS **−1415 / −3940 /
+    −1612**. At 90% utilisation with two thirds of the worst path in
+    interconnect, placement alone moves the answer more than any single cut in
+    this session did. So:
+      - **A single build cannot resolve a change under ~1.5 ns.** Three seeds
+        minimum before believing a per-change number - including the ones in the
+        progression table.
+      - The t3-vs-t4 gap (1.48 ns) is *inside* the spread. The honest claim about
+        `PLACEMENT_EFFORT_MULTIPLIER 3.0` is "did not help, cost build time,
+        churned the placement" - not "is harmful". The QSF comment says so now.
+      - What survives the noise: the clk2x total, −4.622 → −2.535 (2.09 ns), and
+        unambiguously **clk1x, −4.622 / TNS −133 → +1.584 / TNS 0 on all three
+        seeds**. A domain going from 133 ns of total violation to exactly zero is
+        not a placement accident.
+      - Seed 0 (the default) happened to be the best of the three. Before any
+        deploy, sweep - `SEED_OVERRIDE=n build/remote-build.sh` - as the
+        `artifacts-swp-seed*` builds already did once.
