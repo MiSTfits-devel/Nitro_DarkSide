@@ -254,8 +254,12 @@ architecture arch of nds_top is
    -- island-side copy of the IO bus record: nds_top rebuilds io_bus9 from it with
    -- the stretched enable substituted, since only .ena needs to cross
    signal i9_io_bus : proc_bus_gb_type;
-   -- island-side capture of the IO request payload, held across the bridge
-   signal io9_lat   : proc_bus_gb_type;
+   -- island-side capture of the IO request payload, held across the bridge,
+   -- and its clk1x re-registration (see io_bus9 below)
+   signal io9_lat    : proc_bus_gb_type;
+   signal io9_lat_1x : proc_bus_gb_type;
+   -- island-side capture of the main-RAM request's SWP lock bit (see mr9_lock)
+   signal mr9_lock  : std_logic := '0';
    signal io9_ena   : std_logic := '0';   -- stretched io_bus9.ena, clk1x domain
    signal cdc_dmab_ena_d, dmab_ena_i9   : std_logic := '0';
    signal cdc_cpudone_tgl, cdc_cpudone_tgl_d, cpu9_done_1x : std_logic := '0';
@@ -833,10 +837,60 @@ begin
       end if;
    end process;
 
-   io_bus9 <= (Din  => io9_lat.Din,  Adr  => io9_lat.Adr,
-               rnw  => io9_lat.rnw,  ena  => io9_ena,
-               acc  => io9_lat.acc,  bEna => io9_lat.bEna,
+   -- ...and then re-registered onto clk1x before it reaches the peripherals.
+   -- io9_lat is a clk2x flop, so driving the IO fabric straight from it left
+   -- every peripheral's address decode inside a clk2x -> clk1x crossing with
+   -- only 14.915 ns. That was the whole remaining clk1x failing family once
+   -- mem9_lock was fixed - `io9_lat.Adr[5] -> nds_card|delay_cnt[*]` at
+   -- -1.959 ns, the card's cycle-count decode hanging off the bridge.
+   --
+   -- Unconditional, and it costs no latency. io9_lat is written on the island
+   -- edge that toggles cdc_req_io, and io9_ena cannot rise before the clk1x
+   -- edge that first sees that toggle - the same edge this captures on - so the
+   -- payload is already valid in the cycle the enable is asserted. It also
+   -- cannot move underneath the access: membus9 has one IO transaction in
+   -- flight at a time and waits in W_IO_RESP for cdc_io_cpl, which is not
+   -- toggled until the end of the enable cycle.
+   process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         io9_lat_1x <= io9_lat;
+      end if;
+   end process;
+
+   io_bus9 <= (Din  => io9_lat_1x.Din,  Adr  => io9_lat_1x.Adr,
+               rnw  => io9_lat_1x.rnw,  ena  => io9_ena,
+               acc  => io9_lat_1x.acc,  bEna => io9_lat_1x.bEna,
                rst  => i9_io_bus.rst);
+
+   -- Main-RAM SWP lock, island -> clk1x. Same payload-latch reasoning as io9_lat
+   -- above, but this one was a *timing* bug rather than a functional one, and it
+   -- was the whole worst-path family: `cpu9_lock and not bus_cacheable_d` was
+   -- wired live into nds_mainram's mem9_lock, so nds_mainram's clk1x req9_lock
+   -- flop closed a combinational path that started at the ARM9's register file
+   -- and ran through the shifter, the ALU, the writeback mux, the address mux
+   -- and the CP15 PU region compare - 18.48 ns into a 14.915 ns clk2x->clk1x
+   -- relationship. All 50 paths in the global -npaths 50 report ended here.
+   --
+   -- Nothing about that was necessary. req9_lock only samples mem9_lock in the
+   -- clk1x cycle where mem9_ena is high, and mem9_ena is mr9_ena - the toggle
+   -- edge-detect above, which cannot fire until at least one clk1x edge AFTER
+   -- the island raised i9_mr_ena. Latching the term in the island at the instant
+   -- the request is launched therefore delivers the identical value with a full
+   -- clk1x period of settling, and turns the crossing into flop -> flop.
+   --
+   -- dma_bus_on / ld_busy stay live at the port: both are clk1x registers that
+   -- hold for the whole burst, so they cost one LUT and no cross-domain cone.
+   process (clk2x)
+   begin
+      if rising_edge(clk2x) then
+         if (resetCpu = '1') then
+            mr9_lock <= '0';
+         elsif (i9_mr_ena = '1') then
+            mr9_lock <= cpu9_lock and not bus_cacheable_d;
+         end if;
+      end if;
+   end process;
 
    -- Done narrow, clk1x -> clk2x. A 1-clk1x done is high for two clk2x cycles;
    -- edge-detect so the island's FSM sees exactly one.
@@ -1538,7 +1592,7 @@ begin
       clk1x => clk1x, clkMem => clkMem, clkMemIndex => clkMemIndex, reset => reset_boot,
       arm7_priority => exmem_prio7,
       mem9_ena => mem9_ena,
-      mem9_lock => cpu9_lock and not bus_cacheable_d and not dma_bus_on and not ld_busy,
+      mem9_lock => mr9_lock and not dma_bus_on and not ld_busy,
       mem9_rnw => mem9_rnw, mem9_addr => mem9_addr, mem9_be => mem9_be,
       mem9_writedata => mem9_writedata, mem9_done => mem9_done, mem9_readdata => mem9_readdata,
       mem7_ena => mr7_ena,
