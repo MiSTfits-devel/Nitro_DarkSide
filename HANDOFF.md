@@ -20,9 +20,9 @@ short and specific.
 | **DMA0** | **FIXED.** `bootreq` 0x5A5B9E7F → **0x5A5BDE7F**, a strict superset of the melonDS oracle (0x5A5BDC7F). |
 | **BIOS9 fetches** | **FIXED.** 15 of Kirby's first 28 were stale words. Now 650/650. |
 | Kirby in sim | Runs the full 90 ms, takes its first vblank IRQ, fills VRAM. No longer derails into ITCM. |
-| 67 MHz island timing | **FAILS.** `decode_RM_op2 → fetch_PC` = 20.9 ns in a 14.915 ns period. |
+| 67 MHz island timing | **STILL FAILS**, worst −4.622 ns (was −7.643). `decode_RM_op2` is no longer on the path — see the timing section, the old plan is void. |
 | Deployed on hardware | **Nothing from this session.** Do not deploy until timing closes. |
-| Area | 88% ALMs / 86% M10K / 84% DSP — fits, not the constraint |
+| Area | 91% ALMs / 86% M10K / 84% DSP — fits, not the constraint |
 
 Commits since `663cb6c`:
 
@@ -35,6 +35,9 @@ d5f0e32  ROOT CAUSE: latch the ARM9 IO payload   <-- WRONG, see 8051589
 8051589  Correction: the IO latch is NOT the root cause, and the timing verdict
 487427c  purpose-built iotest ROM
 4e93f3f  Fix ARM9 IO reads (W_IO_RESP) + bootreq subsystem suite
+0b11f58  DMA cacheability + BIOS9 onto clk2x
+d6a2d55  p_vidregs: report on change
+2b41fdb  ARM9 worst path: TCM compares and the ALU's second carry chain
 ```
 
 ---
@@ -205,23 +208,48 @@ branch.
 ## The timing blocker (independent of everything above)
 
 ```
-decode_RM_op2[*] -> fetch_PC[29]    data delay 20.9 ns, period 14.915, slack -6.7
-general[1] (clk2x, 67 MHz island)  -7.643
-general[2] (clk_sys, 33.5 MHz)     -7.020
-Fitter: Successful, 88% ALMs
+worst -4.622 ns in a 14.915 ns period       build/artifacts-alu2/
+  shiftresult_RRX[28] (retimed reg in the shifter) -> imainram|req9_lock
+Fitter: Successful, 91% ALMs
 ```
 
-Every worst path in the design is that one — the barrel-shifter operand feeding
-the fetch PC, i.e. operand → shifter → ALU → PC, the classic long path in a
-non-pipelined ARM. Report: `build/artifacts-island/NDS.paths_cpu9.rpt` (scoped to
-`icpu9`/`imembus9`; the global report ranks by slack and never reaches the CPU,
-which is how the "0 blocking paths" myth started).
+**`decode_RM_op2` is no longer on the critical path.** Earlier revisions of this
+document said pipelining it was the whole job; that is now void, and acting on it
+would buy nothing. Commit `2b41fdb` removed the two blocks of accidental logic
+that made it look dominant, and the launch point moved behind a register
+Quartus's physical synthesis placed inside the shifter — the register-file mux is
+now on the far side of that flop and is not counted.
 
-**Do not deploy the island to hardware until this closes.** A −7.6 ns core will
+Get the node-by-node budget before choosing a cut. The scoped report
+(`NDS.paths_cpu9.rpt`) is `-detail summary` and only gives endpoints; the global
+`NDS.paths.rpt` is `-detail full_path` and currently covers this path because it
+is the worst in the design. That breakdown is what showed the old model
+("operand → shifter → ALU → PC") was missing where the time actually went.
+
+Remaining 18.48 ns:
+
+| segment | ns |
+|---|---|
+| shifter tail | 5.95 (4.38 of it interconnect) |
+| ALU adder (one carry chain since `2b41fdb`) | 2.42 |
+| `execute_writedata` → `execute_branchPC` → `RESULT` | 5.11 |
+| `bus_cacheable_i` + `bus_cacheable_d` (PU compare) | 4.30 |
+| `imainram\|req9_lock` | 0.71 |
+
+All four reported families now sit in a −3.6…−4.6 band (they were −2.8…−4.5), so
+**there is no single dominant path left.** Expect the next fix to move the global
+worst by much less than it moves its own family — `2b41fdb` gained 0.5–0.64 ns on
+the two cpu9-rooted families and only 0.25 ns globally, because the membus9-rooted
+ones regressed by a similar amount as the fitter rebalanced.
+
+The mux chain is the cheapest-looking structural target left: 5.11 ns of pure
+muxing, `alu_result` → `execute_writedata` → `execute_branchPC` → `RESULT`, where
+the branch-PC case re-muxes a value the writedata mux already selected. The PU
+cacheability compare at 4.30 ns is the *regrown* version of the one already fixed
+once with the mask trick (see COORDINATION 2026-07-25), not a fresh target.
+
+**Do not deploy the island to hardware until this closes.** A −4.6 ns core will
 behave nondeterministically and generate evidence you then have to un-explain.
-
-The fix is pipelining that path in `nds_cpu9`. This is the substantial remaining
-engineering task.
 
 ### There is no timing-clean fallback: ISLAND=0 does not work
 
@@ -239,7 +267,7 @@ added since that comment was written: `cdc_req_io` toggles on `clk2x` and
 completion toggling back on `clk1x` (`:901`). Those handshakes were written
 against a 2:1 ratio and at least one of them does not survive 1:1.
 
-The consequence for planning: **pipelining `decode_RM_op2` is the only route to a
+The consequence for planning: **closing clk2x timing is the only route to a
 deployable core.** There is no "ship the 1x build meanwhile" option to fall back
 on, and anyone who assumes there is one will lose a day discovering this. If a 1x
 build is ever wanted as an escape hatch, it is its own project — auditing every
@@ -391,12 +419,18 @@ report inward to `0x02FFFF00`.
 
 ## Next steps, in order
 
-1. **Pipeline the worst path in `nds_cpu9`.** This is now the *only* thing between
-   here and a core that can run on hardware — see the ISLAND=0 note above for why
-   there is no fallback. Note the real ranking: `decode_RM_op2 → vram_din` at
-   −7.643 is the worst, `decode_RM_op2 → fetch_PC` at −6.705 is only third, and
-   there is a second independent family rooted at `io_bus.Adr`. Pipelining only
-   the path this document used to name would leave ≈ −7.1 on the table.
+1. **Close the remaining −4.622 ns on clk2x.** Still the *only* thing between here
+   and a core that can run on hardware — see the ISLAND=0 note above for why there
+   is no fallback. **Do not start from `decode_RM_op2`**; it is off the path since
+   `2b41fdb` and this list used to say otherwise. Read the budget table in the
+   timing section first, then pick a cut. Cheapest-looking is the 5.11 ns
+   `execute_writedata → execute_branchPC → RESULT` mux chain. Budget one build per
+   probe and expect the global worst to move less than the family does — the four
+   families are within 1 ns of each other now.
+   * Before spending a build on an inference, check it against the *previous*
+     build's `NDS.paths.rpt` rather than reasoning from the VHDL. Two of this
+     session's three rewrites were aimed correctly and one was aimed at logic that
+     turned out not to be there; the report would have said so for free.
 2. **Verify the screen in sim before building.** Kirby now runs the full 90 ms and
    takes its first vblank IRQ, but 90 ms is ~5 frames and the handoff's own rule
    is to judge only after ~600 (white at frame 0 is normal — melonDS reports
@@ -438,6 +472,19 @@ report inward to `0x02FFFF00`.
 - Editing a running shell script (`bash` reads incrementally — it will die
   mid-build) or a source tree during a `remote-build` (it snapshots at launch).
 - Deploying a core that misses timing.
+- Writing a carry-in as `A + B + C`. Quartus infers a ternary adder and builds
+  two chained carry chains — the same structure the `if C then A+B+1` form
+  produces. Costs a build to discover, and simulation cannot catch it because it
+  is functionally identical. Use the extra-LSB form, `(A & '1') + (notB & C)`
+  with bits `[n:1]` taken; see `nds_cpu9.vhd:2105` for the worked version.
+- Comparing a build against `build/artifacts-*` from an earlier session without
+  checking the fitter timestamp against `git log`. `artifacts-island` predates
+  `0b11f58`, which moved BIOS9 onto clk2x, so a diff against it silently mixes
+  that commit into your result (+528 registers that no combinational edit can
+  explain was the tell).
+- A/B'ing a sim with `REF=HEAD` on one side and `DIRTY=1` on the other. The
+  retail BIOS dumps and the Kirby hex images are gitignored, so the `git archive`
+  side runs a different machine. Use a worktree with `sim/tests` rsynced in.
 - Naming artifacts in `remote-sim.sh` that the bench does not write. The
   framebuffer files are `DUMPFILE`/`DUMPFILE_B`, default `top_frame_fb.txt` and
   `top_frame_fb_b.txt` — asking for `kirby_fb.txt` without setting `DUMPFILE`

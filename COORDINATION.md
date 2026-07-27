@@ -1830,3 +1830,60 @@ DESIGN DECISION YOU OWN (document rationale here before implementing):
     `cp15_control = 0x0005707D` (bit 0 PU, bit 2 D$, bit 12 I$). The boot value
     `0x00012078` has bit 0 clear, and `bus_cacheable_*` is gated on it, which is
     why the first ~48 instructions bypass everything.
+- 2026-07-27 sole agent: **the ARM9 worst path was mostly accidental logic, and
+  `decode_RM_op2` is now off it entirely.** Global worst −7.643 → **−4.622 ns**
+  (period 14.915). Commit `2b41fdb`, three rewrites, all trace-identical.
+  * **Get the node-by-node budget before choosing a cut.** `NDS.paths_cpu9.rpt`
+    is `-detail summary` and only gives endpoints. The global `NDS.paths.rpt` is
+    `-detail full_path` and happened to cover this path because it was the worst
+    in the design. That breakdown showed the handoff's model of it (operand →
+    shifter → ALU → PC) was missing most of the time: of 21.83 ns over 19 levels,
+    **62% was interconnect**, the ALU was two chained carry chains (4.74 ns), and
+    3.46 ns was a TCM comparator chain inside `nds_membus9` that nobody had
+    looked at. The register mux `decode_RM_op2` names was only 3.00 ns of it.
+  * **`nds_membus9` TCM decode — the biggest single win.** `a < itcm_limit` and
+    `a >= dtcm_lo and a < dtcm_hi` put the address on a carry chain. Same rewrite
+    as the CP15 PU region compare (2026-07-25): a TCM region is a power of two,
+    so test the bits above the region size against a mask derived from the size
+    *register*. `LessThan2` went **372 → 0** occurrences in the 50 worst paths and
+    the membus9-internal family −7.232 → −2.809. ITCM is a provable identity;
+    DTCM additionally assumes a size-aligned base, which the ARM946E-S requires
+    and melonDS enforces by masking the base. Watch the overflow corner: the old
+    33-bit `512 << size` wrapped to a limit of 0 for size > 23 and made every hit
+    test *false*, where a mask built the same way makes them all *true*.
+  * **Quartus does not fold a carry-in, and this cost a build.** ADC/SBC had the
+    carry in an `if/else`, so Quartus shared `A+B` and chained an incrementer.
+    Rewriting it as `A + B + C` **does not fix it** — it infers a ternary adder
+    and builds the same two chains. Measured: `Add22 → Add24` still in series
+    afterwards and the Add24 count went *up*, 668 → 1012. The form that works
+    appends the carry as an extra LSB so it rides one chain: `(2A+1) + (2B+C) =
+    2(A+B) + 1 + C`, take bits `[n:1]`. Add24 then went **1012 → 0**.
+    Simulation cannot catch the bad form — it is functionally identical, so the
+    trace diff is green either way. Only the fitter report shows it.
+  * **Diminishing returns are here.** The ALU fix gained 0.5–0.64 ns on the two
+    cpu9-rooted families but only **0.25 ns globally**, because the two
+    membus9-rooted families regressed by a similar amount as the fitter
+    rebalanced. All four are now in a −3.6…−4.6 band (was −2.8…−4.5). Expect
+    every further fix to move its own family far more than the worst path.
+  * **Remaining 18.48 ns**, launching from a register physical synthesis placed
+    inside the shifter: shifter tail 5.95 (4.38 of it interconnect), ALU adder
+    2.42, `execute_writedata → execute_branchPC → RESULT` mux chain 5.11, PU
+    cacheability compare 4.30, `imainram|req9_lock` 0.71. The mux chain is the
+    cheapest-looking target; the PU compare is the *regrown* version of the one
+    already fixed once, not a fresh one.
+  * **Two methodology traps, both of which produced a wrong number first.**
+    (a) `build/artifacts-island` is not a valid baseline for anything built after
+    `0b11f58` — check the fitter timestamp against `git log`. It predates BIOS9
+    moving to clk2x, and the tell was +528 registers that no combinational edit
+    can produce. A clean-HEAD rebuild to settle it was killed at 1h46m of
+    routing; the structural evidence (`LessThan2` 372 → 0) gave the attribution
+    for free. (b) A/B sims cannot use `REF=HEAD` on one side and `DIRTY=1` on the
+    other: the retail BIOS dumps and Kirby hexes are gitignored, so the
+    `git archive` side runs a different machine. Use a worktree with `sim/tests`
+    rsynced in.
+  * **Pick the workload for the code you changed, not for realism.** The 25 ms
+    Kirby A/B (ARM9 212,592 + ARM7 79,501 instructions, both MD5-identical) is a
+    real boot and proves the TCM change — 3,152 ITCM and 4,120 DTCM hits — but it
+    executes **zero ADC/SBC**, so on its own it says nothing about the ALU change.
+    `arm9_torture.hex` at 400,000 instructions covers it with 880 ADC/SBC-class
+    and 7,185 LDM/STM retired. Both green.
