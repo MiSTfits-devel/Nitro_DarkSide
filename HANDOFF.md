@@ -20,9 +20,9 @@ short and specific.
 | **DMA0** | **FIXED.** `bootreq` 0x5A5B9E7F → **0x5A5BDE7F**, a strict superset of the melonDS oracle (0x5A5BDC7F). |
 | **BIOS9 fetches** | **FIXED.** 15 of Kirby's first 28 were stale words. Now 650/650. |
 | Kirby in sim | Runs the full 90 ms, takes its first vblank IRQ, fills VRAM. No longer derails into ITCM. |
-| 67 MHz island timing | **STILL FAILS**, worst −4.622 ns (was −7.643). `decode_RM_op2` is no longer on the path — see the timing section, the old plan is void. |
+| 67 MHz island timing | **STILL FAILS**, worst −2.535 ns (was −4.622, and −7.643 before that). But **clk1x and clkMem now both pass with zero TNS** — the island is the only failing domain left. See the timing section: the clock labels in earlier revisions of this document were wrong. |
 | Deployed on hardware | **Nothing from this session.** Do not deploy until timing closes. |
-| Area | 91% ALMs / 86% M10K / 84% DSP — fits, not the constraint |
+| Area | 90% ALMs / 86% M10K / 84% DSP — fits, but at this density it *is* what the island's remaining slack is made of: ~65% of the worst path is interconnect |
 
 Commits since `663cb6c`:
 
@@ -207,49 +207,142 @@ branch.
 
 ## The timing blocker (independent of everything above)
 
+### First: `NDS.sta.summary` names PLL outputs, not clocks
+
+Earlier revisions of this document read that summary wrong, and the error changed
+what the problem looked like. The mapping is in `NDS.sv:213-215`:
+
+| STA name | PLL output | clock | period |
+|---|---|---|---|
+| `general[0]` | `outclk_0` | clkMem | 9.95 ns |
+| **`general[1]`** | `outclk_1` | **clk2x — the ARM9 island, 67.028 MHz** | 14.915 ns |
+| **`general[2]`** | `outclk_2` | **clk1x — everything else, 33.514 MHz** | 29.83 ns |
+
+and **Quartus groups setup by the *latch* clock.** So the headline "−4.622 ns"
+was the *clk1x* domain, reached by a clk2x → clk1x **crossing**, while the
+island's own worst was −4.196 with 29× the total negative slack (−3838 vs −133).
+Reading it as "the ARM9 core misses by 4.6 ns" sends you into the datapath;
+reading it correctly sends you to a CDC, which is where it was. Always check
+which of the two failing domains a number belongs to before acting on it.
+
+### Where it is now
+
+**Two of the three clock domains now pass.** Only the island is left.
+
 ```
-worst -4.622 ns in a 14.915 ns period       build/artifacts-alu2/
-  shiftresult_RRX[28] (retimed reg in the shifter) -> imainram|req9_lock
-Fitter: Successful, 91% ALMs
+build/artifacts-t5/  (seed 0, the shipping settings)
+  clk2x (island):  -2.535   TNS -1415.1    <- the only thing left
+  clk1x:           +1.584   TNS     0.0    PASSES (was -4.622)
+  clkMem:          +1.372   TNS     0.0
+Fitter: Successful, 90% ALMs
 ```
 
-**`decode_RM_op2` is no longer on the critical path.** Earlier revisions of this
-document said pipelining it was the whole job; that is now void, and acting on it
-would buy nothing. Commit `2b41fdb` removed the two blocks of accidental logic
-that made it look dominant, and the launch point moved behind a register
-Quartus's physical synthesis placed inside the shifter — the register-file mux is
-now on the far side of that flop and is not counted.
+`clk1x` closing is the `io9_lat` re-registration: it was the last combinational
+clk2x -> clk1x crossing, and every peripheral's address decode sat inside it.
+There is no longer a cross-domain path anywhere in the failing set.
 
-Get the node-by-node budget before choosing a cut. The scoped report
-(`NDS.paths_cpu9.rpt`) is `-detail summary` and only gives endpoints; the global
-`NDS.paths.rpt` is `-detail full_path` and currently covers this path because it
-is the worst in the design. That breakdown is what showed the old model
-("operand → shifter → ALU → PC") was missing where the time actually went.
+Progression, every step trace-identical against the previous HEAD:
 
-Remaining 18.48 ns:
+| build | change | clk2x | clk1x | ALMs |
+|---|---|---|---|---|
+| `artifacts-alu2` | baseline | −4.196 (TNS −3838) | −4.622 | 91% |
+| `artifacts-t1` | lock CDC, shift width, address mux, PU width | −3.400 (−2465) | −1.668 | 89% |
+| `artifacts-t2` | + five shifters → one rotator | **−2.499 (−790)** | −1.959 | 91% |
+| `artifacts-t3` | + TCM selects, mux merge, **fitter knobs** | −4.104 (−3356) | −2.212 | 91% |
+| `artifacts-t4` | t3 with the knobs reverted | −2.622 (−1244) | −2.099 | 91% |
+| `artifacts-t5` | t4 minus the `adr_is_pcw` expansion, plus the clk1x IO payload latch | −2.535 (−1415) | **+1.584** | 90% |
+| `artifacts-t5s3` | same netlist, seed 3 | −4.065 (−3940) | +1.535 | 90% |
+| `artifacts-t5s7` | same netlist, seed 7 | −3.046 (−1612) | **+1.981** | 90% |
+
+### Read that table with the seed spread in mind, or you will fool yourself
+
+The last three rows are **the same netlist**. Seeds 0 / 3 / 7 give **−2.535 /
+−4.065 / −3.046** with TNS **−1415 / −3940 / −1612**. That is a **1.53 ns spread
+and 2.8x on TNS from placement alone**, on a design at 90% utilisation where two
+thirds of the worst path is interconnect.
+
+Consequences, all of which bite:
+
+- **A single build cannot resolve a change smaller than ~1.5 ns.** Sweep at least
+  three seeds before believing any per-change number, including the ones above.
+- The overall clk2x result, −4.622 → −2.535, is 2.09 ns — above the spread, but
+  not by much. **The unambiguous win is clk1x**: −4.622 / TNS −133 → +1.584 /
+  TNS 0, and it holds on all three seeds.
+- **The `t3` attribution is weaker than it looks.** t3 (knobs, −4.104) vs t4 (no
+  knobs, −2.622) is 1.48 ns, i.e. *inside* the spread, from one sample each. What
+  can honestly be said: raising `PLACEMENT_EFFORT_MULTIPLIER` did not help, cost
+  build time, and moved the worst endpoints into DSP logic (`dblsat`, `dsp_rb`)
+  that no source change had been near. It is not established as systematically
+  harmful. Do not spend builds re-litigating it.
+- **The two RTL edits in t3 were a wash** — t2 −2.499 / 37,971 ALMs vs t4 −2.622
+  / 38,306, a 0.12 ns difference that means nothing. The `adr_is_pcw` expansion
+  was reverted on the ALM count, which is the one number in that comparison that
+  is not noise; the TCM select simplification is strictly less logic and stayed.
+
+### What is left, and the two shapes it comes in
+
+**(a) The datapath loop** — `fetch_PC/regs → op2 mux → rotator → keep/fill → ALU
+adder → writedata mux → pcwrite_Addr → +2/+4 → fetch_PC`, 16.672 ns off
+`artifacts-t2/NDS.paths_fam.rpt`:
 
 | segment | ns |
 |---|---|
-| shifter tail | 5.95 (4.38 of it interconnect) |
-| ALU adder (one carry chain since `2b41fdb`) | 2.42 |
-| `execute_writedata` → `execute_branchPC` → `RESULT` | 5.11 |
-| `bus_cacheable_i` + `bus_cacheable_d` (PU compare) | 4.30 |
-| `imainram\|req9_lock` | 0.71 |
+| op2 register-file mux, **split either side of the loop by retiming** | 5.67 (4.9 interconnect) |
+| `fetch_PC` `+2/+4` adder | 3.17 |
+| rotator + keep/fill mux | 2.42 |
+| ALU adder | 2.08 |
+| `pcwrite_Addr` / `bus_AddrFetch_eff` | 2.54 |
+| `execute_writedata` mux | 0.85 |
 
-All four reported families now sit in a −3.6…−4.6 band (they were −2.8…−4.5), so
-**there is no single dominant path left.** Expect the next fix to move the global
-worst by much less than it moves its own family — `2b41fdb` gained 0.5–0.64 ns on
-the two cpu9-rooted families and only 0.25 ns globally, because the membus9-rooted
-ones regressed by a similar amount as the fitter rebalanced.
+**(b) The DTCM store's write enable**, which is the worst endpoint in `t5` at
+17.629 ns over 11 levels (`fetch_PC[1] → … → idtcm|ram_block1a0~porta_we_reg`).
+The address now arrives 2.6 ns earlier than in `t1`, but the tail is unforgiving:
 
-The mux chain is the cheapest-looking structural target left: 5.11 ns of pure
-muxing, `alu_result` → `execute_writedata` → `execute_branchPC` → `RESULT`, where
-the branch-PC case re-muxes a value the writedata mux already selected. The PU
-cacheability compare at 4.30 ns is the *regrown* version of the one already fixed
-once with the mask trick (see COORDINATION 2026-07-25), not a fresh target.
+| segment | ns |
+|---|---|
+| bus address → `imembus9` (one routing hop across the port) | 1.99 |
+| `itcm_hit` → `dtcm_we` | 2.75 |
+| **routing into the M10K + its write-enable setup** | **3.46** |
 
-**Do not deploy the island to hardware until this closes.** A −4.6 ns core will
-behave nondeterministically and generate evidence you then have to un-explain.
+That last row is 20% of the whole path and no amount of logic work touches it.
+The way out is to stop presenting the TCM write in the accept cycle: port B of
+`SyncRamDualByteEnable` is unused (`ce_b => '0'` in both `iitcm` and `idtcm`), so
+the write could move there with a registered address/data/we, giving it a full
+extra cycle. **The catch is a read-after-write hazard** — port A reads
+combinationally off the live `cpu_adr`, `membus9` accepts a new request in the
+same cycle it retires one, and mixed-port read-during-write on Cyclone V returns
+old data — so it needs a store-forward bypass (compare the pending write address,
+merge per byte-enable into the read data). That is a real piece of work, not a
+tweak, but it is now the largest single identifiable item after the register file.
+
+Which of (a) and (b) reports as *the* worst path moves with the seed; they are
+within a few hundred ps of each other and both are ~65% interconnect. **That is
+the real finding: what is left is placement, not logic.** The register-file mux
+in (a) is a 16:1 32-bit mux read three times (op1/op2/opDest) across 512 source
+flops; the RAM tail in (b) is fixed silicon. Neither yields to restructuring.
+
+So **area is the next lever, not further rewriting**: `nds_sound` is 6,538 ALMs,
+larger than `nds_cpu9` at 5,676 and larger than either `nds_gpu2d`, and
+`FITTING.md`'s RESOLUTION section documents the async-read-array pattern its
+16-channel state looks like. The four separate families of the previous session
+have collapsed into these two; there is no cheap structural target left inside
+`nds_cpu9`.
+
+### Ideas that are wrong, recorded so they are not tried again
+
+- **Moving the PU cacheability compare onto the registered `creq_addr`.** It looks
+  free — `creq_cacheable` is consumed the cycle *after* accept, so the value would
+  be identical. It is not: `nds_cache9` uses `req_cacheable` to gate the early-hit
+  `resp_done` (`nds_cache9.vhd:535`), and `resp_done` feeds `accept_now` →
+  `cpu_done` → the CPU's whole execute stage, so a 4-level cone in front of it
+  adds ~4.3 ns to the `cpu_done` family. One failing family traded for a worse
+  one. The compare stays on the live address; only its width came down (bits
+  31:12, which is melonDS's own `PU_Map[addr >> 12]` granularity).
+- **Leaving a redundant copy of a term you have bypassed.** Static timing does not
+  know two conditions are mutually exclusive, so the long path is still reported
+  and still routed. The PC-write term had to come *out* of `execute_branchPC`, not
+  merely be duplicated onto the final address mux.
+- **Raising `PLACEMENT_EFFORT_MULTIPLIER`.** See `t3` above.
 
 ### There is no timing-clean fallback: ISLAND=0 does not work
 
@@ -341,6 +434,18 @@ tail -1 /tmp/or9.txt | awk '{printf "pass=%s prog=%s\n",$13,$14}'
 - Excluded from `bootreq` for the above reasons: TCM (7, 8), VBlank IF (13 — needs
   a full frame, ~800k instructions). Known-bad: bit 9 (shared WRAM) fails on
   melonDS too, so that subtest is wrong.
+- **Missing from `bootreq`, and it is now load-bearing: an ARM9 SWP.** Measured on
+  the 25 ms Kirby trace, the ARM9 executes **zero** SWP/SWPB, and `bootreq` has no
+  subtest for one, so no ROM has ever driven `nds_mainram`'s lock pair through the
+  full system. `sim/tb_mainram.vhd` covers the lock *semantics* (it drives
+  `mem9_lock` directly, 10,000 concurrent pairs) but not how `mem9_lock` is
+  produced — which changed on 2026-07-27 when `nds_top` started sourcing it from
+  the island latch `mr9_lock` instead of live combinational logic. That rewrite is
+  equivalent by construction (the CPU is stalled with the address held while the
+  access is in flight) and it is the single biggest timing win in the design, but
+  it has never been executed. Note that a single-threaded SWP would not
+  distinguish a working lock from a missing one either — the bench needs to count
+  `imainram|lock_pair` assertions.
 
 ---
 
@@ -359,6 +464,36 @@ WORK=sim/nvc_work_x PRELOAD=1 HEXFILE=sim/tests/kirby_4mb.hex DIRECT=1 \
   TIMEOUT_MS=90 CYCLE_HIST=4000000 sh sim/run_top_frame.sh
 ```
 
+**The A/B recipe for an RTL change that must not alter behaviour.** Three tiers,
+each catching what the one before it cannot; run all three before a build:
+
+```bash
+# 1. exhaustive, 0.3 s - algebraic identities (currently just the shifter)
+sh sim/run_shifter_equiv.sh                        # 294,912 cases
+
+# 2. targeted, ~80 s local - the ISA features you touched
+SEED=1 CHUNKS=400 LOOPS=1000 sim/tests/build_arm9_torture.sh
+MAXINSTR=400000 HEXFILE=sim/tests/arm9_torture.hex LOADADDR=33554432 \
+  TIMEOUT_MS=800 sh sim/run_arm9_trace.sh          # then md5 arm9_trace.log
+#    CACHES=1 on the build line turns the PU and both caches on - a different
+#    machine, and the only variant that exercises bus_cacheable_*
+
+# 3. integration, ~15 min on a pod - a real boot, both CPUs
+DIRTY=1 POD=nds-sim-new ARTIFACTS="isl9.txt isl7.txt" \
+  ENV="WORK=sim/nvc_work_ab PRELOAD=1 HEXFILE=sim/tests/kirby_4mb.hex DIRECT=1 \
+       TRACEFILE=isl9.txt TRACEFILE7=isl7.txt TRACE_START_FRAME=-1 \
+       TRACE7_START_FRAME=-1 TIMEOUT_MS=25 FRAMES=2" \
+  build/remote-sim.sh run_top_frame.sh
+#    reference numbers: ARM9 212,592 / ARM7 79,501 lines, and for the tree at
+#    the time of writing md5 6be14b4d9fb41a01e02d377b9c19d098 / d6ea0d1d5...
+```
+
+The reference side must be a **worktree with `sim/tests` rsynced in**, not
+`REF=HEAD` — the BIOS dumps and Kirby hexes are gitignored, so a `git archive`
+side runs a different machine. Anything touching the IO bridge also wants
+`bootreq` (`pass=0x5A5BDE7F`, and the bench's own `IO9 path:` line, which counts
+island requests against clk1x arrivals and will show a dropped one).
+
 - **`TRACE_START_FRAME=-1` is required** to trace from instruction 0. The gate is
   `dump_frame_index >= TRACE_START_FRAME` and that starts at −1, only reaching 0
   after the first vblank (~17 ms). With the default 0, any shorter run writes an
@@ -375,9 +510,14 @@ WORK=sim/nvc_work_x PRELOAD=1 HEXFILE=sim/tests/kirby_4mb.hex DIRECT=1 \
   *the loader is still copying* — what a healthy design does — not a dead CPU. I
   called a working island dead on exactly that evidence.
 
-**First-divergence vs the oracle** — `scratchpad/firstdiv.awk`. Fold case (the RTL
-writes uppercase hex, melonDS lowercase, or every line "diverges" on line 1) and
-exclude cpsr, r13, r14 (melonDS pre-sets SP/LR).
+**First-divergence vs the oracle** — `sim/tests/compare_trace.py`, which already
+does this and is documented in `docs/TRACE_DIFF.md`; earlier revisions of this
+document sent you to a `scratchpad/firstdiv.awk` that no longer exists and never
+needed to. It folds case on its own (the RTL writes uppercase hex and melonDS
+lowercase, or every line "diverges" on line 1). **Against melonDS pass
+`--ignore cpsr,r13,r14`** — it pre-sets SP/LR, so those columns differ from
+instruction 1 and hide everything real behind them. Comparing two RTL traces,
+ignore nothing.
 
 **Driver audit after any domain split.** Three island bugs were multiple-driver or
 undriven signals, and `nvc` sees neither (`std_logic` resolves multiple drivers
@@ -419,18 +559,28 @@ report inward to `0x02FFFF00`.
 
 ## Next steps, in order
 
-1. **Close the remaining −4.622 ns on clk2x.** Still the *only* thing between here
+1. **Close the remaining ~2.5 ns on clk2x.** Still the *only* thing between here
    and a core that can run on hardware — see the ISLAND=0 note above for why there
-   is no fallback. **Do not start from `decode_RM_op2`**; it is off the path since
-   `2b41fdb` and this list used to say otherwise. Read the budget table in the
-   timing section first, then pick a cut. Cheapest-looking is the 5.11 ns
-   `execute_writedata → execute_branchPC → RESULT` mux chain. Budget one build per
-   probe and expect the global worst to move less than the family does — the four
-   families are within 1 ns of each other now.
+   is no fallback. **Do not start by restructuring `nds_cpu9` logic.** The four
+   families of the previous session have collapsed into one loop whose largest
+   single item is the register-file mux, and 4.9 of its 5.67 ns is interconnect.
+   Read the budget table in the timing section, then go after **area**:
+   * `nds_sound` is 6,538 ALMs — bigger than `nds_cpu9` at 5,676 and bigger than
+     either `nds_gpu2d`. Its 16-channel state is an array of records indexed at
+     runtime, which is the flops-plus-16:1-mux pattern `FITTING.md`'s RESOLUTION
+     section already had to fix elsewhere. The unit is time-multiplexed over
+     channels, so the state is a natural fit for an MLAB.
+   * `MISTER_DISABLE_YC` is still commented out in `NDS.qsf`. Turning it on drops
+     the composite/S-video encoder. That is a product decision, not a free win —
+     ask before taking it.
    * Before spending a build on an inference, check it against the *previous*
-     build's `NDS.paths.rpt` rather than reasoning from the VHDL. Two of this
-     session's three rewrites were aimed correctly and one was aimed at logic that
-     turned out not to be there; the report would have said so for free.
+     build's `NDS.paths_fam.rpt` rather than reasoning from the VHDL. That report
+     now exists precisely because endpoint names are not enough: the path that
+     replaced `req9_lock` ran `cache9|resp_done → cpu_done → execute_writeback →
+     execute_writereg → pcwrite_fetch → gb_bus_Adr → dtcm_hit → dtcm_we → M10K`,
+     and 3.32 ns of it was the M10K's own write-enable routing and setup.
+   * Keep changing one thing per build. Bundling two fitter knobs with two RTL
+     edits cost a build and 1.6 ns of confusion (`artifacts-t3`).
 2. **Verify the screen in sim before building.** Kirby now runs the full 90 ms and
    takes its first vblank IRQ, but 90 ms is ~5 frames and the handoff's own rule
    is to judge only after ~600 (white at frame 0 is normal — melonDS reports
@@ -464,6 +614,26 @@ report inward to `0x02FFFF00`.
 
 - Inferring subsystem state from a Kirby boot trace. Write a ROM.
 - Treating trace agreement as proof that stores or IO accesses work.
+- **Running `sim/run_arm9_trace.sh` on a main-RAM-linked ROM without
+  `LOADADDR`.** It defaults to 0, which means "HEXFILE is the boot ROM at
+  0xFFFF0000". `arm9_torture.hex` is linked at 0x02000000, so without
+  `LOADADDR=33554432` the run executes open-bus garbage at `0x0000xxxx` for every
+  one of its instructions — and **both sides of an A/B produce the same garbage
+  and the same MD5**, so it reads as a clean pass. Check the trace's pc column
+  spans the ROM before believing a diff.
+- **Believing a trace diff without checking the workload executes what you
+  changed.** Correctly loaded, the torture ROM as it stood retired **2**
+  register-specified shifts and **zero** PC writes in 400,000 instructions; it
+  could not see either of the two `nds_cpu9` changes it was being used to
+  validate. `gen_arm9_torture.py` now has `chunk_pcwrite`; count the opcodes you
+  care about in the trace rather than assuming.
+- **Reading a slack number out of `NDS.sta.summary` without resolving which
+  clock it belongs to.** The names are PLL outputs, `general[1]` is clk2x and
+  `general[2]` is clk1x, and the grouping is by *latch* clock. See the timing
+  section.
+- **Bundling fitter settings with RTL changes in one build.** `artifacts-t3` did
+  and came out 1.6 ns worse; it took another whole build to establish that the
+  settings, not the code, were responsible.
 - Taking an IO measurement before instruction ~536,610 (~57 ms) and reading
   meaning into it. Kirby does almost no IO before then.
 - Gating the ARM7's `ce` to fake the ratio. Measured twice wrong; kills the ARM7
@@ -499,8 +669,10 @@ report inward to `0x02FFFF00`.
 `scratchpad/` was never tracked in git and is gone. Two tools this document tells
 you to use no longer exist and need rewriting when next needed:
 
-- `scratchpad/firstdiv.awk` — first divergence vs the oracle. Rebuildable from the
-  description above (fold case; exclude cpsr, r13, r14).
+- ~~`scratchpad/firstdiv.awk`~~ — **not missing and never was.**
+  `sim/tests/compare_trace.py` does the job, is documented in
+  `docs/TRACE_DIFF.md`, and now takes `--ignore cpsr,r13,r14` for the melonDS
+  case. Nothing to rewrite.
 - `scratchpad/deploy-probe.sh` — upload + SHA verify + **production-core guard** +
   `load_core`. Rewrite this one carefully before the next deploy: its job included
   refusing to touch `NDS_20260719.rbf`, and a careless replacement loses that
