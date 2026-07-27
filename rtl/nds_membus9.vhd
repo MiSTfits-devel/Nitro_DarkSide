@@ -146,7 +146,15 @@ end entity;
 architecture arch of nds_membus9 is
 
    type t_target is (T_ITCM, T_DTCM, T_BROM, T_MAIN, T_WRAMSH, T_IO, T_VRAM, T_PAL, T_OAM, T_OPEN);
-   type t_state  is (IDLE, FINISH, W_WRAMSH, W_VRAM, W_MAIN, W_IO_ALIGN);
+   -- W_IO_RESP: wait for the IO fabric's completion before retiring the access.
+   -- Before the ARM9 moved to its own clock the IO fabric shared clk1x with the
+   -- CPU, so io_wired_done was already valid in FINISH and going straight there
+   -- was correct. Across the island bridge the round trip takes several island
+   -- cycles, so FINISH was reached with io_wired_done still low - and the read mux
+   -- falls back to x"00000000" for an unclaimed T_IO. Every ARM9 IO read returned
+   -- zero. Measured with sim/tests/iotest: IPCSYNC, IE, DISPCNT and POWCNT1 all
+   -- read back 0 where melonDS returns the written value.
+   type t_state  is (IDLE, FINISH, W_WRAMSH, W_VRAM, W_MAIN, W_IO_ALIGN, W_IO_RESP);
 
    signal state    : t_state  := IDLE;
    signal target   : t_target := T_OPEN;
@@ -227,7 +235,8 @@ begin
                           (state = IDLE or state = FINISH or
                            (state = W_WRAMSH and wsh_done   = '1') or
                            (state = W_VRAM   and vram_done  = '1') or
-                           (state = W_MAIN   and cresp_done = '1')) else '0';
+                           (state = W_MAIN   and cresp_done = '1') or
+                           (state = W_IO_RESP and io_wired_done = '1')) else '0';
 
    -- ================= TCM store drive =================
    -- Presented in the accept cycle so the BRAM's internal address register
@@ -358,8 +367,17 @@ begin
             if (state = W_IO_ALIGN) then
                if (io_ce_next = '1') then
                   io_bus.ena <= '1';
-                  state      <= FINISH;
+                  state      <= W_IO_RESP;
                end if;
+            -- No dedicated W_IO_RESP branch on purpose. accept_now already covers
+            -- "W_IO_RESP and io_wired_done", so this state completes through the
+            -- shared accept path below exactly like W_MAIN / W_VRAM / W_WRAMSH do.
+            -- A private branch here looks harmless but silently drops a request:
+            -- this bus accepts a new access in the very cycle it completes one, so
+            -- handling the completion without also honouring cpu_ena loses the
+            -- CPU's next request and it waits forever for a done that never comes.
+            -- That is exactly how the first version of this fix hung the ARM9 on
+            -- its second IO access.
             elsif can_accept then
                state <= IDLE;
                if (cpu_ena = '1') then
@@ -436,7 +454,7 @@ begin
                         io_bus.bEna <= be;
                         if (io_ce_next = '1') then
                            io_bus.ena <= '1';
-                           state      <= FINISH;
+                           state      <= W_IO_RESP;
                         else
                            state <= W_IO_ALIGN;
                         end if;
@@ -451,10 +469,11 @@ begin
       end if;
    end process;
 
-   cpu_done <= '1'        when state = FINISH   else
-               wsh_done   when state = W_WRAMSH else
-               vram_done  when state = W_VRAM   else
-               cresp_done when state = W_MAIN   else '0';
+   cpu_done <= '1'            when state = FINISH    else
+               wsh_done       when state = W_WRAMSH  else
+               vram_done      when state = W_VRAM    else
+               cresp_done     when state = W_MAIN    else
+               io_wired_done  when state = W_IO_RESP else '0';
 
    -- ================= read data mux + rotation (gba_mem_readrotate) =================
    din_unrot <= itcm_readdata when target = T_ITCM   else
