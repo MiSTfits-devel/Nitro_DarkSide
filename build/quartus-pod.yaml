@@ -47,6 +47,10 @@ spec:
           "report_timing -setup -npaths 40 -detail summary -from \$m9 -to \$m9 -append -file output_files/NDS.paths_cpu9.rpt" \
           "report_timing -setup -npaths 40 -detail summary -from \$a9 -to \$m9 -append -file output_files/NDS.paths_cpu9.rpt" \
           "report_timing -setup -npaths 40 -detail summary -from \$m9 -to \$a9 -append -file output_files/NDS.paths_cpu9.rpt" \
+          "report_timing -setup -npaths 2 -detail full_path -from \$a9 -to \$a9 -file output_files/NDS.paths_fam.rpt" \
+          "report_timing -setup -npaths 2 -detail full_path -from \$m9 -to \$m9 -append -file output_files/NDS.paths_fam.rpt" \
+          "report_timing -setup -npaths 2 -detail full_path -from \$a9 -to \$m9 -append -file output_files/NDS.paths_fam.rpt" \
+          "report_timing -setup -npaths 2 -detail full_path -from \$m9 -to \$a9 -append -file output_files/NDS.paths_fam.rpt" \
           "project_close" > paths.tcl
         quartus_sta -t paths.tcl || true
         echo ${rc} > /work/exitcode
