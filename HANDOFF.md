@@ -17,7 +17,9 @@ short and specific.
 | Cross-CPU IPCSYNC | **WORKS** in sim (`bootreq` bit 15). This was the boot handshake blocker. |
 | ARM9:ARM7 instruction ratio | 0.42 → **2.86** (island + speculative cache index) |
 | Instruction fidelity vs melonDS | 1,293,260 ARM9 / 231,343 ARM7 exact on pc/opcode/r0..r12 |
-| **DMA0** | **BROKEN** — the one real functional failure left. `bootreq` bit 14. |
+| **DMA0** | **FIXED.** `bootreq` 0x5A5B9E7F → **0x5A5BDE7F**, a strict superset of the melonDS oracle (0x5A5BDC7F). |
+| **BIOS9 fetches** | **FIXED.** 15 of Kirby's first 28 were stale words. Now 650/650. |
+| Kirby in sim | Runs the full 90 ms, takes its first vblank IRQ, fills VRAM. No longer derails into ITCM. |
 | 67 MHz island timing | **FAILS.** `decode_RM_op2 → fetch_PC` = 20.9 ns in a 14.915 ns period. |
 | Deployed on hardware | **Nothing from this session.** Do not deploy until timing closes. |
 | Area | 88% ALMs / 86% M10K / 84% DSP — fits, not the constraint |
@@ -101,11 +103,9 @@ of anything that leaves the CPU.
 
 ---
 
-## The one real functional failure: DMA0
+## DMA0 — FIXED. A DMA access is never cacheable.
 
-`bootreq` bit 14. A one-word main-RAM→main-RAM DMA0 transfer completes on melonDS
-and does not on our RTL. Kirby's boot uses DMA heavily. This is the next thing to
-fix and there is a 33 KB reproducer that hits it in ~9 ms of simulated time.
+`bootreq` bit 14. Reproducer (~9 ms of simulated time):
 
 ```bash
 cd /Users/heni/sources/NDS_MiSTfits
@@ -115,12 +115,90 @@ WORK=sim/nvc_work_bq PRELOAD=0 HEXFILE=sim/tests/nds_bootreq.hex DIRECT=1 \
 tail -1 bq9.txt | awk '{printf "pass=%s prog=%s\n",$13,$14}'
 ```
 
-Expect `prog=0x63` (99 = ran to completion). Current: `pass=0x5A5B9E7F`, oracle
-`0x5A5BDC7F`. Only bit 14 differs in the RTL's disfavour.
+Was `pass=0x5A5B9E7F`, now `0x5A5BDE7F` against the oracle's `0x5A5BDC7F` — a
+strict superset (bit 9, shared WRAM, is the known-bad subtest that fails on
+melonDS too; we happen to pass it).
 
-Start at `rtl/nds_dma9.vhd` and the `mbus_ena`/`dmab_ena_i9` bridge path in
-`nds_top.vhd` — the DMA is on `clk1x` and masters a `clk2x` membus, which is
-exactly the kind of crossing that produced three bugs already this session.
+`nds_membus9` applied `bus_cacheable_d` to DMA accesses. That signal is decoded
+in `nds_cpu9` from `gb_bus_Adr`, the **CPU's own** address register — not the
+muxed bus — so while the DMA owns the bus it describes whatever address the CPU
+last presented. Kirby's DMA paused the CPU mid instruction-fetch from main RAM,
+inside the one region marked cacheable, so `bus_cacheable_d` read `'1'` for the
+whole transfer: the DMA's read allocated a cache line, its write hit that same
+line and stopped there dirty, and the CPU's read-back through the uncached
+mirror saw 0. **On the bus the transfer looked perfect** — right address, right
+data, right handshake — which is why it survived a probe of the DMA path itself.
+
+The fix is one branch (`dma_bus = '1'` → `creq_cacheable <= '0'`), and it is also
+just correct hardware: the ARM9 DMA is a separate master that does not see the
+CPU's caches, which is why NitroSDK brackets every DMA with `DC_FlushRange` /
+`DC_InvalidateRange`.
+
+---
+
+## The white screen after that: BIOS9 was clocked on the wrong clock
+
+**`ibios9` was instantiated on `clk1x` while the ARM9 island runs on `clk2x`.**
+15 of Kirby's first 28 BIOS fetches returned the wrong word.
+
+`nds_bios9` is a *synchronous* RAM. Its read address is driven combinationally
+from the island's `cpu_adr` (`nds_membus9.vhd:191`) and its data is consumed
+combinationally in the island's `FINISH` state (`nds_membus9.vhd:508`) — **there
+is no done handshake on `T_BROM` at all.** On `clk1x` the ROM therefore sampled
+the address on only every *other* island cycle, so every second BIOS9 fetch
+returned the previous word, and the first fetch after reset returned whatever
+was latched (word 0).
+
+The failure chain, which had looked like three unrelated mysteries:
+
+1. Kirby's `blx` at `0x0213FEAC` enters Thumb and hits `swi 0x0B` (CpuSet) at
+   `0x020002BE`. The CPU vectors correctly to `0xFFFF0008`.
+2. The fetch there delivers **word 0** — `EA000042`, the *reset* vector — instead
+   of `EA0000A2`, the SWI vector.
+3. So it branches to `0xFFFF0120`, the middle of the BIOS CRC16 helper, and
+   executes onward with every other word stale until `ldr pc,[r0,#-4]` at
+   `0xFFFF0294` throws it into ITCM at `0x00000008`.
+4. It then spins in ITCM garbage forever — ~500,000 instructions of it, in User
+   mode, at PCs like `0x000000BC`, which is what "the ARM9 ran off into garbage"
+   was.
+
+`clk1x` → `clk2x` on `ibios9` is the whole fix. ITCM and DTCM were already on
+`clk2x` (`nds_top.vhd:1141,1170`); `ibios9` was the lone outlier, and `T_BROM`
+was the last unhandshaked target left on that bus after `W_IO_RESP` closed the
+IO one.
+
+### Why the ARM7 is the control, and use it
+
+The ARM7's BIOS shares its CPU's clock, so it is the known-good reference for
+anything on a BIOS path. In the same broken run, all 488 of its SWI entries
+fetched the right vector and landed in the right handler; 9,272 of 9,272 of its
+ARM-state BIOS fetches were correct. When an ARM9 memory path looks wrong, check
+whether the ARM7's equivalent is right before theorising.
+
+### The assertion, and the trace PC convention it rests on
+
+`sim/check_bios9_fetch.awk` compares every BIOS fetch in a trace against the BIOS
+image. Oracle-free — the expected value is known exactly, so a mismatch is a fact:
+
+```bash
+awk -f sim/check_bios9_fetch.awk sim/tests/bios9_retail.hex simout/<pod>/isl9.txt
+awk -v arm7=1 -f sim/check_bios9_fetch.awk sim/tests/bios7_retail.hex .../isl7.txt
+```
+
+**In ARM state the trace's pc column is the pipeline PC — the instruction address
+plus 8.** The opcode on a line belongs to `pc-8`. Calibrated on the ARM7's 9,759
+ARM-state BIOS fetches: 0 match at `pc`, 9,272 at `pc-8`. Do not "fix" this by
+comparing at `pc`. Two further filters are needed or the check cries wolf: Thumb
+lines (the trace prints a zero-extended halfword and steps pc by 2), and
+ARM/Thumb transition lines, where the cpsr column already carries the new T-clear
+flag while the opcode is still the Thumb halfword — those were all 487 residual
+"mismatches" on the ARM7 control.
+
+This is the third bug in a row that an instruction-exact trace diff could not
+see, and for the same reason each time: **it is a wrong value the trace records
+faithfully.** A dropped store, an IO read of 0, a stale BIOS word — all leave
+pc/opcode/registers agreeing right up to the moment the wrong value changes a
+branch.
 
 ---
 
@@ -144,6 +222,28 @@ behave nondeterministically and generate evidence you then have to un-explain.
 
 The fix is pipelining that path in `nds_cpu9`. This is the substantial remaining
 engineering task.
+
+### There is no timing-clean fallback: ISLAND=0 does not work
+
+`nds_top.vhd:67` says "Tie to clk1x to disable the island". **That comment is
+stale.** `sim/run_top_frame.sh` now takes `ISLAND=0`, which ties `clk2x` to
+`clk1x` in the bench, and in that configuration the ARM9 makes **5 memory
+accesses in 30 ms and stops** — a hard stall almost immediately, not the slow-but-
+working behaviour the comment implies (the island run has 116,003 accepts by
+6 ms). The ARM7 keeps running and reaches 100,000 instructions, so it is the
+ARM9 side specifically.
+
+Not chased to a proven root cause, but the shape points at the toggle-based CDC
+added since that comment was written: `cdc_req_io` toggles on `clk2x` and
+`clk1x` edge-detects it via `cdc_req_io_d` (`nds_top.vhd:787,800,806`), with the
+completion toggling back on `clk1x` (`:901`). Those handshakes were written
+against a 2:1 ratio and at least one of them does not survive 1:1.
+
+The consequence for planning: **pipelining `decode_RM_op2` is the only route to a
+deployable core.** There is no "ship the 1x build meanwhile" option to fall back
+on, and anyone who assumes there is one will lose a day discovering this. If a 1x
+build is ever wanted as an escape hatch, it is its own project — auditing every
+CDC handshake for ratio independence — not a generic flip.
 
 ---
 
@@ -291,16 +391,25 @@ report inward to `0x02FFFF00`.
 
 ## Next steps, in order
 
-1. **Fix DMA0** (`bootreq` bit 14). Fast reproducer exists. Suspect the
-   `clk1x` DMA mastering a `clk2x` membus.
-2. **Re-run `bootreq` and Kirby** with IO reads fixed. The handshake may now
-   simply work; re-measure before theorising about ratios.
-3. **Pipeline `decode_RM_op2 → fetch_PC`** in `nds_cpu9`. Until this closes,
-   nothing from this session is deployable.
-4. Then build and deploy, and judge the screen only after ~600 frames (white at
-   frame 0 is normal — melonDS reports `DISPCNT=0` there too).
-5. Write the ROMs `bootreq` had to exclude: TCM, BIOS SWIs, VBlank/IRQ dispatch,
-   card reads.
+1. **Pipeline the worst path in `nds_cpu9`.** This is now the *only* thing between
+   here and a core that can run on hardware — see the ISLAND=0 note above for why
+   there is no fallback. Note the real ranking: `decode_RM_op2 → vram_din` at
+   −7.643 is the worst, `decode_RM_op2 → fetch_PC` at −6.705 is only third, and
+   there is a second independent family rooted at `io_bus.Adr`. Pipelining only
+   the path this document used to name would leave ≈ −7.1 on the table.
+2. **Verify the screen in sim before building.** Kirby now runs the full 90 ms and
+   takes its first vblank IRQ, but 90 ms is ~5 frames and the handoff's own rule
+   is to judge only after ~600 (white at frame 0 is normal — melonDS reports
+   `DISPCNT=0` there too). Reaching 600 frames is ~10 s of simulated time, which
+   is out of reach for a full-trace run; use `p_vidregs` and the framebuffer
+   dumps instead of a trace.
+3. **Write a render-test ROM in the modes Kirby actually uses.** `p_vidregs` in
+   the bench reports the last value written to every engine-A/B video register
+   plus POWCNT1, which is the prerequisite — matching "the same modes as Kirby"
+   is otherwise a guess. The `sdk2d` custom-crt0 pattern and `sim/tests/nds_2d*`
+   are the starting points.
+4. Write the ROMs `bootreq` had to exclude: TCM, BIOS SWIs, VBlank/IRQ dispatch,
+   card reads. A BIOS SWI ROM would have caught the BIOS9 clock bug directly.
 
 ## Do not repeat
 
@@ -314,3 +423,23 @@ report inward to `0x02FFFF00`.
 - Editing a running shell script (`bash` reads incrementally — it will die
   mid-build) or a source tree during a `remote-build` (it snapshots at launch).
 - Deploying a core that misses timing.
+- Naming artifacts in `remote-sim.sh` that the bench does not write. The
+  framebuffer files are `DUMPFILE`/`DUMPFILE_B`, default `top_frame_fb.txt` and
+  `top_frame_fb_b.txt` — asking for `kirby_fb.txt` without setting `DUMPFILE`
+  fetches nothing, the pod is deleted, and a 15-minute run has to be repeated.
+- Trusting a probe's address decode without checking the register map.
+  `io_bus9.Adr` is a **byte** offset into `0x0400_0000`: BG0CNT is `0x008`
+  (`reg_nds_display.vhd:58`), engine B is the `0x1000` window
+  (`nds_top.vhd:1663`), POWCNT1 is `0x304`.
+
+## Missing tooling — this document references files that do not exist
+
+`scratchpad/` was never tracked in git and is gone. Two tools this document tells
+you to use no longer exist and need rewriting when next needed:
+
+- `scratchpad/firstdiv.awk` — first divergence vs the oracle. Rebuildable from the
+  description above (fold case; exclude cpsr, r13, r14).
+- `scratchpad/deploy-probe.sh` — upload + SHA verify + **production-core guard** +
+  `load_core`. Rewrite this one carefully before the next deploy: its job included
+  refusing to touch `NDS_20260719.rbf`, and a careless replacement loses that
+  protection silently.
