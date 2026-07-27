@@ -2102,8 +2102,42 @@ begin
               execute_op2 when (decode_switch_op = '0' and decode_alu_use_shift = '0') else
               execute_op1;
    
+   -- ADC/SBC used to write their carry-in as a *second* arithmetic operation
+   -- chained onto the first ("A+B then +1", "A-B then -1"), because the carry
+   -- appeared as a separate term inside an if/else. Quartus shared the common
+   -- A+B and hung an incrementer off it, so the operand path ran through two
+   -- 32-bit carry chains in series: `Add22 -> Add24` in the worst-path report,
+   -- 4.74 ns of the 21.8 ns `decode_RM_op2 -> vram_din` path. Folding the carry
+   -- into a single sum puts it in the chain's own carry-in and leaves one chain.
+   --
+   --   ADC: A + B + C                     (C as the adder carry-in)
+   --   SBC: A + not B + C  ==  A - B - (1-C)
+   --
+   -- Both are exact rewrites, not approximations: SBC with C=1 is A-B and with
+   -- C=0 is A-B-1, which is what the if/else spelled out.
+   --
+   -- Writing that literally as `A + B + C` does NOT work, and this comment used
+   -- to claim it would. Quartus treats the third operand as a full-width term
+   -- and builds a ternary adder - two chained carry chains, exactly what the
+   -- if/else produced. Measured: `Add22 -> Add24` still in series on the worst
+   -- path afterwards, and the Add24 count went *up* (668 -> 1012).
+   --
+   -- The form below appends the carry as an extra LSB so it rides the one
+   -- chain, then drops that bit:
+   --
+   --   (2A + 1) + (2B + C)  =  2(A + B) + 1 + C,  bits [n:1] = A + B + C
+   --
+   -- since floor((1+C)/2) is C for C in {0,1}. SBC's 33-bit sum can wrap, which
+   -- is harmless: dropping a multiple of 2^33 before the shift drops a multiple
+   -- of 2^32 after it, and the result is taken mod 2^32 anyway. ADC's 34-bit
+   -- sum cannot wrap (max 2^34-2), so bit 33 is a true carry-out and lands on
+   -- alu_result_add(32), which is what the flag logic reads.
    process (all)
+      variable adc_wide : unsigned(33 downto 0);
+      variable sbc_wide : unsigned(32 downto 0);
    begin
+      adc_wide := ('0' & alu_op1 & '1') + ('0' & alu_op2 & Flag_Carry);
+      sbc_wide := (alu_op1 & '1') + ((not alu_op2) & Flag_Carry);
       alu_result     <= (others => '0');
       alu_result_add <= (others => '0');
       case (decode_functions_detail) is
@@ -2122,19 +2156,11 @@ begin
             alu_result <= alu_op1 - alu_op2;
          
          when alu_add_withcarry =>
-            if (Flag_Carry = '1') then
-               alu_result_add <= ('0' & alu_op1) + ('0' & alu_op2) + to_unsigned(1, 33);
-            else
-               alu_result_add <= ('0' & alu_op1) + ('0' & alu_op2);
-            end if;
+            alu_result_add <= adc_wide(33 downto 1);
             alu_result <= alu_result_add(31 downto 0);
-         
+
          when alu_sub_withcarry =>
-            if (Flag_Carry = '1') then
-               alu_result <= alu_op1 - alu_op2;
-            else
-               alu_result <= alu_op1 - alu_op2 - 1;
-            end if;
+            alu_result <= sbc_wide(32 downto 1);
  
          when others => null;
       end case;
@@ -3333,7 +3359,22 @@ begin
                         execute_stall            <= '1';
                         execute_blockRW_writereg <= unsigned(decode_RM_op2);
                         execute_blockRW_endaddr  <= unsigned(signed(execute_busaddress) + decode_block_endmod);
-                        execute_blockRW_addr     <= execute_RW_addr + 4;
+                        -- First beat only, so execute_stall is still '0' and the
+                        -- combinational execute_RW_addr above is the
+                        -- `execute_busaddress + decode_block_addrmod` branch (the
+                        -- later beats at DATARW_BLOCKREAD/BLOCKWRITE take the
+                        -- registered execute_blockRW_addr branch and already cost
+                        -- one adder). Writing `execute_RW_addr + 4` here chained a
+                        -- second 32-bit adder onto that one; folding the constant
+                        -- into decode_block_addrmod - a decode-stage integer -
+                        -- leaves a single adder on execute_busaddress.
+                        --
+                        -- The low-bit clear commutes with the +4: masking then
+                        -- adding 4 and adding 4 then masking both give
+                        -- X - (X mod 4) + 4, so applying it after is identical to
+                        -- execute_RW_addr(1 downto 0) <= "00" happening before.
+                        execute_blockRW_addr     <= unsigned(signed(execute_busaddress) + (decode_block_addrmod + 4));
+                        execute_blockRW_addr(1 downto 0) <= "00";
                   
                      when IRQ =>
                         IRQ_disable <= '1';
