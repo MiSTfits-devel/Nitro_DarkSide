@@ -403,11 +403,26 @@ report inward to `0x02FFFF00`.
    `DISPCNT=0` there too). Reaching 600 frames is ~10 s of simulated time, which
    is out of reach for a full-trace run; use `p_vidregs` and the framebuffer
    dumps instead of a trace.
-3. **Write a render-test ROM in the modes Kirby actually uses.** `p_vidregs` in
-   the bench reports the last value written to every engine-A/B video register
-   plus POWCNT1, which is the prerequisite — matching "the same modes as Kirby"
-   is otherwise a guess. The `sdk2d` custom-crt0 pattern and `sim/tests/nds_2d*`
-   are the starting points.
+3. **Write a render-test ROM — but not "in Kirby's modes", because Kirby has not
+   picked any.** Measured with `p_vidregs`: in a 95 ms run Kirby touches video
+   registers exactly 42 times, all in a 100 µs burst at ~83.7 ms, and it is all
+   initialisation — POWCNT1 = `0x820F`, then every engine-A register `+000..+03C`
+   zeroed, then every engine-B register, then identity affine matrices
+   (`0x00000100` / `0x01000100` = 1.0 in 8.8) for BG2 and BG3 on both engines.
+   **`DISPCNT` is still 0.**
+
+   So the white screen at this point is the hardware being *correct*, not
+   failing: display mode 0 is display-off, and both framebuffers come out
+   uniformly `0x3FFFF` (white) across all 49,152 pixels, which is what they
+   should be. Do not read a rendering bug into a white frame here.
+
+   Kirby's real modes are therefore not obtainable from RTL sim — it does not
+   choose them inside reachable simulated time. That is a melonDS question, where
+   hundreds of frames are trivial: extend `sim/melonds_tracer/main_fbdump.cpp` to
+   log video-register writes. Meanwhile a render ROM does not need to match Kirby
+   to be worth writing — one that programs a *known* mode and is diffed against
+   melonDS running the same ROM gives a real oracle, which Kirby never will. The
+   `sdk2d` custom-crt0 pattern and `sim/tests/nds_2d*` are the starting points.
 4. Write the ROMs `bootreq` had to exclude: TCM, BIOS SWIs, VBlank/IRQ dispatch,
    card reads. A BIOS SWI ROM would have caught the BIOS9 clock bug directly.
 

@@ -851,12 +851,19 @@ begin
    -- sampled on clk2x: the clk1x-domain signals are stable for two island cycles,
    -- so an edge detector here sees each of them exactly once, while dmab_ena_i9
    -- and cpu9_done_1x are one-island-cycle pulses that a clk1x sampler would miss.
-   -- Every ARM9 write to a video-mode register, deduplicated to the last value
-   -- per register and reported once at the end. This is how you find out what
-   -- video mode a commercial ROM actually programs, which is the prerequisite for
-   -- writing a devkitPro render-test ROM that exercises the SAME modes instead of
-   -- a guess. Engine A is at 0x0400_0000, engine B at 0x0400_1000, and POWCNT1 at
-   -- 0x0400_0304 decides which engine reaches which screen at all.
+   -- Every ARM9 write to a video-mode register that CHANGES it, reported as it
+   -- happens. This is how you find out what video mode a commercial ROM actually
+   -- programs, which is the prerequisite for writing a devkitPro render-test ROM
+   -- that exercises the SAME modes instead of a guess. Engine A is at
+   -- 0x0400_0000, engine B at 0x0400_1000, and POWCNT1 at 0x0400_0304 decides
+   -- which engine reaches which screen at all.
+   --
+   -- Reported on change rather than summarised at the end, and that is not a
+   -- style choice: tests_done is set only on normal completion (line 1335), while
+   -- every Kirby-length run ends at p_watchdog's `severity failure`, which
+   -- --exit-severity=failure turns into an immediate abort. An end-of-run
+   -- summary in this bench is a summary that never prints. Dedup keeps it to a
+   -- handful of lines - games write DISPCNT every frame with the same value.
    p_vidregs : process
       alias a_iob is << signal .tb_top_frame.idut.io_bus9 : proc_bus_gb_type >>;
       type t_seen is array (0 to 16#40#) of std_logic_vector(31 downto 0);
@@ -872,29 +879,30 @@ begin
          -- (nds_top.vhd:1663), POWCNT1 is 0x304.
          adr := to_integer(unsigned(a_iob.Adr));
          if (adr <= 16#03C#) then
-            segA(adr / 4) := a_iob.Din;
+            if (segA(adr / 4) /= a_iob.Din) then
+               segA(adr / 4) := a_iob.Din;
+               report "VIDREG A +" & to_hstring(to_unsigned(adr, 12)) &
+                      " = " & to_hstring(a_iob.Din) &
+                      " bEna=" & to_hstring(a_iob.bEna) &
+                      " @" & time'image(now) severity note;
+            end if;
          elsif (adr >= 16#1000# and adr <= 16#103C#) then
-            segB((adr - 16#1000#) / 4) := a_iob.Din;
+            if (segB((adr - 16#1000#) / 4) /= a_iob.Din) then
+               segB((adr - 16#1000#) / 4) := a_iob.Din;
+               report "VIDREG B +" & to_hstring(to_unsigned(adr - 16#1000#, 12)) &
+                      " = " & to_hstring(a_iob.Din) &
+                      " bEna=" & to_hstring(a_iob.bEna) &
+                      " @" & time'image(now) severity note;
+            end if;
          elsif (adr = 16#304#) then
-            powcnt := a_iob.Din;
+            if (powcnt /= a_iob.Din) then
+               powcnt := a_iob.Din;
+               report "VIDREG POWCNT1 = " & to_hstring(a_iob.Din) &
+                      " @" & time'image(now) severity note;
+            end if;
          end if;
       end if;
       p_ena := a_iob.ena;
-
-      if (tests_done) then
-         report "VIDREG POWCNT1 = " & to_hstring(powcnt) severity note;
-         for i in 0 to 15 loop
-            if (segA(i)(0) /= 'U') then
-               report "VIDREG A +" & to_hstring(to_unsigned(i * 4, 12)) &
-                      " = " & to_hstring(segA(i)) severity note;
-            end if;
-            if (segB(i)(0) /= 'U') then
-               report "VIDREG B +" & to_hstring(to_unsigned(i * 4, 12)) &
-                      " = " & to_hstring(segB(i)) severity note;
-            end if;
-         end loop;
-         wait;
-      end if;
    end process;
 
    p_dmawatch : process
