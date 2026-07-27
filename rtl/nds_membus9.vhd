@@ -161,6 +161,24 @@ architecture arch of nds_membus9 is
    signal r_acc    : std_logic_vector(1 downto 0) := "10";
    signal r_low    : std_logic_vector(1 downto 0) := "00";
 
+   -- "bits at or above the region size" mask for a TCM size code: the region is
+   -- 512 << size bytes, so bit 9+size and everything above it must be clear (or
+   -- match the base) for an address to be inside. Pure function of the size
+   -- register - see the TCM decode below for why that matters.
+   function region_mask (size : std_logic_vector(4 downto 0)) return unsigned is
+      variable m : unsigned(32 downto 0) := (others => '0');
+   begin
+      for i in 0 to 32 loop
+         if (i >= 9 + to_integer(unsigned(size))) then
+            m(i) := '1';
+         end if;
+      end loop;
+      return m;
+   end function;
+
+   signal itcm_size_ovf : std_logic;
+   signal dtcm_size_ovf : std_logic;
+
    signal itcm_hit   : std_logic;
    signal dtcm_hit   : std_logic;
    signal dec_target : t_target;
@@ -256,28 +274,67 @@ begin
    dtcm_be        <= be;
    dtcm_writedata <= wdata;
 
+   -- size > 23 makes 512 << size overflow the 33-bit limit the old compares
+   -- used, which turned every hit test false. See the TCM decode below.
+   itcm_size_ovf <= '1' when (unsigned(itcm_size) > 23) else '0';
+   dtcm_size_ovf <= '1' when (unsigned(dtcm_size) > 23) else '0';
+
    -- ================= TCM decode =================
+   -- Both hit tests used to be unsigned magnitude compares against runtime
+   -- limits, which put the *address* on a carry chain: `a < itcm_limit` for
+   -- ITCM and `a >= dtcm_lo and a < dtcm_hi` for DTCM. In the 88% island build
+   -- that chain (`imembus9|LessThan2~15/34/44/45`) was 3.46 ns of the 21.8 ns
+   -- `decode_RM_op2 -> vram_din` worst path, and it is most of the separate
+   -- `io_bus.Adr -> vram_din` family too.
+   --
+   -- Same rewrite as the CP15 PU region compare above: a TCM region is a power
+   -- of two, so "inside the region" is a test on the address bits *above* the
+   -- region size - an and + zero-detect instead of a compare.
+   --
+   --   ITCM (base is architecturally 0):  a < 2^k          <->  (a and mask) = 0
+   --   DTCM:                              a in [lo,lo+2^k) <->  ((a xor lo) and mask) = 0
+   --
+   -- with mask(i) = '1' iff i >= k. The masks derive from itcm_size/dtcm_size
+   -- only - both registers - so the shift stays off the address path exactly as
+   -- it does for the PU compare.
+   --
+   -- Two things the old form did that this has to keep doing:
+   --
+   -- * 512 << size is computed in 33 bits, so any size > 23 shifted the region
+   --   bit off the top and left a limit of 0 - which made the compare false for
+   --   every address. A mask built from k > 32 is all-zero, i.e. hit for every
+   --   address: the exact opposite. `*_size_ovf` restores the old answer, and
+   --   being size-derived it costs nothing on the address path. melonDS wraps
+   --   the same way (u32 `0x200 << N`), so "no hit" is also the oracle's answer.
+   -- * a(32) is always '0' (cpu_adr is 32 bits), so size 23 - mask = bit 32
+   --   alone - hits for every address, which is what `a < 2^32` did.
+   --
+   -- The ITCM form is an identity. The DTCM form additionally assumes the base
+   -- is aligned to the region size; the ARM946E-S requires that (an unaligned
+   -- TCM base is UNPREDICTABLE) and melonDS - the trace oracle - enforces it by
+   -- masking the base. Masking dtcm_lo here makes the two agree.
    process (all)
-      variable a          : unsigned(32 downto 0);
-      variable itcm_limit : unsigned(32 downto 0);
-      variable dtcm_lo    : unsigned(32 downto 0);
-      variable dtcm_hi    : unsigned(32 downto 0);
+      variable a         : unsigned(32 downto 0);
+      variable itcm_mask : unsigned(32 downto 0);
+      variable dtcm_mask : unsigned(32 downto 0);
+      variable dtcm_lo   : unsigned(32 downto 0);
    begin
       a := unsigned('0' & cpu_adr);
 
-      itcm_limit := shift_left(to_unsigned(512, 33), to_integer(unsigned(itcm_size)));
-      itcm_hit   <= '0';
-      if (itcm_ena = '1' and a < itcm_limit and dma_bus = '0') then
+      itcm_mask := region_mask(itcm_size);
+      itcm_hit  <= '0';
+      if (itcm_ena = '1' and itcm_size_ovf = '0' and (a and itcm_mask) = 0 and dma_bus = '0') then
          -- load mode: writes land in the TCM, reads see the external map
          if (cpu_rnw = '0' or itcm_load = '0') then
             itcm_hit <= '1';
          end if;
       end if;
 
-      dtcm_lo  := unsigned('0' & dtcm_base & x"000");
-      dtcm_hi  := dtcm_lo + shift_left(to_unsigned(512, 33), to_integer(unsigned(dtcm_size)));
-      dtcm_hit <= '0';
-      if (dtcm_ena = '1' and cpu_code = '0' and a >= dtcm_lo and a < dtcm_hi and dma_bus = '0') then
+      dtcm_mask := region_mask(dtcm_size);
+      dtcm_lo   := unsigned('0' & dtcm_base & x"000") and dtcm_mask;
+      dtcm_hit  <= '0';
+      if (dtcm_ena = '1' and cpu_code = '0' and dtcm_size_ovf = '0' and
+          ((a xor dtcm_lo) and dtcm_mask) = 0 and dma_bus = '0') then
          if (cpu_rnw = '0' or dtcm_load = '0') then
             dtcm_hit <= '1';
          end if;
