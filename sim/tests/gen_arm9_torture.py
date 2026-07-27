@@ -254,6 +254,34 @@ class Gen:
         self.out.append(f"{skip}:")
         self.emit(f"bl   {name}")
 
+    def chunk_pcwrite(self):
+        # Writing the PC from the datapath. chunk_callret only ever reaches the
+        # PC through ldm, which is a different path in the core: the value comes
+        # from memory, not from the ALU. These forms make this cycle's ALU result
+        # the next fetch address, which is the ARM9's longest combinational path
+        # (register file -> shifter -> ALU -> writeback mux -> bus address ->
+        # CP15 PU compare), so anything restructuring it has to be diffed against
+        # a workload that actually executes them.
+        dest = self.label()
+        a = self.reg()
+        b = self.rng.choice([r for r in FREE if r != a])
+        form = self.rng.randrange(5)
+        self.emit(f"adr  {a}, {dest}")
+        if form == 0:
+            self.emit(f"mov  pc, {a}")                  # plain ALU -> PC
+        elif form == 1:
+            self.emit(f"add  pc, {a}, #0")              # adder -> PC
+        elif form == 2:
+            # through the barrel shifter, which is where the path launches
+            self.emit(f"mov  {b}, {a}, lsr #2")
+            self.emit(f"mov  pc, {b}, lsl #2")
+        elif form == 3:
+            self.emit(f"bx   {a}")                      # v5 interworking, stays ARM
+        else:
+            self.emit(f"str  {a}, [r8]")                # load -> PC
+            self.emit("ldr  pc, [r8]")
+        self.out.append(f"{dest}:")
+
     def pool(self):
         l = self.label()
         self.out.append(f"   b    {l}")
@@ -296,8 +324,9 @@ class Gen:
         o.append("outer:")
         chunks = [self.chunk_const, self.chunk_alu, self.chunk_mul,
                   self.chunk_mem, self.chunk_ldmstm, self.chunk_cond,
-                  self.chunk_msr, self.chunk_thumb, self.chunk_callret]
-        weights = [15, 25, 15, 15, 8, 10, 5, 5, 2]
+                  self.chunk_msr, self.chunk_thumb, self.chunk_callret,
+                  self.chunk_pcwrite]
+        weights = [15, 25, 15, 15, 8, 10, 5, 5, 2, 6]
         if self.caches:
             chunks.append(self.chunk_cachemaint)
             weights.append(4)

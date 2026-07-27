@@ -83,7 +83,8 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    sim/tb_gpu2d.vhd \
    sim/tb_gpu2d_frame.vhd \
    sim/tb_gpu2d_timed.vhd \
-   sim/tb_gpu_timing.vhd
+   sim/tb_gpu_timing.vhd \
+   sim/tb_shifter_equiv.vhd
 # (tb_gpu_* / tb_vram_ls / tb_gpu2d* are analyze-only: their hex-file
 #  constants load at elaboration and the vectors are generated, not
 #  checked in)
@@ -98,5 +99,6 @@ nvc -H 1g -L "$WORK" --work="$WORK/work" -e tb_arm9_island
 nvc -H 1g -L "$WORK" --work="$WORK/work" -e tb_arm9_trace
 nvc -L "$WORK" --work="$WORK/work" -e tb_gpu_timing
 nvc -L "$WORK" --work="$WORK/work" -e tb_card_chipid
+nvc -L "$WORK" --work="$WORK/work" -e tb_shifter_equiv
 
 echo "analyze-all: OK"

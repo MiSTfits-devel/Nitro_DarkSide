@@ -38,6 +38,11 @@ ARTIFACT_FILES=(
    # out long before it reaches the CPU, so it cannot answer "would the ARM9
    # close at 67 MHz" - this one is scoped to icpu9/imembus9 and can.
    NDS.paths_cpu9.rpt
+   # ...but paths_cpu9 is -detail summary: it names the endpoints and never says
+   # where the nanoseconds went. Choosing a cut off endpoint names alone is how
+   # a build got spent on logic that turned out not to be on the path. This is
+   # the same four families with -detail full_path, two paths each.
+   NDS.paths_fam.rpt
 )
 
 if [[ ! "$POD" =~ ^([a-z0-9]|[a-z0-9][-a-z0-9]{0,61}[a-z0-9])$ ]]; then
