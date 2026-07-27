@@ -262,13 +262,26 @@ begin
    -- valid in the FINISH cycle, writes land at the accept edge (one cycle
    -- earlier than the old external write process - unobservable, the next
    -- request is accepted no earlier than the FINISH edge).
-   itcm_sel       <= '1' when (accept_now = '1' and cpu_ena = '1' and dec_target = T_ITCM) else '0';
+   -- These test the hit bits directly rather than `dec_target = T_*`, which is
+   -- the same Boolean function and a shorter path. dec_target is an enum: the
+   -- region decode below encodes itcm_hit/dtcm_hit into it and this comparison
+   -- decodes them back out, two LUT levels of round trip on a signal that is
+   -- already the far end of the ARM9's longest path. The DTCM store's M10K
+   -- write-enable was the worst endpoint in the design after imainram|req9_lock
+   -- (-4.196 ns), and it is reached exactly this way:
+   --    ALU -> bus address -> dtcm_hit -> dec_target -> dtcm_sel -> dtcm_we.
+   --
+   -- Equivalence is by construction from the priority order below:
+   --   dec_target = T_ITCM  <->  itcm_hit
+   --   dec_target = T_DTCM  <->  dtcm_hit and not itcm_hit
+   -- and nothing above ITCM can claim the address.
+   itcm_sel       <= accept_now and cpu_ena and itcm_hit;
    itcm_addr      <= unsigned(cpu_adr(14 downto 2));
    itcm_we        <= itcm_sel and not cpu_rnw;
    itcm_be        <= be;
    itcm_writedata <= wdata;
 
-   dtcm_sel       <= '1' when (accept_now = '1' and cpu_ena = '1' and dec_target = T_DTCM) else '0';
+   dtcm_sel       <= accept_now and cpu_ena and dtcm_hit and not itcm_hit;
    dtcm_addr      <= unsigned(cpu_adr(13 downto 2));
    dtcm_we        <= dtcm_sel and not cpu_rnw;
    dtcm_be        <= be;
