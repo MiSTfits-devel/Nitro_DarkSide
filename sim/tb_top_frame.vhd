@@ -717,6 +717,103 @@ begin
       end process;
    end generate;
 
+   -- ================= IPCSYNC watch =================
+   -- Does the ARM9's echo actually land in the register? The ARM7 reads 0 for the
+   -- ARM9's nibble at instruction 231,344 where the oracle reads 8, and the
+   -- instruction-count evidence says the ARM9 is AHEAD by then - so "too slow" may
+   -- be the wrong story. Only io_bus9.ena is synchronised across the island bridge;
+   -- Adr/Din/bEna cross unsynchronised, so a write can land with the wrong payload
+   -- or not at all while the ARM9's own trace stays perfect. This reports every
+   -- change to either side's out-nibble with a timestamp, which distinguishes
+   -- "never written", "written late", and "written with the wrong value".
+   -- Counts the ARM9 IO write path end to end, so a dropped store can be pinned to
+   -- a stage instead of guessed at: membus9 issuing (i9_io_bus.ena, island), the
+   -- bridge delivering (io_bus9.ena, clk1x), and how many of each are writes.
+   p_iocount : process
+      alias a_i9ena is << signal .tb_top_frame.idut.i9_io_bus : proc_bus_gb_type >>;
+      alias a_io9   is << signal .tb_top_frame.idut.io_bus9   : proc_bus_gb_type >>;
+      alias a_mb_adr is << signal .tb_top_frame.idut.mbus_adr : std_logic_vector(31 downto 0) >>;
+      alias a_mb_ena is << signal .tb_top_frame.idut.mbus_ena : std_logic >>;
+      alias a_mb_acc is << signal .tb_top_frame.idut.imembus9.accept_now : std_logic >>;
+      alias a_itcm   is << signal .tb_top_frame.idut.imembus9.itcm_hit : std_logic >>;
+      alias a_dtcm   is << signal .tb_top_frame.idut.imembus9.dtcm_hit : std_logic >>;
+      variable c_isl, c_isl_wr, c_1x, c_1x_wr, c_sync : natural := 0;
+      variable prev_isl : std_logic := '0';
+      variable cyc : natural := 0;
+      variable b_tot, b_r2, b_r3, b_r4, b_ro, b_hi : natural := 0;
+      variable b_itcm, b_dtcm, b_io_eaten : natural := 0;
+   begin
+      wait until rising_edge(clk2x);
+      cyc := cyc + 1;
+      -- island side: membus9's one-island-cycle request pulse
+      if (a_i9ena.ena = '1' and prev_isl = '0') then
+         c_isl := c_isl + 1;
+         if (a_i9ena.rnw = '0') then c_isl_wr := c_isl_wr + 1; end if;
+      end if;
+      prev_isl := a_i9ena.ena;
+      if (clk1x = '1' and a_io9.ena = '1') then
+         c_1x := c_1x + 1;
+         if (a_io9.rnw = '0') then
+            c_1x_wr := c_1x_wr + 1;
+            if (a_io9.Adr = x"0000180") then c_sync := c_sync + 1; end if;
+         end if;
+      end if;
+      -- Census of every request membus9 ACCEPTS, bucketed by address region and by
+      -- whether a TCM claimed it. If the ARM9's IO stores are executed (the trace
+      -- proves they are) but io_bus.ena almost never pulses, they must be landing
+      -- on some other target - this says which, instead of guessing.
+      if (a_mb_ena = '1' and a_mb_acc = '1') then
+         b_tot := b_tot + 1;
+         case a_mb_adr(27 downto 24) is
+            when x"2"   => b_r2 := b_r2 + 1;
+            when x"3"   => b_r3 := b_r3 + 1;
+            when x"4"   => b_r4 := b_r4 + 1;
+            when others => b_ro := b_ro + 1;
+         end case;
+         if (a_mb_adr(31 downto 28) /= x"0") then b_hi := b_hi + 1; end if;
+         if (a_itcm = '1') then b_itcm := b_itcm + 1; end if;
+         if (a_dtcm = '1') then b_dtcm := b_dtcm + 1; end if;
+         -- an IO-range access that a TCM swallowed is the smoking gun
+         if (a_mb_adr(31 downto 24) = x"04" and (a_itcm = '1' or a_dtcm = '1')) then
+            b_io_eaten := b_io_eaten + 1;
+         end if;
+      end if;
+      if (cyc mod 200000 = 0) then
+         report "IO9 path: island req " & integer'image(c_isl) & " (wr " &
+                integer'image(c_isl_wr) & ")   clk1x seen " & integer'image(c_1x) &
+                " (wr " & integer'image(c_1x_wr) & ")   IPCSYNC writes " &
+                integer'image(c_sync) severity note;
+         report "  mbus9 accepts " & integer'image(b_tot) & ": 0x02 " &
+                integer'image(b_r2) & "  0x03 " & integer'image(b_r3) & "  0x04 " &
+                integer'image(b_r4) & "  other " & integer'image(b_ro) &
+                "  above-0x0FFFFFFF " & integer'image(b_hi) &
+                "   itcm_hit " & integer'image(b_itcm) & "  dtcm_hit " &
+                integer'image(b_dtcm) & "  IO-eaten-by-TCM " &
+                integer'image(b_io_eaten) severity note;
+      end if;
+   end process;
+
+   p_ipcwatch : process
+      alias a_s9 is << signal .tb_top_frame.idut.iipc.sync9_out : std_logic_vector(3 downto 0) >>;
+      alias a_s7 is << signal .tb_top_frame.idut.iipc.sync7_out : std_logic_vector(3 downto 0) >>;
+      variable p9, p7 : std_logic_vector(3 downto 0) := (others => '0');
+      variable n : integer := 0;
+   begin
+      wait until rising_edge(clk1x);
+      if (a_s9 /= p9) then
+         report "IPCSYNC arm9_out " & to_hstring(p9) & " -> " & to_hstring(a_s9) &
+                " at " & time'image(now) severity note;
+         p9 := a_s9;
+         n := n + 1;
+      end if;
+      if (a_s7 /= p7) then
+         report "IPCSYNC arm7_out " & to_hstring(p7) & " -> " & to_hstring(a_s7) &
+                " at " & time'image(now) severity note;
+         p7 := a_s7;
+         n := n + 1;
+      end if;
+   end process;
+
    -- ================= ARM9 trace writer (TRACEFILE /= "") =================
    -- Same line format as tb_arm9_trace / melonds_tracer (docs/TRACE_DIFF.md):
    -- <pc> <opcode> <cpsr> <r0>..<r14>, one line per retired instruction.
@@ -745,6 +842,14 @@ begin
                end loop;
                writeline(tf, l);
                n := n + 1;
+               -- Timestamp the instruction stream. Without this an instruction
+               -- index cannot be converted to a time, so "the ARM9 had not echoed
+               -- when the ARM7 read IPCSYNC" cannot be turned into a cycle count -
+               -- and the size of that margin is what decides whether the fix is a
+               -- tweak or a memory-subsystem redesign.
+               if (n mod 10000 = 0) then
+                  report "T9 " & integer'image(n) & " " & time'image(now) severity note;
+               end if;
                if (n mod 500000 = 0) then
                   report "traced " & integer'image(n) & " instructions" severity note;
                end if;
@@ -780,6 +885,18 @@ begin
                end loop;
                writeline(tf, l);
                n := n + 1;
+               if (n mod 10000 = 0) then
+                  report "T7 " & integer'image(n) & " " & time'image(now) severity note;
+               end if;
+               -- The handshake instruction itself (see COORDINATION.md): the ARM7
+               -- reads IPCSYNC here and the oracle sees the ARM9's echo nibble
+               -- already set. Report it exactly rather than interpolating.
+               if (n = 231344 or n = 231343 or n = 231345) then
+                  report "T7 HANDSHAKE instr " & integer'image(n) & " pc=" &
+                         to_hstring(dbg_export7.pc) & " r0=" &
+                         to_hstring(dbg_export7.regs(0)) & " at " & time'image(now)
+                         severity note;
+               end if;
                if (n >= MAXINSTR) then
                   report "tb_top_frame: ARM7 trace cap reached, closing " & TRACEFILE7 severity note;
                   file_close(tf);
