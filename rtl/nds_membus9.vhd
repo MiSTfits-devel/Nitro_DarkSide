@@ -198,6 +198,9 @@ begin
       req_addr      => creq_addr,
       req_be        => creq_be,
       req_wdata     => creq_wdata,
+      -- the CPU's address before this membus registers it into creq_addr, so the
+      -- cache can index its tag/data BRAMs a cycle earlier (see nds_cache9)
+      spec_addr     => cpu_adr,
       resp_done     => cresp_done,
       resp_rdata    => cresp_rdata,
       mem_ena       => mr_ena,
