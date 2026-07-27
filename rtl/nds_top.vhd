@@ -254,6 +254,8 @@ architecture arch of nds_top is
    -- island-side copy of the IO bus record: nds_top rebuilds io_bus9 from it with
    -- the stretched enable substituted, since only .ena needs to cross
    signal i9_io_bus : proc_bus_gb_type;
+   -- island-side capture of the IO request payload, held across the bridge
+   signal io9_lat   : proc_bus_gb_type;
    signal io9_ena   : std_logic := '0';   -- stretched io_bus9.ena, clk1x domain
    signal cdc_dmab_ena_d, dmab_ena_i9   : std_logic := '0';
    signal cdc_cpudone_tgl, cdc_cpudone_tgl_d, cpu9_done_1x : std_logic := '0';
@@ -806,9 +808,32 @@ begin
    end process;
 
    -- everything except .ena is a stable level for the whole transaction
-   io_bus9 <= (Din  => i9_io_bus.Din,  Adr  => i9_io_bus.Adr,
-               rnw  => i9_io_bus.rnw,  ena  => io9_ena,
-               acc  => i9_io_bus.acc,  bEna => i9_io_bus.bEna,
+   -- IO payload latch, island -> clk1x. Only `ena` was synchronised across the
+   -- bridge; Adr/Din/bEna/rnw were taken live from the island signal. membus9
+   -- asserts io_bus.ena for ONE island cycle and then enters FINISH, where
+   -- accept_now is already true - so it can accept the next request and overwrite
+   -- the payload on the following island cycle, a full clk1x edge before the IO
+   -- fabric samples it. The write then landed with whatever had replaced it.
+   --
+   -- This is why the screen was white. The ARM9 wrote IPCSYNC 59 times and
+   -- nds_ipc applied every one of them with a data nibble of 0, so sync9_out never
+   -- left 0, the ARM7 read 0x0800 instead of 0x0808 and the boot handshake never
+   -- completed; DISPCNT was programmed with garbage for the same reason. None of it
+   -- was visible in the ARM9's instruction trace, which stayed byte-identical to
+   -- melonDS for 1.29M instructions - a store that goes astray does not touch the
+   -- CPU's registers.
+   process (clk2x)
+   begin
+      if rising_edge(clk2x) then
+         if (i9_io_bus.ena = '1') then
+            io9_lat <= i9_io_bus;
+         end if;
+      end if;
+   end process;
+
+   io_bus9 <= (Din  => io9_lat.Din,  Adr  => io9_lat.Adr,
+               rnw  => io9_lat.rnw,  ena  => io9_ena,
+               acc  => io9_lat.acc,  bEna => io9_lat.bEna,
                rst  => i9_io_bus.rst);
 
    -- Done narrow, clk1x -> clk2x. A 1-clk1x done is high for two clk2x cycles;
