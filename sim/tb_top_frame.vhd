@@ -755,7 +755,18 @@ begin
          c_1x := c_1x + 1;
          if (a_io9.rnw = '0') then
             c_1x_wr := c_1x_wr + 1;
-            if (a_io9.Adr = x"0000180") then c_sync := c_sync + 1; end if;
+            if (a_io9.Adr = x"0000180") then
+               c_sync := c_sync + 1;
+               -- The write reaches the bus but sync9_out never moves, so print
+               -- what nds_ipc actually receives. It applies the write only when
+               -- bEna(1)='1' and takes the nibble from Din(11:8).
+               if (c_sync <= 12) then
+                  report "IPCSYNC WR#" & integer'image(c_sync) & " Adr=" &
+                         to_hstring(a_io9.Adr) & " Din=" & to_hstring(a_io9.Din) &
+                         " bEna=" & to_hstring(a_io9.bEna) & " acc=" &
+                         to_hstring(a_io9.acc) & " at " & time'image(now) severity note;
+               end if;
+            end if;
          end if;
       end if;
       -- Census of every request membus9 ACCEPTS, bucketed by address region and by
