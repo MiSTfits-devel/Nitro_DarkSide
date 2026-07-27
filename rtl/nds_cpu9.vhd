@@ -143,7 +143,7 @@ architecture arch of nds_cpu9 is
    signal cp15_dtcm_reg    : std_logic_vector(31 downto 0) := x"0300000A"; -- c9,c1,0
    signal cp15_itcm_reg    : std_logic_vector(31 downto 0) := x"00000020"; -- c9,c1,1
    type t_cp15_regions is array (0 to 7) of std_logic_vector(31 downto 0);
-   type t_cp15_masks   is array (0 to 7) of unsigned(31 downto 0);
+   type t_cp15_masks   is array (0 to 7) of unsigned(31 downto 12);
    -- per-region "bits above the size code" mask, derived from the region
    -- registers only so it stays off the address path (see the PU compare below)
    signal cp15_pu_mask : t_cp15_masks;
@@ -374,18 +374,18 @@ architecture arch of nds_cpu9 is
    signal shiftresult                     : unsigned(31 downto 0);
    signal shiftercarry                    : std_logic;
                                           
-   signal shiftercarry_LSL                : std_logic;
-   signal shiftercarry_RSL                : std_logic;
-   signal shiftercarry_ARS                : std_logic;
-   signal shiftercarry_ROR                : std_logic;
-   signal shiftercarry_RRX                : std_logic;
-                                          
-   signal shiftresult_LSL                 : unsigned(31 downto 0);
-   signal shiftresult_RSL                 : unsigned(31 downto 0);
-   signal shiftresult_ARS                 : unsigned(31 downto 0);
-   signal shiftresult_ROR                 : unsigned(31 downto 0);
-   signal shiftresult_RRX                 : unsigned(31 downto 0);  
-               
+   -- single-rotator shifter control (all register-derived - see the shifter)
+   type t_shfill is (FILL_ZERO, FILL_SIGN, FILL_CARRY);
+   type t_shcsel is (CSEL_ZERO, CSEL_CARRY, CSEL_VALUE);
+   signal sh_rot                          : integer range 0 to 31;
+   signal sh_keep                         : std_logic_vector(31 downto 0);
+   signal sh_fill                         : t_shfill;
+   signal sh_cidx                         : integer range 0 to 31;
+   signal sh_csel                         : t_shcsel;
+   signal sh_rotv                         : unsigned(31 downto 0);
+   signal sh_fillb                        : std_logic;
+
+
    signal alu_op1                         : unsigned(31 downto 0);
    signal alu_op2                         : unsigned(31 downto 0);
    signal alu_result                      : unsigned(31 downto 0);
@@ -407,6 +407,12 @@ architecture arch of nds_cpu9 is
    signal execute_nextIsthumb             : std_logic;
    signal execute_branchPC                : unsigned(31 downto 0);
    signal execute_branchPC_masked         : unsigned(31 downto 0);
+   -- PC-write fetch address, muxed straight into gb_bus_Adr (see there)
+   signal pcwrite_fetch                   : std_logic;
+   signal pcwrite_Addr                    : unsigned(31 downto 0);
+   signal bus_AddrFetch_eff               : unsigned(31 downto 0);
+   signal adr_early                       : std_logic_vector(31 downto 0);
+   signal adr_is_pcw                      : std_logic;
                
    signal execute_stall                   : std_logic := '0';
    signal execute_done                    : std_logic;
@@ -626,12 +632,21 @@ begin
    -- it replaces eight barrel shifters with eight decoders (frees ALMs, which is
    -- the binding constraint on this design). sz=31 gives an all-zero mask, which
    -- matches shift_right(x,32)=0 always being true.
+   -- The compare runs on bits 31:12 only. The mask is `i > sz` and a region
+   -- register can only express a 4 KB-aligned base, so for every size code the
+   -- ARM946E-S allows (4 KB is its minimum region, sz = 11) the low twelve mask
+   -- bits are already zero and those address bits were being compared against
+   -- nothing. Below that they made a sub-4 KB region match only its first byte;
+   -- melonDS resolves the PU into a per-4 KB-page table (PU_Map[addr >> 12]),
+   -- so treating an illegal sub-page region as a page is also the oracle's
+   -- answer. What it buys is 12 of 32 bits off the widest layer of a compare
+   -- that is 58% interconnect on the worst path.
    process (all)
       variable sz : integer range 0 to 31;
    begin
       for r in 0 to 7 loop
          sz := to_integer(unsigned(cp15_pu_region(r)(5 downto 1)));
-         for i in 0 to 31 loop
+         for i in 12 to 31 loop
             if (i > sz) then cp15_pu_mask(r)(i) <= '1';
             else             cp15_pu_mask(r)(i) <= '0';
             end if;
@@ -640,15 +655,15 @@ begin
    end process;
 
    process (all)
-      variable a : unsigned(31 downto 0);
+      variable a : unsigned(31 downto 12);
    begin
       bus_cacheable_i <= '0';
       bus_cacheable_d <= '0';
-      a := unsigned(gb_bus_Adr);
+      a := unsigned(gb_bus_Adr(31 downto 12));
       if (cp15_control(0) = '1') then
          for r in 0 to 7 loop
             if (cp15_pu_region(r)(0) = '1') then
-               if (((a xor unsigned(std_logic_vector'(cp15_pu_region(r)(31 downto 12) & x"000")))
+               if (((a xor unsigned(cp15_pu_region(r)(31 downto 12)))
                     and cp15_pu_mask(r)) = 0) then
                   bus_cacheable_i <= cp15_control(12) and cp15_pu_icache(r);
                   bus_cacheable_d <= cp15_control(2)  and cp15_pu_dcache(r);
@@ -823,10 +838,55 @@ begin
       end if;
    end process;
    
-   gb_bus_Adr  <= gb_bus_saved_Adr                when (gb_bus_saved = '1') else 
-                  std_logic_vector(bus_AddrFetch) when (bus_accessFetch = '1') else 
-                  std_logic_vector(execute_RW_addr);
-                 
+   -- ===== PC-write fetch address: one mux level instead of two =====
+   --
+   -- When an instruction writes the PC, this cycle's ALU result becomes the next
+   -- fetch address, and it used to get there through execute_writedata ->
+   -- execute_branchPC -> (execute_branchPC_masked / bus_AddrFetch / gb_bus_Adr,
+   -- which Quartus packs into one LUT). Measured on the worst path that tail is
+   -- 3.55 ns for two levels, 2.94 ns of it interconnect - the muxes are cheap,
+   -- the hops between them are not, and both levels select the same value.
+   --
+   -- So: strip the writedata term out of execute_branchPC entirely and give it a
+   -- port on the LAST mux, past everything else. Every remaining input of
+   -- adr_early is register-derived, so the late value crosses exactly one LUT.
+   --
+   -- The IRQ / software_interrupt exclusion is not a detail. execute_branch puts
+   -- the PC-write case FIRST, but execute_branchPC puts the exception vectors
+   -- first, so an exception that also writes the PC must still take the vector.
+   -- Drop that condition and those branches go to the written value instead.
+   pcwrite_fetch <= '1' when (execute_writeback = '1' and execute_writereg = x"F" and
+                              decode_functions_detail /= IRQ and
+                              decode_functions_detail /= software_interrupt_detail) else '0';
+
+   -- what execute_branchPC_masked used to produce for that case: branchPC is
+   -- writedata(31:1) & '0', then the mask clears bit 1 unless the target is
+   -- thumb and always clears bit 0
+   pcwrite_Addr <= execute_writedata(31 downto 2) &
+                   (execute_writedata(1) and execute_nextIsthumb) & '0';
+
+   -- the code-fetch address as actually presented on the bus. bus_AddrFetch no
+   -- longer covers the PC-write case, so everything that consumed it as "the
+   -- address we are fetching from" - fetch_PC's +2/+4 advance and the savestate
+   -- PC - has to read this instead.
+   bus_AddrFetch_eff <= pcwrite_Addr when (pcwrite_fetch = '1') else bus_AddrFetch;
+
+   adr_early <= gb_bus_saved_Adr                when (gb_bus_saved = '1') else
+                std_logic_vector(bus_AddrFetch) when (bus_accessFetch = '1') else
+                std_logic_vector(execute_RW_addr);
+
+   -- Tried spelling this out as the full five-term AND instead of reusing
+   -- pcwrite_fetch, on the theory that it saves a LUT level and a 32-fanout
+   -- broadcast in front of the final address mux (pcwrite_fetch is five levels
+   -- downstream of the memory system's done). Measured the other way: build
+   -- artifacts-t4 came out 0.12 ns worse than t2 with +335 ALMs, because
+   -- duplicating the writereg compare is not free at 91% utilisation. Left
+   -- sharing pcwrite_fetch.
+   adr_is_pcw <= bus_accessFetch and pcwrite_fetch and not gb_bus_saved;
+
+   gb_bus_Adr <= std_logic_vector(pcwrite_Addr) when (adr_is_pcw = '1') else adr_early;
+
+
    gb_bus_rnw  <= gb_bus_saved_rnw when (gb_bus_saved = '1') else 
                   '1'              when (bus_accessFetch = '1') else 
                   execute_RW_rnw;
@@ -879,9 +939,9 @@ begin
             --if (bus_accessFetch = '1' and gb_bus_ena = '1' and (busState = BUSSTATE_IDLE or gb_bus_done = '1')) then
             if (gb_bus_code = '1' and gb_bus_ena = '1') then
                if (execute_nextIsthumb = '1') then
-                  fetch_PC <= bus_AddrFetch + 2;
+                  fetch_PC <= bus_AddrFetch_eff + 2;
                else
-                  fetch_PC <= bus_AddrFetch + 4;
+                  fetch_PC <= bus_AddrFetch_eff + 4;
                end if;
             end if;
             
@@ -895,15 +955,18 @@ begin
                fetch_ready <= '1'; 
             end if;
             
+            -- bus_AddrFetch_eff, not execute_branchPC_masked: pcwrite_fetch = '1'
+            -- implies execute_branch = '1', so inside this branch the two are the
+            -- same value - and only the former still carries the PC-write case.
             if (execute_branch = '1') then
                fetch_ready <= '0';
                if ((execute_stall = '1' and execute_done = '0') or dma_on = '1') then
-                  fetch_PC <= execute_branchPC_masked;
+                  fetch_PC <= bus_AddrFetch_eff;
                end if;
             end if;
 
             if (jump_out = '1') then
-               SAVESTATE_PC_out <= std_logic_vector(execute_branchPC_masked);
+               SAVESTATE_PC_out <= std_logic_vector(bus_AddrFetch_eff);
             end if;
 
          end if;
@@ -2012,86 +2075,137 @@ begin
 
    end process;
    
-   -- shifter
+   -- ================= shifter =================
+   -- One rotator, not five shifters.
+   --
+   -- This used to build a full 32-bit barrel shifter per mode (LSL, LSR, ASR,
+   -- ROR, plus the trivial RRX) and mux the five results. Worse, the amount is
+   -- declared `integer range 0 to 255` - a register-specified shift may name any
+   -- Rs[7:0] - and Quartus sizes a variable shifter from the DECLARED range, not
+   -- the reachable one, so each was EIGHT stages deep even though every branch
+   -- using it is guarded by `< 32`. The three extra stages can only shift by 32,
+   -- 64 or 128, i.e. produce zero. Same for the `shiftervalue(amount - 1)` carry
+   -- picks: four 256-entry muxes to select one of 32 bits.
+   --
+   -- On the worst path that showed up as a 5.95 ns "shifter tail" with 4.38 ns
+   -- of it interconnect - the signature of a block too large to place compactly,
+   -- not of deep logic.
+   --
+   -- Every ARM shift is a right-rotate plus an edge fill:
+   --
+   --   LSL n  = (v ror (32-n)) with bits [n-1:0]  := 0
+   --   LSR n  = (v ror n)      with bits [31:32-n] := 0
+   --   ASR n  = (v ror n)      with bits [31:32-n] := v(31)
+   --   ROR n  = (v ror n)
+   --   RRX    = (v ror 1)      with bit 31         := C
+   --
+   -- so the operand crosses one 5-stage rotator and one keep/fill mux. The
+   -- rotate amount, the keep mask, which fill to use and which bit the carry
+   -- comes from are all functions of decode_shift_amount / decode_shift_mode /
+   -- decode_shift_RRX - registers, every one - so none of that decode sits on
+   -- the operand path at all.
    shiftervalue <= execute_op2;
-   
-   process (all) 
+
+   process (all)
+      variable n : integer range 0 to 255;
    begin
+      n       := decode_shift_amount;
 
-      -- LSL
-      shiftresult_LSL <= shiftervalue;
-      if (decode_shift_amount >= 32) then
-         if (decode_shift_amount = 32) then
-            shiftercarry_LSL <= shiftervalue(0);
-         else
-            shiftercarry_LSL <= '0';
-         end if;
-         shiftresult_LSL <= (others => '0');
-      elsif (decode_shift_amount > 0) then
-         shiftercarry_LSL <= shiftervalue(32 - decode_shift_amount);
-         shiftresult_LSL <= shiftervalue sll decode_shift_amount;
-      else
-         shiftercarry_LSL <= Flag_Carry;
-      end if;
-      
-      -- RSL
-      shiftresult_RSL <= shiftervalue;
-      if (decode_shift_amount >= 32) then
-         if (decode_shift_amount = 32) then
-            shiftercarry_RSL <= shiftervalue(31);
-         else
-            shiftercarry_RSL <= '0';
-         end if;
-         shiftresult_RSL <= (others => '0');
-      elsif (decode_shift_amount > 0) then
-         shiftercarry_RSL <= shiftervalue(decode_shift_amount - 1);
-         shiftresult_RSL <= shiftervalue srl decode_shift_amount;
-      else
-         shiftercarry_RSL <= Flag_Carry;
-      end if;
-      
-      -- ARS
-      shiftresult_ARS <= shiftervalue;
-      if (decode_shift_amount >= 32) then
-         shiftercarry_ARS <= shiftervalue(31);
-         shiftresult_ARS <= unsigned(shift_right(signed(shiftervalue),31));
-      elsif (decode_shift_amount > 0)  then
-         shiftercarry_ARS <= shiftervalue(decode_shift_amount - 1);
-         shiftresult_ARS <= unsigned(shift_right(signed(shiftervalue),decode_shift_amount));
-      else
-         shiftercarry_ARS <= Flag_Carry;
-      end if;
-      
-      -- ROR
-      shiftresult_ROR <= shiftervalue;
-      if (decode_shift_amount >= 32) then -- >32 can never happen, as checked above, but this fixes simulation problems with carry index and other shifters
-         shiftercarry_ROR <= shiftervalue(31);
-      elsif (decode_shift_amount > 0) then
-         shiftercarry_ROR <= shiftervalue(decode_shift_amount - 1); -- this is the critical line that should not be called if another shifter uses >32
-         shiftresult_ROR  <= shiftervalue ror decode_shift_amount;
-      else
-         shiftercarry_ROR <= Flag_Carry;
-      end if;
-      
-      -- RRX
-      shiftercarry_RRX <= shiftervalue(0);
-      shiftresult_RRX  <= Flag_Carry & shiftervalue(31 downto 1);
+      sh_rot  <= 0;
+      sh_keep <= (others => '1');
+      sh_fill <= FILL_ZERO;
+      sh_cidx <= 0;
+      sh_csel <= CSEL_CARRY;         -- amount 0 leaves C untouched, all modes
 
-      -- combine
       if (decode_shift_RRX = '1') then
-         shiftercarry <= shiftercarry_RRX;
-         shiftresult  <= shiftresult_RRX;
-      else
+         sh_rot  <= 1;
+         sh_keep <= (31 => '0', others => '1');
+         sh_fill <= FILL_CARRY;
+         sh_csel <= CSEL_VALUE;
+         sh_cidx <= 0;               -- carry out = v(0)
+
+      elsif (n /= 0) then
          case (decode_shift_mode) is
-            when "00" => shiftercarry <= shiftercarry_LSL; shiftresult <= shiftresult_LSL;
-            when "01" => shiftercarry <= shiftercarry_RSL; shiftresult <= shiftresult_RSL;
-            when "10" => shiftercarry <= shiftercarry_ARS; shiftresult <= shiftresult_ARS;
-            when "11" => shiftercarry <= shiftercarry_ROR; shiftresult <= shiftresult_ROR;
-            when others => null;
+
+            when "00" =>                                  -- LSL
+               if (n < 32) then
+                  sh_rot  <= 32 - n;
+                  for i in 0 to 31 loop
+                     if (i < n) then sh_keep(i) <= '0'; end if;
+                  end loop;
+                  sh_csel <= CSEL_VALUE;
+                  sh_cidx <= 32 - n;
+               else
+                  sh_keep <= (others => '0');
+                  -- LSL #32 shifts bit 0 out; beyond that the carry is clear
+                  if (n = 32) then
+                     sh_csel <= CSEL_VALUE;
+                     sh_cidx <= 0;
+                  else
+                     sh_csel <= CSEL_ZERO;
+                  end if;
+               end if;
+
+            when "01" =>                                  -- LSR
+               if (n < 32) then
+                  sh_rot  <= n;
+                  for i in 0 to 31 loop
+                     if (i > 31 - n) then sh_keep(i) <= '0'; end if;
+                  end loop;
+                  sh_csel <= CSEL_VALUE;
+                  sh_cidx <= n - 1;
+               else
+                  sh_keep <= (others => '0');
+                  if (n = 32) then
+                     sh_csel <= CSEL_VALUE;
+                     sh_cidx <= 31;
+                  else
+                     sh_csel <= CSEL_ZERO;
+                  end if;
+               end if;
+
+            when "10" =>                                  -- ASR
+               -- saturates: >= 32 is the sign in every bit, carry = sign
+               sh_fill <= FILL_SIGN;
+               sh_csel <= CSEL_VALUE;
+               if (n < 32) then
+                  sh_rot  <= n;
+                  for i in 0 to 31 loop
+                     if (i > 31 - n) then sh_keep(i) <= '0'; end if;
+                  end loop;
+                  sh_cidx <= n - 1;
+               else
+                  sh_keep <= (others => '0');
+                  sh_cidx <= 31;
+               end if;
+
+            when others =>                                -- ROR
+               -- decode already folds a register amount > 32 down to Rs[4:0] or
+               -- to exactly 32, so >= 32 here means ROR #32: value unchanged,
+               -- carry = bit 31.
+               sh_csel <= CSEL_VALUE;
+               if (n < 32) then
+                  sh_rot  <= n;
+                  sh_cidx <= n - 1;
+               else
+                  sh_rot  <= 0;
+                  sh_cidx <= 31;
+               end if;
+
          end case;
       end if;
-
    end process;
+
+   sh_rotv  <= shiftervalue ror sh_rot;
+   sh_fillb <= Flag_Carry       when sh_fill = FILL_CARRY else
+               shiftervalue(31) when sh_fill = FILL_SIGN  else '0';
+
+   gshiftbit : for i in 0 to 31 generate
+      shiftresult(i) <= sh_rotv(i) when sh_keep(i) = '1' else sh_fillb;
+   end generate;
+
+   shiftercarry <= Flag_Carry            when sh_csel = CSEL_CARRY else
+                   shiftervalue(sh_cidx) when sh_csel = CSEL_VALUE else '0';
    
    -- ALU
    alu_op1 <= shiftresult when (decode_switch_op = '1' and decode_alu_use_shift = '1') else
@@ -2658,9 +2772,15 @@ begin
    -- exception vectors sit at 0xFFFF0000 when CP15 control bit 13 is set
    exception_base <= x"FFFF0000" when (cp15_control(13) = '1') else x"00000000";
 
+   -- The `execute_writedata(31 downto 1) & '0' when (writeback and writereg=F)`
+   -- term that used to sit third here is gone: it is the one late input in this
+   -- mux and it is now handled at the far end, in the gb_bus_Adr / bus_AddrFetch_eff
+   -- pair above. Everything left is register-derived. Leaving a redundant copy
+   -- here would have bought nothing - static timing does not know the two
+   -- conditions are mutually exclusive, so the long path would still be reported
+   -- (and still be routed).
    execute_branchPC <= exception_base + 16#18#                                                  when (decode_functions_detail = IRQ) else
                        exception_base + 16#08#                                                  when (decode_functions_detail = software_interrupt_detail) else
-                       execute_writedata(31 downto 1) & '0'                                     when (execute_writeback = '1' and execute_writereg = x"F") else
                        (execute_op2(31 downto 1) & '0' + (decode_immidiate(10 downto 0) & '0')) when (decode_branch_long = '1') else
                        execute_op2(31 downto 1) & '0'                                           when (decode_branch_usereg = '1') else
                        unsigned(signed(decode_PC) + resize(decode_branch_immi, 32));
