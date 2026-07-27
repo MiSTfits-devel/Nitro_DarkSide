@@ -46,7 +46,15 @@ entity nds_loader is
       -- a no-op that costs ~1M word writes - well over a hundred milliseconds of
       -- simulated time before the CPUs are even released, which is most of the
       -- cost of every boot-length run. Skipping it changes no simulated state.
-      is_simu     : std_logic := '0'
+      is_simu     : std_logic := '0';
+      -- '1' skips the ARM9/ARM7 binary copy passes for sections that land in main
+      -- RAM, on the promise that the testbench has already placed them there. The
+      -- copy is 443,230 words for Kirby at roughly five clk1x cycles each - about
+      -- 70 ms of simulated time before the CPUs are released, which dominates the
+      -- wall clock of every boot-length run and measures nothing. Sections that
+      -- target WRAM7 are still copied normally: only main RAM is preloadable.
+      -- Never set this for hardware; there is nothing to preload there.
+      skip_copy   : std_logic := '0'
    );
    port
    (
@@ -267,7 +275,9 @@ begin
                   else
                      src <= unsigned(romoff(26 downto 2));
                      dst <= unsigned(loadaddr);
-                     if (size(1 downto 0) = "00") then
+                     if (skip_copy = '1' and loadaddr(31 downto 24) = x"02") then
+                        words <= (others => '0');   -- already in the model's RAM
+                     elsif (size(1 downto 0) = "00") then
                         words <= unsigned(size(23 downto 2));
                      else
                         words <= unsigned(size(23 downto 2)) + 1;

@@ -61,7 +61,11 @@ entity tb_top_frame is
       -- that many clkMem cycles plus 0..15 of jitter to each op.
       MEM_LAT    : integer := 0;
       -- >0: print a cumulative ARM9 memory-path cycle histogram every N clk1x
-      CYCLE_HIST : integer := 0
+      CYCLE_HIST : integer := 0;
+      -- /=0: stage the ARM9/ARM7 main-RAM sections directly into the SDRAM model
+      -- and let nds_loader skip copying them. Same end state, ~70 ms of simulated
+      -- time cheaper per boot. See preload_main below.
+      PRELOAD    : integer := 0
    );
 end entity;
 
@@ -101,6 +105,52 @@ architecture sim of tb_top_frame is
       return mem;
    end function;
    constant card : t_card := load_hex(HEXFILE);
+
+   -- ================= main-RAM backing store (+ optional preload) =================
+   -- PRELOAD/=0 stages the ARM9 and ARM7 sections straight into the SDRAM model
+   -- and lets nds_loader skip its copy passes (nds_top's skip_copy generic). The
+   -- end state is identical - same words at the same addresses - but it removes
+   -- ~443k word copies, about 70 ms of simulated time, from the front of every
+   -- boot-length run. Steady-state memory timing is untouched, so a ratio or CPI
+   -- number measured with PRELOAD=1 is still comparable to one measured without.
+   -- Only main-RAM sections are staged; a WRAM7 section is left to the loader.
+   type t_mem is array (0 to 1048575) of std_logic_vector(31 downto 0);
+   impure function preload_main(c : t_card) return t_mem is
+      variable m    : t_mem := (others => (others => '0'));
+      variable off  : integer;
+      variable ram  : integer;
+      variable sz   : integer;
+      variable base : integer;
+      variable n    : integer := 0;
+   begin
+      if (PRELOAD = 0) then
+         return m;
+      end if;
+      -- .nds header: word 8 = byte 0x20. Per CPU: rom offset, entry, ram addr, size.
+      for cpu in 0 to 1 loop
+         off := to_integer(unsigned(c(8 + cpu*4 + 0)));
+         ram := to_integer(unsigned(c(8 + cpu*4 + 2)));
+         sz  := to_integer(unsigned(c(8 + cpu*4 + 3)));
+         if (ram >= 16#02000000# and ram < 16#02400000#) then
+            base := (ram - 16#02000000#) / 4;
+            for i in 0 to (sz + 3) / 4 - 1 loop
+               if (base + i <= 1048575 and off / 4 + i < CARD_WORDS) then
+                  m(base + i) := c(off / 4 + i);
+                  n := n + 1;
+               end if;
+            end loop;
+            report "preload: cpu" & integer'image(cpu) & " " & integer'image(sz) &
+                   " bytes from rom 0x" & integer'image(off) & " to 0x" &
+                   integer'image(ram) severity note;
+         else
+            report "preload: cpu" & integer'image(cpu) &
+                   " target is not main RAM - left to the loader" severity note;
+         end if;
+      end loop;
+      report "preload: staged " & integer'image(n) & " words into main RAM" severity note;
+      return m;
+   end function;
+   shared variable mainram : t_mem := preload_main(card);
 
    signal card_ena, card_done : std_logic := '0';
    signal card_addr  : std_logic_vector(26 downto 2);
@@ -297,7 +347,8 @@ begin
    (
       is_simu                  => '1',
       Softmap_NDS_MAINRAM_ADDR => MAINRAM_BASE,
-      GPU_CE_DIV               => GPUCEDIV
+      GPU_CE_DIV               => GPUCEDIV,
+      skip_copy                => itosl(PRELOAD)
    )
    port map
    (
@@ -763,8 +814,6 @@ begin
 
    -- ================= behavioral SDRAM (from tb_mainram/tb_dual_boot) =================
    psdram : process
-      type t_mem is array (0 to 1048575) of std_logic_vector(31 downto 0);
-      variable mem : t_mem := (others => (others => '0'));
       variable a   : integer;
       variable w   : integer;
       variable refresh_cnt : integer := 0;
@@ -800,7 +849,7 @@ begin
 
          if (v_rnw = '1') then
             for k in 1 to 6 loop wait until rising_edge(clkMem); end loop;
-            sdram_Dout   <= mem(w);
+            sdram_Dout   <= mainram(w);
             sdram_done32 <= '1';
             wait until rising_edge(clkMem);
             sdram_done32 <= '0';
@@ -809,7 +858,7 @@ begin
             for k in 1 to 3 loop wait until rising_edge(clkMem); end loop;
             for j in 0 to 3 loop
                if (v_be(j) = '1') then
-                  mem(w)(j*8 + 7 downto j*8) := v_din(j*8 + 7 downto j*8);
+                  mainram(w)(j*8 + 7 downto j*8) := v_din(j*8 + 7 downto j*8);
                end if;
             end loop;
             sdram_done32 <= '1';

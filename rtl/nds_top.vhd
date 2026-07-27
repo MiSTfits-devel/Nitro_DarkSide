@@ -51,7 +51,10 @@ entity nds_top is
    (
       is_simu                  : std_logic := '0';
       Softmap_NDS_MAINRAM_ADDR : integer   := 8388608; -- byte offset of the 4 MB window in SDRAM
-      GPU_CE_DIV               : integer   := 3        -- render-fabric clocks per dot
+      GPU_CE_DIV               : integer   := 3;       -- render-fabric clocks per dot
+      -- simulation only: the testbench has staged the ARM9/ARM7 main-RAM sections
+      -- itself, so nds_loader may skip copying them (see nds_loader.skip_copy)
+      skip_copy                : std_logic := '0'
    );
    port
    (
@@ -673,7 +676,7 @@ begin
    boot_error <= '1' when boot_state = B_ERROR else '0';
 
    iloader : entity work.nds_loader
-   generic map ( is_simu => is_simu )
+   generic map ( is_simu => is_simu, skip_copy => skip_copy )
    port map
    (
       clk => clk1x, reset => reset_boot,
