@@ -246,7 +246,7 @@ architecture arch of nds_top is
    signal cdc_req_wsh_d, cdc_req_vram_d, cdc_req_mr_d  : std_logic := '0';
    signal cdc_req_io_d,  cdc_req_pal_d,  cdc_req_oam_d : std_logic := '0';
    signal cdc_wsh_done_d, cdc_vram_done_d         : std_logic := '0';
-   signal cdc_mr_done_d,  cdc_io_done_d           : std_logic := '0';
+   signal cdc_mr_done_d                           : std_logic := '0';
    -- island side (clk2x): membus9's raw request pulses / narrowed dones
    signal i9_wsh_ena, i9_vram_ena, i9_mr_ena, i9_io_ena : std_logic;
    signal i9_pal_we,  i9_oam_we                         : std_logic;
@@ -259,6 +259,8 @@ architecture arch of nds_top is
    signal io9_ena   : std_logic := '0';   -- stretched io_bus9.ena, clk1x domain
    signal cdc_dmab_ena_d, dmab_ena_i9   : std_logic := '0';
    signal cdc_cpudone_tgl, cdc_cpudone_tgl_d, cpu9_done_1x : std_logic := '0';
+   -- per-transaction IO completion, clk1x -> island (see i9_io_done below)
+   signal cdc_io_cpl, cdc_io_cpl_d : std_logic := '0';
    signal dbg_mb9, dbg_cache9, dbg_mr_s      : std_logic_vector(7 downto 0);
    signal dbg_probe                          : std_logic_vector(31 downto 0);
    signal dbg_pk_addr_s        : std_logic_vector(31 downto 0);
@@ -844,7 +846,6 @@ begin
          cdc_wsh_done_d  <= wsh9_done;
          cdc_vram_done_d <= vram9_done;
          cdc_mr_done_d   <= mr9_done;
-         cdc_io_done_d   <= io_wired_done9;
       end if;
    end process;
    -- DMA9 masters the ARM9 membus while dma_bus_on, but nds_dma9 is a clk1x unit
@@ -881,7 +882,34 @@ begin
    i9_wsh_done  <= wsh9_done       and not cdc_wsh_done_d;
    i9_vram_done <= vram9_done      and not cdc_vram_done_d;
    i9_mr_done   <= mr9_done        and not cdc_mr_done_d;
-   i9_io_done   <= io_wired_done9  and not cdc_io_done_d;
+
+   -- IO completion, clk1x -> island. io_wired_done9 is a pure address decode
+   -- ("some peripheral claims this address"), not a per-transaction event, so
+   -- edge-detecting it fires once and then never again across back-to-back IO
+   -- accesses to claimed addresses. Generate an explicit completion one clk1x
+   -- after the access was presented: by then the peripheral has seen io_bus9.ena
+   -- and its wired_out is stable (the payload latch holds Adr), so the island can
+   -- sample the read data in the cycle it retires the access.
+   --
+   -- Unconditional on purpose - it must fire for UNCLAIMED addresses too, or
+   -- membus9 would hang in W_IO_RESP on any unmapped IO read. That is still
+   -- correct data: io_wired_out9 is a wired-OR tree and reads 0 when nothing
+   -- claims the address, which is what an NDS9 unclaimed IO read returns.
+   process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         if (io9_ena = '1') then cdc_io_cpl <= not cdc_io_cpl; end if;
+      end if;
+   end process;
+
+   process (clk2x)
+   begin
+      if rising_edge(clk2x) then
+         cdc_io_cpl_d <= cdc_io_cpl;
+      end if;
+   end process;
+
+   i9_io_done   <= cdc_io_cpl xor cdc_io_cpl_d;
 
 
    -- out ports are write-only in VHDL-93; nds_debug reads the internals
