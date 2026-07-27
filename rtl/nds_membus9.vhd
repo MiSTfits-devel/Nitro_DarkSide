@@ -439,7 +439,34 @@ begin
                         creq_addr  <= cpu_adr;
                         creq_be    <= be;
                         creq_wdata <= wdata;
-                        if (cpu_code = '1') then
+                        -- A DMA access is never cacheable. Two independent reasons,
+                        -- either of which is sufficient:
+                        --
+                        -- 1. Hardware. The ARM9 DMA is a separate bus master; it
+                        --    does not see the CPU's caches. That is precisely why
+                        --    NitroSDK calls DC_FlushRange before a DMA and
+                        --    DC_InvalidateRange after one.
+                        -- 2. bus_cacheable_i/_d are decoded in nds_cpu9 from
+                        --    gb_bus_Adr - the CPU's OWN address register (see
+                        --    nds_cpu9.vhd:642-659) - not from the muxed bus. While
+                        --    the DMA owns the bus that value is whatever address
+                        --    the CPU last presented, which has nothing to do with
+                        --    the address being transferred.
+                        --
+                        -- Leaving it stale is what broke bootreq subtest 14. The
+                        -- CPU was paused mid instruction-fetch from main RAM, i.e.
+                        -- inside the one PU region the test marks cacheable, so
+                        -- bus_cacheable_d read '1' for the whole transfer. The
+                        -- DMA's read of 0x02FFFF60 then allocated a line and its
+                        -- write of 0x02FFFF70 hit that same line and stopped there,
+                        -- dirty. The CPU's read-back went through the uncached
+                        -- mirror straight to main RAM and saw 0. On the bus the
+                        -- transfer looked perfect - correct address, correct data,
+                        -- correct handshake - which is why this survived a probe of
+                        -- the DMA path itself.
+                        if (dma_bus = '1') then
+                           creq_cacheable <= '0';
+                        elsif (cpu_code = '1') then
                            creq_cacheable <= bus_cacheable_i;
                         else
                            creq_cacheable <= bus_cacheable_d;

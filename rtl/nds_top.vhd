@@ -980,7 +980,29 @@ begin
    )
    port map
    (
-      clk       => clk1x,
+      -- clk2x, NOT clk1x. This is a synchronous RAM whose read address comes
+      -- combinationally from the island's cpu_adr (nds_membus9.vhd:191) and
+      -- whose data is consumed combinationally in the island's FINISH state
+      -- (nds_membus9.vhd:508) - there is no done handshake on T_BROM at all.
+      -- On clk1x the ROM only sampled the address on every OTHER island cycle,
+      -- so every second BIOS9 fetch returned the previous word, and the first
+      -- fetch after reset returned whatever was latched (word 0).
+      --
+      -- That is what put Kirby's ARM9 into ITCM garbage. The Thumb `swi 0x0B`
+      -- at 0x020002BE vectored correctly to 0xFFFF0008, but the fetch there
+      -- delivered word 0 (the reset vector, EA000042) instead of the SWI vector
+      -- (EA0000A2), so it branched to 0xFFFF0120 - the middle of the CRC16
+      -- helper - and executed the BIOS from there with every other word stale
+      -- until `ldr pc,[r0,#-4]` at 0xFFFF0294 threw it into ITCM at 0x00000008.
+      -- The ARM7 is the control: its BIOS shares clk1x with its CPU, and all
+      -- 488 of its SWI entries fetch the right vector and land in the right
+      -- handler.
+      --
+      -- Safe for the hot-load write port too: it is fed from the ioctl download
+      -- (NDS.sv:421), which finishes long before the CPUs are released, and
+      -- clocking it at 2x only oversamples the same load_we pulse - worst case
+      -- the same word is written twice to the same address, which is idempotent.
+      clk       => clk2x,
       brom_addr => brom_addr,
       brom_data => brom_data,
       load_addr => bios9_load_addr,

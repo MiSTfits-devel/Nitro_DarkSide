@@ -36,6 +36,11 @@ entity tb_top_frame is
       FRAMES     : integer := 3;
       TIMEOUT_MS : integer := 400;
       DIRECT     : integer := 0;         -- 1 = firmware direct-boot env (stock ROMs)
+      ISLAND     : integer := 1;         -- 0 = tie clk2x to clk1x, i.e. no ARM9 island
+                                         -- (nds_top.vhd:67). The island is what fails
+                                         -- 67 MHz timing by -7.6 ns, so a 0 build is the
+                                         -- only deployable one; this switch is how to ask
+                                         -- whether it still needs the island to boot.
       DBG_T0     : integer := 0;         -- ARM9 pipeline debug window start/end in us (0 = off)
       DBG_T1     : integer := 0;
       DBG_TRIGPC : integer := 0;         -- alternative: trigger on decode_PC (dumps 256 cycles before, 768 after)
@@ -305,19 +310,27 @@ begin
    -- hardware (outclk_1 = 2 x outclk_2, same VCO, 0 ps). clk1x rises at 5 ns and
    -- every 30 ns after (3 clkMem phases of 10 ns), so clk2x rises at 5 ns and
    -- every 15 ns. Not derivable from clkMem: 2x clk1x is 2/3 of clkMem.
-   p_clk2x : process
-   begin
-      clk2x <= '0';
-      wait for 5 ns;
-      while not tests_done loop
-         clk2x <= '1';
-         wait for 7500 ps;
+   gisland : if ISLAND /= 0 generate
+      p_clk2x : process
+      begin
          clk2x <= '0';
-         wait for 7500 ps;
-      end loop;
-      clk2x <= '0';
-      wait;
-   end process;
+         wait for 5 ns;
+         while not tests_done loop
+            clk2x <= '1';
+            wait for 7500 ps;
+            clk2x <= '0';
+            wait for 7500 ps;
+         end loop;
+         clk2x <= '0';
+         wait;
+      end process;
+   end generate;
+
+   -- ISLAND=0: the ARM9 runs at clk1x like everything else. Everything that
+   -- crosses the bridge still works, it just crosses within one domain.
+   gnoisland : if ISLAND = 0 generate
+      clk2x <= clk1x;
+   end generate;
 
    process (clkMem)
    begin
@@ -802,6 +815,159 @@ begin
                 integer'image(b_dtcm) & "  IO-eaten-by-TCM " &
                 integer'image(b_io_eaten) severity note;
       end if;
+   end process;
+
+   -- Walks the IO completion chain stage by stage: membus9's request pulse, the
+   -- island toggle, the clk1x enable, the clk1x completion toggle, and the pulse
+   -- the island finally sees. Whichever count is the first zero is the broken link.
+   p_iochain : process
+      alias a_ena   is << signal .tb_top_frame.idut.i9_io_bus : proc_bus_gb_type >>;
+      alias a_rq    is << signal .tb_top_frame.idut.cdc_req_io : std_logic >>;
+      alias a_io9e  is << signal .tb_top_frame.idut.io9_ena : std_logic >>;
+      alias a_cpl   is << signal .tb_top_frame.idut.cdc_io_cpl : std_logic >>;
+      alias a_done  is << signal .tb_top_frame.idut.i9_io_done : std_logic >>;
+      variable n_ena, n_rq, n_io9e, n_cpl, n_done, cyc : natural := 0;
+      variable p_ena, p_rq, p_io9e, p_cpl : std_logic := '0';
+   begin
+      wait until rising_edge(clk2x);
+      cyc := cyc + 1;
+      if (a_ena.ena = '1' and p_ena = '0') then n_ena  := n_ena  + 1; end if;
+      if (a_rq   /= p_rq)                  then n_rq   := n_rq   + 1; end if;
+      if (a_io9e = '1' and p_io9e = '0')    then n_io9e := n_io9e + 1; end if;
+      if (a_cpl  /= p_cpl)                 then n_cpl  := n_cpl  + 1; end if;
+      if (a_done = '1')                    then n_done := n_done + 1; end if;
+      p_ena := a_ena.ena; p_rq := a_rq; p_io9e := a_io9e; p_cpl := a_cpl;
+      if (cyc mod 100000 = 0) then
+         report "IO chain: membus9.ena " & integer'image(n_ena) &
+                " -> cdc_req_io tgl " & integer'image(n_rq) &
+                " -> io9_ena " & integer'image(n_io9e) &
+                " -> cdc_io_cpl tgl " & integer'image(n_cpl) &
+                " -> i9_io_done " & integer'image(n_done) severity note;
+      end if;
+   end process;
+
+   -- Every observable event on the ARM9 DMA path, in order. bootreq runs exactly
+   -- one DMA, so this is a handful of lines and not a firehose. Everything is
+   -- sampled on clk2x: the clk1x-domain signals are stable for two island cycles,
+   -- so an edge detector here sees each of them exactly once, while dmab_ena_i9
+   -- and cpu9_done_1x are one-island-cycle pulses that a clk1x sampler would miss.
+   -- Every ARM9 write to a video-mode register, deduplicated to the last value
+   -- per register and reported once at the end. This is how you find out what
+   -- video mode a commercial ROM actually programs, which is the prerequisite for
+   -- writing a devkitPro render-test ROM that exercises the SAME modes instead of
+   -- a guess. Engine A is at 0x0400_0000, engine B at 0x0400_1000, and POWCNT1 at
+   -- 0x0400_0304 decides which engine reaches which screen at all.
+   p_vidregs : process
+      alias a_iob is << signal .tb_top_frame.idut.io_bus9 : proc_bus_gb_type >>;
+      type t_seen is array (0 to 16#40#) of std_logic_vector(31 downto 0);
+      variable segA, segB : t_seen := (others => (others => 'U'));
+      variable powcnt : std_logic_vector(31 downto 0) := (others => 'U');
+      variable p_ena : std_logic := '0';
+      variable adr : natural;
+   begin
+      wait until rising_edge(clk2x);
+      if (a_iob.ena = '1' and p_ena = '0' and a_iob.rnw = '0') then
+         -- Adr is the byte offset into 0x0400_0000, word-aligned: BG0CNT is
+         -- 0x008 (reg_nds_display.vhd:58), engine B is the 0x1000 window
+         -- (nds_top.vhd:1663), POWCNT1 is 0x304.
+         adr := to_integer(unsigned(a_iob.Adr));
+         if (adr <= 16#03C#) then
+            segA(adr / 4) := a_iob.Din;
+         elsif (adr >= 16#1000# and adr <= 16#103C#) then
+            segB((adr - 16#1000#) / 4) := a_iob.Din;
+         elsif (adr = 16#304#) then
+            powcnt := a_iob.Din;
+         end if;
+      end if;
+      p_ena := a_iob.ena;
+
+      if (tests_done) then
+         report "VIDREG POWCNT1 = " & to_hstring(powcnt) severity note;
+         for i in 0 to 15 loop
+            if (segA(i)(0) /= 'U') then
+               report "VIDREG A +" & to_hstring(to_unsigned(i * 4, 12)) &
+                      " = " & to_hstring(segA(i)) severity note;
+            end if;
+            if (segB(i)(0) /= 'U') then
+               report "VIDREG B +" & to_hstring(to_unsigned(i * 4, 12)) &
+                      " = " & to_hstring(segB(i)) severity note;
+            end if;
+         end loop;
+         wait;
+      end if;
+   end process;
+
+   p_dmawatch : process
+      alias a_iob   is << signal .tb_top_frame.idut.io_bus9       : proc_bus_gb_type >>;
+      alias a_on    is << signal .tb_top_frame.idut.dma_on        : std_logic >>;
+      alias a_bus   is << signal .tb_top_frame.idut.dma_bus_on    : std_logic >>;
+      alias a_idle  is << signal .tb_top_frame.idut.cpu9_bus_idle : std_logic >>;
+      alias a_ena   is << signal .tb_top_frame.idut.dmab_ena      : std_logic >>;
+      alias a_enai  is << signal .tb_top_frame.idut.dmab_ena_i9   : std_logic >>;
+      alias a_rnw   is << signal .tb_top_frame.idut.dmab_rnw      : std_logic >>;
+      alias a_adr   is << signal .tb_top_frame.idut.dmab_adr      : std_logic_vector(31 downto 0) >>;
+      alias a_dout  is << signal .tb_top_frame.idut.dmab_dout     : std_logic_vector(31 downto 0) >>;
+      alias a_dn1x  is << signal .tb_top_frame.idut.cpu9_done_1x  : std_logic >>;
+      alias a_din   is << signal .tb_top_frame.idut.cpu9_din      : std_logic_vector(31 downto 0) >>;
+      alias a_mbena is << signal .tb_top_frame.idut.mbus_ena      : std_logic >>;
+      -- the stale, CPU-derived cacheability that membus9 used to apply to DMA
+      -- accesses: decoded in nds_cpu9 from the CPU's own address register, so
+      -- while the DMA owns the bus it describes some unrelated CPU access
+      alias a_cchd  is << signal .tb_top_frame.idut.bus_cacheable_d : std_logic >>;
+      alias a_cchi  is << signal .tb_top_frame.idut.bus_cacheable_i : std_logic >>;
+      alias a_cadr  is << signal .tb_top_frame.idut.cpu9_adr       : std_logic_vector(31 downto 0) >>;
+      variable p_iobe, p_on, p_bus : std_logic := '0';
+      variable n : natural := 0;
+      variable adr : unsigned(27 downto 0);
+      variable rw : string(1 to 2);
+   begin
+      wait until rising_edge(clk2x);
+      if (n < 400) then
+         -- register traffic to 0x040000B0..0x040000EF (the whole DMA9 block)
+         if (a_iob.ena = '1' and p_iobe = '0') then
+            adr := unsigned(a_iob.Adr);
+            if (adr >= 16#0B0# and adr < 16#0F0#) then
+               if (a_iob.rnw = '1') then rw := "rd"; else rw := "wr"; end if;
+               report "DMAREG " & rw &
+                      " adr=" & to_hstring(a_iob.Adr) & " Din=" & to_hstring(a_iob.Din) &
+                      " bEna=" & to_hstring(a_iob.bEna) & " @" & time'image(now) severity note;
+               n := n + 1;
+            end if;
+         end if;
+         if (a_on /= p_on) then
+            report "DMA dma_on " & std_logic'image(p_on) & " -> " & std_logic'image(a_on) &
+                   " (cpu9_bus_idle=" & std_logic'image(a_idle) & ") @" & time'image(now) severity note;
+            n := n + 1;
+         end if;
+         if (a_bus /= p_bus) then
+            report "DMA dma_bus_on " & std_logic'image(p_bus) & " -> " & std_logic'image(a_bus) &
+                   " @" & time'image(now) severity note;
+            n := n + 1;
+         end if;
+         -- the narrowed request the island actually sees, and the stretched done
+         if (a_enai = '1') then
+            if (a_rnw = '1') then rw := "RD"; else rw := "WR"; end if;
+            report "DMA req " & rw &
+                   " adr=" & to_hstring(a_adr) & " dout=" & to_hstring(a_dout) &
+                   " mbus_ena=" & std_logic'image(a_mbena) &
+                   " [stale cacheable_d=" & std_logic'image(a_cchd) &
+                   " _i=" & std_logic'image(a_cchi) &
+                   " from cpu9_adr=" & to_hstring(a_cadr) & "]" &
+                   " @" & time'image(now) severity note;
+            n := n + 1;
+         end if;
+         if (a_dn1x = '1' and a_bus = '1') then
+            report "DMA done din=" & to_hstring(a_din) & " @" & time'image(now) severity note;
+            n := n + 1;
+         end if;
+         -- a raw request that never became a narrowed one is a dropped access
+         if (a_ena = '1' and a_enai = '0' and a_bus = '0') then
+            report "DMA req WHILE NOT GRANTED adr=" & to_hstring(a_adr) &
+                   " @" & time'image(now) severity note;
+            n := n + 1;
+         end if;
+      end if;
+      p_iobe := a_iob.ena; p_on := a_on; p_bus := a_bus;
    end process;
 
    p_ipcwatch : process
