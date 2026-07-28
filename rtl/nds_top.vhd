@@ -303,10 +303,13 @@ architecture arch of nds_top is
    signal itcm_we   : std_logic;
    signal itcm_be   : std_logic_vector(3 downto 0);
    signal itcm_writedata, itcm_readdata : std_logic_vector(31 downto 0);
+   -- DTCM port A is the read port; the store is deferred onto port B (dtcm_*_b)
    signal dtcm_addr : unsigned(13 downto 2);
-   signal dtcm_we   : std_logic;
-   signal dtcm_be   : std_logic_vector(3 downto 0);
-   signal dtcm_writedata, dtcm_readdata : std_logic_vector(31 downto 0);
+   signal dtcm_readdata : std_logic_vector(31 downto 0);
+   signal dtcm_addr_b : unsigned(13 downto 2);
+   signal dtcm_we_b   : std_logic;
+   signal dtcm_be_b   : std_logic_vector(3 downto 0);
+   signal dtcm_writedata_b : std_logic_vector(31 downto 0);
 
    signal brom_addr : unsigned(14 downto 2);
    signal brom_data : std_logic_vector(31 downto 0);
@@ -1147,8 +1150,9 @@ begin
       cpu_lastread => cpu9_lastread, cpu_din => cpu9_din, cpu_done => cpu9_done,
       itcm_addr => itcm_addr, itcm_we => itcm_we, itcm_be => itcm_be,
       itcm_writedata => itcm_writedata, itcm_readdata => itcm_readdata,
-      dtcm_addr => dtcm_addr, dtcm_we => dtcm_we, dtcm_be => dtcm_be,
-      dtcm_writedata => dtcm_writedata, dtcm_readdata => dtcm_readdata,
+      dtcm_addr => dtcm_addr, dtcm_readdata => dtcm_readdata,
+      dtcm_addr_b => dtcm_addr_b, dtcm_we_b => dtcm_we_b,
+      dtcm_be_b => dtcm_be_b, dtcm_writedata_b => dtcm_writedata_b,
       brom_addr => brom_addr, brom_data => brom_data,
       wsh_ena => i9_wsh_ena, wsh_rnw => wsh9_rnw, wsh_addr => wsh9_addr, wsh_be => wsh9_be,
       wsh_din => wsh9_din, wsh_dout => wsh9_dout, wsh_done => i9_wsh_done, wsh_mapped => wsh9_mapped,
@@ -1244,21 +1248,27 @@ begin
    port map
    (
       clk       => clk2x,
+      -- Port A: READ ONLY. The write moved to port B so its enable comes off a
+      -- flop instead of off the CPU's address - see the "DTCM deferred store"
+      -- comment in nds_membus9. Tying the port-A write inputs off (rather than
+      -- leaving them driven with we_a = '0') is what lets Quartus prune the
+      -- shifter -> datain_a cone, which is half the point of the change.
       ce_a      => '1',
       addr_a    => to_integer(dtcm_addr),
-      datain_a0 => dtcm_writedata( 7 downto  0),
-      datain_a1 => dtcm_writedata(15 downto  8),
-      datain_a2 => dtcm_writedata(23 downto 16),
-      datain_a3 => dtcm_writedata(31 downto 24),
+      datain_a0 => x"00", datain_a1 => x"00", datain_a2 => x"00", datain_a3 => x"00",
       dataout_a => dtcm_readdata,
-      we_a      => dtcm_we,
-      be_a      => dtcm_be,
-      ce_b      => '0',
-      addr_b    => 0,
-      datain_b0 => x"00", datain_b1 => x"00", datain_b2 => x"00", datain_b3 => x"00",
+      we_a      => '0',
+      be_a      => "0000",
+      -- Port B: the deferred store, one cycle behind the accept.
+      ce_b      => '1',
+      addr_b    => to_integer(dtcm_addr_b),
+      datain_b0 => dtcm_writedata_b( 7 downto  0),
+      datain_b1 => dtcm_writedata_b(15 downto  8),
+      datain_b2 => dtcm_writedata_b(23 downto 16),
+      datain_b3 => dtcm_writedata_b(31 downto 24),
       dataout_b => open,
-      we_b      => '0',
-      be_b      => "0000"
+      we_b      => dtcm_we_b,
+      be_b      => dtcm_be_b
    );
 
    -- ================= ARM7 CPU + membus =================

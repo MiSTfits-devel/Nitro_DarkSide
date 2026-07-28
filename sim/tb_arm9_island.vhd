@@ -93,10 +93,13 @@ architecture sim of tb_arm9_island is
    signal itcm_we   : std_logic;
    signal itcm_be   : std_logic_vector(3 downto 0);
    signal itcm_writedata, itcm_readdata : std_logic_vector(31 downto 0);
+   -- DTCM port A is the read port; the store is deferred onto port B
    signal dtcm_addr : unsigned(13 downto 2);
-   signal dtcm_we   : std_logic;
-   signal dtcm_be   : std_logic_vector(3 downto 0);
-   signal dtcm_writedata, dtcm_readdata : std_logic_vector(31 downto 0);
+   signal dtcm_readdata : std_logic_vector(31 downto 0);
+   signal dtcm_addr_b : unsigned(13 downto 2);
+   signal dtcm_we_b   : std_logic;
+   signal dtcm_be_b   : std_logic_vector(3 downto 0);
+   signal dtcm_writedata_b : std_logic_vector(31 downto 0);
 
    -- shared WRAM
    signal wsh_ena, wsh_rnw, wsh_done, wsh_mapped : std_logic;
@@ -135,6 +138,13 @@ architecture sim of tb_arm9_island is
    signal irp_timer : std_logic_vector(3 downto 0);
 
    signal mailbox_bits : std_logic_vector(31 downto 0) := (others => '0');
+
+   -- Port-A read address colliding with the port-B deferred store: the cycle in
+   -- which the M10K would return old data and nds_membus9's store-forward merge
+   -- has to cover for it. Counted so test 12 cannot pass vacuously - if the CPU
+   -- never issues a load tight enough behind a store to collide, the test proves
+   -- nothing and the verdict below says so.
+   signal dtcm_fwd_hits : natural := 0;
    signal tests_done   : boolean := false;
 
    -- ARM9 runs at 2x the system/bus clock: the CPU gets ce='1' every clk1x
@@ -258,8 +268,9 @@ begin
       cpu_lastread => cpu_lastread, cpu_din => cpu_din, cpu_done => cpu_done,
       itcm_addr => itcm_addr, itcm_we => itcm_we, itcm_be => itcm_be,
       itcm_writedata => itcm_writedata, itcm_readdata => itcm_readdata,
-      dtcm_addr => dtcm_addr, dtcm_we => dtcm_we, dtcm_be => dtcm_be,
-      dtcm_writedata => dtcm_writedata, dtcm_readdata => dtcm_readdata,
+      dtcm_addr => dtcm_addr, dtcm_readdata => dtcm_readdata,
+      dtcm_addr_b => dtcm_addr_b, dtcm_we_b => dtcm_we_b,
+      dtcm_be_b => dtcm_be_b, dtcm_writedata_b => dtcm_writedata_b,
       brom_addr => brom_addr, brom_data => brom_data,
       wsh_ena => wsh_ena, wsh_rnw => wsh_rnw, wsh_addr => wsh_addr, wsh_be => wsh_be,
       wsh_din => wsh_din, wsh_dout => wsh_dout, wsh_done => wsh_done, wsh_mapped => wsh_mapped,
@@ -290,12 +301,15 @@ begin
                end if;
             end loop;
          end if;
-         if (dtcm_we = '1') then
+         if (dtcm_we_b = '1') then
             for i in 0 to 3 loop
-               if (dtcm_be(i) = '1') then
-                  dtcm(to_integer(dtcm_addr))(i*8 + 7 downto i*8) <= dtcm_writedata(i*8 + 7 downto i*8);
+               if (dtcm_be_b(i) = '1') then
+                  dtcm(to_integer(dtcm_addr_b))(i*8 + 7 downto i*8) <= dtcm_writedata_b(i*8 + 7 downto i*8);
                end if;
             end loop;
+            if (dtcm_addr_b = dtcm_addr) then
+               dtcm_fwd_hits <= dtcm_fwd_hits + 1;
+            end if;
          end if;
          -- sync-read store model (matches the M10K in nds_top; the membus
          -- presents the address combinationally in the accept cycle)
@@ -435,7 +449,24 @@ begin
                report "island progress: bitmask=" & to_hstring(mr9_writedata) severity note;
             elsif (mr9_addr = std_logic_vector(to_unsigned(16#FFFC1#, 20))) then
                if (mr9_writedata = x"CAFEBABE") then
-                  report "tb_arm9_island: PASS  bitmask=" & to_hstring(mailbox_bits) severity note;
+                  report "tb_arm9_island: PASS  bitmask=" & to_hstring(mailbox_bits) &
+                         "  dtcm store-forward collisions=" &
+                         integer'image(dtcm_fwd_hits) severity note;
+                  -- Reported, not asserted, and the distinction is the finding:
+                  -- this count is 0 and is expected to be. Reaching the hazard
+                  -- needs two back-to-back DATA accesses in write-then-read
+                  -- order at one address, because DTCM excludes code fetches
+                  -- (nds_membus9 `cpu_code = '0'`) so a fetch always separates
+                  -- two data accesses. No ARM instruction stores then loads
+                  -- (LDM/STM/LDRD/STRD are homogeneous, SWP is read-then-write),
+                  -- so the only route in is the prefetch buffer eliding the
+                  -- intervening fetch. The merge is therefore unexercised
+                  -- insurance, kept because the failure it prevents is silent
+                  -- wrong data. If this ever prints non-zero, the merge has
+                  -- started carrying real traffic - re-verify it directly.
+                  report "note: DTCM store-forward collisions=" &
+                         integer'image(dtcm_fwd_hits) &
+                         " (0 is expected - see comment)" severity note;
                   tests_done <= true;
                else
                   report "tb_arm9_island: FAIL magic=" & to_hstring(mr9_writedata) &

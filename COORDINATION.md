@@ -131,6 +131,108 @@ Append entries with date + agent. Claim files before editing.
 - nds-quartus-clash-9: Agent C (Clash integration compile; isolated fresh pod)
 
 ## Log
+- 2026-07-28 sole agent: **THE ISLAND'S 67 MHz IS INHERITED FROM THE VIDEO CLOCK,
+  NOT REQUIRED BY THE ARM9 - AND clk2x FAILS ON A BROAD FRONT, NOT A PATH.** Two
+  findings that between them reframe the timing effort, plus one RTL fix and one
+  tooling repair. No fit deployed, no hardware claim.
+  * **`NDS.sv:206` - `assign CLK_VIDEO = clk_video_67;`.** The ARM9 island shares
+    the 67.027964 MHz *video pixel clock*. Every session in this ledger has
+    treated 67 MHz as a fixed requirement and gone looking for nanoseconds inside
+    `nds_cpu9`; the number is a video-timing artifact. Giving the island its own
+    PLL output is a lever nobody had costed.
+  * **The failing set is a broad front.** Census of ALL violating paths in
+    `build/artifacts-t5/NDS.paths_67mhz.rpt` (not the -npaths 50 report, which
+    shows only the worst family and is what made this look like one path):
+    | family | paths | worst |
+    |---|---|---|
+    | DTCM `porta_we` | 2,009 | -2.535 |
+    | store data -> `pal/vram/oam/wsh_din` | 514 | -2.491 |
+    | `creq_*` (mostly `creq_cacheable` cones) | 351 | -2.254 |
+    | `io_bus` | 78 | -2.278 |
+    | other (shifter, `execute_busaddress`) | ~50 | -2.170 |
+    Five families inside **0.37 ns**, with more hidden behind them.
+  * **FITTED AND MEASURED (`build/artifacts-dtcm`, seed 0, apples-to-apples with
+    `artifacts-t5`): removing 67% of the violating paths bought NOTHING on WNS.**
+    The DTCM deferral eliminated the whole 2,009-path family - `idtcm|*porta_we_reg`
+    appears **zero** times in the new violating set - and:
+    | | t5 | dtcm | delta |
+    |---|---|---|---|
+    | clk2x WNS | -2.535 | **-2.809** | -0.274 (worse) |
+    | clk2x TNS | -1415 | -1551 | worse |
+    | violating paths | ~3,000 | ~3,000 | **unchanged** |
+    | ALMs | 37,652 | 37,232 | -420 (better) |
+    | clk1x / clkMem | +1.584 / +1.372 | +1.397 / +1.090 | still pass |
+    New worst is `shiftervalue -> fetch_PC` at -2.809: the PC-update datapath loop
+    the 07-26 handoff already called unamenable to restructuring, with **2,021
+    paths that were queued invisibly behind DTCM** (fetch_PC already appeared 346
+    times in t5's report - it just was not the worst). The -0.274 ns is inside the
+    1.53 ns seed spread so it is not attributable to the edit; the attributable
+    facts are that the target family is gone and 420 ALMs came back. **Conclusion:
+    the failing front is deep as well as broad, and per-family RTL work cannot
+    close clk2x. Keep the DTCM change for its area, not its slack.** A clock change
+    gives every path +2.6 ns at once.
+  * **Measured the frequency trade instead of assuming it.** Parameterised the
+    bench's island period (`ISLAND_HALF_PS`, default 7500 = the current 2:1) and
+    ran the island at 8750 ps = 57.1 MHz, a 1.705:1 non-integer ratio:
+    - `bootreq` **pass=0x5A5BDE7F prog=0x63, identical to the 2:1 control** -
+      all 15 subtests including IPC and DMA.
+    - Kirby 25 ms: ARM9 212,592 -> 203,207 lines, ARM7 79,501 -> 77,215, and
+      **both runs end in the same 3-instruction copy loop** at 0x020008A8/AC/B0,
+      i.e. the same functional state.
+    - Ratio 2.674 -> **2.632, a 1.6% drop for a 14.4% clock cut.** The ARM9 is
+      overwhelmingly memory-bound, so island frequency is close to free. Target
+      quoted in this ledger is 2.32 (itself flagged as resting on a bad model).
+    - Required period for the current netlist is 14.915 + 2.535 = 17.45 ns =
+      **57.3 MHz**, so ~57 MHz closes clk2x with the ratio still clear of target.
+  * **The CDC handshakes are ratio-independent by construction**, contrary to the
+    2026-07-26 handoff's worry. Request clk2x->clk1x is a toggle that "sits stable
+    until the transaction completes" (`nds_top.vhd:774-780`); the `*_done`
+    clk1x->clk2x paths are rising-edge detectors and a 1-clk1x pulse is still
+    1.705 island cycles, so it cannot be missed. The one genuinely ratio-sensitive
+    structure, the `cpu9_done` toggle+XOR (`nds_top.vhd:924-937`), loses a done
+    only if two fire inside one clk1x period - **less** likely at 1.705 than at
+    2.0. The "exactly 2x" wording in those comments explains why pulse widths need
+    reconciling; it is not a dependency on the value 2. NOTE this is analysis plus
+    two passing sims, not a fit: the PLL change and an SDC update are still to do.
+  * **TOOLING BUG that fakes a dropped-request CDC failure.** `tb_top_frame`'s
+    `p_iocount` counted clk1x-side IO arrivals as `if (clk1x = '1' and
+    a_io9.ena = '1')` - a *level sample* that is correct only by accident of the
+    2:1 coincident-edge relationship. At 1.705:1 it reported **183 of 314**
+    requests arriving, which is indistinguishable from the CDC losing 131 of them
+    and is exactly the failure the handoff predicted. It is a miscount: replaced
+    with a rising-edge detector (`prev_1x`), correct at any ratio. The handoff's
+    own advice - "the bench's `IO9 path:` line will show a dropped one" - is
+    therefore unsafe at any ratio but 2:1. Do not trust a cross-domain counter
+    without checking how it samples.
+  * **RTL: the DTCM store is deferred onto M10K port B** (`nds_membus9.vhd`,
+    `nds_top.vhd:1235`). It was presented combinationally in the accept cycle,
+    putting `ALU -> cpu_adr -> dtcm_hit -> dtcm_sel -> dtcm_we -> M10K we setup`
+    in one island cycle, ~3.46 ns of it the M10K's own write-enable routing and
+    setup. Port B was unused (`ce_b => '0'`), so the write moved there with a
+    registered address/data/we and port A became read-only with its write inputs
+    tied off so Quartus prunes the shifter->datain_a cone. Write ports were
+    *renamed* (`dtcm_we_b` etc.) so a missed instantiation fails analysis rather
+    than writing twice - the three island TBs were caught that way.
+  * **The store-forward bypass is unexercised insurance, and that is measured.**
+    Mixed-port read-during-write returns old data, so a load accepted in the cycle
+    the deferred store commits needs a merge. Added it, then added a collision
+    counter to `tb_arm9_island` that FAILED the run when the count was zero - and
+    it was zero. Reaching the hazard needs two back-to-back *data* accesses in
+    write-then-read order at one address, but DTCM excludes code fetches
+    (`cpu_code = '0'`) so a fetch always separates data accesses, and no ARM
+    instruction stores then loads (LDM/STM/LDRD/STRD are homogeneous, SWP is
+    read-then-write). Kept the merge because the failure it prevents is silent
+    wrong data; the counter is now a `report` so a future workload that reaches it
+    is visible instead of assumed.
+  * VERIFIED: analyze-all OK; `arm9_island` 12/12 with new byte/halfword/
+    different-address store-forward subtests (0x1122EE44 and 0x9ABC7788 prove the
+    byte enables land through port B); `arm9_cache` 0xFF; `bootreq`
+    pass=0x5A5BDE7F with `IO9 path` 363/363 matched at 2:1; **Kirby 25 ms A/B
+    byte-identical to HEAD on both CPUs** - md5 6be14b4d9fb41a01e02d377b9c19d098
+    (ARM9, 212,592 lines) / d6ea0d1d544fa34f25731bd22b22915a (ARM7, 79,501), and
+    the bench reports `dtcm_hit 4120` so the workload does exercise the changed
+    path. `dual_boot` TIMEOUTs with arm9=0 arm7=0 - **pre-existing, reproduced
+    identically at HEAD in a worktree**, not caused by this change.
 - 2026-07-24 sole agent: **CARTRIDGE CHIP ID IS NOW SIZE-DERIVED IN nds_card
   INSTEAD OF A 64 MB CONSTANT; SIM-ONLY, NO FIT AND NO HARDWARE CLAIM.**
   `rtl/nds_card.vhd` hardcoded `CHIPID = 0x00003FC2`, which is melonDS's

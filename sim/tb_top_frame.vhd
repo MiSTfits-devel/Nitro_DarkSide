@@ -37,6 +37,15 @@ entity tb_top_frame is
       TIMEOUT_MS : integer := 400;
       DIRECT     : integer := 0;         -- 1 = firmware direct-boot env (stock ROMs)
       ISLAND     : integer := 1;         -- 0 = tie clk2x to clk1x, i.e. no ARM9 island
+      -- clk2x half period in ps. 7500 = 66.67 MHz, the 2:1-with-coincident-edges
+      -- relationship the hardware PLL currently produces because the island
+      -- SHARES the 67.028 MHz video clock (NDS.sv: `assign CLK_VIDEO =
+      -- clk_video_67`) rather than because the ARM9 needs 67 MHz. Raising this
+      -- models giving the island its own slower PLL output, which is the only
+      -- lever that closes clk2x timing without restructuring nds_cpu9 - at the
+      -- cost of breaking the exact 2:1 the clk1x<->clk2x handshakes have only
+      -- ever run at. That is what this generic exists to test.
+      ISLAND_HALF_PS : integer := 7500;
                                          -- (nds_top.vhd:67). The island is what fails
                                          -- 67 MHz timing by -7.6 ns, so a 0 build is the
                                          -- only deployable one; this switch is how to ask
@@ -317,9 +326,9 @@ begin
          wait for 5 ns;
          while not tests_done loop
             clk2x <= '1';
-            wait for 7500 ps;
+            wait for ISLAND_HALF_PS * 1 ps;
             clk2x <= '0';
-            wait for 7500 ps;
+            wait for ISLAND_HALF_PS * 1 ps;
          end loop;
          clk2x <= '0';
          wait;
@@ -752,6 +761,7 @@ begin
       alias a_dtcm   is << signal .tb_top_frame.idut.imembus9.dtcm_hit : std_logic >>;
       variable c_isl, c_isl_wr, c_1x, c_1x_wr, c_sync : natural := 0;
       variable prev_isl : std_logic := '0';
+      variable prev_1x  : std_logic := '0';
       variable cyc : natural := 0;
       variable b_tot, b_r2, b_r3, b_r4, b_ro, b_hi : natural := 0;
       variable b_itcm, b_dtcm, b_io_eaten : natural := 0;
@@ -764,7 +774,16 @@ begin
          if (a_i9ena.rnw = '0') then c_isl_wr := c_isl_wr + 1; end if;
       end if;
       prev_isl := a_i9ena.ena;
-      if (clk1x = '1' and a_io9.ena = '1') then
+      -- clk1x side: RISING-EDGE detect, not a level sample. This used to read
+      -- `clk1x = '1' and a_io9.ena = '1'`, which counted correctly only by
+      -- accident of the exact 2:1 coincident-edge relationship: clk1x is high
+      -- for one of every two clk2x edges, so a one-clk1x-wide ena pulse
+      -- overlapped exactly one sample. At any other ratio (e.g. an island on its
+      -- own slower PLL output) that coincidence is gone and the count silently
+      -- drops requests that were never dropped - it reported 183 of 314 at
+      -- 1.705:1 and looked exactly like the CDC losing them. An edge detector is
+      -- correct at any ratio where the pulse is at least one island cycle wide.
+      if (a_io9.ena = '1' and prev_1x = '0') then
          c_1x := c_1x + 1;
          if (a_io9.rnw = '0') then
             c_1x_wr := c_1x_wr + 1;
@@ -782,6 +801,7 @@ begin
             end if;
          end if;
       end if;
+      prev_1x := a_io9.ena;
       -- Census of every request membus9 ACCEPTS, bucketed by address region and by
       -- whether a TCM claimed it. If the ARM9's IO stores are executed (the trace
       -- proves they are) but io_bus.ena almost never pulses, they must be landing

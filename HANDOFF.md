@@ -205,6 +205,78 @@ branch.
 
 ---
 
+## UPDATE 2026-07-28: read this before acting on the timing section below
+
+Two measurements change what the timing problem *is*. The section below is
+accurate about slack numbers and about what has been tried; its **strategy
+advice ("go after area", "close the remaining 2.5 ns") is superseded.**
+
+1. **67 MHz is inherited from the video clock, not required by the ARM9.**
+   `NDS.sv:206` is `assign CLK_VIDEO = clk_video_67;` — the island shares the
+   video pixel clock. This number was never an ARM9 requirement.
+
+2. **clk2x fails on a broad front, not a path.** Census of *all* violating paths
+   in `artifacts-t5/NDS.paths_67mhz.rpt` — the `-npaths 50` report shows only the
+   worst family, which is what made this look like a single-path problem:
+
+   | family | paths | worst |
+   |---|---|---|
+   | DTCM `porta_we` | 2,009 | −2.535 |
+   | store data → `pal/vram/oam/wsh_din` | 514 | −2.491 |
+   | `creq_*` | 351 | −2.254 |
+   | `io_bus` | 78 | −2.278 |
+   | other | ~50 | −2.170 |
+
+   Five families inside **0.37 ns** — and more hidden behind them.
+
+   **This was then tested, and the result is the strongest evidence in this
+   document.** The DTCM port-B deferral (`build/artifacts-dtcm`, seed 0, directly
+   comparable to `artifacts-t5`) eliminated the entire 2,009-path DTCM family —
+   `idtcm|*porta_we_reg` appears **zero** times in the new violating set, so the
+   fix did exactly what it was designed to do. Result:
+
+   | | t5 | dtcm | delta |
+   |---|---|---|---|
+   | clk2x WNS | −2.535 | **−2.809** | −0.274 (worse) |
+   | clk2x TNS | −1415 | −1551 | worse |
+   | violating paths | ~3,000 | ~3,000 | **unchanged** |
+   | ALMs | 37,652 | 37,232 | −420 (better) |
+
+   Removing **67% of all violating paths bought nothing on WNS.** The new worst is
+   `shiftervalue → fetch_PC` at −2.809, i.e. the PC-update datapath loop that the
+   section below already calls unamenable to restructuring, with 2,021 paths that
+   were queued invisibly behind DTCM. The −0.274 ns is inside the 1.53 ns seed
+   spread so it is not attributable, but that is the point: **the front is deep as
+   well as broad, and per-family RTL work cannot close this.** Do not spend more
+   builds on one family at a time — the DTCM change is worth keeping for its 420
+   ALMs, not for its slack.
+
+3. **A slower island is nearly free, and the CDCs survive a non-integer ratio.**
+   `ISLAND_HALF_PS` (new bench generic, 7500 = current 2:1) at 8750 = 57.1 MHz,
+   ratio 1.705:1: `bootreq` **pass=0x5A5BDE7F prog=0x63 identical to control**;
+   IO bridge **314 requests issued / 314 arrived, 19/19 writes**; Kirby 25 ms
+   ends in the **same 3-instruction copy loop**, ratio 2.674 → **2.632 (−1.6%
+   for a −14.4% clock)** because the ARM9 is memory-bound. Required period is
+   17.45 ns = **57.3 MHz**, so ~57 MHz closes clk2x with the ratio still clear of
+   the 2.32 target. Remaining work is a 4th PLL output + SDC — *not* done, and
+   not yet fitted.
+
+   The "the handshakes were written against a 2:1 ratio" worry below **does not
+   hold**: the request toggle sits stable until the transaction completes
+   (`nds_top.vhd:774-780`), the `*_done` paths are edge detectors and a 1-clk1x
+   pulse is still 1.705 island cycles, and the one ratio-sensitive structure
+   (`cpu9_done` toggle+XOR, `:924-937`) is *safer* slower. ISLAND=0 breaking at
+   1:1 is a real but separate defect — 1:1 is the degenerate case, 1.705:1 works.
+
+4. **`tb_top_frame`'s `IO9 path:` counter lied, and the handoff told you to trust
+   it.** `p_iocount` counted clk1x arrivals with `if (clk1x = '1' and
+   a_io9.ena = '1')` — a level sample correct only by accident of 2:1 coincident
+   edges. At 1.705:1 it reported 183 of 314 and looked exactly like the CDC
+   dropping 131 requests. Now a rising-edge detector. **Never trust a
+   cross-domain counter without reading how it samples.**
+
+---
+
 ## The timing blocker (independent of everything above)
 
 ### First: `NDS.sta.summary` names PLL outputs, not clocks
@@ -559,9 +631,16 @@ report inward to `0x02FFFF00`.
 
 ## Next steps, in order
 
-1. **Close the remaining ~2.5 ns on clk2x.** Still the *only* thing between here
-   and a core that can run on hardware — see the ISLAND=0 note above for why there
-   is no fallback. **Do not start by restructuring `nds_cpu9` logic.** The four
+1. **Close the remaining ~2.5 ns on clk2x** — still the only thing between here and
+   a core that can run on hardware. **But do it by giving the ARM9 island its own
+   PLL output at ~57 MHz, not by more RTL: see "UPDATE 2026-07-28" above.** The
+   failing set is five families inside 0.37 ns, so fixing families one at a time
+   cannot close it; a clock change gives all ~3,000 paths +2.6 ns at once, and it
+   was measured to cost 1.6% of the ARM9:ARM7 ratio. Concrete remaining work:
+   add a 4th output to `rtl/pll` (the island stops sharing `clk_video_67`), update
+   the SDC/`NDS.sv` wiring, then fit and re-run `bootreq` + a Kirby A/B. The rest
+   of this item is the *old* plan, kept because its measurements are still valid:
+   **do not start by restructuring `nds_cpu9` logic.** The four
    families of the previous session have collapsed into one loop whose largest
    single item is the register-file mux, and 4.9 of its 5.67 ns is interconnect.
    Read the budget table in the timing section, then go after **area**:

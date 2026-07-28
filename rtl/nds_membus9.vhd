@@ -74,12 +74,19 @@ entity nds_membus9 is
       itcm_writedata : out std_logic_vector(31 downto 0);
       itcm_readdata  : in  std_logic_vector(31 downto 0);
 
-      -- DTCM store (16 KB): same timing contract as the ITCM store
-      dtcm_addr      : out unsigned(13 downto 2);
-      dtcm_we        : out std_logic;
-      dtcm_be        : out std_logic_vector(3 downto 0);
-      dtcm_writedata : out std_logic_vector(31 downto 0);
-      dtcm_readdata  : in  std_logic_vector(31 downto 0);
+      -- DTCM store (16 KB). Port A is now READ-ONLY and keeps the ITCM's
+      -- contract: address presented combinationally in the accept cycle, read
+      -- data valid in FINISH. The store moved to port B one cycle later, so its
+      -- write enable comes straight off a flop instead of off the CPU's address
+      -- - see "DTCM deferred store" below. The write ports are deliberately
+      -- renamed rather than reused: an instantiation that still wires the old
+      -- port-A write fails analysis instead of quietly writing twice.
+      dtcm_addr        : out unsigned(13 downto 2);
+      dtcm_readdata    : in  std_logic_vector(31 downto 0);
+      dtcm_addr_b      : out unsigned(13 downto 2) := (others => '0');
+      dtcm_we_b        : out std_logic := '0';
+      dtcm_be_b        : out std_logic_vector(3 downto 0) := (others => '0');
+      dtcm_writedata_b : out std_logic_vector(31 downto 0) := (others => '0');
 
       -- boot ROM store (32 KB at 0xFFFF0000, read-only)
       brom_addr      : out unsigned(14 downto 2) := (others => '0');
@@ -191,6 +198,28 @@ architecture arch of nds_membus9 is
 
    signal din_unrot  : std_logic_vector(31 downto 0);
 
+   -- DTCM deferred store (see the block comment at the drive below).
+   -- dw_* is the write presented on port B *this* cycle; it commits at the edge
+   -- ending this cycle. dwq_* is that same write one cycle later, which is what
+   -- a read accepted alongside it has to be bypassed against.
+   signal dw_pend    : std_logic := '0';
+   signal dw_addr    : unsigned(13 downto 2) := (others => '0');
+   signal dw_data    : std_logic_vector(31 downto 0) := (others => '0');
+   signal dw_be      : std_logic_vector(3 downto 0) := (others => '0');
+
+   signal dwq_pend   : std_logic := '0';
+   signal dwq_addr   : unsigned(13 downto 2) := (others => '0');
+   signal dwq_data   : std_logic_vector(31 downto 0) := (others => '0');
+   signal dwq_be     : std_logic_vector(3 downto 0) := (others => '0');
+
+   -- the accepted read's own address, one cycle on: both valid in FINISH.
+   -- Registering the address here rather than comparing against the live
+   -- cpu_adr in the accept cycle is the point: it keeps the 12-bit bypass
+   -- compare off the ALU's address path, where the old dtcm_we already was.
+   signal dr_pend    : std_logic := '0';
+   signal dr_addr    : unsigned(13 downto 2) := (others => '0');
+   signal dtcm_rd_eff : std_logic_vector(31 downto 0);
+
    -- cache <-> CPU-request side (main RAM only; the cache owns the mr_* port)
    signal creq_ena       : std_logic := '0';
    signal creq_rnw       : std_logic := '1';
@@ -283,9 +312,90 @@ begin
 
    dtcm_sel       <= accept_now and cpu_ena and dtcm_hit and not itcm_hit;
    dtcm_addr      <= unsigned(cpu_adr(13 downto 2));
-   dtcm_we        <= dtcm_sel and not cpu_rnw;
-   dtcm_be        <= be;
-   dtcm_writedata <= wdata;
+
+   -- ================= DTCM deferred store =================
+   -- This store's M10K write enable (`idtcm|ram_block1a*~porta_we_reg`) was the
+   -- single biggest timing family in the design: 46 of the 50 worst setup paths in
+   -- build/artifacts-t5, and **2,009 of the ~3,000 paths that violate at 67 MHz**
+   -- across the whole NDS.paths_67mhz.rpt, worst -2.535 ns. ~3.46 ns of it was the
+   -- M10K's own write-enable routing and setup, which no logic work touches.
+   -- Presenting the write in the accept cycle put the whole chain
+   --     ALU -> cpu_adr -> dtcm_hit -> dtcm_sel -> dtcm_we -> M10K we setup
+   -- inside one island cycle. Port B was unused (`ce_b => '0'`), so the write
+   -- moves there with a registered address/data/we: the write enable is now a
+   -- flop output and the M10K tail gets a full cycle of its own.
+   --
+   -- Do not expect this alone to close clk2x. The four other violating families
+   -- (store data -> pal/vram/oam/wsh_din at -2.491, io_bus -2.278, creq_* -2.254,
+   -- shifter/execute_busaddress -2.170) sit within 0.37 ns of this one, so
+   -- removing 67% of the violating paths still leaves WNS near -2.49. See the
+   -- "UPDATE 2026-07-28" section of HANDOFF.md: the front is broad, and the lever
+   -- that moves all of it at once is the island's clock, not its logic.
+   --
+   -- One pending slot is sufficient. This bus accepts at most one request per
+   -- cycle, so a store accepted in cycle N is always issued in N+1 before a
+   -- store accepted in N+1 can need the slot.
+   --
+   -- THE HAZARD, and why the bypass below is not optional. Port A reads
+   -- combinationally off the live cpu_adr and altsyncram registers that address
+   -- at the edge ending the accept cycle. A store accepted in N-1 is presented
+   -- on port B during N and commits at that *same* edge, so a read accepted in
+   -- cycle N is a mixed-port read-during-write at one address on Cyclone V,
+   -- which returns OLD data. The store-forward merge below substitutes the
+   -- pending bytes into the read data in FINISH. Note the merge is safe
+   -- regardless of what the silicon actually returns for mixed-port RDW: it
+   -- substitutes exactly the bytes the write wrote, so if the M10K did return
+   -- new data the bypass is a no-op on an identical value.
+   --
+   -- The simulation model has the same behaviour (`gsimu` reads `ram(addr_a)` as
+   -- a signal, i.e. the pre-edge value), so a sim run does exercise this hazard
+   -- rather than hiding it.
+   process (clk)
+   begin
+      if rising_edge(clk) then
+         -- age this cycle's port-B write by one, for the bypass compare
+         dwq_pend <= dw_pend;
+         dwq_addr <= dw_addr;
+         dwq_data <= dw_data;
+         dwq_be   <= dw_be;
+
+         dw_pend  <= '0';
+         dr_pend  <= '0';
+
+         if (reset = '0') then
+            dw_addr <= unsigned(cpu_adr(13 downto 2));
+            dw_data <= wdata;
+            dw_be   <= be;
+            dr_addr <= unsigned(cpu_adr(13 downto 2));
+
+            if (dtcm_sel = '1') then
+               dw_pend <= not cpu_rnw;
+               dr_pend <=     cpu_rnw;
+            end if;
+         else
+            dwq_pend <= '0';
+         end if;
+      end if;
+   end process;
+
+   dtcm_addr_b      <= dw_addr;
+   dtcm_we_b        <= dw_pend;
+   dtcm_be_b        <= dw_be;
+   dtcm_writedata_b <= dw_data;
+
+   -- store-forward merge, consumed in FINISH via din_unrot below. Both operands
+   -- are flops, so this whole compare-and-merge starts at the top of the cycle.
+   process (all)
+   begin
+      dtcm_rd_eff <= dtcm_readdata;
+      if (dr_pend = '1' and dwq_pend = '1' and dwq_addr = dr_addr) then
+         for i in 0 to 3 loop
+            if (dwq_be(i) = '1') then
+               dtcm_rd_eff(8*i + 7 downto 8*i) <= dwq_data(8*i + 7 downto 8*i);
+            end if;
+         end loop;
+      end if;
+   end process;
 
    -- size > 23 makes 512 << size overflow the 33-bit limit the old compares
    -- used, which turned every hit test false. See the TCM decode below.
@@ -574,7 +684,7 @@ begin
 
    -- ================= read data mux + rotation (gba_mem_readrotate) =================
    din_unrot <= itcm_readdata when target = T_ITCM   else
-                dtcm_readdata when target = T_DTCM   else
+                dtcm_rd_eff   when target = T_DTCM   else
                 brom_data     when target = T_BROM   else
                 wsh_dout      when target = T_WRAMSH else
                 vram_dout     when target = T_VRAM   else
