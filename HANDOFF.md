@@ -272,6 +272,31 @@ real deficiency is **renderer throughput: the v1 line server needs ~18 clk1x
 cycles per dot where a real-time dot clock affords 6.** That is exactly why
 `GPU_CE_DIV=1` drops ~110 lines/frame and why `tb_gpu2d_timed` says 3.
 
+### Measured at GPUCEDIV=1 (confirms the arithmetic exactly)
+
+```
+frames at 29.13 / 45.94 / 62.74 / 79.55 / 96.36 / 113.16 ms
+deltas   16.806 ms x5, dead constant     ratio to GPUCEDIV=3's 50.42 ms = 3.000
+```
+
+**16.806 ms against real NDS 16.716 ms - 0.5% off real-time**, and exactly 3.000x
+the current config. That half is content-independent (pure timing-unit arithmetic)
+and is now confirmed empirically as well as from `LINE_CYCLES`.
+
+**The line-drop cost is NOT yet measured, and do not repeat this mistake.** The
+same run reports only **3 dropped lines/frame** (cumulative 7/10/13/16/19/22),
+which looks like the renderer nearly keeping up - but the framebuffer is
+**100% white across all 294,912 pixels**, i.e. `DISPCNT=0`, display off, so the
+renderer had nothing to draw. That number is worthless as a throughput measure.
+The header's ~110 drops/frame on an affine scene stands as the relevant figure for
+real content, and renderer throughput remains the open problem.
+
+Which loops back to the unresolved blocker: **Kirby never turns the display on
+within reachable simulated time** (still blank at 6 frames / 216 ms), so renderer
+load under real content cannot be measured in RTL sim at all. That makes next-step
+3 below - extend `sim/melonds_tracer/main_fbdump.cpp` to log video-register writes -
+a prerequisite for the GPU work, not a side quest.
+
 **Two routes, and they are alternatives not steps:**
 
 1. **Move the render fabric to `clkMem`** (the documented intent: "fabric
