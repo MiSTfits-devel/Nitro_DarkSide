@@ -178,6 +178,37 @@ int main(int argc, char** argv)
         // FRAMEMAP=1 prints the game's own vblank counter per dump frame.
         if (getenv("FRAMEMAP"))
             fprintf(stderr, "FRAMEMAP %d vb=%u\n", n, nds.ARM9Read32(0x02FFFF08));
+        // VIDLOG=1: report the video-mode registers whenever they CHANGE, with the
+        // dump-frame index and the game's own vblank counter.
+        //
+        // This exists because the RTL sim cannot answer the question it is asked.
+        // Kirby's framebuffer is uniformly white in every reachable RTL window
+        // (6 frames / 216 ms) because DISPCNT is 0, i.e. display OFF - which is the
+        // hardware behaving correctly, not a rendering bug. The handoff's own rule
+        // is to judge only after ~600 frames, which is ~10 s of simulated time and
+        // out of reach. melonDS does hundreds of frames in seconds, so the "does
+        // Kirby ever turn the display on, and to what mode" question belongs here.
+        //
+        // Reported on change rather than every frame: a 600-frame run is then a
+        // handful of lines, and the first line where DISPCNT goes non-zero is the
+        // answer. POWCNT1 (0x304) decides which engine reaches which screen at all,
+        // so a display-on DISPCNT with the wrong POWCNT1 still shows nothing.
+        if (getenv("VIDLOG"))
+        {
+            static u32 pa = 0xFFFFFFFF, pb = 0xFFFFFFFF, ppw = 0xFFFFFFFF;
+            u32 da = nds.ARM9Read32(0x04000000);   // engine A DISPCNT
+            u32 db = nds.ARM9Read32(0x04001000);   // engine B DISPCNT
+            u32 pw = nds.ARM9Read16(0x04000304);   // POWCNT1
+            if (da != pa || db != pb || pw != ppw)
+            {
+                fprintf(stderr,
+                        "VIDLOG frame=%d vb=%u DISPCNT_A=%08X (mode %u%s) "
+                        "DISPCNT_B=%08X POWCNT1=%04X\n",
+                        n, nds.ARM9Read32(0x02FFFF08), da, (da >> 16) & 3,
+                        ((da >> 16) & 3) ? "" : " = DISPLAY OFF", db, pw);
+                pa = da; pb = db; ppw = pw;
+            }
+        }
         // Capture the inputs immediately before the final rendered frame;
         // games commonly update palettes at VBlank, so an end-of-run state
         // dump is one animation step newer than the displayed front buffer.
