@@ -176,16 +176,50 @@ Append entries with date + agent. Claim files before editing.
     anyone "fixes" the edge detector. The membus9 state histogram did not print
     buckets 5/6 (`W_IO_ALIGN`/`W_IO_RESP`) so it could not settle the question.
     Not on the critical path any more: /16 closes timing without ISLAND=0.
-  * **THE CPI PROBLEM IS BRIDGE LATENCY, NOT MEMORY BANDWIDTH - and it costs reads
-    too, so the write buffer is the smaller half of the story.** From the same
-    histograms: `mainram occupancy: arm7 78567 cyc / 26189 ops` = **3.0 cyc/op**,
-    `arm9 2149 cyc / 869 ops` = **2.5 cyc/op**, while the ARM9 pays ~11.5 cycles per
-    access. And `BYPASS_WAIT split: total 294 mainram-working 120
-    latched-awaiting-arb 6 mainram-IDLE(bridge/protocol) 168` - **57% of the stall
-    is the ARM9 waiting while main RAM is IDLE.** Main RAM is not the bottleneck;
-    the clk2x->clk1x->clkMem->back chain is. Healthy-island confirmation run in
-    flight (`CYCLE_HIST=600000`) - the ISLAND=0 numbers above are from a broken
-    configuration and must not be quoted as the healthy split.
+  * **ISLAND=0 WORKS. The stall was a testbench delta cycle.** `clk2x <= clk1x` is a
+    concurrent copy of a signal that is itself driven from the clkMem process, so
+    clk2x sat **one delta behind** clk1x, and that inverts every clk1x->clk2x edge
+    detector in nds_top: clk1x rises at delta 1 and schedules the new
+    `cdc_io_cpl`; at delta 2 `cdc_io_cpl` updates *and* clk2x rises, so the clk2x
+    process samples the already-updated value, `cdc_io_cpl_d` tracks it exactly and
+    `i9_io_done` can never pulse. Fixed by driving clk2x off the same clkMem edge
+    and same clkMemIndex as clk1x (same delta = what one shared net does).
+    **Before: pass=0x0, 90 accepts, `i9_io_done 0`. After: pass=0x5A5BDE7F
+    prog=0x63, IO chain 106/106/106/106/106.** On hardware the two are one net, so
+    the detector always worked. Retires the 07-26 handoff's "there is no
+    timing-clean fallback" AND its suspicion that a handshake "does not survive
+    1:1" - the ARM9 on clk1x is a deployable config today (clk1x passes at
+    +1.397 ns), just slower than a /16 island. Also `bootreq` passes at the /16
+    ratio itself (1.5:1, exactly 3:2): pass=0x5A5BDE7F, IO chain 267/267 matched.
+  * **CPI: my "bridge latency" claim was WRONG - it came from the broken ISLAND=0
+    run. Healthy island (2:1, 18 ms) is a different picture entirely:**
+    `BYPASS_WAIT split: total 438650  mainram-working 308960 (70%)
+    latched-awaiting-arb 21004 (5%)  mainram-IDLE(bridge/protocol) 108686 (25%)
+    [serving7 230874]` and `mainram occupancy: arm7 587040 cyc / 97872 ops (6.0
+    cyc/op)  arm9 186891 cyc / 45014 ops (4.2 cyc/op)  idle 426069`.
+    So bridge idle is 25%, not 57%, and **the ARM9's single largest stall cause is
+    queueing behind the ARM7 (230,874 of 438,650 = 53%)**, which occupies main RAM
+    3.1x more than the ARM9 because it is uncached and this cart puts its binary at
+    0x02380000. **That contention is ARCHITECTURALLY FAITHFUL, not a bug**:
+    `nds_mainram`'s tiebreak is `arm7_priority` = EXMEMCNT bit 15, the game's own
+    register, so overriding it would be an accuracy cut. 4.2 cyc/op at clk1x is
+    ~125 ns, against ~134 ns for a real NDS ARM9 main-RAM access - our main RAM
+    latency is roughly authentic.
+  * **EVERY CPI NUMBER THIS SESSION IS BOOT-PHASE AND MUST NOT BE GENERALISED.**
+    At 18 ms the cache histogram is `BYPASS_WAI 438650 (36%)`, `FILL_BEAT 3352`,
+    `FILL_WAIT 48844` - about **419 line fills against ~44,600 bypass ops, i.e. 99%
+    of ARM9 main-RAM traffic bypasses the cache**, and 29% of all instructions reach
+    main RAM. That is because `cp15_control` resets to `x"00012078"` (bit 0 PU=0,
+    bit 2 D-cache=0, bit 12 I-cache=0; only bit 13 high-vectors and bit 16 DTCM
+    set) and cacheability is gated on bit 0 (`nds_cpu9.vhd:663`). **This does NOT
+    mean the ARM9 runs uncached forever** - a census of the ARM9 binary finds
+    Kirby writing CP15 CRn=1 **17 times**, CRn=6 (PU regions) 11, CRn=7 (cache
+    ops) 25, CRn=9 (TCM) 4. It enables the caches later; 18 ms is simply before
+    that. (A first scan for the exact word `0xEE010F10` found 0 sites and nearly
+    produced the alarming conclusion - the mask was too narrow. Match
+    `(v & 0x0F100010)==0x0E000010` with coproc field 0xF instead.)
+    A 400 ms / ~24-frame untraced run with `CYCLE_HIST` is in flight to get the
+    steady-state split; nothing about playability should be concluded before it.
   * Also measured: `nds_mainram` latches a request into `req9_*` in the accept cycle
     and **overwrites it unconditionally** on the next `mem9_ena`, so it is
     single-entry - a posted write MUST NOT issue a second request before
