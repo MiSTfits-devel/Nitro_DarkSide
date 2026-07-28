@@ -268,7 +268,49 @@ advice ("go after area", "close the remaining 2.5 ns") is superseded.**
    (`cpu9_done` toggle+XOR, `:924-937`) is *safer* slower. ISLAND=0 breaking at
    1:1 is a real but separate defect — 1:1 is the degenerate case, 1.705:1 works.
 
-4. **`tb_top_frame`'s `IO9 path:` counter lied, and the handoff told you to trust
+4. **DO NOT PICK /16. The ratio collapses on a 3:2 harmonic.** Ratio measured on
+   Kirby 25 ms at each available divisor (all four runs end in the *same* copy loop
+   at 0x020008A8/AC/B0, so these are same-phase comparisons):
+
+   | MHz | div | ARM9 | ARM7 | ratio | vs 2.32 |
+   |---|---|---|---|---|---|
+   | 67.028 | /12 | 212,592 | 79,501 | 2.674 | +0.354 |
+   | 57.453 | /14 | 203,207 | 77,215 | 2.632 | +0.312 |
+   | 53.622 | /15 | 198,545 | 75,865 | 2.617 | +0.297 |
+   | 50.271 | /16 | 174,616 | 78,939 | **2.212** | **−0.108 BELOW** |
+
+   /16 is exactly **3:2** against clk1x (24/16 = 1.5) and the ARM9 loses 12% of its
+   instructions while the ARM7 *gains* — it looks like a systematic main-RAM
+   arbitration slot lost to the harmonic alignment. /15 is 8:5 and /14 is 12:7.
+   **The only divisor that both closes timing and holds the ratio is /15
+   (53.6 MHz), and its +1.20 ns is inside the 1.53 ns seed spread**, so expect a
+   seed sweep. Do not extrapolate a trend across divisors — measure each one.
+
+5. **TIMING CLOSURE IS NECESSARY BUT NOT SUFFICIENT, and the clock change trades
+   away speed the core does not have.** Instantaneous rate from the `T9`/`T7`
+   checkpoints of a Kirby 25 ms run at the current 67 MHz:
+
+   | CPU | MIPS | CPI | trend |
+   |---|---|---|---|
+   | ARM9 @ 67.028 | **8.02** | **8.4** | flat over 23 ms |
+   | ARM7 @ 33.514 | **3.04** | **11.0** | flat |
+
+   Real hardware is roughly CPI 1.2–2 (ARM9, caches on) and ~3–5 (ARM7 from main
+   RAM), i.e. **the core is ~4–7x too slow** — the same order as the "~9x slower"
+   note in the ledger. The window is the boot copy loop, so it is the memory-bound
+   worst case and does *not* measure gameplay locality; but the rate is flat, so
+   nothing is warming up.
+
+   **Consequence for ordering: fix CPI before touching the clock.** The known
+   mechanism is already diagnosed — `BYPASS_WAIT` at ~35% of ARM9 cycles because a
+   cacheable write miss goes write-no-allocate (`nds_cache9.vhd:624`, correct for
+   ARM946E-S) but stalls the CPU for the whole ~11.5-cycle round trip, where real
+   hardware posts it through a write buffer (`cp15_pu_wbuf` = 0x02 enables
+   buffering on main RAM). A posted-write FIFO is worth roughly **4x** (8 → ~30
+   MIPS); the /15 clock cut costs **20%**. Doing the clock first spends speed the
+   core cannot spare; doing the write buffer first makes the clock cut painless.
+
+6. **`tb_top_frame`'s `IO9 path:` counter lied, and the handoff told you to trust
    it.** `p_iocount` counted clk1x arrivals with `if (clk1x = '1' and
    a_io9.ena = '1')` — a level sample correct only by accident of 2:1 coincident
    edges. At 1.705:1 it reported 183 of 314 and looked exactly like the CDC
@@ -631,9 +673,17 @@ report inward to `0x02FFFF00`.
 
 ## Next steps, in order
 
+0. **NEW ORDER OF WORK, per the 2026-07-28 measurements above.** (a) Posted-write
+   FIFO for the ARM9's cacheable write misses — worth ~4x on CPI, and the core is
+   4–7x too slow, so this is the actual gate on *playable*. (b) Then give the island
+   its own PLL output at **/15 = 53.6 MHz** (not /16 — the ratio collapses on its
+   3:2 harmonic), expecting a seed sweep because +1.20 ns is inside the seed
+   spread. (c) Then fit, `bootreq`, Kirby A/B, and only then deploy. Item 1 below
+   is the old plan; its measurements hold, its strategy does not.
+
 1. **Close the remaining ~2.5 ns on clk2x** — still the only thing between here and
    a core that can run on hardware. **But do it by giving the ARM9 island its own
-   PLL output at ~57 MHz, not by more RTL: see "UPDATE 2026-07-28" above.** The
+   PLL output at ~53.6 MHz, not by more RTL: see "UPDATE 2026-07-28" above.** The
    failing set is five families inside 0.37 ns, so fixing families one at a time
    cannot close it; a clock change gives all ~3,000 paths +2.6 ns at once, and it
    was measured to cost 1.6% of the ARM9:ARM7 ratio. Concrete remaining work:
