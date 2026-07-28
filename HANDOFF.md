@@ -250,12 +250,43 @@ This is 12x further than any previous measurement and it changes the speed story
 > (fabric 100.5 MHz, dots 33.5) **with clk1x standing in for the fabric clock** …
 > Consequence: relative to the CPUs the frame is GPU_CE_DIV x longer than hardware
 
-The render fabric is on `clk1x` (33.5 MHz) instead of `clkMem` (100.5 MHz), so each
-dot costs 3 clk1x cycles rather than 3 fabric cycles. **Move the fabric to clkMem
-and the frame becomes 16.81 ms against 16.74 ms real.** `GPU_CE_DIV=1` is not the
-fix — at 1 the v1 line server drops ~110 lines/frame; `tb_gpu2d_timed` proves 3 is
-the right number, it just needs the faster clock underneath it. This is the
-"M9 pacing" item the header defers, and it is the real headline for playability.
+### The exact mechanism, and why it is not a misconfiguration
+
+`nds_gpu_timing.vhd:80` is `constant LINE_CYCLES : integer := 355 * 6`, which
+already encodes the real relationship: 355 dots x 6 clk1x cycles per dot, because
+clk1x (33.514 MHz) is 6x the NDS dot clock (5.585 MHz). But the timing unit is
+ce-gated 1-in-3, so a line costs 2,130 x 3 = 6,390 clk1x cycles:
+
+| | clk1x cycles/frame | frame time |
+|---|---|---|
+| GPU_CE_DIV=3 (current) | 263 x 6,390 = 1,680,570 | **50.15 ms** (measured 50.42) |
+| GPU_CE_DIV=1 | 263 x 2,130 = 560,190 | **16.72 ms** = real NDS |
+
+And **`gpu_ce` gates ONLY `itiming`** (`nds_top.vhd:1685` is its single consumer -
+grep it). The renderer runs at full `clk1x` the whole time. So slowing the timing
+unit stretches each dot from 6 clk1x cycles to 18, and *that* is what lets the
+renderer keep up.
+
+So this is not a wrong clock assignment, it is a deliberate placeholder, and the
+real deficiency is **renderer throughput: the v1 line server needs ~18 clk1x
+cycles per dot where a real-time dot clock affords 6.** That is exactly why
+`GPU_CE_DIV=1` drops ~110 lines/frame and why `tb_gpu2d_timed` says 3.
+
+**Two routes, and they are alternatives not steps:**
+
+1. **Move the render fabric to `clkMem`** (the documented intent: "fabric
+   100.5 MHz, dots 33.5"). At 3x clk1x the renderer gets 18 clkMem cycles per dot -
+   precisely its measured need - while `itiming` runs at full clk1x for real-time
+   frames. clkMem is an exact 3x, phase-locked, and `clkMemIndex` is already
+   plumbed, so unlike the ARM9 island this is an **integer-ratio related clock**,
+   which is the friendly case. The work is CDC between the clkMem fabric and the
+   clk1x IO/VRAM/framebuffer interfaces.
+2. **Make the line server 3x cheaper per dot.** Attacks the same number from the
+   other side and needs no clock work, but it is a gpu2d rewrite.
+
+Either way, `itiming` must end up with `ce = '1'`. This is the "M9 pacing" item the
+header defers and it is the whole of the remaining 3x - it is worth more than any
+further timing effort.
 
 Supporting numbers from the same run:
 
