@@ -458,6 +458,46 @@ have collapsed into these two; there is no cheap structural target left inside
   merely be duplicated onto the final address mux.
 - **Raising `PLACEMENT_EFFORT_MULTIPLIER`.** See `t3` above.
 
+### CORRECTION 2026-07-28: the ISLAND=0 stall below is a TESTBENCH ARTIFACT
+
+The section that follows concludes "closing clk2x timing is the only route to a
+deployable core" and warns that "anyone who assumes there is [a fallback] will
+lose a day discovering this." **That conclusion rests on one line of the bench.**
+
+`sim/tb_top_frame.vhd` tied the domains with `clk2x <= clk1x`. But `clk1x` is
+itself a *signal* driven from the `clkMem` process, so a concurrent copy puts
+`clk2x` **one delta cycle** behind it — and that delta inverts every
+clk1x→clk2x edge detector in `nds_top`:
+
+```
+delta 1: clk1x rises; the clk1x process schedules the new cdc_io_cpl
+delta 2: cdc_io_cpl becomes new AND clk2x rises, so the clk2x process
+         samples the ALREADY-UPDATED value
+```
+
+`cdc_io_cpl_d` therefore tracks `cdc_io_cpl` exactly, `i9_io_done` can never
+pulse, and `membus9` parks in `W_IO_RESP` on its first IO access. That is
+precisely the reported signature: Kirby retires **1** ARM9 instruction with 5
+accepts, bootreq reaches 90 accepts and `pass=0x0`, and the bench's own IO chain
+reads `cdc_io_cpl tgl 1 -> i9_io_done 0`.
+
+On hardware, `clk2x` tied to `clk1x` is **one net**: both flops see the same
+edge and the detector works. The fix is to drive `clk2x` from the same `clkMem`
+edge and the same `clkMemIndex` as `clk1x` so both land in the same delta, which
+is what a shared net does — done, see the `gnoisland` comment in the bench.
+
+Two things follow. **(a) The "5 memory accesses in 30 ms" evidence proves nothing
+about the RTL.** **(b) The suspicion recorded below — "those handshakes were
+written against a 2:1 ratio and at least one of them does not survive 1:1" — is
+unsupported.** The request path is a toggle held until the transaction completes
+and the done paths are `V(t) xor V(t-1)` edge detectors, both correct at any
+ratio; and the 1.5:1 and 1.705:1 runs pass `bootreq` with the IO chain fully
+matched (267 issued / 267 arrived / 267 done at 1.5:1).
+
+Note this does *not* make ISLAND=0 desirable — it drops the ARM9 to 33.5 MHz,
+and absolute speed is the thing the core can least afford. It removes the *fear*
+that there is no fallback, and it retires a bogus 1:1 CDC bug hunt.
+
 ### There is no timing-clean fallback: ISLAND=0 does not work
 
 `nds_top.vhd:67` says "Tie to clk1x to disable the island". **That comment is
