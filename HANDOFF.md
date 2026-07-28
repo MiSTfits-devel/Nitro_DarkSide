@@ -291,11 +291,50 @@ renderer had nothing to draw. That number is worthless as a throughput measure.
 The header's ~110 drops/frame on an affine scene stands as the relevant figure for
 real content, and renderer throughput remains the open problem.
 
-Which loops back to the unresolved blocker: **Kirby never turns the display on
-within reachable simulated time** (still blank at 6 frames / 216 ms), so renderer
-load under real content cannot be measured in RTL sim at all. That makes next-step
-3 below - extend `sim/melonds_tracer/main_fbdump.cpp` to log video-register writes -
-a prerequisite for the GPU work, not a side quest.
+### ANSWERED: Kirby's real video mode, and the ~600-frame rule was invented
+
+**Delete the "judge only after ~600 frames" rule wherever it appears in this
+document.** Kirby enables its display at **dump frame 51**, and on real hardware /
+melonDS within 3-4 seconds. `main_fbdump.cpp` now has a `VIDLOG=1` hook that reports
+the video-mode registers on change:
+
+```
+VIDLOG frame=0   DISPCNT_A=00000000  DISPLAY OFF
+VIDLOG frame=10  DISPCNT_A=80200018  off, BG config being written
+VIDLOG frame=51  DISPCNT_A=80211218  mode 1 - DISPLAY ON (BG1+OBJ)
+VIDLOG frame=109 DISPCNT_A=80211810  mode 1, settled (BG3+OBJ)
+VIDLOG frame=120 DISPCNT_B=00211810  engine B follows
+```
+
+Steady-state target, which is what a render-test ROM should program:
+
+| field | engine A | engine B |
+|---|---|---|
+| DISPCNT | `80211810` | `00211810` |
+| display mode (16-17) | **1, graphics** | 1 |
+| BG mode (0-2) | **0, all tiled** | 0 |
+| BGs enabled | **BG3 only** | BG3 only |
+| OBJ | **on, 1D mapping** | on, 1D |
+| ext palettes (b31) | **yes** | no |
+| POWCNT1 | `820F` | — |
+
+**Kirby never uses the 3D engine.** `BG0 enable` (bit 8) is 0 in *every* value
+logged, so the BG0 2D/3D bit is moot even in the frames where it is set. The
+2D-only scope is safe for this title.
+
+Run it:
+```bash
+VIDLOG=1 sim/melonds_tracer/build/melonds_fbdump --direct \
+  "/Users/heni/Downloads/Kirby - Squeak Squad (USA)/Kirby - Squeak Squad (USA).nds" \
+  /tmp/kfb.txt 300 2>&1 >/dev/null | grep VIDLOG
+```
+Caveat: `FRAMEMAP`'s vblank counter (`0x02FFFF08`) reads a constant garbage value on
+this ROM under direct boot, so dump-frame index is the only usable time axis, and
+`RunFrame` coalesces frames while the LCD is off.
+
+Renderer load under real content still cannot be measured in RTL sim (216 ms only
+reaches 6 frames), but it no longer needs to be inferred - the mode above can be
+programmed directly by a test ROM and driven at full rate.
 
 **Two routes, and they are alternatives not steps:**
 
@@ -877,14 +916,17 @@ report inward to `0x02FFFF00`.
      and 3.32 ns of it was the M10K's own write-enable routing and setup.
    * Keep changing one thing per build. Bundling two fitter knobs with two RTL
      edits cost a build and 1.6 ns of confusion (`artifacts-t3`).
-2. **Verify the screen in sim before building.** Kirby now runs the full 90 ms and
-   takes its first vblank IRQ, but 90 ms is ~5 frames and the handoff's own rule
-   is to judge only after ~600 (white at frame 0 is normal — melonDS reports
-   `DISPCNT=0` there too). Reaching 600 frames is ~10 s of simulated time, which
-   is out of reach for a full-trace run; use `p_vidregs` and the framebuffer
-   dumps instead of a trace.
-3. **Write a render-test ROM — but not "in Kirby's modes", because Kirby has not
-   picked any.** Measured with `p_vidregs`: in a 95 ms run Kirby touches video
+2. ~~**Verify the screen in sim before building.**~~ **The "~600 frames" rule in
+   this item was invented and is deleted** — Kirby enables its display at melonDS
+   dump frame **51** (3-4 s on real hardware), see the ANSWERED section above. RTL
+   sim still only reaches ~6 frames in 216 ms, so the screen is not judgeable
+   there, but the answer no longer has to be waited for: it is a `VIDLOG` run.
+3. **Write a render-test ROM in Kirby's modes — they are now known** (the "Kirby
+   has not picked any" premise below was a consequence of only ever looking at the
+   first ~95 ms). Target `DISPCNT_A=80211810` / `DISPCNT_B=00211810` /
+   `POWCNT1=820F`: display mode 1, BG mode 0, BG3 + OBJ, 1D OBJ mapping, engine-A
+   extended palettes, and **no 3D** (BG0 is never enabled). Original note follows,
+   still accurate about the early-init burst: Measured with `p_vidregs`: in a 95 ms run Kirby touches video
    registers exactly 42 times, all in a 100 µs burst at ~83.7 ms, and it is all
    initialisation — POWCNT1 = `0x820F`, then every engine-A register `+000..+03C`
    zeroed, then every engine-B register, then identity affine matrices
