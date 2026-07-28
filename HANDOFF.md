@@ -205,6 +205,36 @@ branch.
 
 ---
 
+## *** TIMING CLOSES 2026-07-28: build/artifacts-isl0, ARM9 at 1:1 ***
+
+**The core meets timing for the first time.** `Report Timing: Found 50 setup paths
+(0 violated). Worst case slack is 1.537`, Fitter Successful, Timing Models Final.
+
+| domain | setup | TNS |
+|---|---|---|
+| clkMem 100.542 MHz | **+1.537** | 0.000 |
+| clk1x 33.514 MHz (**now carries the ARM9**) | **+2.186** | 0.000 |
+| video 67.028 MHz | +5.507 | 0.000 |
+| h2f_user0 / FPGA_CLK2_50 | +5.795 / +13.348 | 0.000 |
+
+Holds all positive, worst +0.248. Area **85% ALMs** (35,824 / 41,910), RAM 85%,
+DSP 84% - the island's removal gave back ~1,400 ALMs on top of the DTCM change.
+
+How: `NDS.sv` passes `clk_sys` as `.clk2x`, i.e. ISLAND=0. That is viable because
+(a) Kirby's boot handshake imposes **no** ARM9:ARM7 ratio - both sides wait
+unboundedly, and (b) the ISLAND=0 stall was a **bench delta cycle**, not RTL. Both
+are documented below. A slower *island* is a dead end - see the /16 result.
+
+Verified on the real workload: Kirby 25 ms at 1:1 gives ARM9 125,695 / ARM7 84,006
+instructions with `itcm_hit 3152` / `dtcm_hit 4120` **identical to the 2:1 island
+run**, so the same functional progress, and the IO chain fully matched. `bootreq`
+passes at 1:1 with `pass=0x5A5BDE7F`.
+
+**The cost is ARM9 clock: 33.514 MHz instead of 67.028.** Whether that is playable
+depends on the GPU pacing item immediately below, which is the next piece of work
+and is worth more than any further timing effort. NOTHING HAS BEEN DEPLOYED - the
+RBF exists at `build/artifacts-isl0/NDS.rbf` but no hardware result is claimed.
+
 ## UPDATE 2026-07-28 (b): the 3x "too slow" is GPU_CE_DIV, not the CPUs
 
 First run past the boot phase: 216 ms / 6 frames, untraced, `CYCLE_HIST=2000000`.
