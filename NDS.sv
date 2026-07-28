@@ -203,8 +203,25 @@ assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 wire pll_locked;
 wire clk_mem;
 wire clk_sys;
-wire clk_video_67;   // 67.027964 MHz: video output AND the ARM9 island clock
+wire clk_video_67;   // 67.027964 MHz: VIDEO OUTPUT ONLY (see clk_island below)
 assign CLK_VIDEO = clk_video_67;
+
+// The ARM9 island used to share clk_video_67, which is why the island was stuck
+// at 67.028 MHz - a video number, never an ARM9 requirement. It now has its own
+// PLL output. All outputs are integer divisions of the same 804.335568 MHz VCO
+// (/8 = clk_mem, /12 = clk_video_67, /16 = clk_island, /24 = clk_sys), so the
+// island stays a *related* clock and the clk1x<->clk2x crossings remain timed
+// paths rather than asynchronous ones.
+//
+// /16 = 50.270973 MHz buys +2.44 ns on every clk2x path, which is what closes a
+// domain that was failing at -2.5 to -2.8 ns across five separate families
+// (see HANDOFF.md "UPDATE 2026-07-28"). The ratio cost is acceptable because
+// Kirby's boot handshake imposes NO minimum ARM9:ARM7 ratio: both sides are
+// unbounded waits (the ARM7 spins forever at 0x0238FEA8/0x0238FEC8 with no
+// timeout, and the ARM9's 1000-poll budget at 0x0214FF50 restores its counter
+// and retries on expiry). The "2.32 target" in the ledger was never a
+// requirement of this code.
+wire clk_island;     // 50.270973 MHz: the ARM9 island (clk2x)
 
 pll pll
 (
@@ -213,6 +230,7 @@ pll pll
 	.outclk_0(clk_mem),
 	.outclk_1(clk_video_67),
 	.outclk_2(clk_sys),
+	.outclk_3(clk_island),
 	.locked(pll_locked)
 );
 
@@ -945,11 +963,18 @@ wire [7:0] touch_y = {~joystick_analog_0[15], joystick_analog_0[14:8]};
 nds_port_wrap nds
 (
 	.clk1x(clk_sys),
-	// PLL outclk_1, exactly 2x clk_sys from the same VCO at 0 ps. Clocks only the
-	// ARM9 island inside nds_top (core + membus + cache + TCMs); the real DS runs
-	// the ARM9 at 2x the ARM7 and having both at clk_sys breaks the IPCSYNC
-	// boot handshake. Same net as CLK_VIDEO.
-	.clk2x(clk_video_67),
+	// PLL outclk_3, 50.270973 MHz = VCO/16, i.e. 1.5x clk_sys from the same VCO at
+	// 0 ps. Clocks only the ARM9 island inside nds_top (core + membus + cache +
+	// TCMs). This was outclk_1/CLK_VIDEO at 67.028 MHz; it is now its own output
+	// so the island's frequency is an ARM9 decision rather than a video one.
+	//
+	// The old comment here claimed "having both at clk_sys breaks the IPCSYNC boot
+	// handshake". That is not what breaks: ISLAND=0 stalls because a bridge
+	// handshake loses a completion at 1:1 (bootreq reaches 90 membus accepts and
+	// parks, with main RAM IDLE), not because the handshake needs a speed ratio.
+	// Kirby's handshake cannot time out on either side - see the block comment at
+	// the pll instantiation above.
+	.clk2x(clk_island),
 	.clkMem(clk_mem),
 	.clkMemIndex(clkMemIndex),
 	.reset(reset | bios_load_reset),

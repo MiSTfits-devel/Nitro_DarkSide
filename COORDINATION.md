@@ -131,6 +131,67 @@ Append entries with date + agent. Claim files before editing.
 - nds-quartus-clash-9: Agent C (Clash integration compile; isolated fresh pod)
 
 ## Log
+- 2026-07-28 sole agent (2): **THERE IS NO ARM9:ARM7 RATIO REQUIREMENT. Kirby's boot
+  handshake cannot time out on either side.** Read both halves of the protocol out
+  of the cart image rather than inferring it from traces. This retires the number
+  that has justified the entire 67 MHz island design.
+  * **ARM9 side**, `0x0214FF00` (static ARM9 section, cart ROM offset 0x00153F00 -
+    derive it from the header: arm9_rom=0x4000, arm9_ram=0x02000000):
+    `mov r2,#1000` is a *polling budget*, and the inner wait at `0x214FF50` is 8
+    instructions x 1000 = **8,000**, which is where the ledger's "8,017 instructions
+    per iteration" came from. It is not a deadline. On expiry `movle ip, r1`
+    **restores the attempt counter** and it loops - there is no failure path at all.
+  * **ARM7 side**, `0x0238FEA0`+ (found by scanning the ARM7 section for
+    `ldr`-literal sites pointing at 0x04000180): sets its nibble to 1, then
+    `238feac: ldrh / and #15 / cmp #1 / bne 0x238feac` - an **unbounded spin**. Then
+    sets 0 and spins again at `0x238fec8`. **No timeout, no retry counter, no
+    give-up path.** Ends `bx ip` to the entry from `[0x027FFE34]`.
+  * So the handshake is pure **liveness**, not speed: either CPU may be arbitrarily
+    slower than the other and it still completes. **Every ratio figure in this
+    ledger (2.32, and the "0.42 -> 2.86 target 2.32" framing) has no basis in this
+    code.** The 07-26 handoff suspected exactly this ("the protocol is therefore not
+    'echo within one step'") and said to re-measure; this is that re-measurement.
+  * Consequence: the /16 disqualification from entry (1) is **void** - a ratio of
+    2.212 is fine. Any divisor may be chosen on timing/speed grounds alone.
+  * **IMPLEMENTED: the island now has its own PLL output.** `rtl/pll/pll_0002.v`
+    `number_of_clocks(3)->(4)` + `output_clock_frequency3("50.270973 MHz")` +
+    `outclk_3` added to the concat and to both port lists (`rtl/pll.v`,
+    `pll_0002.v`); `NDS.sv` declares `clk_island` and passes it as `.clk2x`, while
+    `CLK_VIDEO` keeps `clk_video_67`. All outputs stay integer divisions of the one
+    804.335568 MHz VCO (/8 clkMem, /12 video, **/16 island**, /24 clk1x) so the
+    island remains a *related* clock and the crossings stay timed paths. `NDS.sdc`
+    is only `derive_pll_clocks`/`derive_clock_uncertainty`, so the new clock is
+    constrained automatically - nothing to add there. analyze-all OK. Fit in flight
+    as `build/artifacts-isl16`; expected +2.44 ns on every clk2x path.
+  * **ISLAND=0 reproduced and localised, NOT fixed.** Kirby at 1:1 retires **1**
+    ARM9 instruction with **5** membus accepts; bootreq reaches 90 accepts,
+    pass=0x0, and parks. The bench's IO chain pins the stage:
+    `membus9.ena 1 -> cdc_req_io tgl 1 -> io9_ena 1 -> cdc_io_cpl tgl 1 ->
+    i9_io_done 0` - every stage fires and the island never turns the completion
+    toggle into a done, so membus9 sits in `W_IO_RESP`. NOTE the edge detector
+    `i9_io_done <= cdc_io_cpl xor cdc_io_cpl_d` is ratio-safe on paper (it is
+    `V(t) xor V(t-1)`, a one-cycle pulse at any ratio), and this bench has already
+    been caught miscounting a cross-domain signal this session, so **`i9_io_done 0`
+    may itself be a sampling artifact**. Needs its own instrumented run before
+    anyone "fixes" the edge detector. The membus9 state histogram did not print
+    buckets 5/6 (`W_IO_ALIGN`/`W_IO_RESP`) so it could not settle the question.
+    Not on the critical path any more: /16 closes timing without ISLAND=0.
+  * **THE CPI PROBLEM IS BRIDGE LATENCY, NOT MEMORY BANDWIDTH - and it costs reads
+    too, so the write buffer is the smaller half of the story.** From the same
+    histograms: `mainram occupancy: arm7 78567 cyc / 26189 ops` = **3.0 cyc/op**,
+    `arm9 2149 cyc / 869 ops` = **2.5 cyc/op**, while the ARM9 pays ~11.5 cycles per
+    access. And `BYPASS_WAIT split: total 294 mainram-working 120
+    latched-awaiting-arb 6 mainram-IDLE(bridge/protocol) 168` - **57% of the stall
+    is the ARM9 waiting while main RAM is IDLE.** Main RAM is not the bottleneck;
+    the clk2x->clk1x->clkMem->back chain is. Healthy-island confirmation run in
+    flight (`CYCLE_HIST=600000`) - the ISLAND=0 numbers above are from a broken
+    configuration and must not be quoted as the healthy split.
+  * Also measured: `nds_mainram` latches a request into `req9_*` in the accept cycle
+    and **overwrites it unconditionally** on the next `mem9_ena`, so it is
+    single-entry - a posted write MUST NOT issue a second request before
+    `mem9_done` or the first write is destroyed. Any write-FIFO design has to hold
+    the memory port, and getting the full ~4x needs a second in-flight slot in
+    `nds_mainram`, not just a queue in `nds_cache9`.
 - 2026-07-28 sole agent: **THE ISLAND'S 67 MHz IS INHERITED FROM THE VIDEO CLOCK,
   NOT REQUIRED BY THE ARM9 - AND clk2x FAILS ON A BROAD FRONT, NOT A PATH.** Two
   findings that between them reframe the timing effort, plus one RTL fix and one
