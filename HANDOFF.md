@@ -20,9 +20,11 @@ short and specific.
 | **DMA0** | **FIXED.** `bootreq` 0x5A5B9E7F → **0x5A5BDE7F**, a strict superset of the melonDS oracle (0x5A5BDC7F). |
 | **BIOS9 fetches** | **FIXED.** 15 of Kirby's first 28 were stale words. Now 650/650. |
 | Kirby in sim | Runs the full 90 ms, takes its first vblank IRQ, fills VRAM. No longer derails into ITCM. |
-| 67 MHz island timing | **STILL FAILS**, worst −2.535 ns (was −4.622, and −7.643 before that). But **clk1x and clkMem now both pass with zero TNS** — the island is the only failing domain left. See the timing section: the clock labels in earlier revisions of this document were wrong. |
-| Deployed on hardware | **Nothing from this session.** Do not deploy until timing closes. |
-| Area | 90% ALMs / 86% M10K / 84% DSP — fits, but at this density it *is* what the island's remaining slack is made of: ~65% of the worst path is interconnect |
+| Timing | **CLOSES as of 2026-07-28** — 0 violated paths, worst setup **+1.537**, all holds positive, Fitter Successful. `build/artifacts-isl0`. Reached by removing the 67 MHz island (ARM9 now on clk1x), not by more RTL: the 2.32 ratio that justified the island does not exist, and the ISLAND=0 stall was a bench delta cycle. See the TIMING CLOSES section. |
+| 67 MHz island | **REMOVED.** It failed at −2.535/−2.809 across five path families inside 0.37 ns, and a *slower* island is a dead end (cross-domain budget follows edge alignment: /16 gave −8.362). |
+| Frame rate | **3.01x too slow, and it is NOT the CPUs** — `GPU_CE_DIV=3` with the render fabric on clk1x where the design intends clkMem. Fix that and the frame is 16.81 ms vs 16.74 real. This is now the top item. |
+| Deployed on hardware | **Nothing.** An RBF exists at `build/artifacts-isl0/NDS.rbf` and no hardware result is claimed. |
+| Area | **85% ALMs** / 85% M10K / 84% DSP (35,824 / 41,910), down from 90% — the island removal and the DTCM deferral both gave ALMs back |
 
 Commits since `663cb6c`:
 
