@@ -117,10 +117,13 @@ architecture sim of tb_arm9_trace is
    signal itcm_we   : std_logic;
    signal itcm_be   : std_logic_vector(3 downto 0);
    signal itcm_writedata, itcm_readdata : std_logic_vector(31 downto 0);
+   -- DTCM port A is the read port; the store is deferred onto port B
    signal dtcm_addr : unsigned(13 downto 2);
-   signal dtcm_we   : std_logic;
-   signal dtcm_be   : std_logic_vector(3 downto 0);
-   signal dtcm_writedata, dtcm_readdata : std_logic_vector(31 downto 0);
+   signal dtcm_readdata : std_logic_vector(31 downto 0);
+   signal dtcm_addr_b : unsigned(13 downto 2);
+   signal dtcm_we_b   : std_logic;
+   signal dtcm_be_b   : std_logic_vector(3 downto 0);
+   signal dtcm_writedata_b : std_logic_vector(31 downto 0);
 
    signal wsh_ena, wsh_rnw, wsh_done, wsh_mapped : std_logic;
    signal wsh_addr : unsigned(14 downto 2);
@@ -270,8 +273,9 @@ begin
       cpu_lastread => cpu_lastread, cpu_din => cpu_din, cpu_done => cpu_done,
       itcm_addr => itcm_addr, itcm_we => itcm_we, itcm_be => itcm_be,
       itcm_writedata => itcm_writedata, itcm_readdata => itcm_readdata,
-      dtcm_addr => dtcm_addr, dtcm_we => dtcm_we, dtcm_be => dtcm_be,
-      dtcm_writedata => dtcm_writedata, dtcm_readdata => dtcm_readdata,
+      dtcm_addr => dtcm_addr, dtcm_readdata => dtcm_readdata,
+      dtcm_addr_b => dtcm_addr_b, dtcm_we_b => dtcm_we_b,
+      dtcm_be_b => dtcm_be_b, dtcm_writedata_b => dtcm_writedata_b,
       brom_addr => brom_addr, brom_data => brom_data,
       wsh_ena => wsh_ena, wsh_rnw => wsh_rnw, wsh_addr => wsh_addr, wsh_be => wsh_be,
       wsh_din => wsh_din, wsh_dout => wsh_dout, wsh_done => wsh_done, wsh_mapped => wsh_mapped,
@@ -294,10 +298,10 @@ begin
                end if;
             end loop;
          end if;
-         if (dtcm_we = '1') then
+         if (dtcm_we_b = '1') then
             for i in 0 to 3 loop
-               if (dtcm_be(i) = '1') then
-                  dtcm(to_integer(dtcm_addr))(i*8 + 7 downto i*8) <= dtcm_writedata(i*8 + 7 downto i*8);
+               if (dtcm_be_b(i) = '1') then
+                  dtcm(to_integer(dtcm_addr_b))(i*8 + 7 downto i*8) <= dtcm_writedata_b(i*8 + 7 downto i*8);
                end if;
             end loop;
          end if;

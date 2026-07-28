@@ -269,6 +269,68 @@ reset:
    orr  r9, r9, #1024
    str  r9, [r10]
 
+@ ---- test 12: DTCM store-forward (deferred port-B store hazard) ----
+@ The DTCM store is presented on M10K port B one cycle AFTER the accept cycle,
+@ so a load accepted in the cycle that store commits is a mixed-port
+@ read-during-write on Cyclone V and the RAM returns OLD data. nds_membus9
+@ merges the pending bytes into the read (see "DTCM deferred store" there).
+@ Every pair below is a store immediately followed by a load with no
+@ instruction between them, which is the only shape that can reach the hazard.
+@ tb_arm9_island counts the port-A-read/port-B-write address collisions and
+@ FAILS if the count is zero, so this test cannot pass vacuously.
+   ldr  r0, =0x03800100
+
+@ word store -> word load, same address
+   ldr  r1, =0xA5A51234
+   str  r1, [r0]
+   ldr  r2, [r0]
+   cmp  r2, r1
+   bne  report_fail
+
+@ byte store -> word load: the merge must replace exactly one lane
+   ldr  r1, =0x11223344
+   str  r1, [r0]
+   mov  r3, #0xEE
+   strb r3, [r0, #1]
+   ldr  r2, [r0]
+   ldr  r4, =0x1122EE44
+   cmp  r2, r4
+   bne  report_fail
+
+@ halfword store -> word load: the merge must replace exactly two lanes
+   ldr  r1, =0x55667788
+   str  r1, [r0, #4]
+   ldr  r3, =0x00009ABC
+   strh r3, [r0, #6]
+   ldr  r2, [r0, #4]
+   ldr  r4, =0x9ABC7788
+   cmp  r2, r4
+   bne  report_fail
+
+@ word store -> byte load of a lane inside it
+   ldr  r1, =0x0F1E2D3C
+   str  r1, [r0, #16]
+   ldrb r2, [r0, #17]
+   cmp  r2, #0x2D
+   bne  report_fail
+
+@ store to one address, load a DIFFERENT one: the bypass must NOT fire
+   ldr  r1, =0x0BADF00D
+   str  r1, [r0, #12]          @ seed the address we will read back
+   ldr  r1, =0xDEADBEEF
+   str  r1, [r0, #8]
+   ldr  r2, [r0, #12]          @ must still be 0x0BADF00D, not 0xDEADBEEF
+   ldr  r4, =0x0BADF00D
+   cmp  r2, r4
+   bne  report_fail
+   ldr  r2, [r0, #8]           @ and the store itself must have landed
+   ldr  r4, =0xDEADBEEF
+   cmp  r2, r4
+   bne  report_fail
+
+   orr  r9, r9, #2048
+   str  r9, [r10]
+
 @ ---- all passed ----
    ldr  r1, =0xCAFEBABE
    str  r1, [r10, #4]
