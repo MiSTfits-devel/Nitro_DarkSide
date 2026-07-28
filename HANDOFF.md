@@ -205,6 +205,45 @@ branch.
 
 ---
 
+## UPDATE 2026-07-28 (b): the 3x "too slow" is GPU_CE_DIV, not the CPUs
+
+First run past the boot phase: 216 ms / 6 frames, untraced, `CYCLE_HIST=2000000`.
+This is 12x further than any previous measurement and it changes the speed story.
+
+**Frames dump every 50.42 ms, dead constant** (87.26 / 137.68 / 188.10 ms) against
+16.74 ms for real NDS — exactly **3.01x**. That is not CPU slowness, it is
+`GPU_CE_DIV`, and `nds_top.vhd:14-20` already documents it:
+
+> the GPU dot cadence is ce-paced at 1-of-GPU_CE_DIV … the planned MiSTer topology
+> (fabric 100.5 MHz, dots 33.5) **with clk1x standing in for the fabric clock** …
+> Consequence: relative to the CPUs the frame is GPU_CE_DIV x longer than hardware
+
+The render fabric is on `clk1x` (33.5 MHz) instead of `clkMem` (100.5 MHz), so each
+dot costs 3 clk1x cycles rather than 3 fabric cycles. **Move the fabric to clkMem
+and the frame becomes 16.81 ms against 16.74 ms real.** `GPU_CE_DIV=1` is not the
+fix — at 1 the v1 line server drops ~110 lines/frame; `tb_gpu2d_timed` proves 3 is
+the right number, it just needs the faster clock underneath it. This is the
+"M9 pacing" item the header defers, and it is the real headline for playability.
+
+Supporting numbers from the same run:
+
+- **The caches are working by 200 ms**: `FILL_BEAT` 28,312 (vs 3,352 at 18 ms),
+  `FILL_WAIT` 333,323, `WB_WAIT` 28,487. Every CPI figure in this repo predates
+  cache enable — see the boot-phase warning in COORDINATION.md.
+- **Kirby is really rendering**: `membus9 state 3` (W_VRAM) is 21% of cycles, 0 at
+  18 ms.
+- **The ARM9 has headroom**: `cpu9_ena 2,159,850 of 14,000,000` = it wants the bus
+  only **15.4%** of cycles, and after frame 2 its accept counter freezes for
+  ~3 ms+ with no error, consistent with finishing frame work and idle-waiting for
+  vblank. Rough estimate off that idle window: at a real 16.74 ms frame budget the
+  ARM9 would be **~1.4x short**, not 3-9x. Treat that as an estimate, not a
+  measurement — it is inferred from a frozen counter over a thin sample, and the
+  clean way to settle it is per-frame ARM9 busy cycles.
+- **Screen still white** (294,912 px, all 0x3FFFF) at 6 frames. Expected:
+  `DISPCNT=0` is display-off and this document's own rule is to judge after ~600
+  frames (~10 s simulated, out of reach). The screen question still needs the
+  melonDS video-register log, not RTL sim.
+
 ## UPDATE 2026-07-28: read this before acting on the timing section below
 
 Two measurements change what the timing problem *is*. The section below is
