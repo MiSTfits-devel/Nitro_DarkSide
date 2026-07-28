@@ -184,6 +184,34 @@ Append entries with date + agent. Claim files before editing.
       quoted in this ledger is 2.32 (itself flagged as resting on a bad model).
     - Required period for the current netlist is 14.915 + 2.535 = 17.45 ns =
       **57.3 MHz**, so ~57 MHz closes clk2x with the ratio still clear of target.
+  * **/16 IS DISQUALIFIED - the ratio collapses on a 3:2 harmonic.** Full sweep on
+    Kirby 25 ms; all four runs end in the *same* copy loop at 0x020008A8/AC/B0, so
+    these are same-phase comparisons:
+    | MHz | div | ARM9 | ARM7 | ratio | vs 2.32 |
+    |---|---|---|---|---|---|
+    | 67.028 | /12 | 212,592 | 79,501 | 2.674 | +0.354 |
+    | 57.453 | /14 | 203,207 | 77,215 | 2.632 | +0.312 |
+    | 53.622 | /15 | 198,545 | 75,865 | 2.617 | +0.297 |
+    | 50.271 | /16 | 174,616 | 78,939 | **2.212** | **-0.108 BELOW** |
+    /16 is exactly 3:2 against clk1x (24/16 = 1.5); the ARM9 loses 12% of its
+    instructions while the ARM7 *gains*, which reads as a main-RAM arbitration slot
+    lost systematically to the harmonic. /15 is 8:5, /14 is 12:7. **Only /15
+    (53.6 MHz) both closes timing and holds the ratio, and its +1.20 ns is inside
+    the 1.53 ns seed spread** - expect a seed sweep. Lesson: do not extrapolate a
+    trend across divisors, measure each. I recommended /16 off a linear
+    extrapolation of /12,/14,/15 and the measurement contradicted it.
+  * **TIMING CLOSURE IS NOT SUFFICIENT FOR PLAYABLE, and the clock cut spends speed
+    the core has not got.** Instantaneous rate from the `T9`/`T7` checkpoints of the
+    67 MHz Kirby run: **ARM9 8.02 MIPS / CPI 8.4**, **ARM7 3.04 MIPS / CPI 11.0**,
+    both **flat over 23 ms** (no cache warm-up visible). Real hardware is roughly
+    CPI 1.2-2 (ARM9 with caches) and ~3-5 (ARM7 from main RAM), so the core is
+    **~4-7x too slow**, matching the ledger's "~9x" note. Caveat: the window is the
+    boot copy loop, i.e. the memory-bound worst case, not gameplay locality.
+    **Ordering consequence: do the posted-write FIFO BEFORE the clock change.**
+    BYPASS_WAIT is ~35% of ARM9 cycles because a cacheable write miss goes
+    write-no-allocate (correct for ARM946E-S) but stalls for the full ~11.5-cycle
+    round trip instead of posting. That fix is worth ~4x (8 -> ~30 MIPS); the /15
+    clock cut costs 20%.
   * **The CDC handshakes are ratio-independent by construction**, contrary to the
     2026-07-26 handoff's worry. Request clk2x->clk1x is a toggle that "sits stable
     until the transaction completes" (`nds_top.vhd:774-780`); the `*_done`
