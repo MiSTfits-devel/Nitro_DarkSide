@@ -59,11 +59,26 @@ entity nds_top is
    port
    (
       clk1x            : in  std_logic;   -- 33.513982 MHz system clock
-      -- 67.027964 MHz, PLL outclk_1: EXACTLY 2x clk1x from the same VCO at 0 ps,
-      -- so rising edges coincide on every other clk2x cycle. Clocks only the
-      -- ARM9 island (icpu9 + imembus9 + cache9 + ITCM/DTCM) - the real DS runs
-      -- the ARM9 at 2x the ARM7, and having both on clk1x is what breaks the
-      -- NitroSDK IPCSYNC boot handshake. Tie to clk1x to disable the island.
+      -- The ARM9 island clock, PLL outclk_3, 50.270973 MHz = VCO/16 = 1.5x clk1x
+      -- from the same VCO at 0 ps. Clocks only the ARM9 island (icpu9 + imembus9
+      -- + cache9 + ITCM/DTCM).
+      --
+      -- Historically this was outclk_1 at 67.027964 MHz, "EXACTLY 2x clk1x", and
+      -- the comment here said having both on clk1x "breaks the NitroSDK IPCSYNC
+      -- boot handshake". Both parts of that are now known to be wrong:
+      --   * 67.028 MHz was the VIDEO pixel clock, which the island merely shared.
+      --     It was never an ARM9 requirement.
+      --   * The handshake imposes no speed ratio at all. Both sides are unbounded
+      --     waits (ARM7 spins at 0x0238FEA8/0x0238FEC8 with no timeout; the ARM9's
+      --     1000-poll budget at 0x0214FF50 restores its counter and retries on
+      --     expiry), so either CPU may be arbitrarily slower than the other.
+      -- The bridge handshakes below are ratio-independent by construction - the
+      -- request path is a toggle held until the transaction completes, and the
+      -- done paths are edge detectors - so a non-integer 1.5x is fine.
+      --
+      -- ISLAND=0 (tie to clk1x) still does NOT work, but for an unrelated reason:
+      -- a bridge completion is lost at 1:1 and the ARM9 parks after ~90 accepts
+      -- with main RAM IDLE. That is a bug to fix, not a ratio requirement.
       clk2x            : in  std_logic;
       clkMem           : in  std_logic;   -- 100.542 MHz (3x clk1x, phase-locked)
       clkMemIndex      : in  unsigned(1 downto 0);  -- clkMem phase, 0 on clk1x rising edge
