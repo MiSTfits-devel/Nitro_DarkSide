@@ -203,25 +203,14 @@ assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 wire pll_locked;
 wire clk_mem;
 wire clk_sys;
-wire clk_video_67;   // 67.027964 MHz: VIDEO OUTPUT ONLY (see clk_island below)
+wire clk_video_67;   // 67.027964 MHz: VIDEO OUTPUT ONLY
 assign CLK_VIDEO = clk_video_67;
 
-// The ARM9 island used to share clk_video_67, which is why the island was stuck
-// at 67.028 MHz - a video number, never an ARM9 requirement. It now has its own
-// PLL output. All outputs are integer divisions of the same 804.335568 MHz VCO
-// (/8 = clk_mem, /12 = clk_video_67, /16 = clk_island, /24 = clk_sys), so the
-// island stays a *related* clock and the clk1x<->clk2x crossings remain timed
-// paths rather than asynchronous ones.
-//
-// /16 = 50.270973 MHz buys +2.44 ns on every clk2x path, which is what closes a
-// domain that was failing at -2.5 to -2.8 ns across five separate families
-// (see HANDOFF.md "UPDATE 2026-07-28"). The ratio cost is acceptable because
-// Kirby's boot handshake imposes NO minimum ARM9:ARM7 ratio: both sides are
-// unbounded waits (the ARM7 spins forever at 0x0238FEA8/0x0238FEC8 with no
-// timeout, and the ARM9's 1000-poll budget at 0x0214FF50 restores its counter
-// and retries on expiry). The "2.32 target" in the ledger was never a
-// requirement of this code.
-wire clk_island;     // 50.270973 MHz: the ARM9 island (clk2x)
+// The ARM9 island used to share clk_video_67, which is why it was stuck at
+// 67.028 MHz - a video number, never an ARM9 requirement. Giving it its own PLL
+// output was tried (/16 = 50.270973 MHz, build/artifacts-isl16) and is a DEAD
+// END: cross-domain setup budget is set by EDGE ALIGNMENT, not period, so a
+// non-integer ratio makes timing far worse. See the .clk2x comment below.
 
 pll pll
 (
@@ -230,7 +219,6 @@ pll pll
 	.outclk_0(clk_mem),
 	.outclk_1(clk_video_67),
 	.outclk_2(clk_sys),
-	.outclk_3(clk_island),
 	.locked(pll_locked)
 );
 
@@ -963,18 +951,24 @@ wire [7:0] touch_y = {~joystick_analog_0[15], joystick_analog_0[14:8]};
 nds_port_wrap nds
 (
 	.clk1x(clk_sys),
-	// PLL outclk_3, 50.270973 MHz = VCO/16, i.e. 1.5x clk_sys from the same VCO at
-	// 0 ps. Clocks only the ARM9 island inside nds_top (core + membus + cache +
-	// TCMs). This was outclk_1/CLK_VIDEO at 67.028 MHz; it is now its own output
-	// so the island's frequency is an ARM9 decision rather than a video one.
+	// ISLAND=0 CONFIGURATION. The island runs at clk_sys, i.e. 1:1.
 	//
-	// The old comment here claimed "having both at clk_sys breaks the IPCSYNC boot
-	// handshake". That is not what breaks: ISLAND=0 stalls because a bridge
-	// handshake loses a completion at 1:1 (bootreq reaches 90 membus accepts and
-	// parks, with main RAM IDLE), not because the handshake needs a speed ratio.
-	// Kirby's handshake cannot time out on either side - see the block comment at
-	// the pll instantiation above.
-	.clk2x(clk_island),
+	// A slower island at a NON-INTEGER ratio is counterproductive and the /16 fit
+	// proved it: cross-domain setup budget is set by EDGE ALIGNMENT, not by period.
+	// At 2:1 with coincident edges a clk1x->island path gets a full fast-clock
+	// period (14.919 ns); at 3:2 the closest opposing edge is only half an island
+	// period (9.946 ns), so every crossing lost a third of its budget and the
+	// island went -2.809 -> -8.362 (build/artifacts-isl16) even though its own
+	// period grew. Only integer ratios are viable, and there is no integer between
+	// 1 and 2 - so the choice is 2:1 (fails at -2.809) or 1:1 (this).
+	//
+	// 1:1 is now known to be functionally correct: bootreq passes with
+	// pass=0x5A5BDE7F and the IO chain fully matched. The old "ISLAND=0 stalls"
+	// result was a testbench delta cycle, and no ARM9:ARM7 ratio is required by
+	// Kirby's handshake (both sides wait unboundedly). The cost is ARM9 clock, to
+	// be won back on CPI - the caches are not even enabled in anything measured so
+	// far.
+	.clk2x(clk_sys),
 	.clkMem(clk_mem),
 	.clkMemIndex(clkMemIndex),
 	.reset(reset | bios_load_reset),
