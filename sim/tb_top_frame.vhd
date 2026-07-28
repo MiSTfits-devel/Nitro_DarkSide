@@ -337,8 +337,34 @@ begin
 
    -- ISLAND=0: the ARM9 runs at clk1x like everything else. Everything that
    -- crosses the bridge still works, it just crosses within one domain.
+   --
+   -- This MUST NOT be written `clk2x <= clk1x`. clk1x is itself a signal driven
+   -- from the clkMem process below, so a concurrent copy puts clk2x one DELTA
+   -- CYCLE behind it, and that delta is not a harmless modelling detail - it
+   -- inverts the behaviour of every clk1x->clk2x edge detector in nds_top:
+   --
+   --   delta 1: clk1x rises, the clk1x process schedules the new cdc_io_cpl
+   --   delta 2: cdc_io_cpl becomes new AND clk2x rises, so the clk2x process
+   --            samples the ALREADY-UPDATED value
+   --
+   -- so cdc_io_cpl_d tracks cdc_io_cpl exactly and i9_io_done can never pulse.
+   -- membus9 then parks in W_IO_RESP on its first IO access: Kirby retires ONE
+   -- ARM9 instruction, bootreq gets 90 accepts and reports pass=0. On hardware,
+   -- clk2x tied to clk1x is one net, both flops see the same edge, and the
+   -- detector works - so that stall was an artifact of this line, and the
+   -- 2026-07-26 handoff's "there is no timing-clean fallback, ISLAND=0 does not
+   -- work" conclusion was built on it.
+   --
+   -- Driving clk2x from the same clkMem edge and the same clkMemIndex as clk1x
+   -- puts both updates in the same delta, which is what one shared net does.
    gnoisland : if ISLAND = 0 generate
-      clk2x <= clk1x;
+      process (clkMem)
+      begin
+         if rising_edge(clkMem) then
+            if (clkMemIndex = 2) then clk2x <= '1'; end if;
+            if (clkMemIndex = 0) then clk2x <= '0'; end if;
+         end if;
+      end process;
    end generate;
 
    process (clkMem)
