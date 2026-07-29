@@ -151,6 +151,7 @@ do_probe() {
 	_srv7=$(((_n >> 21) & 1)); _lp=$(((_n >> 22) & 1)); _allow=$(((_n >> 23) & 1))
 	_c9ena=$(((_n >> 24) & 1)); _mr9done=$(((_n >> 25) & 1))
 	_mr9ena=$(((_n >> 26) & 1)); _m9ena=$(((_n >> 27) & 1))
+	_vbl9=$(((_n >> 18) & 1))    # ARM9 DISPSTAT bit 3, VBlank IRQ enable
 	_m9done=$(((_n >> 28) & 1)); _pksel=$(((_n >> 29) & 1))
 	_ldb=$(((_n >> 30) & 1)); _dma=$(((_n >> 31) & 1))
 
@@ -170,6 +171,8 @@ do_probe() {
 	echo "  cache9   : $_csn  beat=$_cbeat code=$_ccode"
 	echo "  membus9  : $_msn  cpu_ena=$_cena accept=$_acc cresp_done=$_cresp mr_done=$_mrdone"
 	echo "  mainram  : $_rsn  req9=$_r9 req7=$_r7 serving7=$_srv7 lock_pair=$_lp allow=$_allow"
+	echo "  vbl ena9 : $_vbl9   <- ARM9 DISPSTAT bit 3. 0 here means the GPU never"
+	echo "             raises the ARM9 VBlank IRQ, so it sleeps in WFI forever."
 	echo "  top mux  : cpu9_ena=$_c9ena mr9_ena=$_mr9ena mr9_done=$_mr9done"
 	echo "             mem9_ena=$_m9ena mem9_done=$_m9done pk_sel=$_pksel ld_busy=$_ldb dma_bus_on=$_dma"
 }
