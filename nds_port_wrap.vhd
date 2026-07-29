@@ -252,6 +252,8 @@ begin
       dbg_export7      => open,
 -- synthesis translate_on
       dbg_line_drop    => open,
+      dbg_line_drop_a  => open,
+      dbg_line_drop_b  => open,
       dbg_line_busy    => open,
       dbg_cpu_err9     => open,
       dbg_cpu_err7     => open,

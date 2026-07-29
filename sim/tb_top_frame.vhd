@@ -246,6 +246,7 @@ architecture sim of tb_top_frame is
    signal vblank_out     : std_logic;
 
    signal dbg_line_drop, dbg_line_busy, dbg_cpu_err9, dbg_cpu_err7 : std_logic;
+   signal dbg_line_drop_a, dbg_line_drop_b : std_logic;
    signal dbg_export9_done : std_logic;
    signal dbg_export9      : cpu_export_type;
    signal dbg_export7_done : std_logic;
@@ -268,6 +269,8 @@ architecture sim of tb_top_frame is
    shared variable banks : t_banks := (others => (others => '0'));
 
    signal drops      : integer := 0;
+   signal drops_a    : integer := 0;
+   signal drops_b    : integer := 0;
    signal tests_done : boolean := false;
    -- Interval currently being rendered: 0 is the interval ending at dump
    -- frame 0.  This makes TRACE*_START_FRAME match melonds_fbdump, which
@@ -433,6 +436,7 @@ begin
       vblank_out => vblank_out,
       sound_out_left => open, sound_out_right => open,
       dbg_line_drop => dbg_line_drop, dbg_line_busy => dbg_line_busy,
+      dbg_line_drop_a => dbg_line_drop_a, dbg_line_drop_b => dbg_line_drop_b,
       dbg_cpu_err9 => dbg_cpu_err9, dbg_cpu_err7 => dbg_cpu_err7,
       dbg_export9_done => dbg_export9_done, dbg_export9 => dbg_export9,
       dbg_export7_done => dbg_export7_done, dbg_export7 => dbg_export7,
@@ -1501,8 +1505,12 @@ begin
       if rising_edge(clk1x) then
          if (dbg_line_drop = '1') then
             drops <= drops + 1;
-            report "tb_top_frame: drawline dropped (render budget overrun)" severity warning;
          end if;
+         -- per engine, because the combined count cannot size the renderer work:
+         -- engine B runs the simpler configuration in Kirby's mode, so which
+         -- engine is behind changes what has to get faster
+         if (dbg_line_drop_a = '1') then drops_a <= drops_a + 1; end if;
+         if (dbg_line_drop_b = '1') then drops_b <= drops_b + 1; end if;
          assert dbg_cpu_err9 /= '1' report "nds_cpu9 error_cpu pulse" severity failure;
          assert dbg_cpu_err7 /= '1' report "gba_cpu error_cpu pulse" severity failure;
          assert boot_error /= '1' report "nds_loader flagged load_error" severity failure;
@@ -1545,7 +1553,8 @@ begin
             end loop;
          end if;
          report "frame " & integer'image(n) & " dumped, drops so far " &
-                integer'image(drops) severity note;
+                integer'image(drops) & " (A " & integer'image(drops_a) &
+                " / B " & integer'image(drops_b) & ")" severity note;
          report "irq9 frame=" & integer'image(n) &
                 " pc=" & to_hstring(dbg_pc9_s) &
                 " ie=" & to_hstring(dbg_irq_ie9_s) &

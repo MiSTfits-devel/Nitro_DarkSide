@@ -206,6 +206,8 @@ entity nds_top is
       dbg_export7      : out cpu_export_type;
 -- synthesis translate_on
       dbg_line_drop    : out std_logic;   -- drawline landed while gpu2d was still busy
+      dbg_line_drop_a  : out std_logic;   -- ... engine A specifically
+      dbg_line_drop_b  : out std_logic;   -- ... engine B specifically
       dbg_line_busy    : out std_logic;
       dbg_cpu_err9     : out std_logic;
       dbg_cpu_err7     : out std_logic;
@@ -1863,6 +1865,14 @@ begin
 
    vblank_out <= gpu_vblank;
 
+   -- Per-engine drop exports. The combined `drawline and (busy_a or busy_b)`
+   -- below is kept because callers use it as "a line was dropped at all", but on
+   -- its own it cannot say WHICH engine was behind - and engine B runs the
+   -- simpler configuration in Kirby's mode (no ext palettes), so attributing a
+   -- combined +7 drops/frame to the wrong engine sizes the renderer work wrong.
+   -- Debug-only signals: behaviourally inert.
+   dbg_line_drop_a <= drawline and line_busy;
+   dbg_line_drop_b <= drawline and line_busy_b;
    dbg_line_drop <= drawline and (line_busy or line_busy_b);
    dbg_line_busy <= line_busy or line_busy_b;
    dbg_cpu_err9  <= error_cpu9;
