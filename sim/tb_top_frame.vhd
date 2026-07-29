@@ -42,6 +42,8 @@ entity tb_top_frame is
       FWBOOT     : integer := 0;
       -- ms of DS time between p_heartbeat's two-PC progress lines (0 = off)
       HEARTBEAT_MS : integer := 0;
+      -- 1 = count renderer VRAM arbiter ops per frame (p_vramops)
+      VRAMOPS      : integer := 0;
       ISLAND     : integer := 1;         -- 0 = tie clk2x to clk1x, i.e. no ARM9 island
       -- clk2x half period in ps. 7500 = 66.67 MHz, the 2:1-with-coincident-edges
       -- relationship the hardware PLL currently produces because the island
@@ -1379,6 +1381,49 @@ begin
    -- until all three clr_busy drop, so the ordering is guaranteed by
    -- construction; this monitor MEASURES it rather than assuming it, and says
    -- which of the loader or the clear was the long pole.
+   -- Renderer VRAM arbiter occupancy, per frame. VRAMOPS=1 to enable.
+   --
+   -- This exists to verify or kill the leading explanation for the 3x frame
+   -- stretch. nds_vram's renderer side is documented as "arbitrated round-robin,
+   -- ONE OP IN FLIGHT ... ~4 cycles/op", with the parallelism pass deferred, and
+   -- both 2D engines' BG/OBJ/palette fetches queue through it. If the renderer
+   -- needs ~18 clk1x cycles/dot against 6 available, and ops cost ~4 cycles,
+   -- then ~4-5 ops/dot would explain the whole deficit - but that number was an
+   -- estimate chosen to make the arithmetic work, which is exactly the kind of
+   -- reasoning this project has been burned by. So measure it:
+   -- Counts rdispatch pulses (one per renderer VRAM op) per frame and per line.
+   -- Multiply ops/line by the documented ~4 cycles/op and compare against the
+   -- 2,130 clk1x cycles a line has at GPUCEDIV=1: if that product is at or over
+   -- the budget, the serial arbiter IS the wall and no pixel-pipeline work will
+   -- help. `rstate` is not aliasable from here - its type is declared inside the
+   -- architecture body and is not visible externally - so occupancy is derived
+   -- from the op count rather than sampled directly.
+   p_vramops : process
+      alias a_rdisp is << signal .tb_top_frame.idut.ivram.rdispatch : std_logic >>;
+      variable ops, cyc : natural := 0;
+      variable frames : natural := 0;
+   begin
+      if (VRAMOPS = 0) then
+         wait;
+      end if;
+      loop
+         wait until rising_edge(clk1x);
+         cyc := cyc + 1;
+         if (a_rdisp = '1') then ops := ops + 1; end if;
+         if (vblank_out = '1' and cyc > 1000) then
+            frames := frames + 1;
+            report "VRAMOPS frame " & integer'image(frames) &
+                   " ops=" & integer'image(ops) &
+                   " cycles=" & integer'image(cyc) &
+                   " ops/line=" & integer'image(ops / 263) &
+                   " est_cycles/line=" & integer'image((ops / 263) * 4) &
+                   " (budget 2130)" severity note;
+            ops := 0;
+            cyc := 0;
+         end if;
+      end loop;
+   end process;
+
    -- Video-mode registers, reported when they CHANGE. The melonDS side of this
    -- (VIDLOG in main_fbdump) is what turned "is the screen white because the
    -- renderer is broken or because the display is off" from a guess into one
