@@ -434,6 +434,30 @@ whole FSM and only swaps the *values*, via `arm9_entry_eff`/`arm7_entry_eff`.
   area. KEY2 is deliberately absent: hardware applies and removes it, so it is
   transparent to software and melonDS ignores it too.
 
+### The extra KEY1 command: benign, an IRQ timing difference
+
+Under `FWBOOT=1` with Kirby the ARM7 issues **two** one-word KEY1 commands where the
+oracle issues one. Ruled out as causes: the chip ID (ours computes `0x00003FC2`,
+byte-identical to melonDS's) and KEY2 (melonDS defines `Key2_Encrypt` and never
+calls it — it really is transparent hardware).
+
+`loopdiff` on a 4M-instruction traced run against a 6M-line oracle trace found it:
+first control-flow divergence at RTL instruction **2,258,084**, where the ARM7
+branches to `pc=0x00000020`. Architectural PC is instruction+8 in ARM state, so that
+is the instruction at **`0x18` — the ARM7 IRQ vector** — followed by a handler at
+`0x2dcc`/`0x2ecc`. melonDS's ARM7 carries straight on at `0x1fe2`.
+
+So the RTL takes an interrupt where melonDS has not yet. That is relative IRQ
+delivery timing between two models that were never cycle-equivalent — the same
+category as the IPCSYNC spin-count difference that already produced one false root
+cause — and an IRQ landing mid-sequence plausibly costs one extra status read. The
+boot completes the entire KEY1 sequence and enters main data mode, so it is treated
+as benign.
+
+**Caveat worth keeping:** `loopdiff` cannot tell "IRQ at a different time" from "IRQ
+that should not fire at all". Confirming this properly means identifying which IRQ
+source asserted.
+
 ### Corrections to what this file used to say
 
 - *"`DIRECT=0` never releases the CPUs - 0 instructions retired across a full
