@@ -185,6 +185,31 @@ Two remaining options, both about gpu2d throughput rather than memory:
    quote either figure as "the" per-line cost until it is. Measuring the CPU's
    share of arbiter dispatches (`rdispatch` split by requester) would settle it.
 
+   **TRANSPARENCY VERIFIED (2026-07-29).** `sim/tests/fbdiff.py` on a `GPUCEDIV=3`
+   A/B, frames 3 and 4:
+
+       4 full rows differ (1, 3, 5, 7), 0 PARTIAL rows, both frames
+
+   Zero partial-row differences means every line both configurations rendered is
+   byte-identical — the adapter alters no pixels. The four full rows are explained:
+   baseline rendered **188/192**, `GPU_FAST=1` rendered **192/192**, so those are
+   the lines the BASELINE dropped. It is not just transparent, it is strictly
+   better:
+
+   | at `GPUCEDIV=3` | baseline | `GPU_FAST=1` |
+   |---|---|---|
+   | lines rendered | 188/192 | **192/192** |
+   | cycles per line | 3,498 | **2,899** (-17%) |
+   | `rvram_busy%` | (old bad metric) | **31%** |
+
+   That 31% is the first trustworthy renderer-VRAM occupancy figure and it agrees
+   with the ~one-third estimate derived from op counts.
+
+   Caveat for rigour: the two runs were launched sequentially so the baseline used
+   a slightly older tree. All deltas are inert (debug output ports, the bench metric
+   rename) and none touch rendering, but a same-tree baseline would be cleaner if
+   this is ever challenged.
+
    **How to test correctness of this, because the obvious test is wrong.**
    Comparing framebuffers between `GPU_FAST=0` and `1` at `GPUCEDIV=1` proves
    nothing: both configurations DROP lines (126/192 and 98/192), and a dropped
