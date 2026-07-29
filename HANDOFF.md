@@ -313,6 +313,52 @@ that protection silently.
 
 ---
 
+## Firmware boot: the right idea, but there is NO firmware-boot path to switch on
+
+Every leftover-memory bug in this project is the same shape - *direct boot skips the
+firmware, so something is not initialised*: main RAM (SWP cart-lock wedge, fixed),
+VRAM/palette/OAM (stale screen, fixed), ARM7 WRAM (fixed). The loader says it
+outright: *"Real hardware gets this clearing from the firmware boot we skip in
+direct boot."* Each fix re-implements one thing the firmware does correctly, and
+there is no reason to believe the last one has been found. So booting the firmware
+attacks the source rather than the symptoms, and is strategically the right move.
+
+**But it is a feature to build, not a flag to flip.** Two facts, measured:
+
+1. **The boot FSM has no firmware path.** `nds_top` runs
+   `B_LDWAIT -> B_S9RST..B_S9POST -> B_S7RST..B_S7POST -> B_RUN` unconditionally,
+   presetting *both* CPU PCs from the cart header via the savestate bus. Nothing
+   lets the CPUs start at their BIOS reset vectors instead. Consistent with
+   `reach9 FFFF0008` being **not**-reached: the ARM9 reset vector never executes.
+2. **`DIRECT=0` is NOT firmware boot** - the name misleads. In `nds_loader` it only
+   skips `ENV_SET` (the direct-boot env block) and enters a verify pass where, per
+   its own comment, *"busy stays high"*; `ld_done` therefore never asserts,
+   `B_LDWAIT` never exits, and the CPUs are never released. Tried with Kirby and the
+   retail firmware: **0 instructions retired on both CPUs, 0 membus accepts, across
+   a full 120 ms.** `DIRECT=0` is "direct boot minus the env block" - strictly worse
+   than `DIRECT=1`, not better.
+
+What real firmware boot would require:
+- **Do not preset the PCs.** Let the ARM9 start at `0xFFFF0000` and the ARM7 at
+  `0x00000000` so the retail BIOSes run.
+- The ARM7 BIOS then pulls the firmware over SPI, validates and decompresses its
+  boot code, and jumps into it. `nds_spi` already serves a firmware image and
+  `FWFILE` exists, so the plumbing is partly there.
+- Firmware needs valid user settings with auto-start, or it waits at the menu for a
+  touch that never comes in sim. **Both firmware images here have valid settings**
+  (version 5 in both copies at 0x3FE00/0x3FF00).
+- Assets: `sim/tests/bios{9,7}_retail.hex` (4 KB / 16 KB) plus
+  `firmware_retail.hex` and `firmware_dslite.hex` (a real DS Lite dump). Those two
+  share only **1%** of their words, so one may be synthetic - establish which before
+  trusting either.
+- `docs/ARCHITECTURE.md` records **"Firmware boot menu = never"** as a deliberate
+  decision and `NDS.sv` hardwires `direct_boot(1'b1)`, so this reverses a design
+  choice rather than fixing an oversight. Boot-to-game also gets much longer.
+
+Verdict: the highest-leverage architectural change available, and the only one that
+retires the whole leftover-initialisation class instead of one member at a time. A
+project, not a patch.
+
 ## Next
 
 1. **GPU pacing** — the whole of the remaining 3x. Two routes above.
