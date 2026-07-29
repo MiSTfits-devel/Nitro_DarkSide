@@ -20,7 +20,7 @@ rules turned out to be invented.
 | **Kirby in sim** | Boots, runs, renders to VRAM. ~6 frames in 216 ms; display still off there, which is correct for that point. |
 | **Frame rate** | 3.01x too slow, and it is **not** the CPUs — `GPU_CE_DIV`. See below. |
 | **HDMI** | **Compiled out** (`MISTER_DEBUG_NOHDMI=1`). `ascal`/`pll_hdmi` absent, analog VGA only. Re-enabling costs ~2,178 ALMs against ~6,086 free. |
-| **Hardware** | Nothing deployed. No hardware result claimed. |
+| **Hardware** | `NDS_isl0_20260728.rbf` deployed 2026-07-28 and **configures and runs** — the debug mailbox returns a coherent probe decode. Not yet exercised with a cart. |
 
 ---
 
@@ -245,6 +245,18 @@ Traps that each cost an iteration:
 ---
 
 ## Hardware
+
+**The timing-clean core runs on real silicon** (2026-07-28). `tools/deploy-core.sh`
+uploaded `build/artifacts-isl0/NDS.rbf` as `NDS_isl0_20260728.rbf`, sha256 verified
+on the device, and `nitrodbg.sh probe` returns a coherent decode rather than
+garbage — `cache9 IDLE / membus9 IDLE / mainram MR_IDLE / allow=1 / ld_busy=0`,
+which is exactly right with no cart loaded. So the bitstream configures, the ARM9
+memory path is alive, and the debug channel works at 1:1.
+
+`tools/deploy-core.sh` is the replacement for the lost `scratchpad/deploy-probe.sh`
+and is **tracked** — the original was lost because it was not. It refuses to write
+`NDS_20260719.rbf`, refuses to overwrite any existing remote `.rbf`, and stages
+through a `.tmp` verified by sha256 on the device before moving into place.
 
 MiSTer IP **moves across reboots — ask, do not scan the subnet.** It was
 `192.168.1.243`; unreachable as of 2026-07-28.
