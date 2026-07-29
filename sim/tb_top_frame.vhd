@@ -44,6 +44,8 @@ entity tb_top_frame is
       HEARTBEAT_MS : integer := 0;
       -- 1 = count renderer VRAM arbiter ops per frame (p_vramops)
       VRAMOPS      : integer := 0;
+      -- 1 = run both 2D engines on clkMem (3x). See rtl/nds_gpu2d_fast.vhd.
+      GPUFAST      : integer := 0;
       ISLAND     : integer := 1;         -- 0 = tie clk2x to clk1x, i.e. no ARM9 island
       -- clk2x half period in ps. 7500 = 66.67 MHz, the 2:1-with-coincident-edges
       -- relationship the hardware PLL currently produces because the island
@@ -407,6 +409,7 @@ begin
       is_simu                  => '1',
       Softmap_NDS_MAINRAM_ADDR => MAINRAM_BASE,
       GPU_CE_DIV               => GPUCEDIV,
+      GPU_FAST                 => GPUFAST,
       skip_copy                => itosl(PRELOAD)
    )
    port map
