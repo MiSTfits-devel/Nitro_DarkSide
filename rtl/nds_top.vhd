@@ -768,6 +768,7 @@ begin
    (
       clk => clk1x, ce => '1', reset => resetCpu,
       card7 => exmem_card7_s,
+      fw_boot => fw_boot,
       chipid => ld_cartid,
       bus9 => io_bus9, wired_out9 => card_wired_out9, wired_done9 => card_wired_done9,
       bus7 => io_bus7, wired_out7 => card_wired_out7, wired_done7 => card_wired_done7,
