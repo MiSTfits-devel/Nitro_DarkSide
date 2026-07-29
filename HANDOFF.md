@@ -333,6 +333,44 @@ that protection silently.
 
 ---
 
+## Kirby on hardware: NOT a deadlock. Both CPUs are live and taking IRQs.
+
+Measured 2026-07-28 on `NDS_vbl_20260728.rbf` with the cart in DDR3.
+
+- **The ARM9 is taking interrupts continuously.** A breakpoint at the IRQ vector
+  (`brk9 FFFF0020`) fires within 5 s in the steady state. It wakes, services, and
+  returns to the NitroSDK idle thread at `0x0214FC10` (`bl sched / bl WFI / b`),
+  parked on the WFI at `0x0214FC08`.
+- **DISPSTAT's ARM9 VBlank IRQ enable IS set** — mailbox probe bit 18,
+  `vbl ena9 : 1`. Kirby's DISPSTAT-writing code is reached (`reach9` on
+  `0x02143A4C`, `0x02143AF0`) and the sim sees the write land
+  (`VIDREG A +004 = 0000000B bEna=3`).
+- The ARM7 is live too: its PC moves across `0x037FC490-0x037FC9FC`.
+
+**So the white screen is NOT an interrupt-delivery failure.** A pinned PC at the
+WFI plus a clear `IF9` is exactly what a *healthy* idle loop looks like when
+sampled — do not read it as a hang, which is the mistake made here first.
+
+**The live lead is IPC.** `IE9 = 0x00040001` = VBlank + **IPC-recv-not-empty**, and
+`IF9` bit 18 **never sets**, while the ARM7's `IF7` bit 18 **does**
+(`IF7 = 0x00040019`, `IE7 = 0x01040099`). So the ARM9's main thread is blocked
+waiting on an IPC message the ARM7 never delivers — the **ARM7 -> ARM9 direction
+of the IPC FIFO** (`0x184` CNT / `0x188` SEND / `0x100000` RECV in `nds_ipc.vhd`,
+a different mechanism from IPCSYNC at `0x180`, which is known good — `bootreq`
+passes it). That is the next thing to chase.
+
+### nitrodbg `reach`/`brk` take the ARCHITECTURAL PC, i.e. instruction + 8
+
+This cost a completely wrong conclusion. `reach9 FFFF0018` for the IRQ vector
+returns **not-reached**, because it breaks when r15 = 0xFFFF0018, i.e. while
+*executing* 0xFFFF0010. The correct probe is `FFFF0020`, which is REACHED. Same
+for the ARM7: `00000020`, not `00000018`. `where9` states the convention in its own
+output (`r15=0x0214FC10 -> executing 0x0214FC08`).
+
+Sanity check for the method: `reach9 FFFF0008` (the reset vector) is **not**
+reached, and that is correct under direct boot — the loader presets the PC and the
+BIOS reset path never runs.
+
 ## Open RTL bug: the ARM9's 8-bit writes to VRAM are performed, and must not be
 
 Found 2026-07-28 by `sim/tests/arm9_2dk.s`. On the DS, **8-bit writes from the
