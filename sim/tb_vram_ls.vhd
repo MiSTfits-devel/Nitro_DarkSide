@@ -107,6 +107,8 @@ architecture sim of tb_vram_ls is
 
    signal tests_done : boolean := false;
 
+   signal clr_busy : std_logic;   -- reset-clear handshake (see pmain)
+
 begin
 
    clk <= not clk after 5 ns when not tests_done else '0';
@@ -123,6 +125,7 @@ begin
       cpu7_dout => open, cpu7_done => open,
       srv_req => srv_req, srv_rnw => srv_rnw, srv_bank => srv_bank, srv_addr => srv_addr,
       srv_be => srv_be, srv_din => srv_din, srv_dout => srv_dout, srv_done => srv_done,
+      clr_busy => clr_busy,
       rdr_bg_req => rdr_bg_req, rdr_bg_addr => rdr_bg_addr,
       rdr_bg_dout => rdr_bg_dout, rdr_bg_done => rdr_bg_done,
       rdr_obj_req => rdr_obj_req, rdr_obj_addr => rdr_obj_addr,
@@ -148,7 +151,10 @@ begin
       variable rs : unsigned(31 downto 0) := to_unsigned(4242, 32);
    begin
       wait until rising_edge(clk) and srv_req = '1';
-      assert srv_rnw = '1' report "unexpected A..D CPU write" severity failure;
+      -- A..D is a read-only fixed-content model here; the only writes it ever
+      -- sees are nds_vram's reset clear pass, which it acknowledges and drops
+      -- (the fixed content stands for what the game writes after the clear)
+      assert srv_rnw = '1' or clr_busy = '1' report "unexpected A..D CPU write" severity failure;
       rs := rs xor shift_left(rs, 13); rs := rs xor shift_right(rs, 17); rs := rs xor shift_left(rs, 5);
       for k in 1 to 1 + to_integer(rs(1 downto 0)) loop
          wait until rising_edge(clk);
@@ -286,6 +292,9 @@ begin
       -- reset
       for k in 1 to 4 loop wait until rising_edge(clk); end loop;
       reset <= '0';
+      -- nds_vram zeroes every bank out of reset; nds_top holds the CPUs until
+      -- clr_busy drops, so do the same here before driving any op
+      wait until rising_edge(clk) and clr_busy = '0';
       wait until rising_edge(clk);
 
       -- ================= fill E..I via LCDC =================
