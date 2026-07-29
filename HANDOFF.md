@@ -219,6 +219,16 @@ runs a different machine.
 - **`bootreq`** is the 15-subtest subsystem suite; `pass=0x5A5BDE7F prog=0x63` is the
   good answer, and the last trace line is the whole report (`r9` pass bitmap at
   `$13`, `r10` progress at `$14`).
+  Subtests 16..25 (the IRQ-driven IPC FIFO block) report separately in **`r11`**
+  at `$15`, tagged `0xFC000000` — the `0x5A5A` tag in `r9` has bits 17/19/20/22
+  set, so it cannot carry them. RTL `r11=0xFC0001BF` vs melonDS `0xFC0003FF`:
+  bits 22 and 25 are the multi-word RECV bug below. `r1` at `$5` is subtest 25's
+  read-back sequence (`0x11223344` correct, `0x22334444` observed).
+  Oracle baseline for this ROM is the **HLE (non-`--direct`) mode** of
+  `melonds_fbdump` — `--direct` runs melonDS's secure-area decryption, which
+  fails on an unencrypted ndstool image and overwrites the first 2 KB of the
+  ARM9 binary with `0xE7FFDEFF`. Pass `BIOS9=`/`BIOS7=` retail dumps so the
+  oracle executes the same BIOS the RTL serves.
 - **First-divergence vs the oracle**: `sim/tests/compare_trace.py`, documented in
   `docs/TRACE_DIFF.md`. Against melonDS pass `--ignore cpsr,r13,r14`.
 - **`sim/check_bios9_fetch.awk`** compares every BIOS fetch against the image —
@@ -247,6 +257,15 @@ Traps that each cost an iteration:
   ARM9 serves reads from D-cache and cross-CPU tests silently pass.
 - **Use high vectors** (control bit 13). With V=0 the vector table sits at `0x0`
   inside uninitialised ITCM.
+- **To take an ARM9 exception you need two more things**, and without either one the
+  vector itself aborts and melonDS prints `EXCEPTION REGION NOT EXECUTABLE` and
+  stops the console: (1) a PU region covering `0xFFFF0000` — `bootreq`'s region 0
+  was `0x2F`, a *16 MB* region, not the 4 GB its comment claimed, so nothing
+  covered the BIOS window; (2) **SP_irq**, which is 0 out of reset while the BIOS
+  dispatcher at `0xFFFF0274` does `push {r0-r3,ip,lr}` before calling the handler
+  at `[DTCM_base+0x3FFC]`. Set SP_irq in the crt0, not from C inline asm: `r14` is
+  banked, so GCC picking `lr` to carry the address makes `mov sp, lr` read
+  `r14_irq` (0) and silently set SP_irq to 0.
 - **The PU aborts on any address no region covers.** A 4 GB catch-all as region 0
   plus specific higher-numbered regions is the right shape.
 - **A subtest that data-aborts discards everything after it.** Order risky ones last.
@@ -390,9 +409,50 @@ is already non-empty, the conjunction still goes 0->1 and should fire — but if
 `rirq9` is set and cleared around a drain, or the ARM7 refills without the
 conjunction ever dropping, no new edge is generated and the IRQ is lost.
 
-**Next step: extend `bootreq` with an IRQ-driven ARM7 -> ARM9 FIFO subtest** (set
-CNT bit 10, have the ARM7 send, and confirm `IF9` bit 18 latches and the handler
-runs). That is oracle-checkable against melonDS and needs no hardware.
+### DONE (2026-07-29): that edge hypothesis is DEAD. The bug is the RECV READ PORT.
+
+`bootreq` subtests 17..25 now cover the IRQ-driven ARM7 -> ARM9 path. The ARM7 needs
+no interrupt path of its own: for ARM7 -> ARM9 it only *sends*, and for the reverse
+control it polls its own `IF7` with IRQs masked, so nothing on that side can fail
+for an unrelated reason. Results, `r11` (`$15`) and `r1` (`$5`):
+
+| bit | subtest | melonDS | RTL |
+|---|---|---|---|
+| 17 | ARM7 send raises `IF9` bit 18 (IME=0) | pass | **pass** |
+| 18 | ARM9 reads its own RECV at `0x04100000` | pass | **pass** |
+| 19 | arming CNT bit 10 while already non-empty fires | pass | **pass** |
+| 20 | drain then refill fires a SECOND IRQ | pass | **pass** |
+| 21 | refill *without* draining does NOT re-fire | pass | **pass** |
+| 22 | two queued words read back in order + empty-read error flag | pass | **FAIL** |
+| 23 | control: ARM9 -> ARM7, `IF7` bit 18 latches | pass | **pass** |
+| 24 | ARM9 actually *takes* the IRQ, handler runs, word correct | pass | **pass** |
+| 25 | four queued words read back in order | pass | **FAIL** |
+
+So the recv IRQ, the rising-edge conjunction in `nds_ipc.vhd:222-237`, the drain/
+refill re-arm and full BIOS-vector dispatch are all **correct**. Do not spend more
+time there.
+
+**What is broken: an ARM9 RECV read returns the FIFO entry AFTER the one it pops.**
+Subtest 25 queues `11 22 33 44` and reads back **`22 33 44 44`** (`r1 =
+0x22334444`). The mechanism is `nds_top.vhd:958-984`, which says so in its own
+comment: `cdc_io_cpl` toggles on the `io9_ena` cycle and the island samples
+`io_wired_out9` **one clk1x later**. That is right for every stateless register, but
+`nds_ipc.vhd:103-107` drives `wired_out9 <= fifo79(rd79)` combinationally, and
+`rd79`/`cnt79` advance on that same edge — so the island latches the *next* entry.
+It is invisible whenever the FIFO holds exactly one word, because `cnt79` is then 0
+and the mux falls through to `last9`, which does hold the correct just-popped word.
+That is why subtests 16, 18, 20 and 24 all pass and why nothing ever caught it.
+
+Not a double pop: the tb's own counters are 1:1 (`membus9.ena 20386 -> io9_ena
+20386 -> i9_io_done 20386`), and a double pop would read back `22 44 44 44`.
+`nds_card`'s `0x04100010` is safe by luck — `romdata` is a register that holds
+past the pop.
+
+Kirby consequence: NitroSDK PXI messages are multi-word and its handler drains in
+a loop, so every burst after the first word is corrupt and one word per burst is
+lost — a receiver that mis-parses a header and never signals the waiting thread.
+Fixing it means registering the popped word for the transaction (or completing the
+IO access in the `ena` cycle), not touching the IRQ logic.
 
 ### nitrodbg `reach`/`brk` take the ARCHITECTURAL PC, i.e. instruction + 8
 
