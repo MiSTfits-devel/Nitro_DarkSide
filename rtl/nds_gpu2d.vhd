@@ -65,6 +65,10 @@ entity nds_gpu2d is
 
       line_busy         : out std_logic;   -- high from drawline until the line is merged
       epfill_busy       : out std_logic;   -- ext-pal shadow refill in progress
+      -- palette/OAM reset clear in progress; nds_top holds the CPUs until it
+      -- drops. Unlike everything else here this pass runs WHILE reset is
+      -- asserted, because reset is resetCpu - see the clear process below.
+      clr_busy          : out std_logic := '1';
 
       -- CPU write ports (byte-enabled words)
       pal_we            : in  std_logic;
@@ -259,6 +263,15 @@ architecture arch of nds_gpu2d is
    -- port each for the OBJ drawer and the BG palette service; the backdrop
    -- color (palette entry 0) is snooped into a register on CPU writes.
    -- OAM is a single M10K (CPU write / OBJ drawer read).
+
+   -- palette/OAM write ports after the reset-clear mux (see p_clear)
+   signal pal_we_i, oam_we_i     : std_logic;
+   signal pal_addr_i, oam_addr_i : integer range 0 to 255;
+   signal pal_din_i, oam_din_i   : std_logic_vector(31 downto 0);
+   signal pal_be_i, oam_be_i     : std_logic_vector(3 downto 0);
+   signal clr_run  : std_logic := '1';
+   signal clr_addr : unsigned(7 downto 0) := (others => '0');
+   signal reset_d  : std_logic := '1';
 
    type t_bgep is array (0 to 8191) of std_logic_vector(31 downto 0);
    signal bgep_shadow : t_bgep := (others => (others => '0'));
@@ -686,6 +699,48 @@ begin
    -- ================= palette / OAM =================
    -- M10K stores; the drawer-side reads keep their 1-cycle registered-read
    -- timing (the BRAM registers the address, q is unregistered)
+   --
+   -- Reset clear pass. A MiSTer ROM change does not reconfigure the FPGA, so
+   -- these three M10Ks keep the previous game's palette and sprite table and
+   -- the new game shows its leftovers - the same class of bug as the
+   -- uninitialised main RAM nds_loader's CLR_WR now fixes. Real hardware gets
+   -- this from the firmware boot direct boot skips.
+   --
+   -- This pass must run WHILE reset is asserted: reset here is nds_top's
+   -- resetCpu, which only releases when the CPUs start, so a clear that waited
+   -- for reset to drop would race the first game write. So it is armed on the
+   -- rising edge of reset (and by the power-up initial values) and stepped
+   -- unconditionally, and nds_top gates the CPU release on clr_busy.
+   -- 256 words covers the full 1 KB of each store; the two palette RAMs are
+   -- mirrors on one write port, so one counter clears all three.
+   p_clear : process (clk)
+   begin
+      if rising_edge(clk) then
+         reset_d <= reset;
+         if (reset = '1' and reset_d = '0') then
+            clr_addr <= (others => '0');
+            clr_run  <= '1';
+         elsif (clr_run = '1') then
+            if (clr_addr = 255) then
+               clr_run <= '0';
+            else
+               clr_addr <= clr_addr + 1;
+            end if;
+         end if;
+      end if;
+   end process;
+
+   clr_busy <= clr_run;
+
+   pal_we_i   <= '1'          when clr_run = '1' else pal_we;
+   pal_addr_i <= to_integer(clr_addr) when clr_run = '1' else pal_addr;
+   pal_din_i  <= (others => '0') when clr_run = '1' else pal_din;
+   pal_be_i   <= "1111"       when clr_run = '1' else pal_be;
+   oam_we_i   <= '1'          when clr_run = '1' else oam_we;
+   oam_addr_i <= to_integer(clr_addr) when clr_run = '1' else oam_addr;
+   oam_din_i  <= (others => '0') when clr_run = '1' else oam_din;
+   oam_be_i   <= "1111"       when clr_run = '1' else oam_be;
+
    ipal_obj : entity MEM.SyncRamDualByteEnable
    generic map ( is_simu => is_simu, is_cyclone5 => '1',
                  BYTE_WIDTH => 8, ADDR_WIDTH => 8, BYTES => 4 )
@@ -693,14 +748,14 @@ begin
    (
       clk       => clk,
       ce_a      => '1',
-      addr_a    => pal_addr,
-      datain_a0 => pal_din( 7 downto  0),
-      datain_a1 => pal_din(15 downto  8),
-      datain_a2 => pal_din(23 downto 16),
-      datain_a3 => pal_din(31 downto 24),
+      addr_a    => pal_addr_i,
+      datain_a0 => pal_din_i( 7 downto  0),
+      datain_a1 => pal_din_i(15 downto  8),
+      datain_a2 => pal_din_i(23 downto 16),
+      datain_a3 => pal_din_i(31 downto 24),
       dataout_a => open,
-      we_a      => pal_we,
-      be_a      => pal_be,
+      we_a      => pal_we_i,
+      be_a      => pal_be_i,
       ce_b      => '1',
       addr_b    => 128 + obj_pal_addr,
       datain_b0 => x"00", datain_b1 => x"00", datain_b2 => x"00", datain_b3 => x"00",
@@ -716,14 +771,14 @@ begin
    (
       clk       => clk,
       ce_a      => '1',
-      addr_a    => pal_addr,
-      datain_a0 => pal_din( 7 downto  0),
-      datain_a1 => pal_din(15 downto  8),
-      datain_a2 => pal_din(23 downto 16),
-      datain_a3 => pal_din(31 downto 24),
+      addr_a    => pal_addr_i,
+      datain_a0 => pal_din_i( 7 downto  0),
+      datain_a1 => pal_din_i(15 downto  8),
+      datain_a2 => pal_din_i(23 downto 16),
+      datain_a3 => pal_din_i(31 downto 24),
       dataout_a => open,
-      we_a      => pal_we,
-      be_a      => pal_be,
+      we_a      => pal_we_i,
+      be_a      => pal_be_i,
       ce_b      => '1',
       addr_b    => bgp_addr(to_integer(pal_serve_cnt)),
       datain_b0 => x"00", datain_b1 => x"00", datain_b2 => x"00", datain_b3 => x"00",
@@ -739,14 +794,14 @@ begin
    (
       clk       => clk,
       ce_a      => '1',
-      addr_a    => oam_addr,
-      datain_a0 => oam_din( 7 downto  0),
-      datain_a1 => oam_din(15 downto  8),
-      datain_a2 => oam_din(23 downto 16),
-      datain_a3 => oam_din(31 downto 24),
+      addr_a    => oam_addr_i,
+      datain_a0 => oam_din_i( 7 downto  0),
+      datain_a1 => oam_din_i(15 downto  8),
+      datain_a2 => oam_din_i(23 downto 16),
+      datain_a3 => oam_din_i(31 downto 24),
       dataout_a => open,
-      we_a      => oam_we,
-      be_a      => oam_be,
+      we_a      => oam_we_i,
+      be_a      => oam_be_i,
       ce_b      => '1',
       addr_b    => obj_oam_addr,
       datain_b0 => x"00", datain_b1 => x"00", datain_b2 => x"00", datain_b3 => x"00",
@@ -759,9 +814,11 @@ begin
    process (clk)
    begin
       if rising_edge(clk) then
-         if (pal_we = '1' and pal_addr = 0) then
-            if (pal_be(0) = '1') then backdrop( 7 downto 0) <= pal_din( 7 downto 0); end if;
-            if (pal_be(1) = '1') then backdrop(14 downto 8) <= pal_din(14 downto 8); end if;
+         -- the clear pass runs through this snoop too, so the backdrop register
+         -- (another leftover across a ROM change) is zeroed with palette entry 0
+         if (pal_we_i = '1' and pal_addr_i = 0) then
+            if (pal_be_i(0) = '1') then backdrop( 7 downto 0) <= pal_din_i( 7 downto 0); end if;
+            if (pal_be_i(1) = '1') then backdrop(14 downto 8) <= pal_din_i(14 downto 8); end if;
          end if;
          obj_ep_data <= objep_shadow(obj_ep_addr);
       end if;

@@ -69,6 +69,7 @@ architecture sim of tb_gpu2d is
    signal linecounter, linecounter_obj : integer range 0 to 191 := 0;
    signal drawline, drawObj, line_trigger, hblank_trigger, vblank_trigger, refpoint_update : std_logic := '0';
    signal line_busy : std_logic;
+   signal clr_busy  : std_logic;   -- palette/OAM reset-clear handshake
 
    signal pal_we, oam_we : std_logic := '0';
    signal pal_addr, oam_addr : integer range 0 to 255 := 0;
@@ -119,6 +120,7 @@ begin
       vblank_trigger  => vblank_trigger,
       refpoint_update => refpoint_update,
       line_busy       => line_busy,
+      clr_busy        => clr_busy,
       pal_we          => pal_we,
       pal_addr        => pal_addr,
       pal_din         => pal_din,
@@ -239,6 +241,10 @@ begin
       report "running " & integer'image(nframes) & " frames" severity note;
 
       for k in 1 to 8 loop wait until rising_edge(clk); end loop;
+      -- nds_gpu2d zeroes palette/OAM out of reset (it runs the pass WHILE reset
+      -- is asserted, since reset here is nds_top's resetCpu); nds_top holds the
+      -- CPUs until clr_busy drops, so wait for it before writing anything
+      wait until rising_edge(clk) and clr_busy = '0';
       reset <= '0';
       wait until rising_edge(clk);
 

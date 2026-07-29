@@ -30,6 +30,10 @@ architecture sim of tb_arm7_island is
    signal clkMem      : std_logic := '0';
    signal clkMemIndex : unsigned(1 downto 0) := "10"; -- wraps to 0 on clk1x edge
    signal reset       : std_logic := '1';
+   -- nds_vram gets its own release, mirroring nds_top: reset_boot drops early so
+   -- the bank clear pass can run, resetCpu (here: reset) is held until it is done
+   signal vreset      : std_logic := '1';
+   signal vclr_busy   : std_logic;
 
    -- CPU <-> membus
    signal cpu_adr      : std_logic_vector(31 downto 0);
@@ -163,8 +167,11 @@ begin
 
    process
    begin
-      for k in 1 to 8 loop wait until rising_edge(clk1x); end loop;
-      reset <= '0';
+      for k in 1 to 4 loop wait until rising_edge(clk1x); end loop;
+      vreset <= '0';                    -- nds_vram's bank clear pass starts here
+      wait until rising_edge(clk1x) and vclr_busy = '0';
+      for k in 1 to 4 loop wait until rising_edge(clk1x); end loop;
+      reset  <= '0';                    -- ... and only then does the CPU run
       wait;
    end process;
    ss_bus.rst <= reset;
@@ -307,13 +314,14 @@ begin
    generic map ( is_simu => '1' )
    port map
    (
-      clk => clk1x, reset => reset, vramcnt => vramcnt,
+      clk => clk1x, reset => vreset, vramcnt => vramcnt,
       cpu9_ena => '0', cpu9_rnw => '1', cpu9_addr => (others => '0'), cpu9_be => "0000",
       cpu9_din => (others => '0'), cpu9_dout => open, cpu9_done => open,
       cpu7_ena => vram_ena, cpu7_rnw => vram_rnw, cpu7_addr => vram_addr, cpu7_be => vram_be,
       cpu7_din => vram_din, cpu7_dout => vram_dout, cpu7_done => vram_done,
       srv_req => srv_req, srv_rnw => srv_rnw, srv_bank => srv_bank, srv_addr => srv_addr,
-      srv_be => srv_be, srv_din => srv_din, srv_dout => srv_dout, srv_done => srv_done
+      srv_be => srv_be, srv_din => srv_din, srv_dout => srv_dout, srv_done => srv_done,
+      clr_busy => vclr_busy
    );
 
    imainram : entity work.nds_mainram

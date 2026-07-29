@@ -1311,6 +1311,50 @@ begin
       vrsrv_done <= '0';
    end process;
 
+   -- ============ reset-clear ordering monitor ============
+   -- nds_vram and both gpu2d engines zero VRAM / palette / OAM out of reset (a
+   -- MiSTer ROM change does not reconfigure the FPGA, so without this the new
+   -- game shows the previous game's leftovers - the video-memory half of what
+   -- nds_loader's CLR_WR does for main RAM). nds_top's boot FSM holds the CPUs
+   -- until all three clr_busy drop, so the ordering is guaranteed by
+   -- construction; this monitor MEASURES it rather than assuming it, and says
+   -- which of the loader or the clear was the long pole.
+   p_clrorder : process
+      alias a_vclr  is << signal .tb_top_frame.idut.vclr_busy   : std_logic >>;
+      alias a_pclra is << signal .tb_top_frame.idut.pclr_busy_a : std_logic >>;
+      alias a_pclrb is << signal .tb_top_frame.idut.pclr_busy_b : std_logic >>;
+      alias a_ldd   is << signal .tb_top_frame.idut.ld_done     : std_logic >>;
+      alias a_ldb   is << signal .tb_top_frame.idut.ld_busy     : std_logic >>;
+      alias a_rstc  is << signal .tb_top_frame.idut.resetCpu    : std_logic >>;
+      variable t_pal, t_vram, t_load : time := 0 ns;
+   begin
+      wait until rising_edge(clk1x) and (a_pclra = '0' and a_pclrb = '0');
+      t_pal := now;
+      report "CLRORDER: palette/OAM clear done at " & time'image(t_pal) severity note;
+
+      wait until rising_edge(clk1x) and a_vclr = '0';
+      t_vram := now;
+      report "CLRORDER: VRAM clear done at " & time'image(t_vram) severity note;
+
+      wait until rising_edge(clk1x) and a_rstc = '0';
+      report "CLRORDER: CPUs released at " & time'image(now) &
+             " (VRAM clear finished " & time'image(now - t_vram) & " earlier)" severity note;
+      assert now > t_vram and now > t_pal
+         report "CPUs released before the clear passes finished" severity failure;
+      wait;
+   end process;
+
+   -- when did the loader itself finish? together with the two above this says
+   -- whether the clear or the loader gates the release
+   p_ldorder : process
+      alias a_ldd is << signal .tb_top_frame.idut.ld_done : std_logic >>;
+      alias a_ldb is << signal .tb_top_frame.idut.ld_busy : std_logic >>;
+   begin
+      wait until rising_edge(clk1x) and a_ldd = '1' and a_ldb = '0';
+      report "CLRORDER: loader done at " & time'image(now) severity note;
+      wait;
+   end process;
+
    -- ================= collectors + monitors =================
    p_collect : process (clk1x)
    begin
