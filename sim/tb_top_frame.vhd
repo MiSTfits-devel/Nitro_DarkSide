@@ -1414,7 +1414,14 @@ begin
       alias b_bg    is << signal .tb_top_frame.idut.rb_bg_req    : std_logic >>;
       alias b_obj   is << signal .tb_top_frame.idut.rb_obj_req   : std_logic >>;
       alias b_bgep  is << signal .tb_top_frame.idut.rb_bgep_req  : std_logic >>;
+      -- per-engine render busy and the per-line trigger (dbg_line_busy at bench
+      -- level is the OR of both engines, which is what needed splitting)
+      alias a_busy  is << signal .tb_top_frame.idut.line_busy     : std_logic >>;
+      alias b_busy  is << signal .tb_top_frame.idut.line_busy_b   : std_logic >>;
+      alias a_draw  is << signal .tb_top_frame.idut.drawline      : std_logic >>;
       variable ops, cyc, blocked, blk_a, blk_b : natural := 0;
+      variable busy_a, busy_b, lines : natural := 0;
+      variable nlines : positive := 1;
       variable frames : natural := 0;
    begin
       if (VRAMOPS = 0) then
@@ -1434,20 +1441,41 @@ begin
              b_bg = '1' or b_obj = '1' or b_bgep = '1') then
             blocked := blocked + 1;
          end if;
+         -- Render time per line: the number this whole section now turns on.
+         -- A line has 2,130 clk1x cycles at GPUCEDIV=1 and 256 dots, so 8.3
+         -- cycles/dot. busy/line well over 2,130 with blocked% near zero means
+         -- the drawer/merge chain itself is the cost, and busy/line divided by
+         -- 256 is the per-pixel figure that says whether it is an FSM stepping
+         -- one pixel at a time (pipelineable) or genuinely that much work.
+         if (a_busy = '1') then busy_a := busy_a + 1; end if;
+         if (b_busy = '1') then busy_b := busy_b + 1; end if;
+         if (a_draw = '1') then lines := lines + 1; end if;
          if (vblank_out = '1' and cyc > 1000) then
             frames := frames + 1;
+            -- lines can legitimately be 0 before the GPU starts issuing
+            -- drawline; guard the divisions rather than special-casing later
+            if (lines = 0) then nlines := 1; else nlines := lines; end if;
             report "VRAMOPS frame " & integer'image(frames) &
                    " ops=" & integer'image(ops) &
                    " cycles=" & integer'image(cyc) &
                    " ops/line=" & integer'image(ops / 263) &
                    " blocked%=" & integer'image(blocked * 100 / cyc) &
                    " (A " & integer'image(blk_a * 100 / cyc) &
-                   " / B " & integer'image(blk_b * 100 / cyc) & ")" severity note;
+                   " / B " & integer'image(blk_b * 100 / cyc) & ")" &
+                   "  lines=" & integer'image(lines) &
+                   " busy/line A=" & integer'image(busy_a / nlines) &
+                   " B=" & integer'image(busy_b / nlines) &
+                   " (budget 2130, " &
+                   integer'image(busy_a / (nlines * 256)) &
+                   " cyc/dot A)" severity note;
             ops := 0;
             cyc := 0;
             blocked := 0;
             blk_a := 0;
             blk_b := 0;
+            busy_a := 0;
+            busy_b := 0;
+            lines := 0;
          end if;
       end loop;
    end process;
