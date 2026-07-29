@@ -100,6 +100,7 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_drawer_obj.vhd \
    rtl/nds_drawer_merge.vhd \
    rtl/nds_gpu2d.vhd \
+   rtl/nds_gpu2d_fast.vhd \
    rtl/nds_gpu_timing.vhd \
    rtl/nds_dma9.vhd \
    rtl/nds_dma7.vhd \

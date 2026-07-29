@@ -595,14 +595,14 @@ begin
    -- end-of-run video-state probe (VRAMCNT, engine B regs, VRAM bank fill)
    pprobe : process
       alias a_vramcnt is << signal .tb_top_frame.idut.vramcnt : std_logic_vector(71 downto 0) >>;
-      alias a_bgmode  is << signal .tb_top_frame.idut.igpu2d_b.R_bgmode : std_logic_vector(2 downto 0) >>;
-      alias a_fblank  is << signal .tb_top_frame.idut.igpu2d_b.R_forced_blank : std_logic_vector(7 downto 7) >>;
+      alias a_bgmode  is << signal .tb_top_frame.idut.igpu2d_b.dbg_bgmode : std_logic_vector(2 downto 0) >>;
+      alias a_fblank  is << signal .tb_top_frame.idut.igpu2d_b.dbg_fblank : std_logic >>;
       variable nz : integer;
    begin
       wait until tests_done;
       report "PROBE vramcnt(A..I low->high)=" & to_hstring(a_vramcnt) &
              " engineB bgmode=" & to_hstring(a_bgmode) &
-             " fblank=" & std_logic'image(a_fblank(7))(2);
+             " fblank=" & std_logic'image(a_fblank)(2);
       for b in 0 to 3 loop
          nz := 0;
          for i in 0 to 32767 loop
@@ -1428,8 +1428,8 @@ begin
       -- ~264 cycles per line is LDRAW waiting for these two. Splitting them says
       -- whether the BG drawers or the OBJ drawer is the cost. linestate itself
       -- is not aliasable - its type is declared inside gpu2d's architecture.
-      alias a_bgbusy  is << signal .tb_top_frame.idut.igpu2d_a.any_bg_busy : std_logic >>;
-      alias a_objbusy is << signal .tb_top_frame.idut.igpu2d_a.obj_busy    : std_logic >>;
+      alias a_bgbusy  is << signal .tb_top_frame.idut.igpu2d_a.dbg_bg_busy : std_logic >>;
+      alias a_objbusy is << signal .tb_top_frame.idut.igpu2d_a.dbg_obj_busy : std_logic >>;
       variable ops, cyc, blocked, blk_a, blk_b : natural := 0;
       variable busy_a, busy_b, lines : natural := 0;
       variable starts_a, starts_b : natural := 0;
