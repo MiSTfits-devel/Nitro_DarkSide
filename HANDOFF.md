@@ -112,11 +112,26 @@ and `GPUCEDIV=1` drops 2 in 3, predicted with no fitting. 2.74x also matches the
 - So **~5,565 of 5,829 cycles are `LDRAW`**, which waits on `any_bg_busy` and
   `obj_busy`. **The BG and OBJ drawers are the cost**, not the merge, and not VRAM.
 
-That is ~21 cycles per pixel inside the drawers with only ~2 of them spent waiting
-for VRAM. Next: split `any_bg_busy` vs `obj_busy` (instrumented, `bg/render` and
-`obj/render` in the VRAMOPS line) to see which drawer dominates, then read that
-drawer's per-pixel FSM in `nds_drawer_text.vhd` / `nds_drawer_obj.vhd`. If it steps
-one pixel through several states it is pipelineable; a 3x cut is what is needed.
+**Split, measured:** of the 5,829 cycles, **`any_bg_busy` accounts for 5,563 (95%)**
+and `obj_busy` for 1,051 (they overlap). Kirby's mode enables **BG3 only**, so a
+*single* text BG drawer is spending **21.7 cycles per pixel** — and only ~2 of those
+are VRAM waiting.
+
+So the target is precise: **`nds_drawer_text.vhd`, ~21.7 cycles/pixel, needs to be
+~8.** Its per-pixel path is `CALCADDR -> WAITREAD_TILE -> CALCCOLORADDR ->
+WAITREAD_COLOR` (`nds_drawer_text.vhd:175-246`), i.e. at least four states and up to
+two VRAM round trips per pixel, with a `VRAM_lastcolor_data` same-address cache that
+is evidently working — total renderer traffic is only **1.06 ops/dot**, so it is not
+refetching per pixel.
+
+That leaves state-machine cycles, not memory, as the cost, which makes it
+pipelineable in principle: one pixel per cycle steady-state instead of a four-state
+walk. **Do not start the rewrite on that reasoning alone** — instrument per-state
+cycle counts in the text drawer first. `t_state` is declared inside the architecture
+so it is not aliasable from the bench (same obstacle as `nds_vram`'s `rstate` and
+`nds_gpu2d`'s `linestate`); either add a debug output encoding the state, or count
+`VRAM_Drawer_ena` assertions against total busy cycles to separate fetch from
+compute.
 
 Two remaining options, both about gpu2d throughput rather than memory:
 
