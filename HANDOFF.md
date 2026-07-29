@@ -135,11 +135,30 @@ compute.
 
 Two remaining options, both about gpu2d throughput rather than memory:
 
-1. **Move the render fabric to `clkMem`** (the documented intent: fabric 100.5 MHz,
-   dots 33.5). At 3x clk1x it gets the cycles it needs while `itiming` runs at full
-   rate. clkMem is an exact 3x, phase-locked, `clkMemIndex` already plumbed — an
-   **integer-ratio related clock**, the friendly case. Work is CDC to the clk1x
-   IO/VRAM/framebuffer interfaces. Buys 3x without understanding the pipeline.
+1. **Move the render fabric to `clkMem`** — attempted 2026-07-29 as
+   `rtl/nds_gpu2d_fast.vhd` (`GPU_FAST` generic, default 0 = inert). **Does not
+   work yet, and the naive form cannot.** Two findings, both worth having:
+
+   - **Only the compute scales.** "5,829 fits 6,390 with 9% margin" is WRONG:
+     `nds_vram` stays on clk1x, so the 509-cycle VRAM-wait component costs the
+     same wall-clock time regardless. 5,320 compute + 1,528 (509 x 3) = 6,848,
+     already 7% over — plus this adapter's per-request latency, ~24% over.
+   - **But that is not the current failure.** Measured with `GPU_FAST=1`:
+     `ops=20480` (vs 71,316), `blocked%=3`, `renders=0`, frames 2 and 3
+     **bit-identical**. Only 3% blocked means it is barely waiting on memory, so
+     this is a **functional stall in the adaptation**, not a timing overrun.
+
+   The fix for both is the same: move `nds_vram`'s **renderer read channels** to
+   clkMem as well, so the service rate scales and `srv_*` stops crossing domains
+   at all (deleting the req-republish hazard). Estimated ~5,320 + ~500 of 6,390 —
+   **to be measured, not trusted.**
+
+   Useful for whoever continues: `clkMem` is an exact 3x of clk1x from the same
+   VCO and phase-locked, so this is synchronous multi-rate, NOT async CDC. Three
+   rules cover the surface (see the file header). One is load-bearing:
+   `eProcReg_gba`'s write path is fully combinational on `proc_bus.ena`, so a
+   clk1x pulse is three clkMem cycles wide and writes every register three times
+   unless edge-detected.
 2. **Make the drawer/merge chain 3x cheaper per dot.** Same number from the other
    side, no clock work, but a gpu2d rewrite — and now the measurement says that is
    where the time actually is.

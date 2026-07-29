@@ -18,11 +18,30 @@
 -- nds_top's header, "fabric 100.5 MHz, dots 33.5, with clk1x standing in for
 -- the fabric" - so this completes a placeholder rather than inventing a scheme.
 --
--- Budget after adaptation, with LMERGE throttled by the output FIFO below:
---   LDRAW   5563 / 3   = 1855 clkMem cycles
---   LMERGE  256 pixels at one per clk1x period = 768 clkMem cycles
---   LFLUSH  8 * 3      =   24
---                        2647 of 6390.   Fits.
+-- BUDGET - THE FIRST VERSION OF THIS ARITHMETIC WAS WRONG, twice over. It read:
+--   LDRAW 5563/3 = 1855, LMERGE 768, LFLUSH 24, total 2647 of 6390, fits.
+-- Scaling the whole 5829 by 3 is invalid, because ONLY THE COMPUTE SCALES. The
+-- VRAM-wait component is served by nds_vram, which is still on clk1x, so it
+-- costs the same wall-clock time however fast the renderer runs:
+--   compute    5320 clk1x -> 5320 clkMem   (scales)
+--   VRAM wait   509 clk1x -> 1528 clkMem   (does NOT scale)
+--                            6848 vs 6390  -> 7% OVER
+-- and this adapter adds per-request latency on top (up to 3 clkMem cycles to
+-- republish req at clkMemIndex=2, plus done narrowing): at 271 ops/line that is
+-- another ~1084, so ~7932 vs 6390, 24% over.
+--
+-- BUT that is NOT why GPU_FAST=1 currently fails. Measured: ops=20480 (vs 71316
+-- baseline), blocked%=3, renders=0, and frames 2 and 3 BIT-IDENTICAL. Only 3%
+-- blocked means the renderer is barely waiting on memory, so this is a
+-- FUNCTIONAL STALL in the adaptation, not a timing overrun - a budget overrun
+-- would show ~271 ops/line and a high blocked%. Do not "fix" the budget and
+-- expect this to work.
+--
+-- The budget error is still real and still has to be fixed, and the fix for both
+-- is the same: move nds_vram's renderer read channels to clkMem too, so the
+-- service rate scales AND srv_* stops crossing domains at all (which deletes the
+-- req-republish hazard below). Estimated ~5320 + ~500 of 6390 - TO BE MEASURED,
+-- not trusted; that is exactly the reasoning that produced the error above.
 --
 -- CAVEAT, stated because it decides how far this gets us: 5829 is Kirby's mode,
 -- which enables BG3 only plus sprites - ONE BG layer. A four-layer scene with
@@ -362,6 +381,39 @@ begin
       pixel_out_y    <= px_y_r;
       pixel_out_data <= px_d_r;
       pixel_out_we   <= px_we_r;
+
+      -- synthesis translate_off
+      -- First-occurrence probe. GPUFAST=1 came back with ops=0 and both drawers
+      -- busy forever, which is either "gpu2d never asked for VRAM" or "this
+      -- adapter swallowed the request" - and those want completely different
+      -- fixes, so distinguish them rather than guess.
+      p_gfdbg : process (clkMem)
+         variable s_idx2, s_draw, s_ireq, s_oreq, s_done : boolean := false;
+      begin
+         if rising_edge(clkMem) then
+            if (clkMemIndex = 2 and not s_idx2) then
+               report "GF: clkMemIndex reached 2 at " & time'image(now) severity note;
+               s_idx2 := true;
+            end if;
+            if (i_drawline = '1' and not s_draw) then
+               report "GF: first narrowed drawline at " & time'image(now) severity note;
+               s_draw := true;
+            end if;
+            if (i_bg_req = '1' and not s_ireq) then
+               report "GF: gpu2d asserted srv_bg_req at " & time'image(now) severity note;
+               s_ireq := true;
+            end if;
+            if (o_bg_req = '1' and not s_oreq) then
+               report "GF: republished srv_bg_req to clk1x at " & time'image(now) severity note;
+               s_oreq := true;
+            end if;
+            if (i_bg_done = '1' and not s_done) then
+               report "GF: first narrowed srv_bg_done at " & time'image(now) severity note;
+               s_done := true;
+            end if;
+         end if;
+      end process;
+      -- synthesis translate_on
 
       igpu : entity work.nds_gpu2d
       generic map ( is_engine_b => is_engine_b, is_simu => is_simu )
