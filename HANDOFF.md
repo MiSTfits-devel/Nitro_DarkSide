@@ -82,7 +82,7 @@ Measured 2026-07-29 with `sim/tests/nds_2dk.hex` (both engines rendering, mode 1
 | dropped lines / frame | **126 of 192 visible — 66%** |
 | per-engine drops | **A 361 / B 361 — exactly equal** |
 | renderer VRAM ops / line | **271** (= 1.06 ops per dot) |
-| renderer blocked on VRAM | **12% of the frame** (A 6% / B 5%) |
+| renderer blocked on VRAM | ~~12% of the frame~~ **RETRACTED, bad metric** — see the clkMem section. From ops instead: 271 x ~4 cycles is ~a third of a line |
 
 **The VRAM arbiter is not the bottleneck, and the cost is localised.** Directly
 measured on the same clean frame, not derived:
@@ -145,21 +145,31 @@ Two remaining options, both about gpu2d throughput rather than memory:
    | clk1x cycles | 5,829 | **3,996** | 2,130 |
    | over budget | 174% | **88%** | |
    | lines rendered / 192 | 66 | **94** | |
-   | VRAM-blocked, share of frame | 12% | **84%** | |
+   | renderer VRAM occupancy | see RETRACTION below | | |
 
-   **The bottleneck inverted.** Baseline was compute-bound (12% blocked); this is
-   memory-bound (84% blocked). The gain is far short of 3x for exactly one reason:
-   **only the compute scales.** `nds_vram` stays on clk1x, so its service costs the
-   same wall-clock time however fast the renderer runs. An earlier version of this
-   section claimed "5,829 fits 6,390 with 9% margin" by scaling the whole figure —
-   that was wrong, and 5,320 + 509x3 = 6,848 was already over before adapter
-   latency.
+   **RETRACTED: the "12% -> 84% blocked, the bottleneck inverted" claim.** That
+   metric counted cycles with any `srv_*_req` asserted and called it VRAM-blocked
+   time. It is not occupancy: `nds_gpu2d` drives req as a ONE-CYCLE PULSE, so it
+   counted requests — 0.94 cycles per op in baseline, where an op takes ~4. And it
+   was not comparable across configurations, because `nds_gpu2d_fast` HOLDS req
+   until done (6.14 cycles per op). The whole "inversion" was an artifact of the
+   two configs driving req differently. `nds_vram` now exposes **`dbg_rbusy`** (its
+   own renderer FSM busy) and the bench reports **`rvram_busy%`** from it —
+   comparable, and the figure to re-measure.
 
-   So **the next step is option 3 below, and it is now measured rather than
-   guessed**: with 84% of the time spent waiting on memory, nothing else can
-   matter. Caveat on that 84%: `blocked%` counts any cycle with a request
-   asserted, including the ext-palette refill during vblank, so it is not cleanly
-   per-line. The direction is unambiguous; the exact split is not.
+   Also retracted: "only ~9% VRAM-blocked" from the original sizing, same bad
+   metric. From op counts instead: 271 ops/line x ~4 cycles is ~1,084 of an
+   uncontended 3,255-cycle line, so memory is roughly **a third** of a line, not a
+   tenth. Still a minority, so the compute-bound conclusion stands — but on
+   ops/dot, not on that number.
+
+   **What survives**, all `line_busy` occupancy and therefore valid and comparable:
+   5,829 -> 3,996 cycles/line, 66 -> 94 lines rendered, BG = 95% of the cost.
+
+   The gain is short of 3x for a reason that does hold: **only the compute scales.**
+   `nds_vram` stays on clk1x, so its service costs the same wall-clock time however
+   fast the renderer runs. (An earlier version claimed "5,829 fits 6,390 with 9%
+   margin" by scaling the whole figure; that was wrong.)
 
    **OPEN QUESTION that changes the sizing: 5,829 is not the intrinsic per-line
    cost.** The same baseline renderer, same scene, measures **3,255 cycles/line at
