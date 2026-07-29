@@ -153,7 +153,15 @@ entity nds_vram is
       rsrv_bank : out std_logic_vector(1 downto 0) := "00";
       rsrv_addr : out unsigned(16 downto 2) := (others => '0');
       rsrv_dout : in  std_logic_vector(31 downto 0) := (others => '0');
-      rsrv_done : in  std_logic := '0'
+      rsrv_done : in  std_logic := '0';
+
+      -- Renderer-side arbiter busy. Exposed as a PORT because rstate's type is
+      -- declared in this architecture and cannot be reached by a bench external
+      -- name, and because measuring occupancy from srv_*_req does NOT work:
+      -- nds_gpu2d drives req as a one-cycle pulse, so counting req-asserted
+      -- cycles counts REQUESTS, not waiting time (measured 0.94 cycles per op
+      -- where an op takes ~4).
+      dbg_rbusy    : out std_logic
    );
 end entity;
 
@@ -434,6 +442,9 @@ begin
    end process;
 
    rdispatch <= '1' when (rstate = RIDLE and rpick_valid = '1') else '0';
+
+   -- true renderer-memory occupancy, for the bench (see the port comment)
+   dbg_rbusy <= '0' when rstate = RIDLE else '1';
 
    rchosen_hit  <= rdec_bg_hit    when rpick = 0 else
                    rdec_obj_hit   when rpick = 1 else

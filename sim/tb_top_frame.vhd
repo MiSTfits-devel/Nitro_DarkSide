@@ -1410,6 +1410,14 @@ begin
       -- ops depend on the server", and A..D go through the rsrv_* channel, so
       -- ops/line x 4 is a LOWER BOUND on occupancy and cannot on its own settle
       -- whether the arbiter is the wall.
+      -- TRUE renderer-memory occupancy from nds_vram's own FSM. The previous
+      -- version counted cycles with any srv_*_req asserted, which is NOT
+      -- occupancy: nds_gpu2d drives req as a one-cycle pulse, so it counted
+      -- REQUESTS (measured 0.94 cycles per op, where an op takes ~4) - and worse,
+      -- it was not comparable across configurations, because nds_gpu2d_fast HOLDS
+      -- req until done, giving 6.14. The "12% -> 84% inversion" that produced was
+      -- an artifact of the two configs driving req differently, not a real change.
+      alias a_rbusy is << signal .tb_top_frame.idut.dbg_rbusy_s   : std_logic >>;
       alias a_bg    is << signal .tb_top_frame.idut.r_bg_req     : std_logic >>;
       alias a_obj   is << signal .tb_top_frame.idut.r_obj_req    : std_logic >>;
       alias a_bgep  is << signal .tb_top_frame.idut.r_bgep_req   : std_logic >>;
@@ -1451,8 +1459,7 @@ begin
          if (b_bg = '1' or b_obj = '1' or b_bgep = '1') then
             blk_b := blk_b + 1;
          end if;
-         if (a_bg = '1' or a_obj = '1' or a_bgep = '1' or a_objep = '1' or
-             b_bg = '1' or b_obj = '1' or b_bgep = '1') then
+         if (a_rbusy = '1') then
             blocked := blocked + 1;
          end if;
          -- Render time per line: the number this whole section now turns on.
@@ -1485,7 +1492,7 @@ begin
                    " ops=" & integer'image(ops) &
                    " cycles=" & integer'image(cyc) &
                    " ops/line=" & integer'image(ops / 263) &
-                   " blocked%=" & integer'image(blocked * 100 / cyc) &
+                   " rvram_busy%=" & integer'image(blocked * 100 / cyc) &
                    " (A " & integer'image(blk_a * 100 / cyc) &
                    " / B " & integer'image(blk_b * 100 / cyc) & ")" &
                    "  lines=" & integer'image(lines) &
