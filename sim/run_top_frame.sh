@@ -11,6 +11,11 @@ FWFILE="${FWFILE:-sim/tests/nds_firmware.hex}"
 FRAMES="${FRAMES:-3}"
 TIMEOUT_MS="${TIMEOUT_MS:-400}"
 DIRECT="${DIRECT:-0}"
+# FWBOOT=1: real firmware boot - no staging, no env block, BIOSes run from their
+# reset vectors. Needs FWFILE to be a genuine firmware image (firmware_retail.hex
+# is the real DS non-Lite dump, verified 100% word-identical to a retail dump).
+FWBOOT="${FWBOOT:-0}"
+HEARTBEAT_MS="${HEARTBEAT_MS:-0}"
 ISLAND="${ISLAND:-1}"      # 0 = tie clk2x to clk1x, no ARM9 island (see tb generic)
 # clk2x half period in ps: 7500 = 66.67 MHz (the current 2:1). Raise to model
 # giving the ARM9 island its own slower PLL output instead of sharing the video
@@ -109,7 +114,7 @@ TRACEGEN=""
 nvc -H "$NVCHEAP" -L "$WORK" --work="$WORK/work" -e "$NVCOPT" tb_top_frame \
    -gCARD_WORDS="$CARDWORDS" -gCARD_LAT="$CARD_LAT" -gFW_LAT="$FW_LAT" -gMEM_LAT="$MEM_LAT" -gCYCLE_HIST="$CYCLE_HIST" -gPRELOAD="$PRELOAD" \
    -gGPUCEDIV="$GPUCEDIV" -gHEXFILE="$HEXFILE" -gFWFILE="$FWFILE" -gFRAMES="$FRAMES" -gTIMEOUT_MS="$TIMEOUT_MS" \
-   -gDUMPFILE="$DUMPFILE" -gDUMPFILE_B="$DUMPFILE_B" -gDUMP_START_FRAME="$DUMP_START_FRAME" -gDIRECT="$DIRECT" -gISLAND="$ISLAND" -gISLAND_HALF_PS="$ISLAND_HALF_PS" \
+   -gDUMPFILE="$DUMPFILE" -gDUMPFILE_B="$DUMPFILE_B" -gDUMP_START_FRAME="$DUMP_START_FRAME" -gDIRECT="$DIRECT" -gFWBOOT="$FWBOOT" -gHEARTBEAT_MS="$HEARTBEAT_MS" -gISLAND="$ISLAND" -gISLAND_HALF_PS="$ISLAND_HALF_PS" \
    -gMAXINSTR="$MAXINSTR" -gTRACE_START_FRAME="$TRACE_START_FRAME" -gTRACE7_START_FRAME="$TRACE7_START_FRAME" -gDUMP_STATE="$DUMP_STATE" \
    -gDBG_T0="$DBG_T0" -gDBG_T1="$DBG_T1" -gDBG_TRIGPC="$DBG_TRIGPC" $TRACEGEN
 nvc -H "$NVCHEAP" -L "$WORK" --work="$WORK/work" -r tb_top_frame --ieee-warnings=off --exit-severity=failure

@@ -36,6 +36,12 @@ entity tb_top_frame is
       FRAMES     : integer := 3;
       TIMEOUT_MS : integer := 400;
       DIRECT     : integer := 0;         -- 1 = firmware direct-boot env (stock ROMs)
+      -- 1 = FIRMWARE BOOT: no image staging, no env block, and the boot FSM leaves
+      -- both PCs alone so the retail BIOSes run from their reset vectors. Requires
+      -- FWFILE to be a real firmware image and BIOS9/BIOS7 to be the retail dumps.
+      FWBOOT     : integer := 0;
+      -- ms of DS time between p_heartbeat's two-PC progress lines (0 = off)
+      HEARTBEAT_MS : integer := 0;
       ISLAND     : integer := 1;         -- 0 = tie clk2x to clk1x, i.e. no ARM9 island
       -- clk2x half period in ps. 7500 = 66.67 MHz, the 2:1-with-coincident-edges
       -- relationship the hardware PLL currently produces because the island
@@ -403,6 +409,7 @@ begin
       clk1x => clk1x, clk2x => clk2x, clkMem => clkMem, clkMemIndex => clkMemIndex,
       reset => reset, nds_on => '1',
       direct_boot => itosl(DIRECT),
+      fw_boot     => itosl(FWBOOT),
       KeyA => '0', KeyB => '0', KeySelect => '0', KeyStart => '0',
       KeyRight => '0', KeyLeft => '0', KeyUp => '0', KeyDown => '0',
       KeyR => '0', KeyL => '0', KeyX => '0', KeyY => '0', lid_closed => '0',
@@ -1368,6 +1375,39 @@ begin
    -- until all three clr_busy drop, so the ordering is guaranteed by
    -- construction; this monitor MEASURES it rather than assuming it, and says
    -- which of the loader or the clear was the long pole.
+   -- Both CPUs' PCs on a slow tick, plus a retired-instruction count each.
+   -- Long untraced runs (a firmware boot is tens of millions of instructions,
+   -- and TRACEFILE costs ~40x) otherwise give no way to tell "grinding through
+   -- a boot stage" from "wedged in a polling loop": the IO counters keep rising
+   -- in both cases. Two PCs and two counts distinguish them in one line.
+   -- HEARTBEAT_MS = 0 disables it.
+   p_heartbeat : process
+      variable n9, n7 : natural := 0;
+      variable p9, p7 : natural := 0;
+   begin
+      if (HEARTBEAT_MS = 0) then
+         wait;
+      end if;
+      loop
+         -- clk1x is clkMem/3 = 33.33 MHz, so 33333 edges is 1.0 ms of DS time.
+         -- Every edge has to be visited anyway to count retires.
+         for i in 1 to HEARTBEAT_MS loop
+            for j in 1 to 33333 loop
+               wait until rising_edge(clk1x);
+               if (dbg_export9_done = '1') then n9 := n9 + 1; end if;
+               if (dbg_export7_done = '1') then n7 := n7 + 1; end if;
+            end loop;
+         end loop;
+         report "HB " & time'image(now) &
+                "  ARM9 pc=" & to_hstring(dbg_export9.pc) & " n=" & integer'image(n9) &
+                " (+" & integer'image(n9 - p9) & ")" &
+                "  ARM7 pc=" & to_hstring(dbg_export7.pc) & " n=" & integer'image(n7) &
+                " (+" & integer'image(n7 - p7) & ")" severity note;
+         p9 := n9;
+         p7 := n7;
+      end loop;
+   end process;
+
    p_clrorder : process
       alias a_vclr  is << signal .tb_top_frame.idut.vclr_busy   : std_logic >>;
       alias a_pclra is << signal .tb_top_frame.idut.pclr_busy_a : std_logic >>;

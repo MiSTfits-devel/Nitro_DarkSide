@@ -85,6 +85,19 @@ entity nds_top is
       reset            : in  std_logic;
       nds_on           : in  std_logic;
       direct_boot      : in  std_logic := '0';  -- synthesize the firmware boot env (stock ROMs)
+      -- '1' = FIRMWARE BOOT. The loader clears memory and derives the cartridge
+      -- chip ID, then stops: no image staging, no direct-boot env block. The boot
+      -- FSM then releases both CPUs WITHOUT presetting their PCs, so they start at
+      -- their architectural reset vectors and the retail BIOSes run - the ARM7 BIOS
+      -- pulls the firmware over SPI and the firmware reads the cartridge itself,
+      -- as real hardware does.
+      --
+      -- This exists because every "leftover memory" bug in this core has been the
+      -- same shape: direct boot skips the firmware, so something is uninitialised.
+      -- Main RAM (SWP cart-lock wedge), VRAM/palette/OAM (stale screen) and ARM7
+      -- WRAM were each fixed by hand-reimplementing one thing the firmware does.
+      -- Booting the firmware addresses the cause rather than the symptoms.
+      fw_boot          : in  std_logic := '0';
 
       -- keys (active high) — X/Y/lid are NDS additions routed via ARM7 side
       KeyA             : in  std_logic;
@@ -235,6 +248,14 @@ architecture arch of nds_top is
    signal ld_start, ld_busy, ld_done, ld_error : std_logic;
    signal preset_direct : std_logic := '0';
    signal arm9_entry, arm7_entry : std_logic_vector(31 downto 0);
+   -- Effective boot PCs. Firmware boot enters each BIOS at its reset vector
+   -- instead of the cart's entry point: the ARM9 at 0xFFFF0000 (the NDS ties
+   -- VINITHI high, so exception vectors are high from reset) and the ARM7 at
+   -- 0x00000000. This core does not model the ARM reset exception at all -
+   -- both CPUs take their initial fetch_PC from the savestate write in
+   -- B_S9GAP/B_S7GAP - so simply releasing reset without presetting a PC
+   -- starts the ARM9 at 0x00000000 and retires nothing at all.
+   signal arm9_entry_eff, arm7_entry_eff : std_logic_vector(31 downto 0);
    signal ld_cartid  : std_logic_vector(31 downto 0);  -- header-size chip ID -> nds_card B8
    -- on-FPGA debug unit (nds_debug): CPU hold/release, register read-back and
    -- a main-RAM peek muxed onto the ARM9 channel the same way the loader is
@@ -639,7 +660,12 @@ begin
 
                when B_S9GAP =>
                   ss_bus9.Adr  <= (others => '0');   -- REG_SAVESTATE_PC
-                  ss_bus9.Din  <= arm9_entry;
+                  -- Firmware boot enters the ARM9 BIOS at its reset vector instead
+                  -- of the cart's entry point. This core does not model the ARM
+                  -- reset exception at all - both CPUs start from whatever this
+                  -- savestate write puts in fetch_PC - so "just release reset and
+                  -- let it vector" boots from 0x00000000 and retires nothing.
+                  ss_bus9.Din  <= arm9_entry_eff;
                   ss_bus9.rnw  <= '0';
                   ss_bus9.bEna <= "1111";
                   ss_bus9.ena  <= '1';
@@ -671,7 +697,7 @@ begin
 
                when B_S7GAP =>
                   ss_bus7.Adr  <= (others => '0');
-                  ss_bus7.Din  <= arm7_entry;
+                  ss_bus7.Din  <= arm7_entry_eff;
                   ss_bus7.rnw  <= '0';
                   ss_bus7.bEna <= "1111";
                   ss_bus7.ena  <= '1';
@@ -718,7 +744,7 @@ begin
    port map
    (
       clk => clk1x, reset => reset_boot,
-      start => ld_start, direct => direct_boot,
+      start => ld_start, direct => direct_boot, fw_boot => fw_boot,
       busy => ld_busy, done => ld_done, load_error => ld_error,
       arm9_entry => arm9_entry, arm7_entry => arm7_entry, cart_id => ld_cartid,
       card_ena => ld_card_ena, card_addr => ld_card_addr,
@@ -728,6 +754,9 @@ begin
       wr_done => ld_wr_done, rd_data => mem9_readdata,
       vfy_bad => dbg_vfy_bad, vfy_addr => dbg_vfy_addr
    );
+
+   arm9_entry_eff <= x"FFFF0000" when (fw_boot = '1') else arm9_entry;
+   arm7_entry_eff <= x"00000000" when (fw_boot = '1') else arm7_entry;
 
    -- card image port: the loader owns it during boot, the slot module after
    -- (the CPUs are in reset while ld_busy, so no ROMCTRL transfer can overlap)
