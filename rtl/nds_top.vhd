@@ -990,9 +990,22 @@ begin
 
    -- PROBE word (mailbox op 0x0A). Byte 3 is the top-level mux state, which is
    -- what decides whether a cache request ever reaches nds_mainram at all.
+   -- Bit 18 is nds_mainram's spare '0' in dbg_mr_s(2); it now carries the ARM9's
+   -- persistent DISPSTAT bit 3 (VBlank IRQ enable). Diagnostic only.
+   --
+   -- WHY: Kirby freezes on hardware with the ARM9 asleep in the NitroSDK idle
+   -- thread's WFI at 0x0214FC08, IE9 VBlank enabled, and IF9 bit 0 NEVER latching
+   -- - while the ARM7 does receive VBlank. reach9 proves Kirby's DISPSTAT-writing
+   -- code IS executed (0x02143A4C, 0x02143AF0), and the sim sees the write land on
+   -- the bus as `VIDREG A +004 = 0000000B bEna=3`, bit 3 set. So the open question
+   -- is exactly whether R_vbl_irq_ena(0) holds that bit, and nothing readable
+   -- answered it: the earlier dbg_vbl_ena9 probe was never exported, and the DDR3
+   -- telemetry lane is clobbered by the framebuffer on a white screen. The mailbox
+   -- probe is the one channel that returns clean data.
    dbg_probe <= dma_bus_on & ld_busy & dbg_pk_sel & mem9_done &
                 mem9_ena & mr9_ena & mr9_done & cpu9_ena &
-                dbg_mr_s & dbg_mb9 & dbg_cache9;
+                dbg_mr_s(7 downto 3) & dbg_vbl_ena9 & dbg_mr_s(1 downto 0) &
+                dbg_mb9 & dbg_cache9;
 
    idebug : entity work.nds_debug
    generic map
