@@ -1375,6 +1375,45 @@ begin
    -- until all three clr_busy drop, so the ordering is guaranteed by
    -- construction; this monitor MEASURES it rather than assuming it, and says
    -- which of the loader or the clear was the long pole.
+   -- Video-mode registers, reported when they CHANGE. The melonDS side of this
+   -- (VIDLOG in main_fbdump) is what turned "is the screen white because the
+   -- renderer is broken or because the display is off" from a guess into one
+   -- grep, and the RTL bench had no equivalent: the only way to ask was to dump
+   -- hundreds of 49,152-line framebuffers and diff them. DISPCNT mode 0 with
+   -- POWCNT1 clear is display OFF and renders uniform white, which is the
+   -- hardware behaving correctly.
+   --   0x000 engine A DISPCNT, 0x1000 engine B DISPCNT, 0x304 POWCNT1
+   -- Snoops ARM9 IO writes rather than reading the registers, so it needs no
+   -- new ports; a register the CPU never writes stays at its reset value and is
+   -- reported as such by the first line.
+   p_vidlog : process
+      alias a_io9 is << signal .tb_top_frame.idut.io_bus9 : proc_bus_gb_type >>;
+      variable da, db, pw : std_logic_vector(31 downto 0) := (others => '0');
+      variable chg : boolean;
+   begin
+      loop
+         wait until rising_edge(clk1x);
+         chg := false;
+         -- only on an actual VALUE change: games rewrite DISPCNT every frame,
+         -- and reporting each write buries the one line that matters
+         if (a_io9.ena = '1' and a_io9.rnw = '0') then
+            if (a_io9.Adr = x"0000000" and a_io9.Din /= da) then
+               da := a_io9.Din; chg := true;
+            elsif (a_io9.Adr = x"0001000" and a_io9.Din /= db) then
+               db := a_io9.Din; chg := true;
+            elsif (a_io9.Adr = x"0000304" and a_io9.Din /= pw) then
+               pw := a_io9.Din; chg := true;
+            end if;
+         end if;
+         if (chg) then
+            report "VIDLOG " & time'image(now) &
+                   " DISPCNT_A=" & to_hstring(da) &
+                   " DISPCNT_B=" & to_hstring(db) &
+                   " POWCNT1="   & to_hstring(pw) severity note;
+         end if;
+      end loop;
+   end process;
+
    -- Both CPUs' PCs on a slow tick, plus a retired-instruction count each.
    -- Long untraced runs (a firmware boot is tens of millions of instructions,
    -- and TRACEFILE costs ~40x) otherwise give no way to tell "grinding through
