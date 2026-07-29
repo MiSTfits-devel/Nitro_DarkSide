@@ -726,16 +726,16 @@ begin
                   if (ch(s) /= 0) then
                      report "  cache9 " & CNAME(s*10 + 1 to s*10 + 10) & " " &
                             integer'image(ch(s)) & "  (" &
-                            integer'image(ch(s) * 100 / n) & "%)";
+                            integer'image(integer(real(ch(s)) * 100.0 / real(n))) & "%)";
                   end if;
                end loop;
                for s in 0 to 5 loop
                   if (mh(s) /= 0) then
                      report "  membus9 state " & integer'image(s) & ": " &
                             integer'image(mh(s)) & "  (" &
-                            integer'image(mh(s) * 100 / n) & "%)" &
+                            integer'image(integer(real(mh(s)) * 100.0 / real(n))) & "%)" &
                             "  of which cache9 IDLE: " & integer'image(jc(s)) &
-                            "  (" & integer'image(jc(s) * 100 / n) & "% of all)";
+                            "  (" & integer'image(integer(real(jc(s)) * 100.0 / real(n))) & "% of all)";
                   end if;
                end loop;
                report "  W_MAIN & cache9 IDLE split: cresp_done=1 (handoff) " &
