@@ -592,6 +592,7 @@ architecture arch of nds_top is
    signal linecounter_obj : integer range 0 to 191;
    signal drawline, drawObj, line_trigger, hblank_trigger, gpu_vblank, refpoint_update : std_logic;
    signal line_busy, epfill_busy : std_logic;
+   signal dbg_rbusy_s : std_logic;
    signal line_busy_b, epfill_busy_b : std_logic;
 
    -- engine streams pre-routing
@@ -1723,6 +1724,8 @@ begin
       clr_busy => vclr_busy,
       rsrv_req => vrsrv_req, rsrv_bank => vrsrv_bank, rsrv_addr => vrsrv_addr,
       rsrv_dout => vrsrv_dout, rsrv_done => vrsrv_done
+      ,
+      dbg_rbusy => dbg_rbusy_s
    );
 
    -- dot pace: 1 of GPU_CE_DIV clocks (see header)
