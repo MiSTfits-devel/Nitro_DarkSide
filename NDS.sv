@@ -258,6 +258,9 @@ parameter CONF_STR = {
 	"F1,BINROM,Load ARM7 BIOS;",
 	"F2,BINROM,Load ARM9 BIOS;",
 	"-;",
+	"O[9],Boot,Direct (HLE),Firmware;",
+	"O[10],GPU pace,1-of-3 (all lines),1-of-1 (real speed);",
+	"-;",
 	"P1,Video & Audio;",
 	"P1-;",
 	"P1O[6:5],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
@@ -788,6 +791,7 @@ wire [31:0] vsrv_din_c;
 wire        vrsrv_req_c;
 wire  [1:0] vrsrv_bank_c;
 wire [14:0] vrsrv_addr_c;
+wire        vrsrv_ready_c;
 
 reg  [31:0] vsrv_dout_r,  vrsrv_dout_r;
 reg         vsrv_done_r,  vrsrv_done_r;
@@ -869,9 +873,20 @@ always @(posedge clk_mem) begin
 end
 
 // ---- vrsrv: renderer read feed on ch1 (no scheduler needed) ----
+// sdram.sv's ch1 holds ONE request at a time (ch1_rq is a single bit), while
+// nds_vram's renderer server now issues its A..D reads pipelined. Without a
+// ready line, every request arriving while ch1 was busy was simply dropped -
+// the core would then wait forever for a word that was never asked for. So the
+// channel exports back-pressure and the core throttles itself to what ch1 can
+// actually take. Pipelining ch1 itself is a separate change and needs hardware
+// to validate; this makes the current depth correct rather than lucky.
 reg        vr_req_d = 0, vr_busy = 0, vr_fin = 0;
 reg        sd_vr_req = 0;
 reg [25:0] vr_adr;
+
+// ready must be a clk1x-observable level: low from acceptance until the done
+// pulse has been presented, so the core never issues into a busy channel
+assign vrsrv_ready_c = ~vr_busy & ~vr_fin;
 
 always @(posedge clk_mem) begin
 	vr_req_d  <= vrsrv_req_c;
@@ -973,7 +988,23 @@ nds_port_wrap nds
 	.clkMemIndex(clkMemIndex),
 	.reset(reset | bios_load_reset),
 	.nds_on(nds_on),
-	.direct_boot(1'b1),          // firmware boot menu = never (docs/ARCHITECTURE.md)
+	// REVERSED 2026-07-29. docs/ARCHITECTURE.md recorded "firmware boot menu =
+	// never" and this was hardwired to 1. A real firmware boot path now exists
+	// and is OSD-selectable on status[9]:
+	//   0 = HLE direct boot, unchanged, the path everything so far was tested on
+	//   1 = both retail BIOSes run from their reset vectors and the firmware
+	//       boots the cart itself, which is what initialises ARM9 CP15 properly
+	//       instead of us faking melonDS's SetupDirectBoot values at CPU reset
+	// Needs all three images loaded from the OSD: ARM7 BIOS, ARM9 BIOS, Firmware.
+	// direct_boot stays 1 because fw_boot short-circuits nds_loader's CARTID_CALC
+	// before ENV_SET is ever reached, so the env-block choice is moot when set.
+	//
+	// KNOWN LIMIT: firmware boot reaches 1.588 s of DS time in sim and then the
+	// ARM7 executes Thumb code in ARM state at 0x037FE28C (lost T bit - see
+	// HANDOFF). Expect it to reach the firmware's video init and then wedge.
+	.direct_boot(1'b1),
+	.fw_boot(status[9]),
+	.gpu_full_pace(status[10]),
 
 	.KeyA(joy[4]),
 	.KeyB(joy[5]),
@@ -1041,6 +1072,7 @@ nds_port_wrap nds
 	.vrsrv_addr(vrsrv_addr_c),
 	.vrsrv_dout(vrsrv_dout_r),
 	.vrsrv_done(vrsrv_done_r),
+	.vrsrv_ready(vrsrv_ready_c),
 
 	.pixel_out_x(pix_x),
 	.pixel_out_y(pix_y),

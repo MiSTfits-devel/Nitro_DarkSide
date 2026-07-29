@@ -102,6 +102,8 @@ entity nds_top is
       -- WRAM were each fixed by hand-reimplementing one thing the firmware does.
       -- Booting the firmware addresses the cause rather than the symptoms.
       fw_boot          : in  std_logic := '0';
+      -- '1' = dot cadence 1-of-1 (real frame rate); '0' = 1-of-GPU_CE_DIV
+      gpu_full_pace    : in  std_logic := '0';
 
       -- keys (active high) — X/Y/lid are NDS additions routed via ARM7 side
       KeyA             : in  std_logic;
@@ -182,6 +184,12 @@ entity nds_top is
       vrsrv_addr       : out unsigned(16 downto 2);
       vrsrv_dout       : in  std_logic_vector(31 downto 0);
       vrsrv_done       : in  std_logic;
+      -- back-pressure for the renderer VRAM feed. nds_vram's renderer server
+      -- now issues A..D reads PIPELINED, so the channel has to say when it can
+      -- take one; without this a platform that serves one op at a time drops
+      -- every request that arrives while it is busy. Defaults high for models
+      -- that are always ready.
+      vrsrv_ready      : in  std_logic := '1';
 
       -- video out: TOP and BOTTOM screen lines after POWCNT routing,
       -- BGR666 (the NDS 18-bit LCD format; B in [17:12])
@@ -549,7 +557,10 @@ architecture arch of nds_top is
    signal keyinput : std_logic_vector(9 downto 0);
    signal extkeyin : std_logic_vector(7 downto 0);
 
-   -- renderer channels between nds_vram and nds_gpu2d
+   -- renderer channels between nds_vram and nds_gpu2d. *_accept pulses when
+   -- the line server takes a request; the BG channels use it so a drawer may
+   -- keep several fetches in flight (see nds_vram's pipeline comment).
+   signal r_bg_accept, rb_bg_accept : std_logic;
    signal r_bg_req, r_bg_done       : std_logic;
    signal r_bg_addr                 : unsigned(18 downto 2);
    signal r_bg_dout                 : std_logic_vector(31 downto 0);
@@ -1707,6 +1718,7 @@ begin
       srv_be => vsrv_be, srv_din => vsrv_din, srv_dout => vsrv_dout, srv_done => vsrv_done,
       rdr_bg_req => r_bg_req, rdr_bg_addr => r_bg_addr,
       rdr_bg_dout => r_bg_dout, rdr_bg_done => r_bg_done,
+      rdr_bg_accept => r_bg_accept,
       rdr_obj_req => r_obj_req, rdr_obj_addr => r_obj_addr,
       rdr_obj_dout => r_obj_dout, rdr_obj_done => r_obj_done,
       rdr_bgep_req => r_bgep_req, rdr_bgep_addr => r_bgep_addr,
@@ -1715,6 +1727,7 @@ begin
       rdr_objep_dout => r_objep_dout, rdr_objep_done => r_objep_done,
       rdr_bgb_req => rb_bg_req, rdr_bgb_addr => rb_bg_addr,
       rdr_bgb_dout => rb_bg_dout, rdr_bgb_done => rb_bg_done,
+      rdr_bgb_accept => rb_bg_accept,
       rdr_objb_req => rb_obj_req, rdr_objb_addr => rb_obj_addr,
       rdr_objb_dout => rb_obj_dout, rdr_objb_done => rb_obj_done,
       rdr_bgepb_req => rb_bgep_req, rdr_bgepb_addr => rb_bgep_addr,
@@ -1723,17 +1736,29 @@ begin
       rdr_objepb_dout => rb_objep_dout, rdr_objepb_done => rb_objep_done,
       clr_busy => vclr_busy,
       rsrv_req => vrsrv_req, rsrv_bank => vrsrv_bank, rsrv_addr => vrsrv_addr,
-      rsrv_dout => vrsrv_dout, rsrv_done => vrsrv_done
+      rsrv_dout => vrsrv_dout, rsrv_done => vrsrv_done,
+      rsrv_ready => vrsrv_ready
       ,
       dbg_rbusy => dbg_rbusy_s
    );
 
    -- dot pace: 1 of GPU_CE_DIV clocks (see header)
+   -- gpu_full_pace = '1' runs the dot cadence at 1-of-1 instead of
+   -- 1-of-GPU_CE_DIV, i.e. real frame rate instead of GPU_CE_DIV x too slow.
+   -- Runtime-selectable rather than a generic so the two can be compared on
+   -- hardware from the OSD without a 25-minute rebuild each way. The trade is
+   -- real and visible: at 1-of-1 a line has 2,130 clk1x cycles and the renderer
+   -- needs ~3,996 even with GPU_FAST, so roughly half the scanlines are dropped
+   -- per frame; at 1-of-3 every line renders but frames are 3x long. Changing it
+   -- mid-frame just perturbs one frame's pacing, so it needs no reset.
    p_gpu_ce : process (clk1x)
       variable div : integer range 0 to GPU_CE_DIV - 1 := 0;
    begin
       if rising_edge(clk1x) then
-         if (div = GPU_CE_DIV - 1) then
+         if (gpu_full_pace = '1') then
+            div    := 0;
+            gpu_ce <= '1';
+         elsif (div = GPU_CE_DIV - 1) then
             div    := 0;
             gpu_ce <= '1';
          else
@@ -1793,6 +1818,7 @@ begin
       oam_we => oam_we_a, oam_addr => oam_addr_lo, oam_din => oam_din, oam_be => oam_be,
       srv_bg_req => r_bg_req, srv_bg_addr => g_bg_addr,
       srv_bg_data => r_bg_dout, srv_bg_done => r_bg_done,
+      srv_bg_accept => r_bg_accept,
       srv_obj_req => r_obj_req, srv_obj_addr => g_obj_addr,
       srv_obj_data => r_obj_dout, srv_obj_done => r_obj_done,
       srv_bgep_req => r_bgep_req, srv_bgep_addr => g_bgep_addr,
@@ -1846,6 +1872,7 @@ begin
       oam_we => oam_we_b, oam_addr => oam_addr_lo, oam_din => oam_din, oam_be => oam_be,
       srv_bg_req => rb_bg_req, srv_bg_addr => gb_bg_addr,
       srv_bg_data => rb_bg_dout, srv_bg_done => rb_bg_done,
+      srv_bg_accept => rb_bg_accept,
       srv_obj_req => rb_obj_req, srv_obj_addr => gb_obj_addr,
       srv_obj_data => rb_obj_dout, srv_obj_done => rb_obj_done,
       srv_bgep_req => rb_bgep_req, srv_bgep_addr => gb_bgep_addr,
