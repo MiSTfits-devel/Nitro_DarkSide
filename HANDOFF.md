@@ -272,6 +272,20 @@ that protection silently.
 2. **Render-test ROM in Kirby's real mode** (`80211810` / `00211810` / `820F`),
    diffed against melonDS on the same ROM. Reaches the interesting mode in
    microseconds and gives a real oracle, which Kirby never will.
+
+   **This is sharper than it looks: Kirby's rendering path is UNTESTED.** Kirby
+   draws BG3 as a 256-colour *text* BG with **extended palettes** (DISPCNT bit 31)
+   and 1D OBJ mapping. `nds_drawer_text.vhd` implements ext palettes properly —
+   `slot*8K + palno*512 + color*2`, BG2/3 to slot 2/3 — but **grep finds zero
+   mentions of `extpal` in `tb_gpu2d.vhd`, `tb_gpu2d_frame.vhd` or
+   `tb_gpu2d_timed.vhd`, and no 1D-OBJ-mapping coverage either.** The existing
+   `sim/tests/arm9_2d.s` is BG mode 1 (BG0 text + BG3 affine) and affine BGs
+   explicitly do *not* use ext palettes. So the one colour-lookup path Kirby
+   actually depends on has never been executed by any test in this repo.
+
+   Start from `arm9_2d.s` (it already carries the melonDS-oracle compat rules: no
+   4 GB PU catch-all, cover the DTCM window, POWCNT1 before any palette/OAM write)
+   and change it to mode 0, BG3 text 256-colour, ext palettes on, OBJ 1D.
 3. **Long untraced runs to display-on** — cheap now (~6.5 h at `GPUCEDIV=1`). The
    question is whether our RTL reaches the transition melonDS makes at frame 51.
 4. Test ROMs `bootreq` had to exclude: TCM, BIOS SWIs, VBlank/IRQ dispatch, card
