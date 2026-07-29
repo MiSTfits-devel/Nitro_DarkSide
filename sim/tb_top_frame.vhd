@@ -1400,7 +1400,21 @@ begin
    -- from the op count rather than sampled directly.
    p_vramops : process
       alias a_rdisp is << signal .tb_top_frame.idut.ivram.rdispatch : std_logic >>;
-      variable ops, cyc : natural := 0;
+      -- Actual blocked time, not inferred. Each channel holds req until its done
+      -- pulse, so "any renderer req asserted" is exactly "some renderer is
+      -- waiting on VRAM". This matters because the ~4 cycles/op in nds_vram's
+      -- header is a floor: the same header says "BRAM ops take ~3 cycles, A..D
+      -- ops depend on the server", and A..D go through the rsrv_* channel, so
+      -- ops/line x 4 is a LOWER BOUND on occupancy and cannot on its own settle
+      -- whether the arbiter is the wall.
+      alias a_bg    is << signal .tb_top_frame.idut.r_bg_req     : std_logic >>;
+      alias a_obj   is << signal .tb_top_frame.idut.r_obj_req    : std_logic >>;
+      alias a_bgep  is << signal .tb_top_frame.idut.r_bgep_req   : std_logic >>;
+      alias a_objep is << signal .tb_top_frame.idut.r_objep_req  : std_logic >>;
+      alias b_bg    is << signal .tb_top_frame.idut.rb_bg_req    : std_logic >>;
+      alias b_obj   is << signal .tb_top_frame.idut.rb_obj_req   : std_logic >>;
+      alias b_bgep  is << signal .tb_top_frame.idut.rb_bgep_req  : std_logic >>;
+      variable ops, cyc, blocked, blk_a, blk_b : natural := 0;
       variable frames : natural := 0;
    begin
       if (VRAMOPS = 0) then
@@ -1410,16 +1424,30 @@ begin
          wait until rising_edge(clk1x);
          cyc := cyc + 1;
          if (a_rdisp = '1') then ops := ops + 1; end if;
+         if (a_bg = '1' or a_obj = '1' or a_bgep = '1' or a_objep = '1') then
+            blk_a := blk_a + 1;
+         end if;
+         if (b_bg = '1' or b_obj = '1' or b_bgep = '1') then
+            blk_b := blk_b + 1;
+         end if;
+         if (a_bg = '1' or a_obj = '1' or a_bgep = '1' or a_objep = '1' or
+             b_bg = '1' or b_obj = '1' or b_bgep = '1') then
+            blocked := blocked + 1;
+         end if;
          if (vblank_out = '1' and cyc > 1000) then
             frames := frames + 1;
             report "VRAMOPS frame " & integer'image(frames) &
                    " ops=" & integer'image(ops) &
                    " cycles=" & integer'image(cyc) &
                    " ops/line=" & integer'image(ops / 263) &
-                   " est_cycles/line=" & integer'image((ops / 263) * 4) &
-                   " (budget 2130)" severity note;
+                   " blocked%=" & integer'image(blocked * 100 / cyc) &
+                   " (A " & integer'image(blk_a * 100 / cyc) &
+                   " / B " & integer'image(blk_b * 100 / cyc) & ")" severity note;
             ops := 0;
             cyc := 0;
+            blocked := 0;
+            blk_a := 0;
+            blk_b := 0;
          end if;
       end loop;
    end process;
