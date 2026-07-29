@@ -325,8 +325,13 @@ attacks the source rather than the symptoms. As of 2026-07-29 it exists:
 
 What it does: no HLE staging, no direct-boot env block, both retail BIOSes running
 from their reset vectors, firmware left to boot the cart. Boot completes at ~16 ms
-of DS time (vs ~240 ms for direct boot, which clears all 4 MB of main RAM one word
-at a time).
+of DS time, all of it the VRAM/palette clear; direct boot with Kirby takes ~240 ms,
+which is the **image staging plus the DIRECT=0 verify read-back** of a 4 MB image,
+NOT the memory clear. `nds_loader`'s IDLE state skips the clear outright when
+`is_simu = '1'` ("model RAM is already zero"), so in simulation those 1,064,960
+writes never happen and **sim understates hardware boot time**. On hardware the
+clear does run. Do not quote a sim boot time as a hardware boot time; this is the
+same sim-zero-fill divergence that hid the uninitialised-main-RAM cart lock.
 
 **Measured state:** both BIOSes execute for real - ARM9 from `0xFFFF0000`, ARM7 from
 `0x00000000`, CPSR `0xD3` - and the ARM7 BIOS now follows melonDS with **zero
@@ -366,10 +371,11 @@ whole FSM and only swaps the *values*, via `arm9_entry_eff`/`arm7_entry_eff`.
 ### Corrections to what this file used to say
 
 - *"`DIRECT=0` never releases the CPUs - 0 instructions retired across a full
-  120 ms, strictly worse than `DIRECT=1`"*: **wrong.** `DIRECT=0` works. It runs a
-  1.6 MB verify pass on top of the 4 MB main-RAM clear, so the CPUs come out at
-  **~240 ms**; the 120 ms window was simply too short. Measured after: 28,153 ARM9
-  IO accesses in the next 57 ms.
+  120 ms, strictly worse than `DIRECT=1`"*: **wrong.** `DIRECT=0` works. It stages
+  the image and then verifies it by reading all of it back, so with Kirby the CPUs
+  come out at **~240 ms**; the 120 ms window was simply too short. Measured after:
+  28,153 ARM9 IO accesses in the next 57 ms. The cost scales with image size, not
+  with the clear - the 4 KB `nds_2dk.hex` finishes its loader in **167 us**.
 - *"`firmware_retail.hex` and `firmware_dslite.hex` share only 1% of their words, so
   one may be synthetic"*: **wrong inference.** `firmware_retail.hex` is
   **byte-identical (65536/65536 words)** to the user's genuine retail non-Lite DS
