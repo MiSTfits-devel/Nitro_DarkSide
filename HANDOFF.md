@@ -406,6 +406,40 @@ Sanity check for the method: `reach9 FFFF0008` (the reset vector) is **not**
 reached, and that is correct under direct boot — the loader presets the PC and the
 BIOS reset path never runs.
 
+## Open bug: direct boot never clears VRAM / palette / OAM
+
+Reported from hardware 2026-07-28 by the user: loading a different ROM does not
+reliably clear the screen — leftovers from the previous ROM persist.
+
+`nds_loader.vhd` has a `CLR_WR` pass that zeroes all 4 MB of **main RAM**, and its
+own comment says why: *"Real hardware gets this clearing from the firmware boot we
+skip in direct boot."* That pass was added after uninitialised SDRAM made the SWP
+cart-lock acquisition fail forever — both CPUs spinning, no IRQ ever enabled, white
+screen — and **simulation hid it completely**, because the behavioural SDRAM model
+powers up all-zero.
+
+**VRAM, palette and OAM never got the same treatment.** grep finds no clear pass in
+`nds_vram.vhd`, only port defaults. So they retain whatever the previous ROM left,
+and on a MiSTer the FPGA is not reconfigured between ROM loads — only the loader
+re-runs. The DDR3 framebuffer at `0x0FE00000` is not cleared either.
+
+Consequences:
+
+- Cosmetic: stale pixels until the new ROM overwrites them (what the user saw).
+- **Not necessarily cosmetic**: a game that enables a BG or OBJ before writing all
+  of its tiles/map/palette shows the *previous* ROM's data rather than the black or
+  known-state a firmware boot would leave. Any game relying on zeroed VRAM
+  misbehaves, and **simulation cannot see it** for exactly the reason the main-RAM
+  bug was invisible — the sim starts every memory at zero and each run is fresh.
+- This is a strong candidate for behaviour that differs between the first ROM load
+  after a core reload and every subsequent one, which is a nasty class of
+  non-reproducible bug.
+
+Fix direction: extend the loader's clear pass to VRAM banks, both palettes and OAM
+(and consider the DDR3 framebuffer), gated the same way `skip_copy` gates the
+main-RAM pass so simulation stays fast. Verify by loading two different test ROMs
+back to back on hardware and confirming the second starts clean.
+
 ## Open RTL bug: the ARM9's 8-bit writes to VRAM are performed, and must not be
 
 Found 2026-07-28 by `sim/tests/arm9_2dk.s`. On the DS, **8-bit writes from the
