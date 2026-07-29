@@ -196,9 +196,23 @@ int main(int argc, char** argv)
         if (getenv("VIDLOG"))
         {
             static u32 pa = 0xFFFFFFFF, pb = 0xFFFFFFFF, ppw = 0xFFFFFFFF;
+            static u32 pds9 = 0xFFFFFFFF, pds7 = 0xFFFFFFFF;
             u32 da = nds.ARM9Read32(0x04000000);   // engine A DISPCNT
             u32 db = nds.ARM9Read32(0x04001000);   // engine B DISPCNT
             u32 pw = nds.ARM9Read16(0x04000304);   // POWCNT1
+            // DISPSTAT is per-CPU. Bit 3 is that CPU's VBlank IRQ enable, and on
+            // real hardware the ARM9 sleeps in WFI forever without it. Logged
+            // because our core freezes with IE9 VBlank set but IF9 bit 0 never
+            // latching, while the ARM7 does receive VBlank.
+            u32 ds9 = nds.ARM9Read16(0x04000004);
+            u32 ds7 = nds.ARM7Read16(0x04000004);
+            if (ds9 != pds9 || ds7 != pds7)
+            {
+                fprintf(stderr, "VBLENA frame=%d DISPSTAT9=%04X (vblIRQ=%u) "
+                        "DISPSTAT7=%04X (vblIRQ=%u)\n", n, ds9, (ds9>>3)&1,
+                        ds7, (ds7>>3)&1);
+                pds9 = ds9; pds7 = ds7;
+            }
             if (da != pa || db != pb || pw != ppw)
             {
                 fprintf(stderr,

@@ -301,7 +301,17 @@ that protection silently.
    diffed against melonDS on the same ROM. Reaches the interesting mode in
    microseconds and gives a real oracle, which Kirby never will.
 
-   **This is sharper than it looks: Kirby's rendering path is UNTESTED.** Kirby
+   **DONE 2026-07-28** — `sim/tests/arm9_2dk.s` + `build_nds_2dk.sh`, both engines
+   **pixel-exact vs melonDS** on every rendered line. Note the premise I set this
+   task with was WRONG: **DISPCNT bit 30 is BG ext-pal, bit 31 is OBJ ext-pal**
+   (`reg_nds_display.vhd:39-40`). Kirby's `80211810` therefore has BG ext-pal
+   **OFF** and OBJ ext-pal **ON** — its BG3 is a 256-colour text BG on the
+   *standard* palette with `palno` ignored, and its *sprites* use ext palettes.
+   The ROM covers that fallback branch (no prior sample did: `arm9_2d.s`'s BG3 is
+   affine, and 2dh/2dw only run it with ext-pal on), plus OBJ ext palettes at
+   palno 5/11/0, BG mode 0, and engine B rendered at all for the first time.
+
+   The old (wrong) framing follows for context: Kirby
    draws BG3 as a 256-colour *text* BG with **extended palettes** (DISPCNT bit 31)
    and 1D OBJ mapping. `nds_drawer_text.vhd` implements ext palettes properly —
    `slot*8K + palno*512 + color*2`, BG2/3 to slot 2/3 — but **grep finds zero
@@ -322,6 +332,28 @@ that protection silently.
    Kirby boot.
 
 ---
+
+## Open RTL bug: the ARM9's 8-bit writes to VRAM are performed, and must not be
+
+Found 2026-07-28 by `sim/tests/arm9_2dk.s`. On the DS, **8-bit writes from the
+ARM9 to VRAM / palette / OAM are dropped** (unlike the GBA, which duplicates the
+byte). melonDS drops them; our RTL performs them.
+
+Reproducer: `strb` two OBJ tile bytes at `0x06400200` and `0x064003FF`. melonDS
+leaves those pixels at index 0 (transparent, background shows through); the RTL
+writes them and renders the sprite pixel — 3 mismatching pixels on both engines:
+
+```
+A (48, 24) rtl=ff0859a2 mds=ff384949    <- spr2 tile-4 byte 0
+A (112,24) rtl=ff080828 mds=ff384949    <- spr4 tile-4 byte 0
+A ( 95,39) rtl=ff08ba30 mds=fffb3038    <- spr3 tile-6 byte 255
+```
+
+The RTL values decode exactly to the palette entries for index 1, confirming the
+byte write landed. Look at the ARM9 store path / `nds_membus9` VRAM byte-enable
+handling. **This is a plausible real-game hazard** — any game that byte-writes
+VRAM gets corruption the hardware would not produce. `arm9_2dk.s` uses word
+stores so the test is not contaminated by it; the bug is unfixed.
 
 ## Do not repeat
 
