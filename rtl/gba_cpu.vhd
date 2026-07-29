@@ -964,7 +964,9 @@ begin
                               -- synthesis translate_off
                               report "ARM7 decode: unhandled opcode " & to_hstring(decode_data) &
                                                                                 " thumb=" & std_logic'image(thumbmode)(2) &
-                                                                                " pc=" & to_hstring(regs(15)) severity failure;
+                                                                                " pc=" & to_hstring(regs(15)) &
+                                    " lr=" & to_hstring(regs(14)) &
+                                    " cpsr=" & to_hstring(CPSR) severity failure;
                               -- synthesis translate_on
                         end case;
                         decode_datacomb(20)            := '1'; -- set condition codes
@@ -1033,7 +1035,9 @@ begin
                                     -- synthesis translate_off
                                     report "ARM7 decode: unhandled opcode " & to_hstring(decode_data) &
                                                                                       " thumb=" & std_logic'image(thumbmode)(2) &
-                                                                                      " pc=" & to_hstring(regs(15)) severity failure;
+                                                                                      " pc=" & to_hstring(regs(15)) &
+                                    " lr=" & to_hstring(regs(14)) &
+                                    " cpsr=" & to_hstring(CPSR) severity failure;
                                     -- synthesis translate_on
                               end case;
                               
@@ -1129,7 +1133,9 @@ begin
                               -- synthesis translate_off
                               report "ARM7 decode: unhandled opcode " & to_hstring(decode_data) &
                                                                                 " thumb=" & std_logic'image(thumbmode)(2) &
-                                                                                " pc=" & to_hstring(regs(15)) severity failure;
+                                                                                " pc=" & to_hstring(regs(15)) &
+                                    " lr=" & to_hstring(regs(14)) &
+                                    " cpsr=" & to_hstring(CPSR) severity failure;
                               -- synthesis translate_on
                      
                         end case;
@@ -1284,7 +1290,9 @@ begin
                         -- synthesis translate_off
                         report "ARM7 decode: unhandled opcode " & to_hstring(decode_data) &
                                                                           " thumb=" & std_logic'image(thumbmode)(2) &
-                                                                          " pc=" & to_hstring(regs(15)) severity failure;
+                                                                          " pc=" & to_hstring(regs(15)) &
+                                    " lr=" & to_hstring(regs(14)) &
+                                    " cpsr=" & to_hstring(CPSR) severity failure;
                         -- synthesis translate_on
                
                   end case;
@@ -1400,7 +1408,9 @@ begin
                               -- synthesis translate_off
                               report "ARM7 decode: unhandled opcode " & to_hstring(decode_data) &
                                                                                 " thumb=" & std_logic'image(thumbmode)(2) &
-                                                                                " pc=" & to_hstring(regs(15)) severity failure;
+                                                                                " pc=" & to_hstring(regs(15)) &
+                                    " lr=" & to_hstring(regs(14)) &
+                                    " cpsr=" & to_hstring(CPSR) severity failure;
                               -- synthesis translate_on
                         end case;
                         
@@ -1498,7 +1508,9 @@ begin
                               -- synthesis translate_off
                               report "ARM7 decode: unhandled opcode " & to_hstring(decode_data) &
                                                                                 " thumb=" & std_logic'image(thumbmode)(2) &
-                                                                                " pc=" & to_hstring(regs(15)) severity failure;
+                                                                                " pc=" & to_hstring(regs(15)) &
+                                    " lr=" & to_hstring(regs(14)) &
+                                    " cpsr=" & to_hstring(CPSR) severity failure;
                               -- synthesis translate_on
                         end case;
                         decode_datatransfer_addvalue <= x"0" & unsigned(decode_datacomb(11 downto 8)) & unsigned(decode_datacomb(3 downto 0));
@@ -2744,7 +2756,9 @@ begin
                         -- synthesis translate_off
                         report "ARM7 decode: unhandled opcode " & to_hstring(decode_data) &
                                                                           " thumb=" & std_logic'image(thumbmode)(2) &
-                                                                          " pc=" & to_hstring(regs(15)) severity failure;
+                                                                          " pc=" & to_hstring(regs(15)) &
+                                    " lr=" & to_hstring(regs(14)) &
+                                    " cpsr=" & to_hstring(CPSR) severity failure;
                         -- synthesis translate_on
                   end case;
 
@@ -2804,7 +2818,9 @@ begin
                         -- synthesis translate_off
                         report "ARM7 decode: unhandled opcode " & to_hstring(decode_data) &
                                                                           " thumb=" & std_logic'image(thumbmode)(2) &
-                                                                          " pc=" & to_hstring(regs(15)) severity failure;
+                                                                          " pc=" & to_hstring(regs(15)) &
+                                    " lr=" & to_hstring(regs(14)) &
+                                    " cpsr=" & to_hstring(CPSR) severity failure;
                         -- synthesis translate_on
                   end case;
                      
