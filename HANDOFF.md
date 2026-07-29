@@ -161,6 +161,20 @@ Two remaining options, both about gpu2d throughput rather than memory:
    asserted, including the ext-palette refill during vblank, so it is not cleanly
    per-line. The direction is unambiguous; the exact split is not.
 
+   **OPEN QUESTION that changes the sizing: 5,829 is not the intrinsic per-line
+   cost.** The same baseline renderer, same scene, measures **3,255 cycles/line at
+   `GPUCEDIV=3`** (all 192 lines rendered, 4% blocked) versus **5,844 at
+   `GPUCEDIV=1`** (66 rendered, 12% blocked) — 80% longer for identical work. So
+   against the 2,130 budget the uncontended cost is **53% over, not 174%**, and the
+   renderer may need only ~1.5x rather than ~2.7x.
+
+   Most likely mechanism: CPU/renderer contention through the shared VRAM arbiter.
+   A `GPUCEDIV=1` frame is 3x shorter in cycles, so the CPU issues 3x more VRAM
+   accesses per frame, and blocked% triples (4% -> 12%). But tripling a 4% term
+   does not account for an 80% increase, so **this is not explained** — do not
+   quote either figure as "the" per-line cost until it is. Measuring the CPU's
+   share of arbiter dispatches (`rdispatch` split by requester) would settle it.
+
    **How to test correctness of this, because the obvious test is wrong.**
    Comparing framebuffers between `GPU_FAST=0` and `1` at `GPUCEDIV=1` proves
    nothing: both configurations DROP lines (126/192 and 98/192), and a dropped
