@@ -100,10 +100,34 @@ begin
                  (others => '0');
    wired_done7 <= '1' when (bus7.Adr = ADR_SYNC or bus7.Adr = ADR_CNT or bus7.Adr = ADR_RECV) else '0';
 
+   -- RECV reads present last9, NOT fifo79(rd79), and the asymmetry with the ARM7
+   -- path above is deliberate.
+   --
+   -- The pop happens at the edge ending the cycle in which bus9.ena is high:
+   -- `last9 <= fifo79(rd79)` captures the popped word and rd79 then advances. So
+   -- fifo79(rd79) is only correct for a consumer that samples in the SAME cycle.
+   -- The ARM7 is such a consumer - membus7 raises io_bus.ena and latches
+   -- io_wired_out in the same FINISH cycle - which is why the ARM7 mux above is
+   -- right as written. **The ARM9 is not.** nds_top's IO completion toggles
+   -- cdc_io_cpl on the io9_ena cycle and the island latches io_wired_out9 one
+   -- clk1x LATER (see the block comment at nds_top's cdc_io_cpl), i.e. after the
+   -- pop edge - so it used to read the entry AFTER the one it popped.
+   --
+   -- Queue 11 22 33 44 and the ARM9 read back 22 33 44 44. It was invisible with
+   -- a single queued word, because cnt79 is then 0 and the old mux fell through
+   -- to last9, which holds the correct value - so every one-word test passed.
+   -- NitroSDK's PXI handler drains multi-word messages in a loop, so every burst
+   -- silently lost a word. Caught by bootreq subtests 22 and 25.
+   --
+   -- last9 is also the correct answer for a read of an EMPTY fifo: hardware
+   -- returns the last value read (and err9 is set below), which is exactly what
+   -- last9 holds. So this is unconditional rather than a cnt79 test.
+   --
+   -- This does depend on the ARM9 sampling after the pop edge. If that ever
+   -- changes, this line has to change with it.
    wired_out9 <= sync9_rd when (bus9.Adr = ADR_SYNC) else
                  cnt9_rd  when (bus9.Adr = ADR_CNT)  else
-                 fifo79(rd79) when (bus9.Adr = ADR_RECV and cnt79 /= 0) else
-                 last9        when (bus9.Adr = ADR_RECV) else
+                 last9    when (bus9.Adr = ADR_RECV) else
                  (others => '0');
    wired_done9 <= '1' when (bus9.Adr = ADR_SYNC or bus9.Adr = ADR_CNT or bus9.Adr = ADR_RECV) else '0';
 
