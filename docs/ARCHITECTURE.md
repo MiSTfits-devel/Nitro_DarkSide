@@ -48,7 +48,7 @@ is [NDS_HARDWARE.md](NDS_HARDWARE.md); the fit analysis is [MEMORY_MAP.md](MEMOR
 | Wifi | — | stub: IDs + IRQ-silent, per melonDS-minimum |
 | GBA slot | — | phase-2+: absent cart reads (open bus 0xFFFF), EXMEMCNT bits honored |
 | 3D geometry/render | — | **out of scope phase 1**: GXSTAT reads sane-idle, GXFIFO swallows writes w/ correct FIFO counts so 2D games that poke it don't hang |
-| Boot | savestates reset path | **HLE direct-boot**: HPS/loader parses card header, stages ARM9/ARM7 images into SDRAM main RAM (via romcopy-style channel), populates shared-area mailbox (user settings, header copies) per NDS_HARDWARE.md §Boot, sets WRAMCNT=3, releases both CPUs at entry addresses. Firmware boot menu = never |
+| Boot | savestates reset path | **HLE direct-boot**: HPS/loader parses card header, stages ARM9/ARM7 images into SDRAM main RAM (via romcopy-style channel), populates shared-area mailbox (user settings, header copies) per NDS_HARDWARE.md §Boot, sets WRAMCNT=3, releases both CPUs at entry addresses. **"Firmware boot menu = never" no longer holds**: a real firmware boot path exists as of 2026-07-29 (`fw_boot` / bench `FWBOOT=1`) — both retail BIOSes run from their reset vectors, `nds_card` implements the raw + KEY1 boot command sequence, and the ARM7 BIOS matches the melonDS oracle exactly. It is **sim-side only**; `NDS.sv` still hardwires `direct_boot(1'b1)`, and enabling it on hardware costs ~4 s of boot. See HANDOFF.md "Firmware boot". |
 | Video out | `videoout160` + colorshade | rework: 256×192×2 screens → DDR3 framebuffer; layouts (stacked/side-by-side/single+swap via POWCNT.DSEL) |
 | Savestates | trio vendored later | phase-3: NDS state ~5 MB (main RAM in SDRAM must stream through) |
 
