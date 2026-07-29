@@ -83,7 +83,23 @@ Two alternatives, not steps:
 
 Either way `itiming` ends at `ce = '1'`. Do **not** quote the ~3 drops/frame seen at
 `GPUCEDIV=1` as evidence the renderer nearly keeps up — that was measured with the
-display off, so it had nothing to draw.
+display off, so it had nothing to draw. Once Kirby writes DISPCNT the same run
+settles at a steady **+7 drops/frame** (7 of 192 visible lines, 3.6%), still with
+display mode 0.
+
+**The drop counter cannot tell you WHICH engine is behind, and that wants fixing
+before the GPU work.** `nds_top.vhd:1810` is
+
+```vhdl
+dbg_line_drop <= drawline and (line_busy or line_busy_b);
+```
+
+— it ORs engine A and engine B, so a drop is counted when *either* is still busy.
+Both the bench's "~110 dropped lines/frame on an affine scene" and the +7/frame
+above inherit that ambiguity. Engine B is the simpler configuration in Kirby's mode
+(no ext palettes), so if the drops are actually engine A the renderer target is
+different from what a combined number implies. Split it into two exports before
+sizing the work — it is a debug-only signal, so the change is behaviourally inert.
 
 ---
 
