@@ -58,7 +58,13 @@ architecture arch of nds_rtc is
    signal out_pos    : integer range 0 to 6 := 0;
 
    -- device registers
-   signal status1    : std_logic_vector(7 downto 0) := x"02";  -- 24h mode
+   -- 0x82, not 0x02: bit 1 is 24h mode, and bit 7 is the power-off / reset
+   -- detect flag, which a real RTC raises on first power-up and auto-clears
+   -- when status1 is read. The ARM7 BIOS bit-bangs status1 out of 0x04000138
+   -- during firmware boot and branches on bits 7:6 to pick cold boot vs warm
+   -- boot; with bit 7 clear it takes the warm-boot path and the boot diverges
+   -- from the melonDS oracle at ARM7 instruction ~217000 (pc 0x2216).
+   signal status1    : std_logic_vector(7 downto 0) := x"82";  -- 24h + power-off
    signal status2    : std_logic_vector(7 downto 0) := x"00";
    -- DateTime: year, month, day, weekday, hour, minute, second (BCD)
    type t_dt is array (0 to 6) of std_logic_vector(7 downto 0);
@@ -104,7 +110,7 @@ begin
 
             io_reg  <= (others => '0');
             in_bit  <= 0; in_pos <= 0; out_bit <= 0; out_pos <= 0;
-            status1 <= x"02";
+            status1 <= x"82";   -- see the declaration: bit 7 is power-off detect
             status2 <= x"00";
             datetime <= (x"26", x"07", x"18", x"06", x"06", x"00", x"00");
             sec_div <= 0;

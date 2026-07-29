@@ -62,6 +62,13 @@ entity nds_loader is
       reset       : in  std_logic;
       start       : in  std_logic;                     -- one-cycle pulse
       direct      : in  std_logic := '0';              -- synth direct-boot env
+      -- '1' = FIRMWARE BOOT: clear memory and derive the cartridge chip ID, then
+      -- stop. Do NOT stage the ARM9/ARM7 images and do NOT write the direct-boot
+      -- env block - under firmware boot the ARM7 BIOS pulls the firmware over SPI
+      -- and the firmware reads the cartridge itself, exactly as real hardware
+      -- does. nds_card serves the cart from its own channel either way, so the
+      -- images do not need to be in main RAM first.
+      fw_boot     : in  std_logic := '0';
       busy        : out std_logic := '0';
       done        : out std_logic := '0';              -- level, stays high
       load_error  : out std_logic := '0';
@@ -295,7 +302,20 @@ begin
                      if (hdr_i = 8) then
                         env_size <= unsigned(card_rdata);
                         cpu_sel  <= 0;
-                        state    <= NEXT_CPU;
+                        if (fw_boot = '1') then
+                           -- firmware boot: skip the staging copies entirely. The
+                           -- header is still read because CARTID_CALC needs the
+                           -- used-ROM-size word, and nds_card must answer B8 with a
+                           -- chip ID consistent with the image.
+                           -- CARTID_CALC rounds cart_p up to a power of two until
+                           -- it reaches env_size, so it must start at 512 exactly
+                           -- as the normal path sets it.
+                           cart_p    <= to_unsigned(512, cart_p'length);
+                           cart_iter <= 9;
+                           state     <= CARTID_CALC;
+                        else
+                           state <= NEXT_CPU;
+                        end if;
                      else
                         hdr(hdr_i) <= card_rdata;
                         hdr_i      <= hdr_i + 1;
@@ -399,7 +419,13 @@ begin
                      else
                         cartid <= x"000100C2"; -- melonDS small-ROM encoding
                      end if;
-                     if (direct = '1') then
+                     if (fw_boot = '1') then
+                        -- firmware boot: nothing more to do. The chip ID above is
+                        -- still needed so nds_card answers B8 correctly.
+                        busy  <= '0';
+                        done  <= '1';
+                        state <= FINISHED;
+                     elsif (direct = '1') then
                         state <= ENV_SET;
                      else
                         -- busy stays high: nds_top only muxes this port onto

@@ -26,6 +26,7 @@
 #include "NDSCart.h"
 #include "ARM.h"
 #include "GPU.h"
+#include "SPI_Firmware.h"
 
 // tracer.patch globals in ARM.cpp
 namespace melonDS
@@ -44,10 +45,12 @@ int main(int argc, char** argv)
 {
     int argbase = 1;
     bool direct = false;
+    bool fwboot = false;
     if (argc > 1 && strcmp(argv[1], "--direct") == 0) { direct = true; argbase = 2; }
+    else if (argc > 1 && strcmp(argv[1], "--fw") == 0) { fwboot = true; argbase = 2; }
     if (argc < argbase + 3)
     {
-        fprintf(stderr, "usage: %s [--direct] <image.nds> <dump.txt> <frames> [dump_b.txt]\n", argv[0]);
+        fprintf(stderr, "usage: %s [--direct|--fw] <image.nds> <dump.txt> <frames> [dump_b.txt]\n", argv[0]);
         return 2;
     }
     const char* ndspath  = argv[argbase];
@@ -95,7 +98,55 @@ int main(int argc, char** argv)
     if (!loadBIOS("BIOS7", nds.GetARM7BIOS(), [&](const auto& v) { nds.SetARM7BIOS(v); })) return 1;
     nds.Reset();
 
-    if (direct)
+    // --fw: real firmware boot. No SetupDirectBoot, no section copy - both
+    // BIOSes run from their reset vectors and the firmware boots the cart
+    // itself, exactly like the RTL's FWBOOT=1. This is the oracle for that
+    // path: without it there is no way to tell "the ARM7 BIOS is grinding
+    // through a boot stage" from "the ARM7 BIOS took an error branch",
+    // because both look like a busy CPU that never reaches the game.
+    // FIRMWARE=<path> must be a real dump; melonDS's generated default
+    // firmware has no boot code and cannot boot a cart at all.
+    if (fwboot)
+    {
+        const char* fwpath = getenv("FIRMWARE");
+        if (!fwpath)
+        {
+            fprintf(stderr, "--fw needs FIRMWARE=<firmware.bin>\n");
+            return 1;
+        }
+        FILE* ff = fopen(fwpath, "rb");
+        if (!ff) { fprintf(stderr, "cannot open FIRMWARE=%s\n", fwpath); return 1; }
+        fseek(ff, 0, SEEK_END);
+        long fwlen = ftell(ff);
+        fseek(ff, 0, SEEK_SET);
+        u8* fwbuf = new u8[fwlen];
+        if (fread(fwbuf, 1, fwlen, ff) != (size_t)fwlen)
+        {
+            fprintf(stderr, "short read on %s\n", fwpath);
+            return 1;
+        }
+        fclose(ff);
+        Firmware fw(fwbuf, (u32)fwlen);
+        if (!fw.Buffer())
+        {
+            fprintf(stderr, "%s is not a valid firmware image\n", fwpath);
+            return 1;
+        }
+        printf("firmware: %ld bytes, usersettings at 0x%X\n", fwlen, fw.GetUserDataOffset());
+        nds.SetFirmware(std::move(fw));
+        delete[] fwbuf;
+
+        auto cart = NDSCart::ParseROM(img, (u32)len);
+        if (!cart)
+        {
+            fprintf(stderr, "ParseROM failed\n");
+            return 1;
+        }
+        nds.SetNDSCart(std::move(cart));
+        nds.Reset();
+        nds.Start();
+    }
+    else if (direct)
     {
         auto cart = NDSCart::ParseROM(img, (u32)len);
         if (!cart)
