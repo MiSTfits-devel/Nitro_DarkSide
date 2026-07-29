@@ -88,19 +88,23 @@ display off, so it had nothing to draw. Once Kirby writes DISPCNT the same run
 settles at a steady **+7 drops/frame** (7 of 192 visible lines, 3.6%), still with
 display mode 0.
 
-**The drop counter cannot tell you WHICH engine is behind, and that wants fixing
-before the GPU work.** `nds_top.vhd:1810` is
+**The drop counter is now split per engine** (`dbg_line_drop_a` / `dbg_line_drop_b`,
+2026-07-29). The combined `drawline and (line_busy or line_busy_b)` export remains
+for callers that only want "a line was dropped at all", but it ORs both engines, so
+every number predating the split — the bench's "~110 dropped lines/frame on an
+affine scene" and the +7/frame above — is ambiguous about which engine is behind.
+Engine B runs the simpler configuration in Kirby's mode (no ext palettes), so
+attributing drops to the wrong engine sizes the renderer target wrong. The bench's
+per-frame report now reads `drops so far N (A x / B y)`; **re-measure with a ROM
+that actually renders before sizing the GPU work** — Kirby's direct boot never turns
+its display on, so use `sim/tests/nds_2dk.hex`, which reaches
+`DISPCNT_A=80211810 / DISPCNT_B=00211810` (both engines, mode 1).
 
-```vhdl
-dbg_line_drop <= drawline and (line_busy or line_busy_b);
-```
-
-— it ORs engine A and engine B, so a drop is counted when *either* is still busy.
-Both the bench's "~110 dropped lines/frame on an affine scene" and the +7/frame
-above inherit that ambiguity. Engine B is the simpler configuration in Kirby's mode
-(no ext palettes), so if the drops are actually engine A the renderer target is
-different from what a combined number implies. Split it into two exports before
-sizing the work — it is a debug-only signal, so the change is behaviourally inert.
+One measurement to be careful with: across the 337-frame direct-boot run the drop
+rate was dead constant at **6.93/frame with the display OFF**. A constant rate with
+nothing to draw means that counter is measuring the line server losing races
+regardless of content, so it is not by itself evidence of a content-dependent
+renderer overload.
 
 ---
 
