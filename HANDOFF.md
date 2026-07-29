@@ -135,30 +135,48 @@ compute.
 
 Two remaining options, both about gpu2d throughput rather than memory:
 
-1. **Move the render fabric to `clkMem`** — attempted 2026-07-29 as
-   `rtl/nds_gpu2d_fast.vhd` (`GPU_FAST` generic, default 0 = inert). **Does not
-   work yet, and the naive form cannot.** Two findings, both worth having:
+1. **Move the render fabric to `clkMem`** — built as `rtl/nds_gpu2d_fast.vhd`
+   (`GPU_FAST` generic, default 0 = inert pass-through; `nds_gpu2d` itself is not
+   modified). **Working, and a 31% gain — but not enough on its own.** Measured on
+   a clean steady-state frame, `nds_2dk.hex`, both engines, `GPUCEDIV=1`:
 
-   - **Only the compute scales.** "5,829 fits 6,390 with 9% margin" is WRONG:
-     `nds_vram` stays on clk1x, so the 509-cycle VRAM-wait component costs the
-     same wall-clock time regardless. 5,320 compute + 1,528 (509 x 3) = 6,848,
-     already 7% over — plus this adapter's per-request latency, ~24% over.
-   - **But that is not the current failure.** Measured with `GPU_FAST=1`:
-     `ops=20480` (vs 71,316), `blocked%=3`, `renders=0`, frames 2 and 3
-     **bit-identical**. Only 3% blocked means it is barely waiting on memory, so
-     this is a **functional stall in the adaptation**, not a timing overrun.
+   | per rendered line | baseline | `GPU_FAST=1` | budget |
+   |---|---|---|---|
+   | clk1x cycles | 5,829 | **3,996** | 2,130 |
+   | over budget | 174% | **88%** | |
+   | lines rendered / 192 | 66 | **94** | |
+   | VRAM-blocked, share of frame | 12% | **84%** | |
 
-   The fix for both is the same: move `nds_vram`'s **renderer read channels** to
-   clkMem as well, so the service rate scales and `srv_*` stops crossing domains
-   at all (deleting the req-republish hazard). Estimated ~5,320 + ~500 of 6,390 —
-   **to be measured, not trusted.**
+   **The bottleneck inverted.** Baseline was compute-bound (12% blocked); this is
+   memory-bound (84% blocked). The gain is far short of 3x for exactly one reason:
+   **only the compute scales.** `nds_vram` stays on clk1x, so its service costs the
+   same wall-clock time however fast the renderer runs. An earlier version of this
+   section claimed "5,829 fits 6,390 with 9% margin" by scaling the whole figure —
+   that was wrong, and 5,320 + 509x3 = 6,848 was already over before adapter
+   latency.
 
-   Useful for whoever continues: `clkMem` is an exact 3x of clk1x from the same
-   VCO and phase-locked, so this is synchronous multi-rate, NOT async CDC. Three
-   rules cover the surface (see the file header). One is load-bearing:
-   `eProcReg_gba`'s write path is fully combinational on `proc_bus.ena`, so a
-   clk1x pulse is three clkMem cycles wide and writes every register three times
-   unless edge-detected.
+   So **the next step is option 3 below, and it is now measured rather than
+   guessed**: with 84% of the time spent waiting on memory, nothing else can
+   matter. Caveat on that 84%: `blocked%` counts any cycle with a request
+   asserted, including the ext-palette refill during vblank, so it is not cleanly
+   per-line. The direction is unambiguous; the exact split is not.
+
+   Two adaptation traps, both of which cost a run (details in the file header):
+   `eProcReg_gba`'s write path is **combinational on `proc_bus.ena`**, so a clk1x
+   pulse is three clkMem cycles wide and writes every register three times unless
+   edge-detected. And **`nds_gpu2d` drives `srv_*_req` as a one-cycle PULSE**
+   despite `nds_vram` documenting a held level — it is safe at clk1x only because
+   `nds_vram` latches into `rpend`. Sampling that pulse at `clkMemIndex=2` misses
+   it two times in three; it must be captured and held until done.
+
+3. **Move `nds_vram`'s renderer read channels to clkMem too** — the measured next
+   step. Makes the service rate scale AND removes every `srv_*` domain crossing,
+   which deletes the whole class of handshake bug the adapter needed. Rough
+   projection from the 84%: a line would land near ~1,760-1,880 cycles, under the
+   2,130 budget — **an estimate, to be measured with `VRAMOPS=1`, not trusted.**
+   Note `nds_vram` also serves the CPU on clk1x, so its BRAMs need
+   independent-clock dual-port (M10K supports it).
+
 2. **Make the drawer/merge chain 3x cheaper per dot.** Same number from the other
    side, no clock work, but a gpu2d rewrite — and now the measurement says that is
    where the time actually is.
