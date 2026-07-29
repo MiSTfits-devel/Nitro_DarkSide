@@ -5,8 +5,9 @@
 -- only anyway), converts the pixel coordinates to plain vectors, and exposes
 -- everything else 1:1 as std_logic/std_logic_vector.
 --
--- No logic lives here. All generics keep their nds_top defaults
--- (is_simu='0', main RAM at SDRAM byte offset 8 MB, GPU_CE_DIV=3).
+-- No logic lives here. Generics keep their nds_top defaults (is_simu='0', main
+-- RAM at SDRAM byte offset 8 MB, GPU_CE_DIV=3) EXCEPT GPU_FAST, which is set to
+-- 1 here so hardware renders on clkMem - see the generic map below.
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -22,6 +23,11 @@ entity nds_port_wrap is
       reset            : in  std_logic;
       nds_on           : in  std_logic;
       direct_boot      : in  std_logic;
+      -- '1' = boot the real firmware from the retail BIOSes' reset vectors
+      -- instead of HLE direct boot. See the header note on ARCHITECTURE.md.
+      fw_boot          : in  std_logic;
+      -- '1' = dot cadence 1-of-1 (real frame rate, some scanlines dropped)
+      gpu_full_pace    : in  std_logic;
 
       -- keys (active high)
       KeyA             : in  std_logic;
@@ -97,6 +103,7 @@ entity nds_port_wrap is
       vrsrv_addr       : out std_logic_vector(14 downto 0);
       vrsrv_dout       : in  std_logic_vector(31 downto 0);
       vrsrv_done       : in  std_logic;
+      vrsrv_ready      : in  std_logic := '1';
 
       -- video out, per-screen pixel writes, BGR666 (B in [17:12])
       pixel_out_x      : out std_logic_vector(7 downto 0);
@@ -152,6 +159,11 @@ begin
    vrsrv_addr   <= std_logic_vector(vrsrv_addr_u);
 
    inds : entity work.nds_top
+   -- GPU_FAST=1: both 2D engines render on clkMem (100.5 MHz) instead of clk1x.
+   -- Verified transparent in sim - fbdiff reported 0 partial-row differences at
+   -- GPUCEDIV=3 - and it takes a rendered line from 5,829 to 3,996 clk1x cycles.
+   -- All other generics keep their nds_top defaults.
+   generic map ( GPU_FAST => 1 )
    port map
    (
       clk1x            => clk1x,
@@ -161,6 +173,8 @@ begin
       reset            => reset,
       nds_on           => nds_on,
       direct_boot      => direct_boot,
+      fw_boot          => fw_boot,
+      gpu_full_pace    => gpu_full_pace,
 
       KeyA             => KeyA,
       KeyB             => KeyB,
@@ -228,6 +242,7 @@ begin
       vrsrv_addr       => vrsrv_addr_u,
       vrsrv_dout       => vrsrv_dout,
       vrsrv_done       => vrsrv_done,
+      vrsrv_ready      => vrsrv_ready,
 
       pixel_out_x      => pix_x_i,
       pixel_out_y      => pix_y_i,
