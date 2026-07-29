@@ -320,6 +320,30 @@ begin
                o_bgep_addr  <= i_bgep_addr;
                o_objep_addr <= i_objep_addr;
             end if;
+            -- Drop the outbound request the moment its done arrives, NOT at the
+            -- next clkMemIndex=2. This is the "hold req low for at least one
+            -- clk1x period between requests" discipline, and leaving it out is
+            -- what broke the first attempt.
+            --
+            -- gpu2d deasserts its req on the done cycle, but o_*_req only tracks
+            -- that up to three clkMem cycles later, so req stayed high for a
+            -- whole further clk1x period AFTER service. nds_vram reads a still-
+            -- high req as a NEW request and re-dispatches - its own rpend comment
+            -- says "back-to-back requests keep req high across done and DO
+            -- relatch the cycle after, which is the correct new-request case".
+            -- The spurious second done then desynchronises gpu2d's internal
+            -- drawer-request arbiter and it never issues another BG or OBJ read.
+            --
+            -- Diagnosed from the op count: GPU_FAST=1 reported exactly 20480 VRAM
+            -- ops per frame, which is precisely the ext-palette shadow refill for
+            -- both engines (8192 BG + 2048 OBJ words each). Zero drawer traffic.
+            -- The epfill channels survived because they stream requests with req
+            -- continuously high, where a re-dispatch IS the intended behaviour;
+            -- the drawer channels issue isolated requests, where it is corruption.
+            if (srv_bg_done    = '1') then o_bg_req    <= '0'; end if;
+            if (srv_obj_done   = '1') then o_obj_req   <= '0'; end if;
+            if (srv_bgep_done  = '1') then o_bgep_req  <= '0'; end if;
+            if (srv_objep_done = '1') then o_objep_req <= '0'; end if;
          end if;
       end process;
 
