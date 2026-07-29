@@ -18,10 +18,27 @@
 --   0x040001B0+ KEY2 seeds (write-only stubs)
 --   0x04100010  read data port (pop: advances the transfer)
 --
--- Commands implemented (direct boot leaves the cart in encrypted-data mode,
--- CmdEncMode=2, so only these are ever issued): B7 block read (contiguous
--- from the image; reads below 0x8000 redirect to 0x8000+(addr&0x1FF) like
--- real carts protect the secure area), B8 chip ID. Anything else returns FF.
+-- Commands implemented, by CmdEncMode. Direct boot hands the cart over already
+-- in main data mode, so it only ever issues the last two; a firmware boot walks
+-- the whole sequence from power-up (measured with sim/melonds_tracer --fw):
+--
+--   mode 0, raw:   9F dummy (FF fill), 00 header read from image byte 0,
+--                  90 chip ID, 3C activate KEY1 -> mode 1
+--   mode 1, KEY1:  command bytes are Blowfish-encrypted with a key schedule
+--                  that lives in the ARM7 BIOS and this model does NOT decrypt
+--                  them. They are decoded by block size plus a counter instead,
+--                  which is sound only because the ARM7 BIOS issues one fixed
+--                  sequence: 4x KEY2-data-mode (0 words), 1x chip ID (1 word),
+--                  four 2x secure-area blocks (1024 words each, at 0x6000,
+--                  0x7000, 0x5000 then 0x4000 - the BIOS reads them OUT OF
+--                  ORDER), Ax enter main data mode -> mode 2.
+--   mode 2, main:  B7 block read (contiguous from the image; reads below 0x8000
+--                  redirect to 0x8000+(addr&0x1FF) like real carts protect the
+--                  secure area), B8 chip ID.
+--
+-- Anything else returns FF. KEY2 is deliberately not implemented: it is applied
+-- and removed in cart/console hardware and is transparent to software, which is
+-- why melonDS ignores it too (NDSCart.cpp serves 2x blocks straight from ROM).
 -- Chip ID is Macronix NTR MROM with the capacity byte derived from the staged
 -- image's header: the chipid input comes straight from nds_loader's cart_id,
 -- so B8 answers exactly what the direct-boot env block at 0x02FFF800 says.
@@ -52,6 +69,12 @@ entity nds_card is
       reset        : in  std_logic;
 
       card7        : in  std_logic;    -- EXMEMCNT[11]: '1' = ARM7 owns the slot
+
+      -- '1' = firmware boot: the cart powers up in raw command mode and the
+      -- ARM7 BIOS walks it through 3C/KEY1 into main data mode itself. Direct
+      -- boot instead hands over with the cart already in main data mode, so it
+      -- must power up there or B7 is answered as an unknown raw command.
+      fw_boot      : in  std_logic := '0';
 
       chipid       : in  std_logic_vector(31 downto 0);  -- nds_loader cart_id, B8 answer
 
@@ -106,9 +129,26 @@ architecture arch of nds_card is
    signal xferlen    : unsigned(12 downto 0) := (others => '0'); -- words, max 4096
    signal xferpos    : unsigned(12 downto 0) := (others => '0');
    signal delay_cnt  : unsigned(19 downto 0) := (others => '0');
-   signal cmd_b7     : std_logic := '0';
-   signal cmd_b8     : std_logic := '0';
+   signal cmd_b7     : std_logic := '0';   -- serve words from the card image
+   signal cmd_b8     : std_logic := '0';   -- serve the chip ID
+   signal cmd_redir  : std_logic := '0';   -- apply the <0x8000 secure-area redirect
    signal b7_addr    : unsigned(31 downto 0) := (others => '0'); -- byte address of next word
+
+   -- Command-encryption mode, GBATEK's CmdEncMode: 0 = raw, 1 = KEY1, 2 = main
+   -- (KEY2) data mode. Direct boot hands over with the cart already in mode 2,
+   -- which is why only B7/B8 existed here; a firmware boot starts in mode 0 and
+   -- walks the whole sequence, so fw_boot picks the power-up mode.
+   signal cmd_mode   : unsigned(1 downto 0) := "10";
+   -- Which secure-area block the next KEY1 2x command is for. In KEY1 mode the
+   -- command bytes are Blowfish-encrypted with a key schedule that lives in the
+   -- ARM7 BIOS, and this model cannot decrypt them - so KEY1 commands are
+   -- decoded by their block SIZE plus this counter instead. That works only
+   -- because the ARM7 BIOS issues one fixed sequence; the block addresses below
+   -- are MEASURED from the melonDS oracle (sim/melonds_tracer --fw, KEY1DEC
+   -- log), not assumed, because the BIOS reads them OUT OF ORDER:
+   -- 0x6000, 0x7000, 0x5000, 0x4000. Assuming 0x4000 upward silently scrambles
+   -- the secure area.
+   signal sec_cnt    : unsigned(2 downto 0) := (others => '0');
 
    signal romctrl_rd : std_logic_vector(31 downto 0);
    signal own9, own7 : std_logic;
@@ -221,6 +261,13 @@ begin
             word_ready <= '0';
             pop_req    <= '0';
             state      <= IDLE;
+            -- raw for a firmware boot, main data mode for a direct boot
+            if (fw_boot = '1') then
+               cmd_mode <= "00";
+            else
+               cmd_mode <= "10";
+            end if;
+            sec_cnt     <= (others => '0');
             spi_data    <= (others => '0');
             spi_hold    <= '0';
             spi_pos     <= (others => '0');
@@ -381,17 +428,64 @@ begin
                busy    <= '1';
                word_ready <= '0';
 
-               cmd_b7 <= '0';
-               cmd_b8 <= '0';
-               if (cmdbytes(63 downto 56) = x"B7") then
-                  cmd_b7 <= '1';
-               elsif (cmdbytes(63 downto 56) = x"B8") then
-                  cmd_b8 <= '1';
-               end if;
-               b7_addr <= unsigned(cmdbytes(55 downto 24));  -- cmd[1..4] big-endian address
+               cmd_b7    <= '0';
+               cmd_b8    <= '0';
+               cmd_redir <= '0';
+               b7_addr   <= unsigned(cmdbytes(55 downto 24));  -- cmd[1..4] big-endian address
+
+               case to_integer(cmd_mode) is
+
+                  when 0 =>      -- raw commands, plaintext
+                     case cmdbytes(63 downto 56) is
+                        when x"9F" =>
+                           null;                        -- dummy read: FF fill
+                        when x"00" =>
+                           cmd_b7  <= '1';              -- header, from image byte 0
+                           b7_addr <= (others => '0');
+                        when x"90" =>
+                           cmd_b8 <= '1';               -- chip ID
+                        when x"3C" =>
+                           cmd_mode <= "01";            -- activate KEY1
+                           sec_cnt  <= (others => '0');
+                        when others =>
+                           null;
+                     end case;
+
+                  when 1 =>      -- KEY1: encrypted, decoded by size + sec_cnt
+                     if (v_len = 0) then
+                        if (sec_cnt = 0) then
+                           null;                        -- 4x: KEY2 data mode
+                        else
+                           cmd_mode <= "10";            -- Ax: enter main data mode
+                        end if;
+                     elsif (v_len = 1) then
+                        cmd_b8 <= '1';                  -- 1x: chip ID, 4 bytes
+                     else
+                        cmd_b7 <= '1';                  -- 2x: 4 KB secure-area block
+                        case to_integer(sec_cnt) is
+                           when 0      => b7_addr <= x"00006000";
+                           when 1      => b7_addr <= x"00007000";
+                           when 2      => b7_addr <= x"00005000";
+                           when others => b7_addr <= x"00004000";
+                        end case;
+                        if (sec_cnt /= 7) then
+                           sec_cnt <= sec_cnt + 1;
+                        end if;
+                     end if;
+
+                  when others => -- main (KEY2) data mode
+                     if (cmdbytes(63 downto 56) = x"B7") then
+                        cmd_b7    <= '1';
+                        cmd_redir <= '1';
+                     elsif (cmdbytes(63 downto 56) = x"B8") then
+                        cmd_b8 <= '1';
+                     end if;
+
+               end case;
 
                -- synthesis translate_off
-               report "CARD: cmd=" & to_hstring(cmdbytes(63 downto 56)) &
+               report "CARD: mode=" & integer'image(to_integer(cmd_mode)) &
+                      " cmd=" & to_hstring(cmdbytes(63 downto 56)) &
                       " addr=" & to_hstring(cmdbytes(55 downto 24)) &
                       " words=" & integer'image(to_integer(v_len));
                -- synthesis translate_on
@@ -427,7 +521,12 @@ begin
                      if (cmd_b7 = '1') then
                         -- secure-area redirect, then fetch from the image
                         v_eff := b7_addr;
-                        if (v_eff < 16#8000#) then
+                        -- Only B7 in main data mode gets the secure-area
+                        -- redirect. The raw header read and the KEY1 2x block
+                        -- reads must reach 0x0000 and 0x4000..0x7FFF for real,
+                        -- or a firmware boot gets the header and the secure
+                        -- area it is about to verify folded onto 0x8000.
+                        if (cmd_redir = '1' and v_eff < 16#8000#) then
                            v_eff := to_unsigned(16#8000#, 32) + (v_eff and to_unsigned(16#1FF#, 32));
                         end if;
                         card_ena  <= '1';
@@ -481,7 +580,12 @@ begin
                   else
                      if (cmd_b7 = '1') then
                         v_eff := b7_addr;
-                        if (v_eff < 16#8000#) then
+                        -- Only B7 in main data mode gets the secure-area
+                        -- redirect. The raw header read and the KEY1 2x block
+                        -- reads must reach 0x0000 and 0x4000..0x7FFF for real,
+                        -- or a firmware boot gets the header and the secure
+                        -- area it is about to verify folded onto 0x8000.
+                        if (cmd_redir = '1' and v_eff < 16#8000#) then
                            v_eff := to_unsigned(16#8000#, 32) + (v_eff and to_unsigned(16#1FF#, 32));
                         end if;
                         card_ena  <= '1';
