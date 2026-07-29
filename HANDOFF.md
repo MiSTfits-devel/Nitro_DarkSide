@@ -72,48 +72,52 @@ at full clk1x throughout, so slowing the timing unit is what *buys* it 18 clk1x
 cycles per dot instead of 6. This is a deliberate placeholder, not a
 misconfiguration, and **the real deficiency is renderer throughput**.
 
-### Why the renderer needs 18 cycles/dot: the VRAM arbiter is deliberately serial
+### MEASURED: the renderer is compute-bound in gpu2d, NOT VRAM-bound
 
 Measured 2026-07-29 with `sim/tests/nds_2dk.hex` (both engines rendering, mode 1,
-`GPUCEDIV=1`): **126 dropped lines in a steady frame against 192 visible — 66%** —
-and the per-engine split reads **A 361 / B 361, exactly equal**, i.e. every single
-drop has *both* engines still busy. They are behind in lockstep, not one lagging.
+`GPUCEDIV=1`, `VRAMOPS=1`), on clean steady-state frames of exactly 560,190 cycles:
 
-That points at a shared resource, and `nds_vram.vhd:30-35` names it:
+| | value |
+|---|---|
+| dropped lines / frame | **126 of 192 visible — 66%** |
+| per-engine drops | **A 361 / B 361 — exactly equal** |
+| renderer VRAM ops / line | **271** (= 1.06 ops per dot) |
+| renderer blocked on VRAM | **12% of the frame** (A 6% / B 5%) |
 
-> Channels are arbitrated round-robin, **one op in flight**… v1 is
-> correctness-first (**one op at a time, ~4 cycles/op**); the per-line
-> prefetch/parallelism pass is deferred to the hardware bring-up milestone.
+**The VRAM arbiter is not the bottleneck.** The renderer is waiting on VRAM 12% of
+the time and still cannot finish 2 lines in 3, so ~88% of its time goes somewhere
+inside `nds_gpu2d` — the drawers and the merge. A and B also barely contend: 6% + 5%
+≈ the combined 12%, so they rarely block simultaneously.
 
-Both engines' BG, OBJ and palette fetches serialise through that one server. The
-arithmetic closes: a tiled BG + OBJ line needs roughly 4-5 VRAM ops per dot across
-both engines, and 4-5 ops x ~4 cycles/op ≈ **18 cycles/dot** — exactly the figure
-`GPU_CE_DIV` is buying by stretching the line 3x. So the renderer deficiency is very
-likely **not** the pixel pipelines; it is the deferred parallelism pass in the VRAM
-arbiter. 66% ≈ 2/3 is also just what a 3x shortfall predicts.
+Their drop counts being *exactly* equal is therefore not shared-resource contention.
+Both engines get the same `drawline` and both overrun the same per-line budget every
+time, so every drop trips both flags. It says the deficit is systematic and affects
+both engines alike, not that one is starving the other.
 
-Three options, not steps. **Option 3 was not on this list before and is probably the
-cheapest:**
+**This corrects a wrong hypothesis recorded here earlier in the same session.** It
+said the serial arbiter (`nds_vram`: "one op in flight… ~4 cycles/op", parallelism
+pass deferred) was probably the cause, using "~4-5 VRAM ops per dot" to make the
+arithmetic reach 18 cycles/dot. The real figure is **1.06 ops/dot** — the estimate
+was ~6x too high, and it had been reverse-engineered from the number it needed to
+produce. Do not resurrect it: the arbiter has ~88% headroom, so making it parallel
+buys almost nothing.
+
+Where to look instead: `nds_gpu2d` and `nds_drawer_*`. 2,130 clk1x cycles per line
+over 256 dots is **8.3 cycles/dot** available, and the renderer needs ~3x that. The
+question to answer next is how many cycles the drawer/merge chain spends per pixel
+and whether it is an FSM stepping one pixel at a time (pipelineable) or genuinely
+that much work. `dbg_line_busy` per line against 2,130 is the measurement.
+
+Two remaining options, both about gpu2d throughput rather than memory:
 
 1. **Move the render fabric to `clkMem`** (the documented intent: fabric 100.5 MHz,
-   dots 33.5). At 3x clk1x it gets the 18 cycles/dot it needs while `itiming` runs
-   at full rate. clkMem is an exact 3x, phase-locked, `clkMemIndex` already plumbed
-   — an **integer-ratio related clock**, the friendly case. Work is CDC to the
-   clk1x IO/VRAM/framebuffer interfaces. Note this does not remove the
-   serialisation, it just runs it 3x faster.
-2. **Make the line server 3x cheaper per dot.** Same number from the other side, no
-   clock work, but a gpu2d rewrite.
-3. **Do the deferred VRAM parallelism pass**: more than one op in flight, and/or
-   separate ports per engine so A and B stop queueing behind each other, and/or the
-   per-line prefetch the file already contemplates. E..I hits are BRAM port-B reads
-   and A..D go through `rsrv_*`, so there is real port capacity to exploit. This
-   attacks the measured cause directly, needs no clock-domain work, and the two
-   engines already have separate `srv_*` channel sets (`r_*` vs `rb_*`) — they only
-   converge at the arbiter.
-
-**Verify before committing to any of them**: instrument ops/dot and arbiter
-occupancy for one rendered line. The 4-5 ops/dot above is an estimate that makes the
-arithmetic work, not a measurement.
+   dots 33.5). At 3x clk1x it gets the cycles it needs while `itiming` runs at full
+   rate. clkMem is an exact 3x, phase-locked, `clkMemIndex` already plumbed — an
+   **integer-ratio related clock**, the friendly case. Work is CDC to the clk1x
+   IO/VRAM/framebuffer interfaces. Buys 3x without understanding the pipeline.
+2. **Make the drawer/merge chain 3x cheaper per dot.** Same number from the other
+   side, no clock work, but a gpu2d rewrite — and now the measurement says that is
+   where the time actually is.
 
 Either way `itiming` ends at `ce = '1'`. Do **not** quote the ~3 drops/frame seen at
 `GPUCEDIV=1` as evidence the renderer nearly keeps up — that was measured with the
