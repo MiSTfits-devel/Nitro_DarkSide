@@ -11,6 +11,7 @@ set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) "nds_drawe
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) "nds_drawer_obj.vhd"]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) "nds_drawer_merge.vhd"]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) "nds_gpu2d.vhd"]
+set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) "nds_gpu2d_fast.vhd"]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) "nds_gpu_timing.vhd"]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) "nds_dma9.vhd"]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) "nds_bios7.vhd"]

@@ -52,6 +52,10 @@ entity nds_top is
       is_simu                  : std_logic := '0';
       Softmap_NDS_MAINRAM_ADDR : integer   := 8388608; -- byte offset of the 4 MB window in SDRAM
       GPU_CE_DIV               : integer   := 3;       -- render-fabric clocks per dot
+      -- 1 = run both 2D engines on clkMem (3x clk1x) instead of clk1x, giving
+      -- the renderer 6390 cycles per scanline instead of 2130. A rendered line
+      -- measures 5829 cycles, so it only fits the former. See nds_gpu2d_fast.
+      GPU_FAST                 : integer   := 0;
       -- simulation only: the testbench has staged the ARM9/ARM7 main-RAM sections
       -- itself, so nds_loader may skip copying them (see nds_loader.skip_copy)
       skip_copy                : std_logic := '0'
@@ -1771,11 +1775,11 @@ begin
    r_bgep_addr  <= to_unsigned(g_bgep_addr, 13);
    r_objep_addr <= to_unsigned(g_objep_addr, 11);
 
-   igpu2d_a : entity work.nds_gpu2d
-   generic map ( is_simu => is_simu )
+   igpu2d_a : entity work.nds_gpu2d_fast
+   generic map ( is_simu => is_simu, GPU_FAST => GPU_FAST )
    port map
    (
-      clk => clk1x, reset => resetCpu,
+      clk1x => clk1x, clkMem => clkMem, clkMemIndex => clkMemIndex, reset => resetCpu,
       gb_bus => io_bus9, wired_out => g2d_wired_out, wired_done => g2d_wired_done,
       linecounter => linecounter, drawline => drawline,
       linecounter_obj => linecounter_obj, drawObj => drawObj,
@@ -1824,11 +1828,11 @@ begin
    rb_bgep_addr  <= to_unsigned(gb_bgep_addr, 13);
    rb_objep_addr <= to_unsigned(gb_objep_addr, 11);
 
-   igpu2d_b : entity work.nds_gpu2d
-   generic map ( is_engine_b => '1', is_simu => is_simu )
+   igpu2d_b : entity work.nds_gpu2d_fast
+   generic map ( is_engine_b => '1', is_simu => is_simu, GPU_FAST => GPU_FAST )
    port map
    (
-      clk => clk1x, reset => resetCpu,
+      clk1x => clk1x, clkMem => clkMem, clkMemIndex => clkMemIndex, reset => resetCpu,
       gb_bus => io_bus9b, wired_out => g2db_wired_out, wired_done => g2db_wired_done,
       linecounter => linecounter, drawline => drawline,
       linecounter_obj => linecounter_obj, drawObj => drawObj,
