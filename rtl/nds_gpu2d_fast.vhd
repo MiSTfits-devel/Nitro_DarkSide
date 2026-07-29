@@ -72,12 +72,15 @@
 --     is fully combinational on proc_bus.ena, so a three-cycle-wide ena writes
 --     the register three times. Idempotent for a plain register, wrong for any
 --     register with a write side effect.
---  3. OUTBOUND signals must be stable across a whole clk1x period, so they are
---     re-registered on the clkMem cycle that ends one (clkMemIndex = 2). For
---     srv_*_req this also enforces the gap nds_vram needs between back-to-back
---     requests: without it a clkMem-rate deassert/reassert inside one clk1x
---     period is invisible to the arbiter, which then re-dispatches a stale
---     address - the exact hazard nds_vram.vhd's rpend comment describes.
+--  3. OUTBOUND PULSES must be CAPTURED, not sampled. gpu2d emits srv_*_req as a
+--     one-cycle pulse (nds_gpu2d clears it every cycle and sets it only in
+--     ARB_IDLE), which is safe at clk1x only because nds_vram latches it into
+--     rpend. Sampling such a pulse at clkMemIndex=2 misses it two times in
+--     three. Capture it on any clkMem cycle and hold until done - holding until
+--     done is nds_vram's documented protocol, and its rpend guard stops it
+--     re-latching the request already being served.
+--     Outbound LEVELS (line_busy, epfill_busy, clr_busy, wired_*) need nothing:
+--     clk1x samples them at its own edge, at most one clk1x period late.
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -307,43 +310,57 @@ begin
       -- Republish the request level only on the clkMem cycle that ends a clk1x
       -- period, so nds_vram always sees a full clk1x period of a stable value
       -- and any clkMem-rate deassert/reassert cannot hide a request boundary.
+      -- gpu2d drives srv_*_req as a ONE-CYCLE PULSE, not a held level:
+      -- nds_gpu2d.vhd's arbiter does `srv_bg_req <= '0'` at the top of every
+      -- cycle and only sets it in ARB_IDLE. At clk1x that is fine because
+      -- nds_vram latches the pulse into rpend - "requests landing while the FSM
+      -- serves another channel are latched in rpend" - so the producer never had
+      -- to hold it.
+      --
+      -- So this must CAPTURE the pulse, not sample it. The first version sampled
+      -- the level at clkMemIndex=2 and therefore missed a one-cycle pulse two
+      -- times in three; the very first BG request was lost, gpu2d sat in ARB_WAIT
+      -- forever, and the whole renderer stalled with ops=0. That was my error
+      -- twice over: I read nds_vram's documented EXPECTATION ("hold req with
+      -- stable addr until done") and assumed the producer complied, then wrote
+      -- that assumption into this file's header as if it were verified.
+      --
+      -- Capture on any clkMem cycle, hold until done. Holding until done IS
+      -- nds_vram's documented protocol, so one dispatch per request; and its
+      -- rpend guard already prevents re-latching the request being served.
+      -- The set is placed after the clear so that a done arriving in the same
+      -- cycle as the next request still leaves the new request pending.
       p_out : process (clkMem)
       begin
          if rising_edge(clkMem) then
-            if (clkMemIndex = 2) then
-               o_bg_req     <= i_bg_req;
-               o_obj_req    <= i_obj_req;
-               o_bgep_req   <= i_bgep_req;
-               o_objep_req  <= i_objep_req;
-               o_bg_addr    <= i_bg_addr;
-               o_obj_addr   <= i_obj_addr;
-               o_bgep_addr  <= i_bgep_addr;
-               o_objep_addr <= i_objep_addr;
+            if (reset = '1') then
+               o_bg_req    <= '0';
+               o_obj_req   <= '0';
+               o_bgep_req  <= '0';
+               o_objep_req <= '0';
+            else
+               if (srv_bg_done    = '1') then o_bg_req    <= '0'; end if;
+               if (srv_obj_done   = '1') then o_obj_req   <= '0'; end if;
+               if (srv_bgep_done  = '1') then o_bgep_req  <= '0'; end if;
+               if (srv_objep_done = '1') then o_objep_req <= '0'; end if;
+
+               if (i_bg_req = '1') then
+                  o_bg_req  <= '1';
+                  o_bg_addr <= i_bg_addr;
+               end if;
+               if (i_obj_req = '1') then
+                  o_obj_req  <= '1';
+                  o_obj_addr <= i_obj_addr;
+               end if;
+               if (i_bgep_req = '1') then
+                  o_bgep_req  <= '1';
+                  o_bgep_addr <= i_bgep_addr;
+               end if;
+               if (i_objep_req = '1') then
+                  o_objep_req  <= '1';
+                  o_objep_addr <= i_objep_addr;
+               end if;
             end if;
-            -- Drop the outbound request the moment its done arrives, NOT at the
-            -- next clkMemIndex=2. This is the "hold req low for at least one
-            -- clk1x period between requests" discipline, and leaving it out is
-            -- what broke the first attempt.
-            --
-            -- gpu2d deasserts its req on the done cycle, but o_*_req only tracks
-            -- that up to three clkMem cycles later, so req stayed high for a
-            -- whole further clk1x period AFTER service. nds_vram reads a still-
-            -- high req as a NEW request and re-dispatches - its own rpend comment
-            -- says "back-to-back requests keep req high across done and DO
-            -- relatch the cycle after, which is the correct new-request case".
-            -- The spurious second done then desynchronises gpu2d's internal
-            -- drawer-request arbiter and it never issues another BG or OBJ read.
-            --
-            -- Diagnosed from the op count: GPU_FAST=1 reported exactly 20480 VRAM
-            -- ops per frame, which is precisely the ext-palette shadow refill for
-            -- both engines (8192 BG + 2048 OBJ words each). Zero drawer traffic.
-            -- The epfill channels survived because they stream requests with req
-            -- continuously high, where a re-dispatch IS the intended behaviour;
-            -- the drawer channels issue isolated requests, where it is corruption.
-            if (srv_bg_done    = '1') then o_bg_req    <= '0'; end if;
-            if (srv_obj_done   = '1') then o_obj_req   <= '0'; end if;
-            if (srv_bgep_done  = '1') then o_bgep_req  <= '0'; end if;
-            if (srv_objep_done = '1') then o_objep_req <= '0'; end if;
          end if;
       end process;
 
