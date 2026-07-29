@@ -378,7 +378,40 @@ of the IPC FIFO** (`0x184` CNT / `0x188` SEND / `0x100000` RECV in `nds_ipc.vhd`
 a different mechanism from IPCSYNC at `0x180`, which is known good — `bootreq`
 passes it). That is the next thing to chase.
 
-### ELIMINATED: IPC works. Do not re-investigate it.
+### THE LEAD: the ARM7 stops servicing IPC, leaving messages queued
+
+Final `p_ipcfifo` state after 400 ms of Kirby (`GPUCEDIV=1`, ~24 frames):
+
+```
+en9=1 rirq9=1 en7=1 rirq7=1
+cnt79(7->9)=0   cnt97(9->7)=3     <- THREE words queued to the ARM7, undrained
+sends 7->9=2    9->7=5
+```
+
+Early in the run the ARM7 drains promptly (`cnt97` 1 -> 0, repeatedly). By the end
+**the ARM9 has sent 5 messages, the ARM7 has drained only 2, and 3 are stuck.** So
+the ARM7 stops servicing IPC partway through — *after* the initial handshake that
+makes the mechanism look healthy.
+
+That is consistent with everything else observed: the ARM9 is alive, takes
+interrupts, and idles in the NitroSDK idle thread because its main thread is
+blocked on a reply that a wedged ARM7 never sends. **The ARM7 is now the prime
+suspect, not IPC.**
+
+Constraints on investigating it, learned the hard way:
+- **`peek7` aliases to main RAM** — it borrows the ARM9 channel, so ARM7 WRAM reads
+  return plausible garbage. Hardware cannot inspect ARM7 state. Its *registers*
+  (via `where7`/`regs7`) are real; its *memory* is not.
+- **Do not trace-diff the ARM7 against melonDS** — see the cross-CPU handshake note
+  below; relative timing legitimately differs.
+- Sim is the place: `TRACEFILE7` / `TRACE7_START_FRAME` give the ARM7's own stream,
+  and the freeze reproduces in sim.
+
+Next step: trace the ARM7 across the window where `cnt97` stops draining and find
+what it is spinning on. On hardware its PC moved across `0x037FC490-0x037FC9FC`,
+which is ARM7 WRAM and therefore unreadable there — in sim it is fully visible.
+
+### ELIMINATED: the IPC *mechanism* works. The FIFO, its enables and its IRQs are fine.
 
 Measured 2026-07-29 with `p_ipcfifo` in `tb_top_frame` (reports IPCFIFOCNT enables,
 queued counts and cumulative sends per direction, on change):
