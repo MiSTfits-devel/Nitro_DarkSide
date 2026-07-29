@@ -128,7 +128,14 @@ entity nds_gpu2d_fast is
       pixel_out_x       : out integer range 0 to 255;
       pixel_out_y       : out integer range 0 to 191;
       pixel_out_data    : out std_logic_vector(17 downto 0);
-      pixel_out_we      : out std_logic
+      pixel_out_we      : out std_logic;
+
+      -- forwarded straight from nds_gpu2d; the path through this wrapper is the
+      -- same whichever generate branch is elaborated, which is the point
+      dbg_bg_busy       : out std_logic;
+      dbg_obj_busy      : out std_logic;
+      dbg_bgmode        : out std_logic_vector(2 downto 0);
+      dbg_fblank        : out std_logic
    );
 end entity;
 
@@ -198,7 +205,9 @@ begin
          srv_objep_req => srv_objep_req, srv_objep_addr => srv_objep_addr,
          srv_objep_data => srv_objep_data, srv_objep_done => srv_objep_done,
          pixel_out_x => pixel_out_x, pixel_out_y => pixel_out_y,
-         pixel_out_data => pixel_out_data, pixel_out_we => pixel_out_we
+         pixel_out_data => pixel_out_data, pixel_out_we => pixel_out_we,
+         dbg_bg_busy => dbg_bg_busy, dbg_obj_busy => dbg_obj_busy,
+         dbg_bgmode => dbg_bgmode, dbg_fblank => dbg_fblank
       );
    end generate;
 
@@ -376,7 +385,9 @@ begin
          srv_objep_req => i_objep_req, srv_objep_addr => i_objep_addr,
          srv_objep_data => srv_objep_data, srv_objep_done => i_objep_done,
          pixel_out_x => i_px_x, pixel_out_y => i_px_y,
-         pixel_out_data => i_px_data, pixel_out_we => i_px_we
+         pixel_out_data => i_px_data, pixel_out_we => i_px_we,
+         dbg_bg_busy => dbg_bg_busy, dbg_obj_busy => dbg_obj_busy,
+         dbg_bgmode => dbg_bgmode, dbg_fblank => dbg_fblank
       );
    end generate;
 

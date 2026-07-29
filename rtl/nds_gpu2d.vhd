@@ -102,7 +102,17 @@ entity nds_gpu2d is
       pixel_out_x       : out integer range 0 to 255;
       pixel_out_y       : out integer range 0 to 191;
       pixel_out_data    : out std_logic_vector(17 downto 0);   -- BGR666 (B in [17:12])
-      pixel_out_we      : out std_logic
+      pixel_out_we      : out std_logic;
+
+      -- Debug taps. Behaviourally inert, and they exist so the testbench does
+      -- not have to reach in with external names: `any_bg_busy` / `obj_busy` /
+      -- `R_bgmode` / `R_forced_blank` were aliased from tb_top_frame, which
+      -- broke the moment nds_gpu2d_fast added a hierarchy level above this
+      -- entity. Ports survive re-parenting; external names do not.
+      dbg_bg_busy       : out std_logic;
+      dbg_obj_busy      : out std_logic;
+      dbg_bgmode        : out std_logic_vector(2 downto 0);
+      dbg_fblank        : out std_logic
    );
 end entity;
 
@@ -1178,6 +1188,11 @@ begin
 
    line_busy   <= '0' when linestate = LIDLE else '1';
    epfill_busy <= '0' when epfill = EPIDLE else '1';
+
+   dbg_bg_busy  <= any_bg_busy;
+   dbg_obj_busy <= obj_busy;
+   dbg_bgmode   <= R_bgmode;
+   dbg_fblank   <= R_forced_blank(7);
 
    -- ================= merge =================
    imerge : entity work.nds_drawer_merge
