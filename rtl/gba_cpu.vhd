@@ -959,7 +959,9 @@ begin
                            when "01" => decode_datacomb(24 downto 21)  := x"A"; -- Opcode -> cmp
                            when "10" => decode_datacomb(24 downto 21)  := x"4"; -- Opcode -> add
                            when "11" => decode_datacomb(24 downto 21)  := x"2"; -- Opcode -> sub
-                           when others => report "should never happen" severity failure;
+                           when others => report "ARM7 decode: unhandled opcode " & to_hstring(decode_data) &
+                                                                                " thumb=" & std_logic'image(thumbmode)(2) &
+                                                                                " pc=" & to_hstring(regs(15)) severity failure;
                         end case;
                         decode_datacomb(20)            := '1'; -- set condition codes
                         decode_datacomb(19 downto 16)  := '0' & decode_data(10 downto 8); -- RN -> 1st op
@@ -1022,7 +1024,9 @@ begin
                                     
                                  when x"E" => decode_datacomb(24 downto 21)  := x"E"; -- 1110 BIC Rd, Rs BICS Rd, Rd, Rs Rd:= Rd AND NOT Rs
                                  when x"F" => decode_datacomb(24 downto 21)  := x"F"; -- 1111 MVN Rd, Rs MVNS Rd, Rs Rd:= NOT Rs
-                                 when others => report "should never happen" severity failure;
+                                 when others => report "ARM7 decode: unhandled opcode " & to_hstring(decode_data) &
+                                                                                      " thumb=" & std_logic'image(thumbmode)(2) &
+                                                                                      " pc=" & to_hstring(regs(15)) severity failure;
                               end case;
                               
                               --alu_operations((byte)((asmcmd >> 6) & 0xF), (byte)((asmcmd >> 3) & 0x7), (byte)(asmcmd & 0x7));
@@ -1112,7 +1116,9 @@ begin
                                  --load_store_sign_extended_byte_halfword((byte)((asmcmd >> 10) & 0x3), (byte)((asmcmd >> 6) & 0x7), (byte)((asmcmd >> 3) & 0x7), (byte)(asmcmd & 0x7));
                               end if;
                               
-                           when others => report "should never happen" severity failure;
+                           when others => report "ARM7 decode: unhandled opcode " & to_hstring(decode_data) &
+                                                                                " thumb=" & std_logic'image(thumbmode)(2) &
+                                                                                " pc=" & to_hstring(regs(15)) severity failure;
                      
                         end case;
                      
@@ -1261,7 +1267,9 @@ begin
                            --long_branch_with_link(((asmcmd >> 11) & 1) == 1, (UInt16)(asmcmd & 0x7FF));
                         end if;
                      
-                     when others => report "should never happen" severity failure; 
+                     when others => report "ARM7 decode: unhandled opcode " & to_hstring(decode_data) &
+                                                                          " thumb=" & std_logic'image(thumbmode)(2) &
+                                                                          " pc=" & to_hstring(regs(15)) severity failure;
                
                   end case;
                
@@ -1371,7 +1379,9 @@ begin
                            when x"D" => decode_functions_detail <= alu_mov;           decode_writeback <= '1'; decode_switch_op <= '0'; --  MOV 1101 operand2(operand1 is ignored)
                            when x"E" => decode_functions_detail <= alu_and_not;       decode_writeback <= '1'; decode_switch_op <= '0'; --  BIC 1110 operand1 AND NOT operand2(Bit clear)
                            when x"F" => decode_functions_detail <= alu_mov_not;       decode_writeback <= '1'; decode_switch_op <= '0'; --  MVN 1111 NOT operand2(operand1 is ignored)
-                           when others => report "should never happen" severity failure; 
+                           when others => report "ARM7 decode: unhandled opcode " & to_hstring(decode_data) &
+                                                                                " thumb=" & std_logic'image(thumbmode)(2) &
+                                                                                " pc=" & to_hstring(regs(15)) severity failure;
                         end case;
                         
                         if (Rdest = x"F" and updateflags = '1') then
@@ -1463,7 +1473,9 @@ begin
                            when "01" => decode_datatransfer_type <= ACCESS_16BIT; decode_datareceivetype <= RECEIVETYPE_WORD;
                            when "10" => decode_datatransfer_type <= ACCESS_8BIT;  decode_datareceivetype <= RECEIVETYPE_SIGNEDBYTE;
                            when "11" => decode_datatransfer_type <= ACCESS_16BIT; decode_datareceivetype <= RECEIVETYPE_SIGNEDWORD;
-                           when others => report "should never happen" severity failure;
+                           when others => report "ARM7 decode: unhandled opcode " & to_hstring(decode_data) &
+                                                                                " thumb=" & std_logic'image(thumbmode)(2) &
+                                                                                " pc=" & to_hstring(regs(15)) severity failure;
                         end case;
                         decode_datatransfer_addvalue <= x"0" & unsigned(decode_datacomb(11 downto 8)) & unsigned(decode_datacomb(3 downto 0));
                         if (decode_functions = halfword_data_transfer_regoffset) then
@@ -2703,7 +2715,9 @@ begin
                         regs_5_13 <= regs(13);
                         regs_5_14 <= regs(14);
                            
-                     when others => report "should never happen" severity failure; 
+                     when others => report "ARM7 decode: unhandled opcode " & to_hstring(decode_data) &
+                                                                          " thumb=" & std_logic'image(thumbmode)(2) &
+                                                                          " pc=" & to_hstring(regs(15)) severity failure;
                   end case;
 
                   case (execute_switchmode_new) is
@@ -2757,7 +2771,9 @@ begin
                         end if;
                         if (execute_switchmode_state = '1') then regs_5_17 <= CPSR; end if;
                            
-                     when others => report "should never happen" severity failure; 
+                     when others => report "ARM7 decode: unhandled opcode " & to_hstring(decode_data) &
+                                                                          " thumb=" & std_logic'image(thumbmode)(2) &
+                                                                          " pc=" & to_hstring(regs(15)) severity failure;
                   end case;
                      
                   if (cpu_mode = CPUMODE_FIQ and execute_switchmode_new /= CPUMODE_FIQ) then
