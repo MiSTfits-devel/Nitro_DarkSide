@@ -765,6 +765,55 @@ begin
       end process;
    end generate;
 
+   -- ================= IPC FIFO watch =================
+   -- Kirby freezes with the ARM9 asleep in the NitroSDK idle thread: IE9 enables
+   -- VBlank + IPC-recv, IF9 bit 18 NEVER latches, and IF7 bit 18 DOES. So the
+   -- ARM7 receives from the ARM9 and never sends back, and the ARM9's main thread
+   -- never becomes runnable. The IPC RECV off-by-one (fixed) was not the cause -
+   -- hardware is bit-identical with and without that fix.
+   --
+   -- Hardware cannot answer the next question: IPCFIFOCNT is IO space, which PEEK
+   -- cannot reach, and peek7 aliases to main RAM so the ARM7's own state is
+   -- unreadable. In sim it is all visible. Reports on CHANGE so a long run stays
+   -- a handful of lines.
+   --
+   --   en9/en7     FIFO enable   (IPCFIFOCNT bit 15) - sends are DROPPED if clear
+   --   rirq9/rirq7 recv IRQ enable (bit 10)
+   --   cnt79       words queued ARM7 -> ARM9   (drives IF9 bit 18)
+   --   cnt97       words queued ARM9 -> ARM7   (drives IF7 bit 18)
+   --   w79/w97     cumulative sends in each direction
+   p_ipcfifo : process
+      alias a_en9   is << signal .tb_top_frame.idut.iipc.en9   : std_logic >>;
+      alias a_en7   is << signal .tb_top_frame.idut.iipc.en7   : std_logic >>;
+      alias a_ri9   is << signal .tb_top_frame.idut.iipc.rirq9 : std_logic >>;
+      alias a_ri7   is << signal .tb_top_frame.idut.iipc.rirq7 : std_logic >>;
+      alias a_c79   is << signal .tb_top_frame.idut.iipc.cnt79 : integer range 0 to 16 >>;
+      alias a_c97   is << signal .tb_top_frame.idut.iipc.cnt97 : integer range 0 to 16 >>;
+      alias a_w79   is << signal .tb_top_frame.idut.iipc.wr79  : integer range 0 to 15 >>;
+      alias a_w97   is << signal .tb_top_frame.idut.iipc.wr97  : integer range 0 to 15 >>;
+      variable p9, p7, pr9, pr7 : std_logic := 'U';
+      variable pc79, pc97, pw79, pw97 : integer := -1;
+      variable n79, n97 : natural := 0;
+   begin
+      wait until rising_edge(clk1x);
+      if (a_w79 /= pw79 and pw79 >= 0) then n79 := n79 + 1; end if;
+      if (a_w97 /= pw97 and pw97 >= 0) then n97 := n97 + 1; end if;
+      if (a_en9 /= p9 or a_en7 /= p7 or a_ri9 /= pr9 or a_ri7 /= pr7 or
+          a_c79 /= pc79 or a_c97 /= pc97) then
+         report "IPCFIFO en9=" & std_logic'image(a_en9)(2) &
+                " rirq9=" & std_logic'image(a_ri9)(2) &
+                " en7=" & std_logic'image(a_en7)(2) &
+                " rirq7=" & std_logic'image(a_ri7)(2) &
+                "  cnt79(7->9)=" & integer'image(a_c79) &
+                " cnt97(9->7)=" & integer'image(a_c97) &
+                "  sends 7->9=" & integer'image(n79) &
+                " 9->7=" & integer'image(n97) &
+                " @" & time'image(now) severity note;
+      end if;
+      p9 := a_en9; p7 := a_en7; pr9 := a_ri9; pr7 := a_ri7;
+      pc79 := a_c79; pc97 := a_c97; pw79 := a_w79; pw97 := a_w97;
+   end process;
+
    -- ================= IPCSYNC watch =================
    -- Does the ARM9's echo actually land in the register? The ARM7 reads 0 for the
    -- ARM9's nibble at instruction 231,344 where the oracle reads 8, and the

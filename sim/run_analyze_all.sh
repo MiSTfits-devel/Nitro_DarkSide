@@ -84,10 +84,16 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    sim/tb_gpu2d_frame.vhd \
    sim/tb_gpu2d_timed.vhd \
    sim/tb_gpu_timing.vhd \
-   sim/tb_shifter_equiv.vhd
+   sim/tb_shifter_equiv.vhd \
+   sim/tb_top_frame.vhd
 # (tb_gpu_* / tb_vram_ls / tb_gpu2d* are analyze-only: their hex-file
 #  constants load at elaboration and the vectors are generated, not
 #  checked in)
+# tb_top_frame is ANALYZE-ONLY for the same reason - it loads HEXFILE at
+#  elaboration - but it must be analysed here. It is the main integration bench,
+#  every Kirby run uses it, and it was previously absent entirely: a duplicate
+#  process label in it passed a clean local `analyze-all: OK` and only failed on
+#  a remote pod minutes later, after a full source upload and elaboration.
 
 # 4) elaborate the standalone entities as a sanity gate
 nvc -L "$WORK" --work="$WORK/work" -e nds_top
