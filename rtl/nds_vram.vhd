@@ -37,6 +37,21 @@
 --
 -- Timing is NOT cycle-accurate yet (M1): BRAM ops take ~3 cycles, A..D ops
 -- depend on the server. Accuracy pass comes with the membus integration.
+--
+-- Reset clear pass (CLR_BRAM / CLR_SRV / CLR_SRVWAIT). On a MiSTer the FPGA is
+-- NOT reconfigured between ROM loads - only the loader re-runs - so every bank
+-- keeps the previous game's contents and the new game shows its leftovers until
+-- it happens to overwrite them. Real hardware gets VRAM cleared by the firmware
+-- boot direct boot skips, exactly like the main RAM zeroing in nds_loader
+-- (CLR_WR). The loader has no path to VRAM, so the clear lives here: on reset
+-- the FSM walks E..I (all five BRAMs in parallel, one word per cycle) and then
+-- A..D through the srv_* write channel it already owns, and holds clr_busy high
+-- until it is finished. nds_top gates the CPU release on clr_busy, so the pass
+-- is guaranteed to complete before any CPU or renderer request can arrive -
+-- it is NOT gated on is_simu, because gating the equivalent main-RAM clear out
+-- of simulation is precisely what hid the SWP cartridge-lock bug (see
+-- nds_loader.vhd). tb_vram_torture pre-dirties every bank and re-asserts reset
+-- to prove the pass actually zeroes them.
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -129,6 +144,10 @@ entity nds_vram is
       rdr_objepb_dout: out std_logic_vector(31 downto 0) := (others => '0');
       rdr_objepb_done: out std_logic := '0';
 
+      -- high from reset until the reset clear pass has zeroed every bank;
+      -- nds_top holds the CPUs until it drops (see the header)
+      clr_busy  : out std_logic := '1';
+
       -- renderer A..D backing channel (read-only)
       rsrv_req  : out std_logic := '0';
       rsrv_bank : out std_logic_vector(1 downto 0) := "00";
@@ -166,14 +185,25 @@ architecture arch of nds_vram is
       BRAMREAD,   -- capture + OR the BRAM dataouts
       SRVSCAN,    -- find next A..D hit (or finish)
       SRVWAIT,    -- wait for server done
-      FINISH
+      FINISH,
+      CLR_BRAM,   -- reset clear: sweep E..I (all five in parallel)
+      CLR_SRV,    -- reset clear: issue one A..D word write
+      CLR_SRVWAIT -- reset clear: wait for the server
    );
-   signal state    : tstate := IDLE;
+   signal state    : tstate := CLR_BRAM;
    signal cur      : t_req := REQ_INIT;
    signal cur_is9  : std_logic := '0';
    signal acc      : std_logic_vector(31 downto 0) := (others => '0');
    signal srv_idx  : integer range 0 to 4 := 0;
    signal prefer9  : std_logic := '1';
+
+   -- reset clear pass: one counter for both phases (E..I sweep 0..16383,
+   -- each A..D bank 0..32767)
+   signal clr_addr : unsigned(14 downto 0) := (others => '0');
+   signal clr_bank : integer range 0 to 3 := 0;
+   signal clr_bram_en : std_logic;                    -- combinational: state = CLR_BRAM
+   constant CLR_BRAM_LAST : natural := 16383;      -- bank E, the largest BRAM
+   constant CLR_SRV_LAST  : natural := 32767;      -- 128 KB per A..D bank
 
    -- E..I BRAM plumbing (CPU side = port A; renderer = port B)
    type t_bram_dout is array (BANK_E to BANK_I) of std_logic_vector(31 downto 0);
@@ -187,6 +217,13 @@ architecture arch of nds_vram is
 
    type t_addrwidth is array (BANK_E to BANK_I) of natural;
    constant BRAM_AW : t_addrwidth := (BANK_E => 14, BANK_F => 12, BANK_G => 12, BANK_H => 13, BANK_I => 12);
+
+   -- port-A payload: normally the dispatched CPU op, during the clear pass the
+   -- sweep counter with an all-bytes zero write
+   type t_bram_addr is array (BANK_E to BANK_I) of unsigned(13 downto 0);
+   signal bram_addr_a : t_bram_addr;
+   signal bram_din_a  : std_logic_vector(31 downto 0);
+   signal bram_be_a   : std_logic_vector(3 downto 0);
 
    -- ==================== renderer line server ====================
 
@@ -427,10 +464,19 @@ begin
    -- E..I BRAM inputs are driven combinationally in the dispatch cycle so the
    -- RAM samples them on the same edge the FSM leaves IDLE (ARM9 only — the
    -- ARM7 can never hit E..I)
+   -- during the clear pass all five BRAMs take the same word index, so E..I go
+   -- in parallel; the banks narrower than E are simply swept more than once
+   clr_bram_en <= '1' when state = CLR_BRAM else '0';
+
    gbramctl : for i in BANK_E to BANK_I generate
-      bram_ce(i) <= dispatch and chosen_is9 and chosen.hit(i);
-      bram_we(i) <= bram_ce(i) and (not chosen.rnw);
+      bram_ce(i)    <= clr_bram_en or (dispatch and chosen_is9 and chosen.hit(i));
+      bram_we(i)    <= clr_bram_en or (dispatch and chosen_is9 and chosen.hit(i) and (not chosen.rnw));
+      bram_addr_a(i) <= resize(clr_addr(BRAM_AW(i) - 1 downto 0), 14) when clr_bram_en = '1' else
+                        resize(chosen.offs(i)(BRAM_AW(i) + 1 downto 2), 14);
    end generate;
+
+   bram_din_a <= (others => '0') when clr_bram_en = '1' else chosen.din;
+   bram_be_a  <= "1111"          when clr_bram_en = '1' else chosen.be;
 
    gbram : for i in BANK_E to BANK_I generate
       ibank : entity MEM.SyncRamDualByteEnable
@@ -447,14 +493,14 @@ begin
          clk        => clk,
 
          ce_a       => bram_ce(i),
-         addr_a     => to_integer(chosen.offs(i)(BRAM_AW(i) + 1 downto 2)),
-         datain_a0  => chosen.din( 7 downto  0),
-         datain_a1  => chosen.din(15 downto  8),
-         datain_a2  => chosen.din(23 downto 16),
-         datain_a3  => chosen.din(31 downto 24),
+         addr_a     => to_integer(bram_addr_a(i)(BRAM_AW(i) - 1 downto 0)),
+         datain_a0  => bram_din_a( 7 downto  0),
+         datain_a1  => bram_din_a(15 downto  8),
+         datain_a2  => bram_din_a(23 downto 16),
+         datain_a3  => bram_din_a(31 downto 24),
          dataout_a  => bram_dout(i),
          we_a       => bram_we(i),
-         be_a       => chosen.be,
+         be_a       => bram_be_a,
 
          -- renderer port (read-only)
          ce_b       => rbram_ce(i),
@@ -587,7 +633,12 @@ begin
 
          if (reset = '1') then
 
-            state      <= IDLE;
+            -- reset re-arms the clear pass; it runs once reset releases, and
+            -- clr_busy keeps the CPUs held until it is done
+            state      <= CLR_BRAM;
+            clr_addr   <= (others => '0');
+            clr_bank   <= 0;
+            clr_busy   <= '1';
             req9.valid <= '0';
             req7.valid <= '0';
             srv_req    <= '0';
@@ -672,6 +723,47 @@ begin
                      cpu7_done <= '1';
                   end if;
                   state <= IDLE;
+
+               -- ===================== reset clear pass =====================
+               -- E..I first (one word per cycle into all five BRAMs), then the
+               -- four SDRAM-backed banks over the srv_* write channel. No CPU
+               -- or renderer op can be in flight: nds_top holds both CPUs and
+               -- the render pipe until clr_busy drops, and `dispatch` is gated
+               -- on state = IDLE so nothing is issued from here either.
+               when CLR_BRAM =>
+                  if (clr_addr = to_unsigned(CLR_BRAM_LAST, clr_addr'length)) then
+                     clr_addr <= (others => '0');
+                     state    <= CLR_SRV;
+                  else
+                     clr_addr <= clr_addr + 1;
+                  end if;
+
+               when CLR_SRV =>
+                  srv_req  <= '1';
+                  srv_rnw  <= '0';
+                  srv_bank <= std_logic_vector(to_unsigned(clr_bank, 2));
+                  srv_addr <= clr_addr;
+                  srv_be   <= "1111";
+                  srv_din  <= (others => '0');
+                  state    <= CLR_SRVWAIT;
+
+               when CLR_SRVWAIT =>
+                  if (srv_done = '1') then
+                     srv_req <= '0';
+                     if (clr_addr = to_unsigned(CLR_SRV_LAST, clr_addr'length)) then
+                        clr_addr <= (others => '0');
+                        if (clr_bank = 3) then
+                           clr_busy <= '0';
+                           state    <= IDLE;
+                        else
+                           clr_bank <= clr_bank + 1;
+                           state    <= CLR_SRV;
+                        end if;
+                     else
+                        clr_addr <= clr_addr + 1;
+                        state    <= CLR_SRV;
+                     end if;
+                  end if;
 
             end case;
 

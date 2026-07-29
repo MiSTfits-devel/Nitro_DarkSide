@@ -255,6 +255,17 @@ architecture arch of nds_top is
    -- while resetCpu is still asserted.
    signal reset_boot : std_logic;
 
+   -- Reset clear passes: VRAM (nds_vram) and palette/OAM (both gpu2d engines)
+   -- zero themselves out of reset, the way nds_loader's CLR_WR zeroes main RAM
+   -- - a MiSTer ROM change does not reconfigure the FPGA, so without this the
+   -- new game renders the previous game's leftovers. The CPU release waits on
+   -- all three so no game write can race a clear (VRAM's pass runs concurrently
+   -- with the loader and is by far the longest, ~660 KB; measured ordering is in
+   -- the bench, not assumed).
+   signal vclr_busy   : std_logic;
+   signal pclr_busy_a : std_logic;
+   signal pclr_busy_b : std_logic;
+
    -- ARM9 clk2x island <-> clk1x world bridge (see the process block below)
    signal cdc_req_wsh, cdc_req_vram, cdc_req_mr   : std_logic := '0';
    signal cdc_req_io,  cdc_req_pal,  cdc_req_oam  : std_logic := '0';
@@ -610,7 +621,8 @@ begin
                when B_LDWAIT =>
                   if (ld_error = '1') then
                      boot_state <= B_ERROR;
-                  elsif (ld_done = '1' and ld_busy = '0') then
+                  elsif (ld_done = '1' and ld_busy = '0' and
+                         vclr_busy = '0' and pclr_busy_a = '0' and pclr_busy_b = '0') then
                      boot_state  <= B_S9RST;
                      boot_cnt    <= 0;
                      ss_bus9.rst <= '1';
@@ -1672,6 +1684,7 @@ begin
       rdr_bgepb_dout => rb_bgep_dout, rdr_bgepb_done => rb_bgep_done,
       rdr_objepb_req => rb_objep_req, rdr_objepb_addr => rb_objep_addr,
       rdr_objepb_dout => rb_objep_dout, rdr_objepb_done => rb_objep_done,
+      clr_busy => vclr_busy,
       rsrv_req => vrsrv_req, rsrv_bank => vrsrv_bank, rsrv_addr => vrsrv_addr,
       rsrv_dout => vrsrv_dout, rsrv_done => vrsrv_done
    );
@@ -1736,7 +1749,7 @@ begin
       linecounter_obj => linecounter_obj, drawObj => drawObj,
       line_trigger => line_trigger, hblank_trigger => hblank_trigger,
       vblank_trigger => gpu_vblank, refpoint_update => refpoint_update,
-      line_busy => line_busy, epfill_busy => epfill_busy,
+      line_busy => line_busy, epfill_busy => epfill_busy, clr_busy => pclr_busy_a,
       pal_we => pal_we_a, pal_addr => pal_addr_lo, pal_din => pal_din, pal_be => pal_be,
       oam_we => oam_we_a, oam_addr => oam_addr_lo, oam_din => oam_din, oam_be => oam_be,
       srv_bg_req => r_bg_req, srv_bg_addr => g_bg_addr,
@@ -1789,7 +1802,7 @@ begin
       linecounter_obj => linecounter_obj, drawObj => drawObj,
       line_trigger => line_trigger, hblank_trigger => hblank_trigger,
       vblank_trigger => gpu_vblank, refpoint_update => refpoint_update,
-      line_busy => line_busy_b, epfill_busy => epfill_busy_b,
+      line_busy => line_busy_b, epfill_busy => epfill_busy_b, clr_busy => pclr_busy_b,
       pal_we => pal_we_b, pal_addr => pal_addr_lo, pal_din => pal_din, pal_be => pal_be,
       oam_we => oam_we_b, oam_addr => oam_addr_lo, oam_din => oam_din, oam_be => oam_be,
       srv_bg_req => rb_bg_req, srv_bg_addr => gb_bg_addr,

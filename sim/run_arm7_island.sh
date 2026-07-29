@@ -5,7 +5,12 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-TIMEOUT_MS="${TIMEOUT_MS:-10}"
+# 45 ms, not 10: nds_vram's reset clear pass zeroes all 656 KB of banks before
+# the CPU is released (mirroring nds_top's clr_busy gate), and this TB's
+# behavioral A..D server answers with 1..8 cycles of random latency, so the
+# clear alone costs ~26 ms of simulated time (measured: 131072 word writes at
+# ~200 ns each).
+TIMEOUT_MS="${TIMEOUT_MS:-45}"
 WORK=sim/nvc_work
 mkdir -p "$WORK"
 

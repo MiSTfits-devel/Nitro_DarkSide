@@ -131,6 +131,10 @@ architecture sim of tb_gpu2d_timed is
    signal drops      : integer := 0;   -- drawline pulses gpu2d had to drop
    signal tests_done : boolean := false;
 
+   -- reset-clear handshakes (see the waits in pmain)
+   signal vclr_busy : std_logic;
+   signal pclr_busy : std_logic;
+
 begin
 
    clk <= not clk after 5 ns when not tests_done else '0';
@@ -191,6 +195,7 @@ begin
       cpu7_dout => open, cpu7_done => open,
       srv_req => srv_req, srv_rnw => srv_rnw, srv_bank => srv_bank, srv_addr => srv_addr,
       srv_be => srv_be, srv_din => srv_din, srv_dout => srv_dout, srv_done => srv_done,
+      clr_busy => vclr_busy,
       rdr_bg_req => r_bg_req, rdr_bg_addr => r_bg_addr,
       rdr_bg_dout => r_bg_dout, rdr_bg_done => r_bg_done,
       rdr_obj_req => r_obj_req, rdr_obj_addr => r_obj_addr,
@@ -218,7 +223,7 @@ begin
       linecounter_obj => linecounter_obj, drawObj => drawObj,
       line_trigger => line_trigger, hblank_trigger => hblank_trigger,
       vblank_trigger => vblank_trigger, refpoint_update => refpoint_update,
-      line_busy => line_busy, epfill_busy => epfill_busy,
+      line_busy => line_busy, epfill_busy => epfill_busy, clr_busy => pclr_busy,
       pal_we => pal_we, pal_addr => pal_addr, pal_din => pal_din, pal_be => "1111",
       oam_we => oam_we, oam_addr => oam_addr, oam_din => oam_din, oam_be => "1111",
       srv_bg_req => r_bg_req, srv_bg_addr => g_bg_addr,
@@ -237,7 +242,10 @@ begin
    pserv : process
    begin
       wait until rising_edge(clk) and srv_req = '1';
-      assert srv_rnw = '1' report "unexpected A..D CPU write" severity failure;
+      -- A..D is a read-only BANKFILE model here; the only writes it ever sees
+      -- are nds_vram's reset clear pass, which it acknowledges and drops (the
+      -- file content stands for what the game writes after the clear)
+      assert srv_rnw = '1' or vclr_busy = '1' report "unexpected A..D CPU write" severity failure;
       wait until rising_edge(clk);
       srv_dout <= banks(to_integer(unsigned(srv_bank)) * 32768 + to_integer(srv_addr));
       srv_done <= '1';
@@ -338,6 +346,9 @@ begin
    begin
       for k in 1 to 4 loop wait until rising_edge(clk); end loop;
       reset <= '0';
+      -- nds_vram / nds_gpu2d zero VRAM and palette/OAM out of reset; nds_top
+      -- holds the CPUs until both clr_busy drop, so do the same here
+      wait until rising_edge(clk) and vclr_busy = '0' and pclr_busy = '0';
       wait until rising_edge(clk);
 
       -- fill E (64 KB) and F (16 KB) via LCDC

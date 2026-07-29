@@ -118,6 +118,10 @@ architecture sim of tb_gpu2d_frame is
 
    signal tests_done : boolean := false;
 
+   -- reset-clear handshakes (see the waits in pmain)
+   signal vclr_busy : std_logic;
+   signal pclr_busy : std_logic;
+
 begin
 
    clk <= not clk after 5 ns when not tests_done else '0';
@@ -134,6 +138,7 @@ begin
       cpu7_dout => open, cpu7_done => open,
       srv_req => srv_req, srv_rnw => srv_rnw, srv_bank => srv_bank, srv_addr => srv_addr,
       srv_be => srv_be, srv_din => srv_din, srv_dout => srv_dout, srv_done => srv_done,
+      clr_busy => vclr_busy,
       rdr_bg_req => r_bg_req, rdr_bg_addr => r_bg_addr,
       rdr_bg_dout => r_bg_dout, rdr_bg_done => r_bg_done,
       rdr_obj_req => r_obj_req, rdr_obj_addr => r_obj_addr,
@@ -161,7 +166,7 @@ begin
       linecounter_obj => linecounter_obj, drawObj => drawObj,
       line_trigger => line_trigger, hblank_trigger => hblank_trigger,
       vblank_trigger => vblank_trigger, refpoint_update => refpoint_update,
-      line_busy => line_busy, epfill_busy => epfill_busy,
+      line_busy => line_busy, epfill_busy => epfill_busy, clr_busy => pclr_busy,
       pal_we => pal_we, pal_addr => pal_addr, pal_din => pal_din, pal_be => "1111",
       oam_we => oam_we, oam_addr => oam_addr, oam_din => oam_din, oam_be => "1111",
       srv_bg_req => r_bg_req, srv_bg_addr => g_bg_addr,
@@ -180,7 +185,10 @@ begin
    pserv : process
    begin
       wait until rising_edge(clk) and srv_req = '1';
-      assert srv_rnw = '1' report "unexpected A..D CPU write" severity failure;
+      -- A..D is a read-only BANKFILE model here; the only writes it ever sees
+      -- are nds_vram's reset clear pass, which it acknowledges and drops (the
+      -- file content stands for what the game writes after the clear)
+      assert srv_rnw = '1' or vclr_busy = '1' report "unexpected A..D CPU write" severity failure;
       wait until rising_edge(clk);
       srv_dout <= banks(to_integer(unsigned(srv_bank)) * 32768 + to_integer(srv_addr));
       srv_done <= '1';
@@ -239,9 +247,13 @@ begin
 
       variable ncases, nregs, p : integer;
       variable exp : std_logic_vector(17 downto 0);
+      variable nz  : integer := 0;   -- clear-check non-zero pixel count
    begin
       for k in 1 to 4 loop wait until rising_edge(clk); end loop;
       reset <= '0';
+      -- nds_vram / nds_gpu2d zero VRAM and palette/OAM out of reset; nds_top
+      -- holds the CPUs until both clr_busy drop, so do the same here
+      wait until rising_edge(clk) and vclr_busy = '0' and pclr_busy = '0';
       wait until rising_edge(clk);
 
       -- fill E (64 KB) and F (16 KB) via LCDC
@@ -344,8 +356,122 @@ begin
          report "case " & integer'image(c) & " done, fails so far " & integer'image(nfail) severity note;
       end loop;
 
+      -- ============ reset-clear check (palette / OAM / VRAM BRAM) ============
+      -- The reported hardware bug is visual: load another ROM and the previous
+      -- game's graphics stay on screen, because a MiSTer ROM change does not
+      -- reconfigure the FPGA. So test it the way it shows up - render the SAME
+      -- scene twice, once with the previous case's palette / OAM / bank data
+      -- still in place and once after a reset, and require the second render to
+      -- be entirely black.
+      --
+      -- Deliberately NOT the golden case's config: this uses a minimal one whose
+      -- every other register is at its reset value (so no brightness or blend
+      -- term can manufacture a non-zero pixel out of zeroed memory), and maps
+      -- only the two CPU-writable BRAM banks - E as main BG, F as main OBJ - so
+      -- the pixels depend on exactly the three stores under test. Banks A..D are
+      -- a read-only BANKFILE model here and are covered by tb_vram_torture's
+      -- direct read-back instead.
+      --
+      -- The first render's non-zero assertion is what stops this passing
+      -- vacuously: sim memories start at zero, so a check that only looked for
+      -- zeros would pass with no clear pass at all.
+      vramcnt <= x"000" & x"000" & x"82" & x"81" & x"00000000";   -- E=BG, F=OBJ
+      wait until rising_edge(clk);
+
+      for pass in 0 to 1 loop
+         if (pass = 1) then
+            -- clear: palette/OAM zero while reset is asserted, VRAM zeroes once
+            -- it releases; nds_top's boot FSM gates the CPU release on both
+            -- gb_bus.rst too: the display register file resets off the proc-bus
+            -- reset, not off `reset`, and in the real core nds_membus9 drives it
+            -- from resetCpu. Without it MASTER_BRIGHT survives the reset here and
+            -- turns cleared black into a uniform grey.
+            reset      <= '1';
+            gb_bus.rst <= '1';
+            for k in 1 to 4 loop wait until rising_edge(clk); end loop;
+            gb_bus.rst <= '0';
+            reset      <= '0';
+            wait until rising_edge(clk) and vclr_busy = '0' and pclr_busy = '0';
+            wait until rising_edge(clk);
+            vramcnt <= x"000" & x"000" & x"82" & x"81" & x"00000000";
+            wait until rising_edge(clk);
+         end if;
+
+         -- display mode 1, BG mode 0, BG0 + OBJ on, no ext palettes
+         regwrite(16#000#, x"00011100");
+         -- BG0CNT: 256-colour text, char base 0, screen base 0
+         regwrite(16#008#, x"00000080");
+
+         vblank_trigger <= '1';
+         wait until rising_edge(clk);
+         vblank_trigger <= '0';
+         wait until rising_edge(clk);
+         while epfill_busy = '1' loop
+            wait until rising_edge(clk);
+         end loop;
+
+         for y in 0 to 191 loop
+            linecounter_obj <= y;
+            wait until rising_edge(clk);
+            drawObj <= '1';
+            wait until rising_edge(clk);
+            drawObj <= '0';
+            linecounter <= y;
+            hblank_trigger <= '1';
+            wait until rising_edge(clk);
+            hblank_trigger <= '0';
+            line_trigger <= '1';
+            wait until rising_edge(clk);
+            line_trigger <= '0';
+            wait until rising_edge(clk);
+            drawline <= '1';
+            wait until rising_edge(clk);
+            drawline <= '0';
+            wait until rising_edge(clk);
+            while line_busy = '1' loop
+               wait until rising_edge(clk);
+            end loop;
+            for k in 1 to 4 loop wait until rising_edge(clk); end loop;
+            refpoint_update <= '1';
+            wait until rising_edge(clk);
+            refpoint_update <= '0';
+            wait until rising_edge(clk);
+         end loop;
+
+         nz := 0;
+         for i in 0 to 49151 loop
+            if (framebuf(i) /= "00" & x"0000") then nz := nz + 1; end if;
+         end loop;
+
+         if (pass = 0) then
+            report "clear-check: pre-dirty render has " & integer'image(nz) &
+                   " non-zero pixels" severity note;
+            assert nz > 0
+               report "clear-check is vacuous: the pre-dirty render is already " &
+                      "all black, so the post-reset check would prove nothing"
+               severity failure;
+         else
+            report "clear-check: post-reset render has " & integer'image(nz) &
+                   " non-zero pixels" severity note;
+            if (nz /= 0) then
+               nfail := nfail + 1;
+               for i in 0 to 49151 loop
+                  if (framebuf(i) /= "00" & x"0000") then
+                     report "palette/OAM/VRAM not cleared on reset: y=" &
+                            integer'image(i / 256) & " x=" & integer'image(i mod 256) &
+                            " reads " & to_hstring(framebuf(i)) severity error;
+                     exit;
+                  end if;
+               end loop;
+               report "tb_gpu2d_frame: FAIL  reset clear pass left " &
+                      integer'image(nz) & " non-black pixels" severity failure;
+            end if;
+         end if;
+      end loop;
+
       if (nfail = 0) then
-         report "tb_gpu2d_frame: PASS  " & integer'image(ncases) & " frames" severity note;
+         report "tb_gpu2d_frame: PASS  " & integer'image(ncases) &
+                " frames + reset-clear check" severity note;
       else
          report "tb_gpu2d_frame: FAIL  " & integer'image(nfail) & " pixel mismatches" severity failure;
       end if;

@@ -8,6 +8,16 @@
 -- server handshake and the WRAM block mapping.
 --
 -- Op count via generic OPCOUNT (override: nvc -e tb_vram_torture -gOPCOUNT=...).
+--
+-- The last phase is the reset-clear check. nds_vram zeroes all nine banks out of
+-- reset (the VRAM half of the "firmware boot we skip" clearing that nds_loader's
+-- CLR_WR does for main RAM), because a MiSTer ROM change does not reconfigure
+-- the FPGA and the previous game's VRAM would otherwise show through. Sim
+-- memories start at zero, so a clear pass looks like it works whether or not it
+-- exists - this phase therefore PRE-DIRTIES every bank with a non-zero pattern
+-- through the CPU port (all nine mapped at once in LCDC mode), asserts that the
+-- pattern really landed, then re-asserts reset and requires every probe to read
+-- back zero. Disable the CLR_* states in nds_vram and this phase fails.
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -40,6 +50,8 @@ architecture sim of tb_vram_torture is
    signal cpu7_addr : unsigned(23 downto 2) := (others => '0');
    signal cpu7_be   : std_logic_vector(3 downto 0) := (others => '0');
    signal cpu7_din, cpu7_dout : std_logic_vector(31 downto 0) := (others => '0');
+
+   signal clr_busy : std_logic;
 
    signal srv_req, srv_rnw, srv_done : std_logic := '0';
    signal srv_bank : std_logic_vector(1 downto 0);
@@ -87,7 +99,8 @@ begin
       cpu7_ena => cpu7_ena, cpu7_rnw => cpu7_rnw, cpu7_addr => cpu7_addr,
       cpu7_be => cpu7_be, cpu7_din => cpu7_din, cpu7_dout => cpu7_dout, cpu7_done => cpu7_done,
       srv_req => srv_req, srv_rnw => srv_rnw, srv_bank => srv_bank, srv_addr => srv_addr,
-      srv_be => srv_be, srv_din => srv_din, srv_dout => srv_dout, srv_done => srv_done
+      srv_be => srv_be, srv_din => srv_din, srv_dout => srv_dout, srv_done => srv_done,
+      clr_busy => clr_busy
    );
 
    iwram : entity work.nds_wram
@@ -297,10 +310,54 @@ begin
       end procedure;
 
       variable pick : integer;
+
+      -- plain (un-modelled) ARM9 word access, used by the clear-check phase
+      procedure cpu9w(byteaddr : integer; data : std_logic_vector(31 downto 0)) is
+      begin
+         cpu9_addr <= to_unsigned(byteaddr, 24)(23 downto 2);
+         cpu9_rnw  <= '0';
+         cpu9_be   <= "1111";
+         cpu9_din  <= data;
+         wait until rising_edge(clk);
+         cpu9_ena  <= '1';
+         wait until rising_edge(clk);
+         cpu9_ena  <= '0';
+         wait until rising_edge(clk) and cpu9_done = '1' for 5 us;
+         assert cpu9_done = '1' report "clear-check write timeout" severity failure;
+      end procedure;
+
+      procedure cpu9r(byteaddr : integer) is
+      begin
+         cpu9_addr <= to_unsigned(byteaddr, 24)(23 downto 2);
+         cpu9_rnw  <= '1';
+         cpu9_be   <= "1111";
+         wait until rising_edge(clk);
+         cpu9_ena  <= '1';
+         wait until rising_edge(clk);
+         cpu9_ena  <= '0';
+         wait until rising_edge(clk) and cpu9_done = '1' for 5 us;
+         assert cpu9_done = '1' report "clear-check read timeout" severity failure;
+      end procedure;
+
+      -- LCDC layout (nds_vram_map): every bank is CPU-visible at once with
+      -- VRAMCNT_x = 0x80 (enabled, MST=0)
+      constant NBANK  : integer := 9;
+      type t_ia is array (0 to NBANK - 1) of integer;
+      constant LCDC_BASE  : t_ia := (16#800000#, 16#820000#, 16#840000#, 16#860000#,
+                                     16#880000#, 16#890000#, 16#894000#, 16#898000#, 16#8A0000#);
+      constant LCDC_WORDS : t_ia := (32768, 32768, 32768, 32768, 16384, 4096, 4096, 8192, 4096);
+      constant NPROBE : integer := 32;
+      type t_probe is array (0 to NBANK - 1, 0 to NPROBE - 1) of integer;
+      variable probe   : t_probe := (others => (others => 0));
+      variable patt    : std_logic_vector(31 downto 0);
+      variable nprobes : integer := 0;
    begin
       wait until rising_edge(clk);
       wait until rising_edge(clk);
       reset <= '0';
+      -- the clear pass owns the datapath out of reset; nds_top holds the CPUs
+      -- the same way (see the clr_busy gate in its boot FSM)
+      wait until rising_edge(clk) and clr_busy = '0';
       wait until rising_edge(clk);
 
       for op in 1 to OPCOUNT loop
@@ -324,9 +381,70 @@ begin
          end if;
       end loop;
 
+      -- ================= reset-clear check (see header) =================
+      -- map every bank in LCDC mode so the CPU port can reach all nine
+      for b in 0 to NBANK - 1 loop
+         vramcnt(b*8 + 7 downto b*8) <= x"80";
+      end loop;
+      wait until rising_edge(clk);
+
+      -- pick probe words per bank: always the first and last word (a clear that
+      -- truncates a bank is the likely failure), the rest pseudo-random
+      for b in 0 to NBANK - 1 loop
+         probe(b, 0) := 0;
+         probe(b, 1) := LCDC_WORDS(b) - 1;
+         for k in 2 to NPROBE - 1 loop
+            rnd(rs);
+            probe(b, k) := to_integer(rs(19 downto 0)) mod LCDC_WORDS(b);
+         end loop;
+      end loop;
+
+      -- PRE-DIRTY: without this the check would pass vacuously, because the sim
+      -- BRAMs and the behavioral A..D model both power up all-zero
+      for b in 0 to NBANK - 1 loop
+         for k in 0 to NPROBE - 1 loop
+            patt := x"DEAD" & std_logic_vector(to_unsigned(b*4096 + k, 16));
+            cpu9w(LCDC_BASE(b) + probe(b, k) * 4, patt);
+         end loop;
+      end loop;
+
+      -- and prove the pattern really landed (catches a broken probe/decode
+      -- rather than a working clear)
+      for b in 0 to NBANK - 1 loop
+         for k in 0 to NPROBE - 1 loop
+            cpu9r(LCDC_BASE(b) + probe(b, k) * 4);
+            assert cpu9_dout /= x"00000000"
+               report "pre-dirty did not land: bank " & integer'image(b) &
+                      " word " & integer'image(probe(b, k))
+               severity failure;
+         end loop;
+      end loop;
+      report "tb_vram_torture: banks pre-dirtied" severity note;
+
+      -- now reset and require every probe back at zero
+      reset <= '1';
+      for k in 1 to 4 loop wait until rising_edge(clk); end loop;
+      reset <= '0';
+      wait until rising_edge(clk) and clr_busy = '0' for 200 ms;
+      assert clr_busy = '0' report "VRAM clear pass never finished" severity failure;
+      wait until rising_edge(clk);
+
+      for b in 0 to NBANK - 1 loop
+         for k in 0 to NPROBE - 1 loop
+            cpu9r(LCDC_BASE(b) + probe(b, k) * 4);
+            assert cpu9_dout = x"00000000"
+               report "VRAM not cleared on reset: bank " & integer'image(b) &
+                      " word " & integer'image(probe(b, k)) &
+                      " reads " & to_hstring(cpu9_dout)
+               severity failure;
+            nprobes := nprobes + 1;
+         end loop;
+      end loop;
+
       report "tb_vram_torture: PASS  vram_ops=" & integer'image(vramops) &
              " wram_ops=" & integer'image(wramops) &
-             " reconfigs=" & integer'image(cfgops)
+             " reconfigs=" & integer'image(cfgops) &
+             " clear_probes=" & integer'image(nprobes)
          severity note;
       tests_done <= true;
       wait;
