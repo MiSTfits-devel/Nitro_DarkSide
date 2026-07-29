@@ -422,11 +422,20 @@ whole FSM and only swaps the *values*, via `arm9_entry_eff`/`arm7_entry_eff`.
 ### Corrections to what this file used to say
 
 - *"`DIRECT=0` never releases the CPUs - 0 instructions retired across a full
-  120 ms, strictly worse than `DIRECT=1`"*: **wrong.** `DIRECT=0` works. It stages
-  the image and then verifies it by reading all of it back, so with Kirby the CPUs
-  come out at **~240 ms**; the 120 ms window was simply too short. Measured after:
-  28,153 ARM9 IO accesses in the next 57 ms. The cost scales with image size, not
-  with the clear - the 4 KB `nds_2dk.hex` finishes its loader in **167 us**.
+  120 ms, strictly worse than `DIRECT=1`"*: half wrong, and the half that was right
+  was right for the wrong reason. `DIRECT=0` **does** release the CPUs: it stages
+  the image then verifies it by reading all of it back, so with Kirby they come out
+  at **~240 ms** and the 120 ms window was simply too short (28,153 ARM9 IO accesses
+  in the next 57 ms). The cost scales with image size - the 4 KB `nds_2dk.hex`
+  finishes its loader in **167 us**.
+
+  **But `DIRECT=0` is not a boot you should regression-test against.** It skips
+  `ENV_SET`, so the direct-boot env block at `0x027FF800` is never written and Kirby
+  never gets the chip ID and header copy it expects: measured over 12 frames at
+  `GPUCEDIV=1` it issues **zero card commands**, where `DIRECT=1` reference runs
+  issue 72. **`NDS.sv` hardwires `direct_boot(1'b1)`, so `DIRECT=1` is the shipping
+  configuration** - use it for anything meant to reflect hardware. `DIRECT=0` exists
+  for the verify pass, which is a loader self-check, not a boot mode.
 - *"`firmware_retail.hex` and `firmware_dslite.hex` share only 1% of their words, so
   one may be synthetic"*: **wrong inference.** `firmware_retail.hex` is
   **byte-identical (65536/65536 words)** to the user's genuine retail non-Lite DS
