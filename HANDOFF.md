@@ -332,9 +332,31 @@ Caveat: `FRAMEMAP`'s vblank counter (`0x02FFFF08`) reads a constant garbage valu
 this ROM under direct boot, so dump-frame index is the only usable time axis, and
 `RunFrame` coalesces frames while the LCD is off.
 
-Renderer load under real content still cannot be measured in RTL sim (216 ms only
-reaches 6 frames), but it no longer needs to be inferred - the mode above can be
-programmed directly by a test ROM and driven at full rate.
+### "Out of reach for RTL sim" is also wrong - it is a TRACING cost, not a sim cost
+
+I wrote that claim into this document earlier the same night and it does not
+survive arithmetic. **Measured untraced rate: ~52 ms simulated in ~4 min wall
+(PRELOAD=1, no TRACEFILE).** Reaching Kirby's display-on point:
+
+| config | frame | frames to display-on | sim time | **wall clock** |
+|---|---|---|---|---|
+| `GPUCEDIV=1` | 16.806 ms | ~200-240 | 3.4-4.0 s | **~6.5 h** |
+| `GPUCEDIV=3` | 50.42 ms | ~200-240 | 10-12 s | **~17 h** |
+
+Entirely affordable. What is expensive is **tracing** - `TRACEFILE` writes a line
+per retired instruction (212,592 lines for 25 ms, 34 MB), and that I/O dominates by
+~40x. The handoff's "out of reach" was measured on traced runs and then quoted as
+if it were a property of the simulator.
+
+**So do not reach for melonDS because "sim cannot get there".** Use melonDS because
+it answers register-level questions in seconds; use RTL sim, untraced and overnight,
+when the question is whether *our* hardware reaches the same state. Prefer
+`GPUCEDIV=1` for these: it is 3x cheaper in simulated time *and* gives the CPUs the
+realistic per-frame cycle budget (at 3 they get 3x too many). Its cost is dropped
+render lines, i.e. pixel accuracy, not whether the display comes on.
+
+The mode above can also be programmed directly by a test ROM, which remains the
+fastest oracle-backed route for renderer work.
 
 **Two routes, and they are alternatives not steps:**
 
