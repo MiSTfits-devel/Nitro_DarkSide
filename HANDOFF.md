@@ -359,6 +359,41 @@ of the IPC FIFO** (`0x184` CNT / `0x188` SEND / `0x100000` RECV in `nds_ipc.vhd`
 a different mechanism from IPCSYNC at `0x180`, which is known good — `bootreq`
 passes it). That is the next thing to chase.
 
+### The suspect, narrowed: the IPC recv IRQ has never been tested
+
+`bootreq` subtest 16 ("IPC FIFO round trip") **passes** — bitmap `0x1DE7F`, bit 16
+set — so the FIFO data path works. But look at what it actually does:
+
+```c
+REG16(IPCFIFOCNT) = 0x8008;      // bit15 FIFO enable + bit3 send clear
+REG32(IPCFIFOSEND) = 0x1234ABCD; // ARM9 -> ARM7
+if (wait_ne(&M_FIFO, 0, 50000) && M_FIFO == 0x1234ABCD) pass |= 1u << 16;
+```
+
+**Bit 10 — recv-not-empty IRQ enable — is never set**, the ARM7 stub is explicitly
+"no BIOS SWIs, no IRQs", and only the **ARM9 -> ARM7** direction is driven. So:
+
+| path | tested | hardware |
+|---|---|---|
+| ARM9 -> ARM7 FIFO, polled | yes, subtest 16 | works, `IF7` bit 18 sets |
+| **ARM7 -> ARM9 FIFO** (`fifo79`) | **never** | — |
+| **recv-not-empty IRQ** (`rirq9`, CNT bit 10 -> `irq9_recv`) | **never** | **`IF9` bit 18 never sets** |
+
+What is proven working is exactly the direction that works on hardware; what has
+never been exercised is exactly what fails. Same signature as every other bug
+here: correct-looking code on a path nothing drives.
+
+The logic to scrutinise is `nds_ipc.vhd:222-237` — `recvpend9 := '1'` requires
+`v_cnt79 /= 0 AND rirq9 = '1'`, and `irq9_recv` fires only on its **rising edge**.
+Note the edge is on the *conjunction*: if the ARM9 enables `rirq9` while the FIFO
+is already non-empty, the conjunction still goes 0->1 and should fire — but if
+`rirq9` is set and cleared around a drain, or the ARM7 refills without the
+conjunction ever dropping, no new edge is generated and the IRQ is lost.
+
+**Next step: extend `bootreq` with an IRQ-driven ARM7 -> ARM9 FIFO subtest** (set
+CNT bit 10, have the ARM7 send, and confirm `IF9` bit 18 latches and the handler
+runs). That is oracle-checkable against melonDS and needs no hardware.
+
 ### nitrodbg `reach`/`brk` take the ARCHITECTURAL PC, i.e. instruction + 8
 
 This cost a completely wrong conclusion. `reach9 FFFF0018` for the IRQ vector
