@@ -1419,9 +1419,20 @@ begin
       alias a_busy  is << signal .tb_top_frame.idut.line_busy     : std_logic >>;
       alias b_busy  is << signal .tb_top_frame.idut.line_busy_b   : std_logic >>;
       alias a_draw  is << signal .tb_top_frame.idut.drawline      : std_logic >>;
+      -- Engine A's drawer busies. nds_gpu2d's linestate goes
+      -- LIDLE -> LDRAW -> LMERGE -> LFLUSH; LMERGE is a fixed 256 cycles (one
+      -- pixel per cycle, already optimal) and LFLUSH is 8, so anything above
+      -- ~264 cycles per line is LDRAW waiting for these two. Splitting them says
+      -- whether the BG drawers or the OBJ drawer is the cost. linestate itself
+      -- is not aliasable - its type is declared inside gpu2d's architecture.
+      alias a_bgbusy  is << signal .tb_top_frame.idut.igpu2d_a.any_bg_busy : std_logic >>;
+      alias a_objbusy is << signal .tb_top_frame.idut.igpu2d_a.obj_busy    : std_logic >>;
       variable ops, cyc, blocked, blk_a, blk_b : natural := 0;
       variable busy_a, busy_b, lines : natural := 0;
-      variable nlines : positive := 1;
+      variable starts_a, starts_b : natural := 0;
+      variable bgcyc, objcyc : natural := 0;
+      variable prev_abusy, prev_bbusy : std_logic := '0';
+      variable nlines, nstarts : positive := 1;
       variable frames : natural := 0;
    begin
       if (VRAMOPS = 0) then
@@ -1450,11 +1461,23 @@ begin
          if (a_busy = '1') then busy_a := busy_a + 1; end if;
          if (b_busy = '1') then busy_b := busy_b + 1; end if;
          if (a_draw = '1') then lines := lines + 1; end if;
+         -- Renders STARTED, counted as line_busy rising edges. This is the right
+         -- denominator for cycles-per-line: dividing by drawline count mixes in
+         -- the DROPPED lines, which contribute no busy cycles at all, and so
+         -- understates the cost of a line that actually gets rendered. With 2/3
+         -- of lines dropped that error is a factor of 3.
+         if (a_bgbusy = '1')  then bgcyc  := bgcyc + 1;  end if;
+         if (a_objbusy = '1') then objcyc := objcyc + 1; end if;
+         if (a_busy = '1' and prev_abusy = '0') then starts_a := starts_a + 1; end if;
+         if (b_busy = '1' and prev_bbusy = '0') then starts_b := starts_b + 1; end if;
+         prev_abusy := a_busy;
+         prev_bbusy := b_busy;
          if (vblank_out = '1' and cyc > 1000) then
             frames := frames + 1;
             -- lines can legitimately be 0 before the GPU starts issuing
             -- drawline; guard the divisions rather than special-casing later
             if (lines = 0) then nlines := 1; else nlines := lines; end if;
+            if (starts_a = 0) then nstarts := 1; else nstarts := starts_a; end if;
             report "VRAMOPS frame " & integer'image(frames) &
                    " ops=" & integer'image(ops) &
                    " cycles=" & integer'image(cyc) &
@@ -1465,9 +1488,13 @@ begin
                    "  lines=" & integer'image(lines) &
                    " busy/line A=" & integer'image(busy_a / nlines) &
                    " B=" & integer'image(busy_b / nlines) &
+                   "  renders=" & integer'image(starts_a) &
+                   " cyc/render A=" & integer'image(busy_a / nstarts) &
                    " (budget 2130, " &
-                   integer'image(busy_a / (nlines * 256)) &
-                   " cyc/dot A)" severity note;
+                   integer'image(busy_a / (nstarts * 256)) &
+                   " cyc/dot)" &
+                   "  bg/render=" & integer'image(bgcyc / nstarts) &
+                   " obj/render=" & integer'image(objcyc / nstarts) severity note;
             ops := 0;
             cyc := 0;
             blocked := 0;
@@ -1476,6 +1503,10 @@ begin
             busy_a := 0;
             busy_b := 0;
             lines := 0;
+            starts_a := 0;
+            starts_b := 0;
+            bgcyc := 0;
+            objcyc := 0;
          end if;
       end loop;
    end process;
@@ -1528,6 +1559,7 @@ begin
    p_heartbeat : process
       variable n9, n7 : natural := 0;
       variable p9, p7 : natural := 0;
+      variable pc9, pc7 : unsigned(31 downto 0) := (others => '0');
    begin
       if (HEARTBEAT_MS = 0) then
          wait;
@@ -1538,14 +1570,26 @@ begin
          for i in 1 to HEARTBEAT_MS loop
             for j in 1 to 33333 loop
                wait until rising_edge(clk1x);
-               if (dbg_export9_done = '1') then n9 := n9 + 1; end if;
-               if (dbg_export7_done = '1') then n7 := n7 + 1; end if;
+               -- Latch each PC on its own retire pulse. The export registers are
+               -- only meaningful when *_done pulses; sampling them at an
+               -- arbitrary cycle returns stale or half-updated values. That is
+               -- not theoretical - it printed ARM7 pc=E0B2D060, an instruction
+               -- word where an address should be, which reads exactly like the
+               -- CPU having jumped into garbage and is nothing of the kind.
+               if (dbg_export9_done = '1') then
+                  n9 := n9 + 1;
+                  pc9 := dbg_export9.pc;
+               end if;
+               if (dbg_export7_done = '1') then
+                  n7 := n7 + 1;
+                  pc7 := dbg_export7.pc;
+               end if;
             end loop;
          end loop;
          report "HB " & time'image(now) &
-                "  ARM9 pc=" & to_hstring(dbg_export9.pc) & " n=" & integer'image(n9) &
+                "  ARM9 pc=" & to_hstring(pc9) & " n=" & integer'image(n9) &
                 " (+" & integer'image(n9 - p9) & ")" &
-                "  ARM7 pc=" & to_hstring(dbg_export7.pc) & " n=" & integer'image(n7) &
+                "  ARM7 pc=" & to_hstring(pc7) & " n=" & integer'image(n7) &
                 " (+" & integer'image(n7 - p7) & ")" severity note;
          p9 := n9;
          p7 := n7;

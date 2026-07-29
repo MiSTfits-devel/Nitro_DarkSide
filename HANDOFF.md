@@ -84,29 +84,39 @@ Measured 2026-07-29 with `sim/tests/nds_2dk.hex` (both engines rendering, mode 1
 | renderer VRAM ops / line | **271** (= 1.06 ops per dot) |
 | renderer blocked on VRAM | **12% of the frame** (A 6% / B 5%) |
 
-**The VRAM arbiter is not the bottleneck.** The renderer is waiting on VRAM 12% of
-the time and still cannot finish 2 lines in 3, so ~88% of its time goes somewhere
-inside `nds_gpu2d` — the drawers and the merge. A and B also barely contend: 6% + 5%
-≈ the combined 12%, so they rarely block simultaneously.
+**The VRAM arbiter is not the bottleneck, and the cost is localised.** Directly
+measured on the same clean frame, not derived:
 
-Their drop counts being *exactly* equal is therefore not shared-resource contention.
-Both engines get the same `drawline` and both overrun the same per-line budget every
-time, so every drop trips both flags. It says the deficit is systematic and affects
-both engines alike, not that one is starving the other.
+| | value |
+|---|---|
+| lines rendered / drawlines | **66 of 192** (126 dropped) |
+| **cycles per RENDERED line** | **5,829** against a **2,130** budget — **2.74x over** |
+| **cycles per visible dot** | **22** against **8.3** available |
+| of which VRAM waiting | **~9%** (509 cycles) |
+| of which gpu2d compute | **~91%** (~5,320 cycles) |
 
-**This corrects a wrong hypothesis recorded here earlier in the same session.** It
-said the serial arbiter (`nds_vram`: "one op in flight… ~4 cycles/op", parallelism
-pass deferred) was probably the cause, using "~4-5 VRAM ops per dot" to make the
-arithmetic reach 18 cycles/dot. The real figure is **1.06 ops/dot** — the estimate
-was ~6x too high, and it had been reverse-engineered from the number it needed to
-produce. Do not resurrect it: the arbiter has ~88% headroom, so making it parallel
-buys almost nothing.
+The renderer waits on VRAM 9% of a line and overruns by 2.74x, so the arbiter has
+~88% headroom and making it parallel buys almost nothing.
 
-Where to look instead: `nds_gpu2d` and `nds_drawer_*`. 2,130 clk1x cycles per line
-over 256 dots is **8.3 cycles/dot** available, and the renderer needs ~3x that. The
-question to answer next is how many cycles the drawer/merge chain spends per pixel
-and whether it is an FSM stepping one pixel at a time (pipelineable) or genuinely
-that much work. `dbg_line_busy` per line against 2,130 is the measurement.
+**This self-validates:** 5,829 fits inside `GPUCEDIV=3`'s 6,390-cycle budget with 9%
+margin, and does not fit 2,130. That is exactly why `GPUCEDIV=3` renders every line
+and `GPUCEDIV=1` drops 2 in 3, predicted with no fitting. 2.74x also matches the
+3.01x frame stretch.
+
+**Where the 5,829 go.** `nds_gpu2d`'s `linestate` is
+`LIDLE -> LDRAW -> LMERGE -> LFLUSH` (`nds_gpu2d.vhd:1142`):
+
+- `LMERGE` is a fixed **256 cycles** — `merge_x` advances one pixel per cycle. That
+  is already optimal and there is nothing to win there.
+- `LFLUSH` is **8** cycles draining the 5-stage merge pipeline.
+- So **~5,565 of 5,829 cycles are `LDRAW`**, which waits on `any_bg_busy` and
+  `obj_busy`. **The BG and OBJ drawers are the cost**, not the merge, and not VRAM.
+
+That is ~21 cycles per pixel inside the drawers with only ~2 of them spent waiting
+for VRAM. Next: split `any_bg_busy` vs `obj_busy` (instrumented, `bg/render` and
+`obj/render` in the VRAMOPS line) to see which drawer dominates, then read that
+drawer's per-pixel FSM in `nds_drawer_text.vhd` / `nds_drawer_obj.vhd`. If it steps
+one pixel through several states it is pipelineable; a 3x cut is what is needed.
 
 Two remaining options, both about gpu2d throughput rather than memory:
 
