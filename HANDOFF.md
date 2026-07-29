@@ -417,6 +417,47 @@ traced from a checkpoint on both sides to bound the file sizes
 technique that found the earlier BIOS/IO bugs and it has not been applied to this
 phase of the boot.
 
+### Trace diffing STOPS WORKING at cross-CPU handshakes — do not chase its output
+
+Ran the documented first-divergence diff on the current RTL (matched retail BIOS on
+both sides: convert `sim/tests/bios{9,7}_retail.hex` to raw `.bin` and pass
+`BIOS9=`/`BIOS7=` to `melonds_fbdump`, or the two diverge inside BIOS code
+immediately). Result:
+
+```
+DIVERGENCE at instruction 844073
+  rtl: 0214FF64 E1D300B0 ... r0=00000008
+  ref: 0214ff64 e1d300b0 ... r0=00000000
+  field r0: rtl=00000008 ref=00000000
+```
+
+That is `ldrh r0,[r3]` with `r3 = 0x04000180`, i.e. **reading IPCSYNC inside the
+ARM9's sync loop**, and the differing field is the ARM7's out-nibble.
+
+**It is almost certainly benign, and it would be easy to misread as the bug.** What
+happens next settles it:
+
+| | next PCs | means |
+|---|---|---|
+| RTL | `FF70 FF74 FF28` — leaves the inner wait for the outer loop | saw the nibble CHANGE, advanced |
+| oracle | `FF6C FF58 FF5C FF60 FF64` — tight inner loop | nibble unchanged, still waiting |
+
+So **our ARM7 reached its next nibble value sooner than melonDS's**. The ARM9 then
+did exactly what the protocol says: counted the change and advanced. Nothing is
+wrong; the two runs simply have different ARM9:ARM7 relative timing, which this
+handshake is built to tolerate (both sides wait unboundedly — see the timing
+section).
+
+**Methodological consequence, and the reason to write this down:** an
+instruction-exact trace diff is only meaningful while execution is a pure function
+of the instruction stream. Once two CPUs interact through a *polling* handshake,
+relative timing legitimately differs from the oracle and the diff reports a
+divergence on the first poll that lands differently. The repo's headline claim of
+"1,293,260 ARM9 instructions exact" must therefore have been measured before this
+point, and it cannot be extended past a cross-CPU poll no matter how long the run.
+Use trace diffing for single-CPU correctness (it found the BIOS-fetch and IO-read
+bugs); use event-level instrumentation like `p_ipcfifo` for anything cross-CPU.
+
 ### Superseded: the IPC recv IRQ hypothesis (kept for the reasoning)
 
 `bootreq` subtest 16 ("IPC FIFO round trip") **passes** — bitmap `0x1DE7F`, bit 16
