@@ -62,3 +62,16 @@ occ9.txt
 occ7.txt
 snap9.txt
 snap7.txt
+bq9.txt
+bq7.txt
+io9.txt
+io7.txt
+ts9.txt
+ts7.txt
+hs7.txt
+fix7.txt
+
+# nvc working directories: one per WORK= value, ~1.3 MB each and one is created
+# by every parallel sim pod. sim/nvc_work/ and _pre were listed individually,
+# which stopped covering anything once runs started using distinct WORK= names.
+sim/nvc_work_*/
