@@ -378,7 +378,46 @@ of the IPC FIFO** (`0x184` CNT / `0x188` SEND / `0x100000` RECV in `nds_ipc.vhd`
 a different mechanism from IPCSYNC at `0x180`, which is known good — `bootreq`
 passes it). That is the next thing to chase.
 
-### The suspect, narrowed: the IPC recv IRQ has never been tested
+### ELIMINATED: IPC works. Do not re-investigate it.
+
+Measured 2026-07-29 with `p_ipcfifo` in `tb_top_frame` (reports IPCFIFOCNT enables,
+queued counts and cumulative sends per direction, on change):
+
+```
+89.93 ms  en7 -> 1                    <- matches melonDS's frame 5 exactly
+90.76 ms  cnt97=1  sends 9->7=1       ARM9 sends
+90.77 ms  cnt97=0                     ARM7 drains it
+90.80 ms  cnt79=1  sends 7->9=1       ARM7 sends back
+90.81 ms  cnt79=0                     ARM9 drains it
+```
+
+Both FIFOs enable where the oracle enables them (melonDS `IPCCNT`: ARM9 at dump
+frame 2, ARM7 at frame 5; ours at ~4.5 and ~5.35 frames), and messages flow **both
+directions and are drained**. So `IF9` bit 18 does latch — the hardware reading of
+`IF9 = 0x00080000` was a post-ack steady-state snapshot, and reading it as "never
+latches" was wrong.
+
+**The full list of things now eliminated for the Kirby freeze**, all measured:
+
+| hypothesis | verdict |
+|---|---|
+| ARM9 never enables the GPU VBlank IRQ | **false** — probe bit 18 reads `vbl ena9 : 1` |
+| Kirby never writes DISPSTAT | **false** — `reach9` REACHED, and the sim sees the write |
+| Neither CPU takes interrupts | **false** — breakpoint at the IRQ vector fires within 5 s |
+| The recv-IRQ edge logic is wrong | **false** — bootreq 17-25 match the oracle exactly |
+| The ARM7 never enables its FIFO / never replies | **false** — see above |
+| ARM9 RECV returned the wrong word | **TRUE, fixed** — but the freeze survives it |
+
+So both CPUs are alive, both service interrupts, IPC is bidirectional, and the
+vblank path is armed — and Kirby still never turns the display on inside 290
+frames, where the oracle does it early. The next tool is a **first-divergence
+trace diff against melonDS** (`sim/tests/compare_trace.py`, `docs/TRACE_DIFF.md`),
+traced from a checkpoint on both sides to bound the file sizes
+(`TRACE9STARTFRAME` in the tracer, `TRACE_START_FRAME` in the bench). That is the
+technique that found the earlier BIOS/IO bugs and it has not been applied to this
+phase of the boot.
+
+### Superseded: the IPC recv IRQ hypothesis (kept for the reasoning)
 
 `bootreq` subtest 16 ("IPC FIFO round trip") **passes** — bitmap `0x1DE7F`, bit 16
 set — so the FIFO data path works. But look at what it actually does:
