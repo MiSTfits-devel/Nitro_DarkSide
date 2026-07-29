@@ -21,6 +21,7 @@ rules turned out to be invented.
 | **Frame rate** | 3.01x too slow, and it is **not** the CPUs — `GPU_CE_DIV`. See below. |
 | **HDMI** | **Compiled out** (`MISTER_DEBUG_NOHDMI=1`). `ascal`/`pll_hdmi` absent, analog VGA only. Re-enabling costs ~2,178 ALMs against ~6,086 free. |
 | **Hardware** | `NDS_isl0_20260728.rbf` deployed 2026-07-28 and **configures and runs** — the debug mailbox returns a coherent probe decode. Not yet exercised with a cart. |
+| **Firmware boot** | **Built** (`FWBOOT=1`, sim only). Both retail BIOSes execute from their reset vectors; the ARM7 BIOS matches the melonDS oracle with **0 control-flow divergence over 323,826 basic blocks**. Cart launch not yet confirmed. |
 
 ---
 
@@ -313,51 +314,89 @@ that protection silently.
 
 ---
 
-## Firmware boot: the right idea, but there is NO firmware-boot path to switch on
+## Firmware boot: BUILT, and the ARM7 BIOS now matches the oracle exactly
 
 Every leftover-memory bug in this project is the same shape - *direct boot skips the
 firmware, so something is not initialised*: main RAM (SWP cart-lock wedge, fixed),
-VRAM/palette/OAM (stale screen, fixed), ARM7 WRAM (fixed). The loader says it
-outright: *"Real hardware gets this clearing from the firmware boot we skip in
-direct boot."* Each fix re-implements one thing the firmware does correctly, and
-there is no reason to believe the last one has been found. So booting the firmware
-attacks the source rather than the symptoms, and is strategically the right move.
+VRAM/palette/OAM (stale screen, fixed), ARM7 WRAM (fixed). Booting the firmware
+attacks the source rather than the symptoms. As of 2026-07-29 it exists:
+**`FWBOOT=1`** in the bench, `fw_boot` through `nds_loader` -> `nds_top` ->
+`nds_card`.
 
-**But it is a feature to build, not a flag to flip.** Two facts, measured:
+What it does: no HLE staging, no direct-boot env block, both retail BIOSes running
+from their reset vectors, firmware left to boot the cart. Boot completes at ~16 ms
+of DS time (vs ~240 ms for direct boot, which clears all 4 MB of main RAM one word
+at a time).
 
-1. **The boot FSM has no firmware path.** `nds_top` runs
-   `B_LDWAIT -> B_S9RST..B_S9POST -> B_S7RST..B_S7POST -> B_RUN` unconditionally,
-   presetting *both* CPU PCs from the cart header via the savestate bus. Nothing
-   lets the CPUs start at their BIOS reset vectors instead. Consistent with
-   `reach9 FFFF0008` being **not**-reached: the ARM9 reset vector never executes.
-2. **`DIRECT=0` is NOT firmware boot** - the name misleads. In `nds_loader` it only
-   skips `ENV_SET` (the direct-boot env block) and enters a verify pass where, per
-   its own comment, *"busy stays high"*; `ld_done` therefore never asserts,
-   `B_LDWAIT` never exits, and the CPUs are never released. Tried with Kirby and the
-   retail firmware: **0 instructions retired on both CPUs, 0 membus accepts, across
-   a full 120 ms.** `DIRECT=0` is "direct boot minus the env block" - strictly worse
-   than `DIRECT=1`, not better.
+**Measured state:** both BIOSes execute for real - ARM9 from `0xFFFF0000`, ARM7 from
+`0x00000000`, CPSR `0xD3` - and the ARM7 BIOS now follows melonDS with **zero
+control-flow divergence across 323,826 collapsed basic blocks** (~1.1M
+instructions). Before the RTC fix below it diverged at block 2096.
 
-What real firmware boot would require:
-- **Do not preset the PCs.** Let the ARM9 start at `0xFFFF0000` and the ARM7 at
-  `0x00000000` so the retail BIOSes run.
-- The ARM7 BIOS then pulls the firmware over SPI, validates and decompresses its
-  boot code, and jumps into it. `nds_spi` already serves a firmware image and
-  `FWFILE` exists, so the plumbing is partly there.
-- Firmware needs valid user settings with auto-start, or it waits at the menu for a
-  touch that never comes in sim. **Both firmware images here have valid settings**
-  (version 5 in both copies at 0x3FE00/0x3FF00).
-- Assets: `sim/tests/bios{9,7}_retail.hex` (4 KB / 16 KB) plus
-  `firmware_retail.hex` and `firmware_dslite.hex` (a real DS Lite dump). Those two
-  share only **1%** of their words, so one may be synthetic - establish which before
-  trusting either.
-- `docs/ARCHITECTURE.md` records **"Firmware boot menu = never"** as a deliberate
-  decision and `NDS.sv` hardwires `direct_boot(1'b1)`, so this reverses a design
-  choice rather than fixing an oversight. Boot-to-game also gets much longer.
+### The trap, and it cost a build
 
-Verdict: the highest-leverage architectural change available, and the only one that
-retires the whole leftover-initialisation class instead of one member at a time. A
-project, not a patch.
+**You MUST preset the boot PCs.** Earlier revisions of this file said the opposite -
+*"Do not preset the PCs. Let the ARM9 start at 0xFFFF0000"* - and that is exactly
+wrong. This core **does not model the ARM reset exception at all**: both CPUs take
+their initial `fetch_PC` from `SAVESTATE_PC_in`, written by the boot FSM in
+`B_S9GAP`/`B_S7GAP`. Skipping the preset starts the ARM9 at `0x00000000` and
+retires **zero instructions** (nvc reports it as an index of -1 in the barrel
+rotator, from `'U'` propagating out of the fetch). `fw_boot` therefore keeps the
+whole FSM and only swaps the *values*, via `arm9_entry_eff`/`arm7_entry_eff`.
+`cp15_control` does reset with bit 13 set, so high vectors are already right.
+
+### Two bugs it exposed
+
+- **`nds_rtc` `status1` powered up `0x02`, must be `0x82`.** Bit 1 is 24-hour mode;
+  bit 7 is power-off / reset detect, which a real RTC raises on first power-up and
+  auto-clears when read (melonDS `RTC.cpp:43`). The ARM7 BIOS bit-bangs status1 out
+  of `0x04000138`, stores it at `0x0380FEC8`, and branches on bits 7:6 at pc
+  `0x2216` to pick cold boot vs warm boot. One bit; the whole boot took the
+  warm-boot path.
+- **`nds_card` had only B7/B8**, which is where *direct* boot hands the cart over.
+  A firmware boot walks the sequence from power-up: raw `9F`/`00`/`90`/`3C`, then
+  seven KEY1-encrypted commands, then B7/B8. Now implemented. KEY1 commands are
+  decoded by block size + a counter (the Blowfish schedule lives in the ARM7 BIOS
+  and this model does not decrypt), which is sound only because the BIOS issues one
+  fixed sequence. **The four secure-area blocks are read OUT OF ORDER: 0x6000,
+  0x7000, 0x5000, 0x4000** - assuming 0x4000 upward silently scrambles the secure
+  area. KEY2 is deliberately absent: hardware applies and removes it, so it is
+  transparent to software and melonDS ignores it too.
+
+### Corrections to what this file used to say
+
+- *"`DIRECT=0` never releases the CPUs - 0 instructions retired across a full
+  120 ms, strictly worse than `DIRECT=1`"*: **wrong.** `DIRECT=0` works. It runs a
+  1.6 MB verify pass on top of the 4 MB main-RAM clear, so the CPUs come out at
+  **~240 ms**; the 120 ms window was simply too short. Measured after: 28,153 ARM9
+  IO accesses in the next 57 ms.
+- *"`firmware_retail.hex` and `firmware_dslite.hex` share only 1% of their words, so
+  one may be synthetic"*: **wrong inference.** `firmware_retail.hex` is
+  **byte-identical (65536/65536 words)** to the user's genuine retail non-Lite DS
+  dump. DS and DS Lite firmware are different images for different consoles; low
+  overlap is expected, not suspicious.
+- `docs/ARCHITECTURE.md` still records *"Firmware boot menu = never"* and `NDS.sv`
+  still hardwires `direct_boot(1'b1)`. `fw_boot` is a sim-side path today; wiring it
+  to hardware is a separate decision, and boot-to-game gets much longer.
+
+### Tooling this produced
+
+- **`sim/melonds_tracer --fw`** - the firmware-boot oracle that did not exist.
+  `BIOS9=/BIOS7=/FIRMWARE=` binaries, real reset-vector boot, no `SetupDirectBoot`.
+  It boots Kirby **all the way**: display on at dump frame 128, POWCNT1 `0x820F`.
+  Convert the RTL `.hex` images back to `.bin` so both sides run identical ROMs.
+- **`sim/tests/loopdiff.py`** - compares the *order of basic blocks*, not
+  instruction index. For BIOS boot an instruction-indexed diff is worthless: both
+  CPUs sit in cross-CPU polling loops whose spin counts depend on the other CPU's
+  progress and legitimately differ. That produced a **false root cause** first -
+  "ARM7 reads IPCSYNC=1 where melonDS reads 0" at instruction 18459 looks exactly
+  like an `nds_ipc` wiring bug and is only a spin count. `nds_ipc` is fine.
+- **`HEARTBEAT_MS`** in `tb_top_frame` - both PCs and both retired-instruction
+  counts on a slow tick. A firmware boot is tens of millions of instructions and
+  `TRACEFILE` costs ~40x, so untraced runs otherwise cannot distinguish "grinding
+  through a boot stage" from "wedged in a poll"; the IO counters rise either way.
+- `tracer.patch` now carries the `NDS.cpp`/`NDSCart.cpp` logging (CARDCMD, KEY1DEC)
+  it used to leave as untracked local edits.
 
 ## Next
 
@@ -726,6 +765,14 @@ stores so the test is not contaminated by it; the bug is unfixed.
 - **Treating trace agreement as proof.** An instruction-exact trace cannot see a
   dropped store, an IO read of 0, or a stale BIOS word — three separate root causes
   hid behind "1.29M instructions match melonDS".
+- **Diffing BIOS/firmware boot traces by instruction index.** Both CPUs sit in
+  cross-CPU polling loops whose spin counts depend on the other CPU's progress and
+  legitimately differ from melonDS. Every such diff "diverges" on the first poll.
+  Use `sim/tests/loopdiff.py`, which compares the order of basic blocks. Doing it
+  the naive way produced a confident false root cause in `nds_ipc`, which is fine.
+- **Assuming a sequence covers a range in order.** The ARM7 BIOS reads the four
+  4 KB secure-area blocks as 0x6000, 0x7000, 0x5000, 0x4000. "Four blocks spanning
+  0x4000..0x7FFF" is true of the range and false of the order.
 - **Trusting a cross-domain counter without reading how it samples.** `p_iocount`
   counted clk1x arrivals with a *level sample* correct only at exactly 2:1; at
   1.705:1 it reported 183 of 314 and looked exactly like a CDC dropping requests.
