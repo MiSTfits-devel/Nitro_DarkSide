@@ -505,7 +505,7 @@ Sanity check for the method: `reach9 FFFF0008` (the reset vector) is **not**
 reached, and that is correct under direct boot — the loader presets the PC and the
 BIOS reset path never runs.
 
-## Open bug: direct boot never clears VRAM / palette / OAM
+## FIXED 2026-07-29: direct boot never cleared VRAM / palette / OAM
 
 Reported from hardware 2026-07-28 by the user: loading a different ROM does not
 reliably clear the screen — leftovers from the previous ROM persist.
@@ -534,10 +534,47 @@ Consequences:
   after a core reload and every subsequent one, which is a nasty class of
   non-reproducible bug.
 
-Fix direction: extend the loader's clear pass to VRAM banks, both palettes and OAM
-(and consider the DDR3 framebuffer), gated the same way `skip_copy` gates the
-main-RAM pass so simulation stays fast. Verify by loading two different test ROMs
-back to back on hardware and confirming the second starts clean.
+**FIXED** (`nds_vram` sweeps E..I in parallel then walks A..D over `srv_*`;
+`nds_gpu2d` zeroes both palettes and OAM; all three `clr_busy` gate the CPU
+release in `nds_top`). The loader's own pass could NOT be extended — it has a
+main-RAM write port only — so each module self-clears using the path it already
+owns, and no new nds_top ports were needed.
+
+**The CPU-release gate is load-bearing, not insurance.** Measured, against my own
+assumption that VRAM's ~164K words would fit inside the loader's 1M-word pass:
+
+```
+palette/OAM clear done    7.685 us
+loader done             132.6   us      <- nds_loader SKIPS CLR_WR when is_simu
+VRAM clear done          16.220 ms      <- 122x longer than the loader
+CPUs released            16.2209 ms
+```
+
+**Fitted** (`build/artifacts-vclr`, seed 0, 0 violated paths):
+
+| build | worst slack | ALMs | M10K |
+|---|---|---|---|
+| `artifacts-isl0` (island removed) | +1.537 | 35,824 | 472 |
+| `artifacts-ipcfix` (+ IPC RECV fix) | +1.534 | 35,830 | 471 |
+| **`artifacts-vclr`** (+ this clear) | **+1.743** | **36,115** | **471** |
+
+285 ALMs (0.7% of the device), no M10K, no timing regression — read the +0.21 ns as
+"no cost", not a gain; it is inside the 1.53 ns seed spread.
+
+**Made verifiable despite sim starting zeroed**, which is how the main-RAM version
+of this bug hid: `tb_vram_torture` PRE-DIRTIES 32 probes per bank with `DEAD_xxxx`,
+asserts the pattern landed, resets, and requires zero. Palette/OAM have no CPU read
+path, so `tb_gpu2d_frame` renders a scene twice and asserts 49,152 non-zero pixels
+before reset and 0 after. Efficacy checked in both directions — disabling each pass
+produces its own specific failure.
+
+**Still unverified**: that it cures the reported ROM-to-ROM symptom (only hardware
+can show that — load two different ROMs back to back and confirm the second starts
+clean), and the ~20 ms hardware cost of the A..D clear against NDS.sv's
+`mainram_allow` borrow scheduler. Note also that the 2D display **register** file
+resets off `gb_bus.rst` rather than `reset`, so register state is a separate
+leftover class, and the ext-palette shadows are deliberately left uncleared since
+they refill from VRAM each vblank.
 
 ## Open RTL bug: the ARM9's 8-bit writes to VRAM are performed, and must not be
 
