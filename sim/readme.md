@@ -55,7 +55,11 @@ eyeball-checked.
   PU/POWCNT rules documented at the top of `sim/tests/arm9_2d.s`
   (established on 0.9.5, unchanged in 1.1).
   Samples: `nds_2d` (text/affine/OBJ), `nds_2dh` (ext palettes + blending),
-  `nds_2dw` (windows + mosaic), `nds_sdk2d` (devkitARM/libnds-built
+  `nds_2dw` (windows + mosaic), `nds_2dk` (Kirby: Squeak Squad's measured
+  video mode — BG mode 0, BG3 256-colour *text* on the standard palette
+  with a palno sweep that must be ignored, OBJ extended palettes, both
+  engines rendering the same scene so every A-vs-B difference is the
+  OBJ ext-pal path; `sim/tests/build_nds_2dk.sh`), `nds_sdk2d` (devkitARM/libnds-built
   DUAL-SCREEN C scene packed by ndstool — `sim/tests/sdk2d/build.sh`, needs
   devkitPro with the nds-dev group; custom crt0, because stock libnds
   2.x/calico needs the ARM7 BIOS IRQ trampoline and DMA, which don't exist
