@@ -133,6 +133,10 @@ architecture arch of nds_loader is
    -- enabled, and the screen stays white. Real hardware gets this clearing from
    -- the firmware boot we skip in direct boot.
    signal clr_i   : unsigned(19 downto 0) := (others => '0');   -- 0..1048575 words = 4 MB
+   -- '0' = clearing main RAM (0x02xxxxxx), '1' = clearing ARM7-private WRAM
+   -- (0x03800000, 64 KB = 16384 words). See the CLR_WR comment for why WRAM7
+   -- has to be cleared too.
+   signal clr_w7  : std_logic := '0';
 
    signal cpu_sel : integer range 0 to 2 := 0;         -- 0 = ARM9, 1 = ARM7, 2 = header env copy
    signal src     : unsigned(26 downto 2) := (others => '0');
@@ -211,7 +215,8 @@ begin
                      busy  <= '1';
                      done  <= '0';
                      hdr_i <= 0;
-                     clr_i <= (others => '0');
+                     clr_i  <= (others => '0');
+                     clr_w7 <= '0';
                      if (is_simu = '1') then
                         state <= HDR_REQ;      -- model RAM is already zero
                      else
@@ -219,24 +224,60 @@ begin
                      end if;
                   end if;
 
-               -- Zero main RAM first, then stage the images over the top of it.
+               -- Zero main RAM AND ARM7-private WRAM first, then stage the images
+               -- over the top. WRAM7 is here for the same reason main RAM is: with
+               -- direct boot there is no firmware to clear it, so anything the ARM7
+               -- reads before writing sees stale contents - and on a MiSTer the FPGA
+               -- is not reconfigured between ROM loads, so "stale" means the
+               -- previous game's data.
+               --
+               -- HONESTY NOTE, so nobody credits this with more than it does: this
+               -- is NOT known to fix Kirby's freeze. Kirby's ARM7 does wedge from
+               -- ~instruction 400,000 in a 23-instruction doubly-linked-list drain
+               -- at 0x037FC48C..0x037FC4B0 (dequeue helper at 0x037FC9C4), looping
+               -- on `[r5] /= 0` with r5 = 0x0380B2FC and a `next` reading
+               -- 0x950000E5, which is not a pointer - and it then stops servicing
+               -- IPC (ARM9 sent 5, ARM7 drained 2, 3 left queued), which is what
+               -- leaves the ARM9 in the idle thread with a white screen. But the
+               -- SIMULATION reproduces that wedge, and in simulation WRAM7 powers up
+               -- ALL-ZERO (SyncRamDualByteEnable's model initialises its array), so
+               -- an uncleared WRAM7 cannot be the cause there. The ARM7 builds that
+               -- corrupt list itself. Root cause still open.
                -- ~1M word writes; at clk1x this costs a fraction of a second
                -- once, at boot, and it is what makes the cartridge lock (and any
                -- other read-before-write the SDK does) behave like real hardware.
                when CLR_WR =>
                   wr_ena  <= '1';
                   wr_rnw  <= '0';
-                  wr_addr <= x"02" & "00" & std_logic_vector(clr_i) & "00";
+                  if (clr_w7 = '0') then
+                     wr_addr <= x"02" & "00" & std_logic_vector(clr_i) & "00";
+                  else
+                     -- ARM7-private WRAM at 0x03800000, 64 KB. ld_to_wram7 in
+                     -- nds_top routes any 0x03xxxxxx loader write here already.
+                     wr_addr <= x"038" & "0" & std_logic_vector(clr_i(13 downto 0)) & "00";
+                  end if;
                   wr_data <= (others => '0');
                   state   <= CLR_WR_WAIT;
 
                when CLR_WR_WAIT =>
                   if (wr_done = '1') then
-                     if (clr_i = to_unsigned(1048575, clr_i'length)) then
-                        state <= HDR_REQ;
+                     if (clr_w7 = '0') then
+                        if (clr_i = to_unsigned(1048575, clr_i'length)) then
+                           -- main RAM done; now ARM7 WRAM
+                           clr_i  <= (others => '0');
+                           clr_w7 <= '1';
+                           state  <= CLR_WR;
+                        else
+                           clr_i <= clr_i + 1;
+                           state <= CLR_WR;
+                        end if;
                      else
-                        clr_i <= clr_i + 1;
-                        state <= CLR_WR;
+                        if (clr_i = to_unsigned(16383, clr_i'length)) then
+                           state <= HDR_REQ;
+                        else
+                           clr_i <= clr_i + 1;
+                           state <= CLR_WR;
+                        end if;
                      end if;
                   end if;
 
