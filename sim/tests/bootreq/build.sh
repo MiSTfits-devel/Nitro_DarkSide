@@ -16,7 +16,12 @@ AS="$DKP/devkitARM/bin/arm-none-eabi-as"
 LD="$DKP/devkitARM/bin/arm-none-eabi-ld"
 NDSTOOL="$DKP/tools/bin/ndstool"
 
+# -ffixed-r9/-r10/-r11: take all three out of GCC's allocator so REPORT() can park
+# the running pass bitmap and progress index there after every subtest and have
+# them survive. Without this the results are only valid on the final trace line,
+# and a subtest that hangs or aborts throws away everything before it.
 "$CC" -mcpu=arm946e-s -marm -O2 -ffreestanding -Wall -Wextra \
+   -ffixed-r9 -ffixed-r10 -ffixed-r11 \
    -I "$DKP/libnds/include" -I "$DKP/calico/include" -D__NDS__ -DARM9 \
    -c arm9_main.c -o arm9_main.o
 "$AS" -mcpu=arm946e-s -o arm9_crt0.o arm9_crt0.s
