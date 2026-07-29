@@ -261,7 +261,7 @@ begin
                   else
                      -- ARM7-private WRAM at 0x03800000, 64 KB. ld_to_wram7 in
                      -- nds_top routes any 0x03xxxxxx loader write here already.
-                     wr_addr <= x"038" & "0" & std_logic_vector(clr_i(13 downto 0)) & "00";
+                     wr_addr <= x"038" & x"0" & std_logic_vector(clr_i(13 downto 0)) & "00";
                   end if;
                   wr_data <= (others => '0');
                   state   <= CLR_WR_WAIT;
