@@ -161,6 +161,14 @@ Two remaining options, both about gpu2d throughput rather than memory:
    asserted, including the ext-palette refill during vblank, so it is not cleanly
    per-line. The direction is unambiguous; the exact split is not.
 
+   **How to test correctness of this, because the obvious test is wrong.**
+   Comparing framebuffers between `GPU_FAST=0` and `1` at `GPUCEDIV=1` proves
+   nothing: both configurations DROP lines (126/192 and 98/192), and a dropped
+   line is itself a visible artifact, so different lines get rendered and the
+   pixels legitimately differ. Compare at **`GPUCEDIV=3`**, where the budget is
+   6,390 and both 5,829 and 3,996 fit, so both render all 192 lines — then
+   byte-identical output is a real transparency check.
+
    Two adaptation traps, both of which cost a run (details in the file header):
    `eProcReg_gba`'s write path is **combinational on `proc_bus.ena`**, so a clk1x
    pulse is three clkMem cycles wide and writes every register three times unless
