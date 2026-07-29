@@ -26,12 +26,19 @@
 --                  90 chip ID, 3C activate KEY1 -> mode 1
 --   mode 1, KEY1:  command bytes are Blowfish-encrypted with a key schedule
 --                  that lives in the ARM7 BIOS and this model does NOT decrypt
---                  them. They are decoded by block size plus a counter instead,
---                  which is sound only because the ARM7 BIOS issues one fixed
---                  sequence: 4x KEY2-data-mode (0 words), 1x chip ID (1 word),
---                  four 2x secure-area blocks (1024 words each, at 0x6000,
---                  0x7000, 0x5000 then 0x4000 - the BIOS reads them OUT OF
---                  ORDER), Ax enter main data mode -> mode 2.
+--                  them. They are decoded by block size plus two bits of state
+--                  instead. The sequence is ROM-DEPENDENT, so do not assume a
+--                  fixed command count:
+--                    retail, secure area present (e.g. Kirby):
+--                      4x KEY2-data-mode (0 words), 1x chip ID (1 word), four
+--                      2x secure-area blocks (1024 words each, at 0x6000,
+--                      0x7000, 0x5000 then 0x4000 - OUT OF ORDER), Ax -> mode 2
+--                    homebrew, no secure area (e.g. sim/tests/nds_2d*.nds):
+--                      4x, then Ax -> mode 2. Nothing else at all.
+--                  4x and Ax both carry no data, so they are told apart by
+--                  key1_seen4 (which came first), NOT by whether a secure-area
+--                  block was read - keying off sec_cnt leaves the homebrew case
+--                  stuck in KEY1 mode forever.
 --   mode 2, main:  B7 block read (contiguous from the image; reads below 0x8000
 --                  redirect to 0x8000+(addr&0x1FF) like real carts protect the
 --                  secure area), B8 chip ID.
@@ -149,6 +156,9 @@ architecture arch of nds_card is
    -- 0x6000, 0x7000, 0x5000, 0x4000. Assuming 0x4000 upward silently scrambles
    -- the secure area.
    signal sec_cnt    : unsigned(2 downto 0) := (others => '0');
+   -- '1' once the KEY1 4x (KEY2-data-mode) command has been seen, so the next
+   -- zero-length KEY1 command is recognised as Ax (enter main data mode).
+   signal key1_seen4 : std_logic := '0';
 
    signal romctrl_rd : std_logic_vector(31 downto 0);
    signal own9, own7 : std_logic;
@@ -268,6 +278,7 @@ begin
                cmd_mode <= "10";
             end if;
             sec_cnt     <= (others => '0');
+            key1_seen4  <= '0';
             spi_data    <= (others => '0');
             spi_hold    <= '0';
             spi_pos     <= (others => '0');
@@ -445,16 +456,25 @@ begin
                         when x"90" =>
                            cmd_b8 <= '1';               -- chip ID
                         when x"3C" =>
-                           cmd_mode <= "01";            -- activate KEY1
-                           sec_cnt  <= (others => '0');
+                           cmd_mode   <= "01";          -- activate KEY1
+                           sec_cnt    <= (others => '0');
+                           key1_seen4 <= '0';
                         when others =>
                            null;
                      end case;
 
-                  when 1 =>      -- KEY1: encrypted, decoded by size + sec_cnt
+                  when 1 =>      -- KEY1: encrypted, decoded by size + counters
                      if (v_len = 0) then
-                        if (sec_cnt = 0) then
-                           null;                        -- 4x: KEY2 data mode
+                        -- Both 4x (KEY2 data mode) and Ax (enter main data mode)
+                        -- carry no data, so they are told apart by which comes
+                        -- first, NOT by whether any secure-area block was read.
+                        -- The number of KEY1 commands is ROM-DEPENDENT: a retail
+                        -- cart with a secure area issues 4x, 1x, four 2x, Ax,
+                        -- but a homebrew image with no secure area issues only
+                        -- 4x, Ax. Keying off sec_cnt left the second case stuck
+                        -- in KEY1 mode forever, because sec_cnt never left 0.
+                        if (key1_seen4 = '0') then
+                           key1_seen4 <= '1';           -- 4x: KEY2 data mode
                         else
                            cmd_mode <= "10";            -- Ax: enter main data mode
                         end if;
