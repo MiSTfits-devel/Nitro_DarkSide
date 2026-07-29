@@ -206,6 +206,22 @@ int main(int argc, char** argv)
             // latching, while the ARM7 does receive VBlank.
             u32 ds9 = nds.ARM9Read16(0x04000004);
             u32 ds7 = nds.ARM7Read16(0x04000004);
+            // IPCFIFOCNT per CPU: bit 15 = FIFO enable, bit 10 = recv-not-empty
+            // IRQ enable. Our RTL shows en9=1/rirq9=1 but en7=0 at 75 ms, and a
+            // send with the sender's enable clear is DROPPED - which is exactly
+            // why IF9 bit 18 never latches. This says whether the real ARM7 ever
+            // enables its FIFO, and when.
+            u32 fc9 = nds.ARM9Read16(0x04000184);
+            u32 fc7 = nds.ARM7Read16(0x04000184);
+            static u32 pfc9 = 0xFFFFFFFF, pfc7 = 0xFFFFFFFF;
+            if (fc9 != pfc9 || fc7 != pfc7)
+            {
+                fprintf(stderr, "IPCCNT frame=%d CNT9=%04X (en=%u rirq=%u) "
+                        "CNT7=%04X (en=%u rirq=%u)\n", n,
+                        fc9, (fc9>>15)&1, (fc9>>10)&1,
+                        fc7, (fc7>>15)&1, (fc7>>10)&1);
+                pfc9 = fc9; pfc7 = fc7;
+            }
             if (ds9 != pds9 || ds7 != pds7)
             {
                 fprintf(stderr, "VBLENA frame=%d DISPSTAT9=%04X (vblIRQ=%u) "
