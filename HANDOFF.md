@@ -1,4 +1,4 @@
-# NDS_MiSTfits — state of play, 2026-07-28
+# NDS_MiSTfits — state of play, 2026-07-30
 
 Goal: **run 2D NDS titles on the DE10-Nano**, Kirby: Squeak Squad as the test case.
 
@@ -8,6 +8,17 @@ state only. **Treat every claim here as provisional and check it before spending
 build or a long run on it**: a large fraction of what the old version asserted as
 rules turned out to be invented.
 
+**Where to look for structural facts.** This file is a work log; it is not the place to
+learn how the core is wired, and several of its older sections are still stale in ways the
+table below does not cover. For the block inventory, clock plan and memory topology read
+`docs/ARCHITECTURE.md` and `docs/MEMORY_MAP.md`, both audited against the RTL on 2026-07-30 —
+and when either disagrees with the RTL, the RTL wins. That audit corrected, among other
+things: `nds_wrap.vhd` / `nds_math.vhd` / `nds_gx_stub.vhd` do not exist; `DDR3Mux` is
+compiled but never instantiated; the ARM9 BIOS is 4 KB not 32; the "clk6x" memory clock is
+3× not 6×; the VRAM line server is on `clk1x`, not in a memory-clock domain; each 2D engine
+has ten drawer instances, not five; and the BRAM ledger was 62 KB light because the BG
+extended palettes are shadowed inside `nds_gpu2d` rather than read live out of banks E–I.
+
 ---
 
 ## Where the project is
@@ -16,11 +27,12 @@ rules turned out to be invented.
 |---|---|
 | **Timing** | **CLOSES.** 0 violated paths, worst setup **+1.537 ns**, all holds positive, Fitter Successful. `build/artifacts-isl0`. |
 | **Area** | 85% ALMs (35,824 / 41,910), 85% M10K, 84% DSP |
-| **ARM9 island** | **Removed.** ARM9 runs on `clk1x` at 1:1. The 67 MHz island existed for a ratio requirement that does not exist. |
+| **ARM9 island** | **Collapsed to 1:1, not removed.** `NDS.sv:1017` drives `clk2x` from `clk_sys`, so the ARM9 runs at the system rate — but `nds_top`'s `clk2x` port and the entire clk1x↔island bridge (`nds_top.vhd:837-1044`: toggle requests, edge-detected dones, IO and lock payload latches) are still instantiated and still load-bearing. The 67 MHz island existed for a ratio requirement that does not exist. There is no `ISLAND` generic on `nds_top` — that is a testbench generic (`sim/tb_top_frame.vhd:61`). |
 | **Kirby in sim** | Boots, runs, renders to VRAM. ~6 frames in 216 ms; display still off there, which is correct for that point. |
-| **Frame rate** | **SOLVED in sim** by the pipelined text drawer: 1,134 cycles/line against a 2,130 budget at `GPUCEDIV=1`, 189/192 lines, ~3 drops/frame (was 5,829 / 66 / 126). Uncommitted — see below. |
+| **Frame rate** | **SOLVED in sim** by the pipelined text drawer: 1,134 cycles/line against a 2,130 budget at `GPUCEDIV=1`, 189/192 lines, ~3 drops/frame (was 5,829 / 66 / 126). Uncommitted — see below. **That number is the always-ready path only**; under hardware-shaped backpressure it is 2,034 cycles/line and 168/192 lines, also under budget. |
+| **Renderer under backpressure** | **Was a wedge, now fixed in sim, unverified on silicon.** `sdram.sv` ch1 permits exactly ONE A–D read in flight and no bench modelled that until `5cf5fe0`. With `VRSRV_ONE=1`: `done`=0–1 lines/frame before, 168 after. Two bugs — a `drawline` livelock in `nds_gpu2d` and a pulsed request against a stale `ready`. See `docs/TICKET-arm7-firmware-wedge.md` §Resolution. |
 | **HDMI** | **Compiled out** (`MISTER_DEBUG_NOHDMI=1`). `ascal`/`pll_hdmi` absent, analog VGA only. Re-enabling costs ~2,178 ALMs against ~6,086 free. |
-| **Hardware** | `NDS_isl0_20260728.rbf` deployed 2026-07-28 and **configures and runs** — the debug mailbox returns a coherent probe decode. Not yet exercised with a cart. |
+| **Hardware** | `NDS_isl0_20260728.rbf` deployed 2026-07-28 and **configures and runs** — the debug mailbox returns a coherent probe decode. **Since exercised with a cart, and it white-screened** (`sdk2k`, both boot modes, both GPU pace settings) — that report is what led to the backpressure row above. No build carrying the fix has been flashed yet. |
 | **Firmware boot** | **Built** (`FWBOOT=1`, sim only). Both retail BIOSes execute from their reset vectors; the ARM7 BIOS matches the melonDS oracle with **0 control-flow divergence over 323,826 basic blocks**. Cart launch not yet confirmed. |
 
 ---
@@ -375,6 +387,23 @@ shows up as its own busy time rather than as memory pressure.
   (`ch1_rq` is a single bit) and silently DROPPED any request arriving while
   busy. Now exports `vrsrv_ready` and the core throttles. Pipelining ch1 itself
   is a separate change and wants hardware to validate.
+  - **Ready alone was not enough** (2026-07-30). A pulsed request is issued on a
+    ready sampled before the request exists, so `rsrv_req`/`rsrv_ready` is a held
+    valid/ready handshake now, and ch1 accepts on `req & ready` at the clk1x-
+    aligned clkMem edge. But do not read that as the white screen — **that was a
+    livelock in `nds_gpu2d`'s `drawline` routing**, which reached the drawers
+    ungated by `line_busy` and restarted an over-budget line forever. See
+    `docs/TICKET-arm7-firmware-wedge.md` → Resolution. Under hardware-shaped
+    backpressure the renderer now completes **168 of 192** lines per frame instead
+    of 0, at 2,034 cycles per line against a 2,130 budget.
+  - **The A..D channel is 64 bits wide and line-addressed** (2026-07-30). ch1 always
+    returned four halfwords per read and `NDS.sv` used two of them. It now takes the
+    whole aligned 8-byte line and `nds_vram` caches **one line per renderer
+    channel** — measured to remove 76% of A..D reads. One SHARED line removes **1%**:
+    the eight channels interleave and evict each other, so the obvious version of
+    this idea is worthless and the per-channel indexing is the whole trick.
+    Requests must be line-aligned or the sequential burst's wrap returns the same
+    bytes rotated. `LINEPROBE` in `tb_top_frame` is the sizing measurement.
 
 ### The drawer, measured in isolation
 

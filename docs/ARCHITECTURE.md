@@ -12,12 +12,21 @@ is [NDS_HARDWARE.md](NDS_HARDWARE.md); the fit analysis is [MEMORY_MAP.md](MEMOR
    same `regmap_type` convention. The 28-bit address covers NDS IO (`0x04000000`–`0x04001060`
    fits easily; engine-B block keys off Adr(12)).
 2. **Core pacing**: single system-clock domain gated by `ce`, fast memory isolated behind an
-   `ena/done` handshake in a wrapper (`nds_wrap` ⟵ `gba_wrap` role). ARM9 2× speed is a `ce`
-   schedule question, not a clock-domain question, until proven otherwise.
+   `ena/done` handshake. **As built this went the other way and then came back.** The ARM9 got
+   a real second clock domain — `nds_top`'s `clk2x` port and the clk1x↔island bridge at
+   `nds_top.vhd:837-1044` — and `NDS.sv:1017` now ties `clk2x` to `clk_sys`, so the island
+   exists in the RTL and runs at 1:1. There is **no `ISLAND` generic** on `nds_top`; `ISLAND`
+   is a testbench generic (`sim/tb_top_frame.vhd:61`), and in hardware the ratio is whatever
+   `NDS.sv` drives into `clk2x`. Do not lower it: cross-domain setup budget follows edge
+   alignment, not period, so only integer ratios are viable and 2:1 failed to close.
 3. **SDRAM guest channels**: `allow/active/busy/hold_ena` arbitration
-   (`gba_mem_ewram_sdram.vhd` pattern) scaled to: VRAM line server, ARM9 main RAM,
-   ARM7 main RAM, save backend.
-4. **DDR3Mux client-index** pattern for framebuffer / card-ROM stream / savestates.
+   (`gba_mem_ewram_sdram.vhd` pattern). As built there are two clients on this pattern, not
+   four: `nds_mainram` owns `sdram ch2`, and the **CPU** VRAM A–D path borrows it
+   (`NDS.sv:805-874`). The VRAM **line server** does not use it at all — it has its own
+   read-only `ch1` (see §Renderer feed in MEMORY_MAP.md). No save backend exists yet.
+4. ~~**DDR3Mux client-index** pattern for framebuffer / card-ROM stream / savestates.~~
+   **Not used.** `DDR3Mux.vhd` is compiled into the project (`rtl/nds.qip:22`) but never
+   instantiated; `ddram.sv`'s own six-channel round-robin arbitrates (`NDS.sv:716`).
 5. **Build-profile macros** (GBA2P_LITE-style `.qsf` one-liners) for e.g. `NDS_DUALSDRAM`,
    `NDS_NOSAVESTATES` fitting experiments.
 6. **nvc sim flow**: three-library build (`altera_mf` stub, `mem`, `work`), self-checking
@@ -43,37 +52,63 @@ is [NDS_HARDWARE.md](NDS_HARDWARE.md); the fit analysis is [MEMORY_MAP.md](MEMOR
 | AUXSPI save | `memorymux_extern` flash/EEPROM FSMs | adapt: EEPROM/Flash/FRAM behind SPI framing |
 | SPI: touch, firmware, PM | none | new, small: TSC2046 model fed by MiSTer touch/analog input; firmware image in DDR3; PM stub |
 | RTC | `gba_gpioRTCSolarGyro.vhd` | adapt bit-bang protocol to reg 0x138 |
-| Divider/sqrt | none | new, small: iterative divider (64/64) + sqrt, latency-accurate |
+| Divider/sqrt | none | **NOT BUILT.** Planned as `nds_math.vhd` (iterative 64/64 divider + sqrt, latency-accurate). No such file exists and there is no `DIVCNT`/`SQRTCNT` decode anywhere in `rtl/`, so `0x04000280`–`0x040002B8` falls through to an unclaimed IO read (returns 0) |
 | Math/keys/EXMEMCNT | reggba patterns | small |
-| Wifi | — | stub: IDs + IRQ-silent, per melonDS-minimum |
+| Wifi | — | **NOT BUILT** (not even the stub): `0x048xxxxx` is open bus in the ARM7 map (`nds_membus7.vhd:164`) and DMA7 timing mode `11` never fires (`nds_dma7.vhd:239`). No IDs, no registers, no IRQ |
 | GBA slot | — | phase-2+: absent cart reads (open bus 0xFFFF), EXMEMCNT bits honored |
-| 3D geometry/render | — | **out of scope phase 1**: GXSTAT reads sane-idle, GXFIFO swallows writes w/ correct FIFO counts so 2D games that poke it don't hang |
+| 3D geometry/render | — | **out of scope phase 1**, and **the register façade was never built either**: grep finds no `GXFIFO` and no `GXSTAT` in `rtl/`, so a title that polls them gets an unclaimed IO read rather than the sane-idle answer this row promised. The only 3D-adjacent thing that exists is DISPCNT's BG0-is-3D bit, and the slot renders transparent |
 | Boot | savestates reset path | **HLE direct-boot**: HPS/loader parses card header, stages ARM9/ARM7 images into SDRAM main RAM (via romcopy-style channel), populates shared-area mailbox (user settings, header copies) per NDS_HARDWARE.md §Boot, sets WRAMCNT=3, releases both CPUs at entry addresses. **DECISION REVERSED 2026-07-29: "Firmware boot menu = never" no longer holds, and it is now wired to hardware.** A real firmware boot path exists (`fw_boot`, bench `FWBOOT=1`) — both retail BIOSes run from their reset vectors, `nds_card` implements the raw + KEY1 boot command sequence, and the ARM7 BIOS matches the melonDS oracle with zero control-flow divergence over 323,826 basic blocks. **Selectable at runtime from the OSD on `status[9]`** (`Boot: Direct (HLE) / Firmware`), so direct boot remains the default and the tested path. Requires ARM7 BIOS, ARM9 BIOS and Firmware all loaded from the OSD. Costs ~4 s of boot when enabled. Known limit: it reaches 1.588 s of DS time and then the ARM7 executes Thumb code in ARM state (lost T bit) — see HANDOFF.md "Firmware boot". |
 | Video out | `videoout160` + colorshade | rework: 256×192×2 screens → DDR3 framebuffer; layouts (stacked/side-by-side/single+swap via POWCNT.DSEL) |
 | Savestates | trio vendored later | phase-3: NDS state ~5 MB (main RAM in SDRAM must stream through) |
 
-## Top-level structure (target)
+## Top-level structure (as built)
+
+This was a *target* tree and three parts of it never happened: there is no `nds_wrap.vhd`,
+no `nds_math.vhd`, no `nds_gx_stub.vhd`, and the memory servers are not in a separate clock
+domain. What is actually instantiated:
 
 ```
-NDS.sv (emu)                        — MiSTer framework glue, HPS, PLL, sdram/ddram
-└── nds_wrap.vhd                    — clk domains, SDRAM/DDR3 muxing, video compose
-    ├── nds_top.vhd                 — the console, clk1x+ce domain
-    │   ├── nds_cpu9 (ARM946E-S)    + itcm/dtcm/caches
-    │   ├── gba_cpu  (ARM7TDMI)
-    │   ├── nds_membus9 / nds_membus7   — per-CPU decoders (GBA memorymux pattern)
-    │   ├── nds_wram.vhd            — shared WRAM + WRAMCNT
-    │   ├── nds_vram.vhd            — banks, VRAMCNT (decode: nds_vram_map.vhd)
-    │   ├── nds_gpu2d ×2            — engines A/B (drawer fork)
-    │   ├── nds_dma ×2, nds_timer ×2, nds_irq ×2
-    │   ├── nds_ipc.vhd             — SYNC + FIFOs
-    │   ├── nds_sound.vhd           — 16ch + capture (ARM7 side)
-    │   ├── nds_card.vhd            — ROMCTRL/AUXSPI
-    │   ├── nds_spi.vhd             — touch/firmware/PM
-    │   ├── nds_math.vhd            — div/sqrt
-    │   └── nds_gx_stub.vhd         — 3D register façade
-    ├── memory servers (clk6x): main-RAM channels, VRAM line server, card pager
-    └── DDR3Mux (vendored) / sdram.sv (vendored)
+NDS.sv (emu)                        — MiSTer glue, HPS, PLL, OSD, *and* everything the
+│                                     planned nds_wrap was going to do: clock plan,
+│                                     clkMemIndex, SDRAM/DDR3 channel adapters, video
+├── pll                             — 50 MHz ref → 3 outputs, exactly 1:2:3
+│                                     clk_sys 33.513982 / CLK_VIDEO 67.027964 / clkMem 100.541946
+├── nds_hps_io_boundary             — HPS transport (currently framework hps_io)
+├── sdram.sv   (clkMem)             — ch1 renderer VRAM reads, ch2 main RAM + CPU VRAM
+├── ddram.sv   (clk_sys)            — ch1 firmware, ch2 card, ch4 mailbox, ch5/ch6 framebuffer
+├── nds_fb_ddr3.sv                  — line accumulators, burst writer, scanout prefetch
+└── nds_port_wrap.vhd               — VHDL/SV boundary ONLY. No logic: terminates record
+    │                                 ports, converts ranged integers. Sets GPU_FAST => 0
+    └── nds_top.vhd                 — the console, clk1x + ce
+        ├── ARM9 island (clk2x port, tied to clk_sys — see convention 2)
+        │   ├── nds_cpu9 (ARM946E-S), nds_membus9, nds_cache9 (8K I + 4K D)
+        │   ├── ITCM 32 KB / DTCM 16 KB (SyncRamDualByteEnable, M10K)
+        │   └── nds_bios9 — 4 KB, and it is clocked at clk2x on purpose (nds_top.vhd:1128)
+        ├── gba_cpu (ARM7TDMI), nds_membus7, nds_bios7 16 KB, ARM7 WRAM 64 KB
+        ├── clk1x↔island bridge     — toggle requests, edge-detected dones, payload latches
+        ├── nds_dma9 / nds_dma7, gba_timer ×2, nds_irq ×2
+        ├── nds_ipc.vhd             — IPCSYNC + two 16-deep 32-bit FIFOs
+        ├── nds_syscnt.vhd          — WRAMCNT / VRAMCNT / POWCNT / EXMEMCNT / HALTCNT
+        ├── nds_wram.vhd            — shared WRAM 32 KB + WRAMCNT
+        ├── nds_mainram.vhd         — 4 MB in SDRAM, two guest channels, arm7_priority
+        ├── nds_vram.vhd            — banks + CPU datapaths + the pipelined line server
+        │                             (decode: nds_vram_map.vhd). ON clk1x, not a memory clock
+        ├── nds_gpu_timing.vhd      — dot/line/frame, DISPSTAT, drawline/drawObj
+        ├── nds_gpu2d_fast ×2       — clock-domain wrapper around nds_gpu2d, engines A/B.
+        │                             GPU_FAST=0 elaborates `gslow` = straight through on clk1x
+        ├── nds_sound.vhd           — 16ch (capture NOT built), ARM7 bus guest
+        ├── nds_card.vhd            — ROMCTRL/AUXSPI regs + raw & KEY1 boot sequence
+        ├── nds_spi.vhd             — PMIC / firmware flash / TSC framing
+        ├── nds_rtc.vhd, nds_loader.vhd, nds_debug.vhd (IS-NITRO-style mailbox)
+        └── (no nds_math, no nds_gx_stub — see the subsystem map)
 ```
+
+Each 2D engine holds **ten** drawer instances, not five: `nds_drawer_text` ×4,
+`nds_drawer_affine` ×2, `nds_drawer_extended` ×2 (BG2/BG3 carry all three, selected by mode
+and muted otherwise), `nds_drawer_obj`, `nds_drawer_merge`. The BG VRAM arbiter inside
+`nds_gpu2d` multiplexes **only the four BG layers**; OBJ, BG ext-palette and OBJ ext-palette
+are three further independent channels per engine, so eight renderer channels reach
+`nds_vram` (`nds_top.vhd:1719-1736`).
 
 ## Risk register (ordered)
 
