@@ -46,6 +46,18 @@ entity tb_top_frame is
       VRAMOPS      : integer := 0;
       -- 1 = run both 2D engines on clkMem (3x). See rtl/nds_gpu2d_fast.vhd.
       GPUFAST      : integer := 0;
+      -- A..D renderer read model (vrsrv_*). The default has been UNLIMITED
+      -- IN-FLIGHT with a fixed 4-cycle pipe and vrsrv_ready never driven at all,
+      -- which does not resemble the hardware: NDS.sv assigns
+      --   vrsrv_ready_c = ~vr_busy & ~vr_fin
+      -- so silicon allows exactly ONE A..D renderer read at a time, and the
+      -- backpressure path was therefore never exercised in simulation. That
+      -- matters a lot more since the drawers were pipelined, because they issue
+      -- ~73% more requests per line (271 -> 469).
+      --   VRSRV_LAT : response latency in clk1x cycles
+      --   VRSRV_ONE : 1 = model hardware, ready low from acceptance until done
+      VRSRV_LAT    : integer := 4;
+      VRSRV_ONE    : integer := 0;
       ISLAND     : integer := 1;         -- 0 = tie clk2x to clk1x, i.e. no ARM9 island
       -- clk2x half period in ps. 7500 = 66.67 MHz, the 2:1-with-coincident-edges
       -- relationship the hardware PLL currently produces because the island
@@ -238,6 +250,17 @@ architecture sim of tb_top_frame is
    signal vrsrv_bank : std_logic_vector(1 downto 0);
    signal vrsrv_addr : unsigned(16 downto 2);
    signal vrsrv_dout : std_logic_vector(31 downto 0) := (others => '0');
+
+   -- in-order response delay line for the pipelined A..D model (see prserv)
+   type t_vrsrvpipe is record
+      v : std_logic;
+      d : std_logic_vector(31 downto 0);
+   end record;
+   type t_vrsrvpipe_arr is array (0 to VRSRV_LAT - 1) of t_vrsrvpipe;
+   signal vrsrvpipe : t_vrsrvpipe_arr := (others => ('0', (others => '0')));
+   -- VRSRV_ONE: hardware-shaped backpressure (one op in flight)
+   signal vrsrv_busy_m  : std_logic := '0';
+   signal vrsrv_ready_s : std_logic;
 
    signal pixel_out_x    : integer range 0 to 255;
    signal pixel_out_y    : integer range 0 to 191;
@@ -434,6 +457,7 @@ begin
       vsrv_be => vsrv_be, vsrv_din => vsrv_din, vsrv_dout => vsrv_dout, vsrv_done => vsrv_done,
       vrsrv_req => vrsrv_req, vrsrv_bank => vrsrv_bank, vrsrv_addr => vrsrv_addr,
       vrsrv_dout => vrsrv_dout, vrsrv_done => vrsrv_done,
+      vrsrv_ready => vrsrv_ready_s,
       pixel_out_x => pixel_out_x, pixel_out_y => pixel_out_y,
       pixel_out_data => pixel_out_data, pixel_out_we => pixel_out_we,
       pixelb_out_x => pixelb_out_x, pixelb_out_y => pixelb_out_y,
@@ -1366,14 +1390,34 @@ begin
       vsrv_done <= '0';
    end process;
 
-   prserv : process
+   -- Renderer A..D feed: PIPELINED, one request accepted per cycle, answered in
+   -- issue order VRSRV_LAT+1 cycles later. On hardware this channel is SDRAM
+   -- (NDS.sv's vrsrv handler on ch1), so the old two-cycle blocking model both
+   -- understated its cost and hid the renderer's outstanding-request behaviour.
+   -- ready mirrors NDS.sv's `~vr_busy & ~vr_fin` when VRSRV_ONE is set, and is
+   -- tied high otherwise (the historical behaviour)
+   vrsrv_ready_s <= '1' when VRSRV_ONE = 0 else (not vrsrv_busy_m);
+
+   prserv : process (clk1x)
+      variable accept_v : boolean;
    begin
-      wait until rising_edge(clk1x) and vrsrv_req = '1';
-      wait until rising_edge(clk1x);
-      vrsrv_dout <= banks(to_integer(unsigned(vrsrv_bank)) * 32768 + to_integer(vrsrv_addr));
-      vrsrv_done <= '1';
-      wait until rising_edge(clk1x);
-      vrsrv_done <= '0';
+      if rising_edge(clk1x) then
+         for k in VRSRV_LAT - 1 downto 1 loop
+            vrsrvpipe(k) <= vrsrvpipe(k - 1);
+         end loop;
+         vrsrvpipe(0).v <= '0';
+         accept_v := (vrsrv_req = '1') and
+                     (VRSRV_ONE = 0 or vrsrv_busy_m = '0');
+         if (accept_v) then
+            vrsrvpipe(0).v <= '1';
+            vrsrvpipe(0).d <= banks(to_integer(unsigned(vrsrv_bank)) * 32768 +
+                                    to_integer(vrsrv_addr));
+            if (VRSRV_ONE /= 0) then vrsrv_busy_m <= '1'; end if;
+         end if;
+         vrsrv_done <= vrsrvpipe(VRSRV_LAT - 1).v;
+         vrsrv_dout <= vrsrvpipe(VRSRV_LAT - 1).d;
+         if (vrsrvpipe(VRSRV_LAT - 1).v = '1') then vrsrv_busy_m <= '0'; end if;
+      end if;
    end process;
 
    -- ============ reset-clear ordering monitor ============
