@@ -167,6 +167,13 @@ DIRTY=1 POD=nds-sim-hw1 \
 410,000 cycles on one line against a 2,130 budget is a **wedge, not slowness**, and
 it is latency-independent — the one-in-flight restriction alone triggers it.
 
+**And it degrades to renders=0.** Frame 3 of the same run: `renders=0`,
+`bg/render=558139`, `rvram_busy%=100` — busy for the entire 560,190-cycle frame with
+**not a single line rendered**. That is the white screen exactly: the framebuffer is
+never written after the reset clear, so the screen stays at its cleared value. The
+symptom reported from silicon and the symptom in this reproduction are the same
+thing.
+
 ## Diagnosis
 
 Serialised memory needs ~324 ops/line x ~5 cycles = ~1,620 of the 2,130 budget, so
