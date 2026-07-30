@@ -124,3 +124,79 @@ So this is the last known blocker between firmware boot and the firmware menu.
   the whole raw + KEY1 boot command sequence
 - The KEY1 command sequence is **ROM-dependent** (7 commands retail, 2 for homebrew
   with no secure area) — see `nds_card.vhd`'s header
+
+---
+
+# SECOND TICKET — pipelined drawer wedges under VRAM backpressure (hardware white screen)
+
+**Filed** 2026-07-30 · **Severity: blocks hardware** · Reported from silicon: the
+sdk2k test ROM white-screens under **both** boot modes and **both** GPU pace
+settings.
+
+## Root gap: simulation never modelled backpressure
+
+| A..D renderer reads (`vrsrv_*`) | simulation (before this) | hardware |
+|---|---|---|
+| in flight at once | **unlimited** | **one** |
+| latency | fixed 4 cycles | real SDRAM + CPU contention |
+| `vrsrv_ready` | **never connected** | `~vr_busy & ~vr_fin` (NDS.sv:889) |
+
+`tb_top_frame`'s `prserv` accepted a request every cycle with no gating. So every
+passing test — `tb_gpu2d`, `tb_gpu2d_frame`, `tb_gpu2d_timed`, `fbdiff`, and
+`run_drawer_text_equiv.sh` — ran against a memory model that cannot say no.
+
+## Reproduction (new generics, ~5 minutes)
+
+```bash
+DIRTY=1 POD=nds-sim-hw1 \
+  ENV="WORK=sim/nvc_work_hw1 PRELOAD=0 HEXFILE=sim/tests/nds_2dk.hex DIRECT=1 \
+       GPUFAST=0 VRAMOPS=1 VRSRV_ONE=1 VRSRV_LAT=4 TIMEOUT_MS=120 FRAMES=3 \
+       GPUCEDIV=1 CYCLE_HIST=0" \
+  build/remote-sim.sh run_top_frame.sh
+```
+
+`VRSRV_ONE=1` models hardware (ready low from acceptance until done);
+`VRSRV_LAT` sets the response latency. Results:
+
+| | `renders` | `bg/render` | `rvram_busy%` |
+|---|---|---|---|
+| `VRSRV_ONE=0` (old sim) | **189/192** | 832 | 32 |
+| `VRSRV_ONE=1 LAT=4` | **1** | 409,876 | **100** |
+| `VRSRV_ONE=1 LAT=8` | **1** | 407,374 | 42 |
+
+410,000 cycles on one line against a 2,130 budget is a **wedge, not slowness**, and
+it is latency-independent — the one-in-flight restriction alone triggers it.
+
+## Diagnosis
+
+Serialised memory needs ~324 ops/line x ~5 cycles = ~1,620 of the 2,130 budget, so
+it should be *tight but feasible*. It is not merely saturating. `rvram_busy%` at 100
+while ops account for ~76% of cycles indicates `nds_vram`'s renderer FSM sits
+**non-IDLE waiting for a response that never arrives** — precisely the failure
+NDS.sv's own comment at :878 describes: *"every request arriving while ch1 was busy
+was simply dropped - the core would then wait forever for a word that was never
+asked for."* The `rsrv_ready` line was added to prevent that; at this request rate it
+does not fully.
+
+A likely contributing race, by inspection: `vrsrv_ready_c` is combinational in
+**clk_mem** (3x clk1x) while `nds_vram` samples it in **clk1x**, so `vr_busy` can
+rise after the core sampled ready high and committed to its one-cycle `rsrv_req`
+pulse. That pulse lands while busy and NDS.sv drops it — `if (vrsrv_req_c &
+~vr_req_d & ~vr_busy)`. Note the **firmware** channel handles exactly this hazard
+with an explicit `fwr_pend` latch (NDS.sv:491) and its comment says a dropped
+request "stalls ARM7 permanently". The vrsrv channel has no equivalent latch.
+
+**Why v1 was safe:** it held `req` until `done` and allowed one op, so it only ever
+issued into an idle channel and never depended on a sampled-then-stale ready.
+
+## Fix candidates (owner: whoever holds the accept-protocol work)
+
+1. **Latch a dropped `vrsrv_req` in NDS.sv**, mirroring `fwr_pend`. Smallest change,
+   matches an existing commented pattern in the same file for the same hazard.
+2. Make `nds_vram` hold `rsrv_req` until it observes acceptance, rather than
+   pulsing on a sampled `ready`.
+3. Pipeline ch1 itself so `AD_DEPTH > 1` is real on hardware — NDS.sv:881 already
+   notes this "is a separate change and needs hardware to validate".
+
+**Do not ship the current tree to hardware until this is fixed.** `GPU_FAST` is
+already off and is not implicated.
