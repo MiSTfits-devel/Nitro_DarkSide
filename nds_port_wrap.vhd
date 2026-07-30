@@ -5,9 +5,9 @@
 -- only anyway), converts the pixel coordinates to plain vectors, and exposes
 -- everything else 1:1 as std_logic/std_logic_vector.
 --
--- No logic lives here. Generics keep their nds_top defaults (is_simu='0', main
--- RAM at SDRAM byte offset 8 MB, GPU_CE_DIV=3) EXCEPT GPU_FAST, which is set to
--- 1 here so hardware renders on clkMem - see the generic map below.
+-- No logic lives here. All generics keep their nds_top defaults (is_simu='0',
+-- main RAM at SDRAM byte offset 8 MB, GPU_CE_DIV=3, GPU_FAST=0) - see the note on
+-- the generic map for why GPU_FAST is deliberately left off.
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -159,11 +159,21 @@ begin
    vrsrv_addr   <= std_logic_vector(vrsrv_addr_u);
 
    inds : entity work.nds_top
-   -- GPU_FAST=1: both 2D engines render on clkMem (100.5 MHz) instead of clk1x.
-   -- Verified transparent in sim - fbdiff reported 0 partial-row differences at
-   -- GPUCEDIV=3 - and it takes a rendered line from 5,829 to 3,996 clk1x cycles.
-   -- All other generics keep their nds_top defaults.
-   generic map ( GPU_FAST => 1 )
+   -- GPU_FAST stays 0: SUPERSEDED, and currently incompatible.
+   --
+   -- It runs both 2D engines on clkMem for 3x the cycles per scanline, and it
+   -- works - verified transparent (fbdiff: 0 partial-row differences) and it took
+   -- a rendered line from 5,829 to 3,996 clk1x cycles against a 2,130 budget.
+   -- But the pipelined text drawer does far better on its own: 1,027 cycles per
+   -- line, UNDER budget with ~50% headroom, at GPUCEDIV=1. clkMem bought 31%;
+   -- the drawer buys 5.7x, so the extra clock domain earns nothing.
+   --
+   -- It is also incompatible as written: nds_gpu2d_fast adapts the OLD done-based
+   -- VRAM protocol, and the drawer rework replaced it with an accept-based one, so
+   -- GPU_FAST=1 now stalls the renderer (ops=3965, renders=1, bg busy 1.2M cycles).
+   -- Fixing that means teaching the adapter the accept handshake - not worth doing
+   -- unless a heavier scene turns out to need the headroom.
+   generic map ( GPU_FAST => 0 )
    port map
    (
       clk1x            => clk1x,
