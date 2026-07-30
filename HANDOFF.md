@@ -18,7 +18,7 @@ rules turned out to be invented.
 | **Area** | 85% ALMs (35,824 / 41,910), 85% M10K, 84% DSP |
 | **ARM9 island** | **Removed.** ARM9 runs on `clk1x` at 1:1. The 67 MHz island existed for a ratio requirement that does not exist. |
 | **Kirby in sim** | Boots, runs, renders to VRAM. ~6 frames in 216 ms; display still off there, which is correct for that point. |
-| **Frame rate** | 3.01x too slow, and it is **not** the CPUs — `GPU_CE_DIV`. See below. |
+| **Frame rate** | **SOLVED in sim** by the pipelined text drawer: 1,134 cycles/line against a 2,130 budget at `GPUCEDIV=1`, 189/192 lines, ~3 drops/frame (was 5,829 / 66 / 126). Uncommitted — see below. |
 | **HDMI** | **Compiled out** (`MISTER_DEBUG_NOHDMI=1`). `ascal`/`pll_hdmi` absent, analog VGA only. Re-enabling costs ~2,178 ALMs against ~6,086 free. |
 | **Hardware** | `NDS_isl0_20260728.rbf` deployed 2026-07-28 and **configures and runs** — the debug mailbox returns a coherent probe decode. Not yet exercised with a cart. |
 | **Firmware boot** | **Built** (`FWBOOT=1`, sim only). Both retail BIOSes execute from their reset vectors; the ARM7 BIOS matches the melonDS oracle with **0 control-flow divergence over 323,826 basic blocks**. Cart launch not yet confirmed. |
@@ -84,8 +84,21 @@ protocol and the rework replaced it with an accept-based one, so `GPU_FAST=1` no
 stalls (`ops=3965`, `renders=1`, bg busy 1.2M cycles). Teaching the adapter the
 accept handshake is only worth it if a heavier scene needs the headroom.
 
-Still to confirm: a steady-state frame (the 1,027 above is frame 1, which includes
-boot) and whether `renders` reaches 192/192.
+**Steady-state frame confirms it** (frame 2, 560,190 cycles = exactly one 16.8 ms
+frame): `cyc/render 1134`, `renders 189/192`, `bg/render 832`, `obj/render 360`,
+`rvram_busy% 32`. And the number that matters for playability: **frame 0 reports 7
+drops total where the v1 baseline reported 235** — roughly 3 drops/frame against
+126.
+
+`rvram_busy%` rising 5% -> 32% is expected and not a problem: the drawer got ~7x
+faster, so the unchanged VRAM service is a much larger share of a much shorter
+line. It is not the limit — a line uses 1,134 of 2,130.
+
+Remaining check worth doing: `fbdiff` the v2 `GPUCEDIV=1` output against a v1
+`GPUCEDIV=3` output. The drop patterns differ so full rows will differ, but any
+PARTIAL-row difference would mean a real rendering fault at real frame rate.
+`run_drawer_text_equiv.sh` already covers v2-vs-v1 pixel equality directly, which
+is the stronger argument.
 
 ---
 
