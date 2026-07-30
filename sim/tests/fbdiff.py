@@ -18,10 +18,25 @@ The shape of the difference tells them apart:
   * differences SCATTERED WITHIN rows, or partial rows
         -> a real rendering difference. This is the one that condemns a change.
 
-Calibration: the GPU_FAST clkMem work compared GPUFAST=0 vs 1. At GPUCEDIV=1 both
-dropped ~2/3 and ~1/2 of lines respectively, so that comparison was meaningless -
-it was rerun at GPUCEDIV=3, where the per-line budget is 6390 cycles and both fit,
-leaving only ~4 drops per frame.
+COMPARE LIKE WITH LIKE, OR THIS TOOL WILL LIE TO YOU. Three separate attempts at
+one gate were invalid before the setup was right:
+
+  1. GPUFAST=0 vs 1 at GPUCEDIV=1 - both dropped most lines (126/192 and 98/192),
+     so the output differed for reasons unrelated to the change.
+  2. Same pair at GPUCEDIV=3 - valid, and it gave the clean answer (0 partial rows).
+  3. v1 drawer at GPUCEDIV=3 vs v2 drawer at GPUCEDIV=1 - invalid on THREE counts,
+     and it produced a confident "RENDERING DIFFERENCE" verdict that was a false
+     alarm. Different pacing means different drop patterns; it also means lines
+     that were STARTED AND PREEMPTED, which show up as partial rows (the signature
+     was exactly 192 of 256 pixels on the even rows between dropped odd rows); and
+     the frame numbering does not correspond, so "frame 4" is a different moment in
+     each run.
+
+Rules, then: vary ONE thing, keep GPUCEDIV equal, and prefer a config where
+`renders` is at or near 192. If both sides drop lines, this tool cannot help you.
+And when a drawer or renderer is replaced wholesale, a dedicated equivalence bench
+against the old implementation (see sim/run_drawer_text_equiv.sh) is a far stronger
+argument than any framebuffer diff.
 """
 import sys
 
