@@ -57,7 +57,7 @@ loads.
 
 ---
 
-## SOLVED (pending steady-state confirmation): the pipelined text drawer
+## SOLVED: the pipelined text drawer
 
 **A rendered line now costs 1,027 clk1x cycles against a 2,130 budget — 52% UNDER,
 at `GPUCEDIV=1`, i.e. real frame rate.** Measured on the working tree's pipelined
@@ -94,11 +94,17 @@ drops total where the v1 baseline reported 235** — roughly 3 drops/frame again
 faster, so the unchanged VRAM service is a much larger share of a much shorter
 line. It is not the limit — a line uses 1,134 of 2,130.
 
-Remaining check worth doing: `fbdiff` the v2 `GPUCEDIV=1` output against a v1
-`GPUCEDIV=3` output. The drop patterns differ so full rows will differ, but any
-PARTIAL-row difference would mean a real rendering fault at real frame rate.
-`run_drawer_text_equiv.sh` already covers v2-vs-v1 pixel equality directly, which
-is the stronger argument.
+**Pixel-equality confirmed a second way.** `fbdiff` on v1 vs v2 at the SAME
+`GPUCEDIV=3`, frames 3 and 4: 4 full rows differ (the drop pattern), **0 partial
+rows**. So v2 is pixel-identical to v1 on every line both rendered — agreeing with
+`run_drawer_text_equiv.sh` (PASS, 64 configurations, identical line buffers) by an
+independent route. And at `GPUCEDIV=3` v2 renders **192/192** where v1 managed 188,
+at 1,184 cycles/line.
+
+Do NOT compare across `GPUCEDIV` settings: doing exactly that produced a confident
+false "RENDERING DIFFERENCE" verdict. Different pacing changes the drop pattern,
+introduces started-then-preempted lines that show up as partial rows, and breaks
+frame correspondence. See the header of `sim/tests/fbdiff.py`.
 
 ---
 
