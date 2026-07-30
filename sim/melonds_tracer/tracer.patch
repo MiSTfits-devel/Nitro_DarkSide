@@ -1,8 +1,16 @@
 diff --git a/src/ARM.cpp b/src/ARM.cpp
-index 827fcb01..76613f35 100644
+index 827fcb01..614927bb 100644
 --- a/src/ARM.cpp
 +++ b/src/ARM.cpp
-@@ -589,6 +589,36 @@ void ARM::CheckGdbIncoming()
+@@ -21,6 +21,7 @@
+ #include <algorithm>
+ #include "NDS.h"
+ #include "DSi.h"
++#include <cstdlib>
+ #include "ARM.h"
+ #include "ARMInterpreter.h"
+ #include "AREngine.h"
+@@ -589,6 +590,58 @@ void ARM::CheckGdbIncoming()
      GdbCheckA();
  }
  
@@ -29,6 +37,28 @@ index 827fcb01..76613f35 100644
 +
 +static inline void ARM7TraceLine(u32 pc, u32 instr, u32 cpsr, u32* r)
 +{
++    // NDS_MiSTfits: ARM7PROBE_LO/HI (hex) report the FIRST execution inside an
++    // address window, with the CPSR so the T bit is visible. Runs before the
++    // trace-file guard so it works with tracing off - the RTL faults at
++    // ARM7 instruction ~30M, and a trace that long is several GB.
++    if (const char* plo = getenv("ARM7PROBE_LO"))
++    {
++        static bool seen = false;
++        if (!seen)
++        {
++            u32 lo = (u32)strtoul(plo, nullptr, 16);
++            u32 hi = lo;
++            if (const char* phi = getenv("ARM7PROBE_HI"))
++                hi = (u32)strtoul(phi, nullptr, 16);
++            if (pc >= lo && pc <= hi)
++            {
++                printf("ARM7PROBE first pc=%08x in [%08x..%08x] cpsr=%08x T=%d instr=%08x\n",
++                       pc, lo, hi, cpsr, (cpsr >> 5) & 1, instr);
++                fflush(stdout);
++                seen = true;
++            }
++        }
++    }
 +    if (!ARM7TraceFile || ARM7TraceCount >= ARM7TraceMax) return;
 +    fprintf(ARM7TraceFile, "%08x %08x %08x", pc, instr, cpsr);
 +    for (int i = 0; i < 15; i++) fprintf(ARM7TraceFile, " %08x", r[i]);
@@ -39,7 +69,7 @@ index 827fcb01..76613f35 100644
  template <CPUExecuteMode mode>
  void ARMv5::Execute()
  {
-@@ -670,8 +700,10 @@ void ARMv5::Execute()
+@@ -670,8 +723,10 @@ void ARMv5::Execute()
                  else             NextInstr[1] = CodeRead32(R[15], false);
  
                  // actually execute
@@ -50,7 +80,7 @@ index 827fcb01..76613f35 100644
              }
              else
              {
-@@ -685,6 +717,7 @@ void ARMv5::Execute()
+@@ -685,6 +740,7 @@ void ARMv5::Execute()
                  NextInstr[1] = CodeRead32(R[15], false);
  
                  // actually execute
@@ -58,7 +88,7 @@ index 827fcb01..76613f35 100644
                  if (CheckCondition(CurInstr >> 28))
                  {
                      u32 icode = ((CurInstr >> 4) & 0xF) | ((CurInstr >> 16) & 0xFF0);
-@@ -696,6 +729,7 @@ void ARMv5::Execute()
+@@ -696,6 +752,7 @@ void ARMv5::Execute()
                  }
                  else
                      AddCycles_C();
@@ -66,7 +96,7 @@ index 827fcb01..76613f35 100644
              }
  
              // TODO optimize this shit!!!
-@@ -808,8 +842,10 @@ void ARMv4::Execute()
+@@ -808,8 +865,10 @@ void ARMv4::Execute()
                  NextInstr[1] = CodeRead16(R[15]);
  
                  // actually execute
@@ -77,7 +107,7 @@ index 827fcb01..76613f35 100644
              }
              else
              {
-@@ -823,6 +859,7 @@ void ARMv4::Execute()
+@@ -823,6 +882,7 @@ void ARMv4::Execute()
                  NextInstr[1] = CodeRead32(R[15]);
  
                  // actually execute
@@ -85,7 +115,7 @@ index 827fcb01..76613f35 100644
                  if (CheckCondition(CurInstr >> 28))
                  {
                      u32 icode = ((CurInstr >> 4) & 0xF) | ((CurInstr >> 16) & 0xFF0);
-@@ -830,6 +867,7 @@ void ARMv4::Execute()
+@@ -830,6 +890,7 @@ void ARMv4::Execute()
                  }
                  else
                      AddCycles_C();

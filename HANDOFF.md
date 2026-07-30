@@ -264,6 +264,123 @@ renderer overload.
 
 ---
 
+## The renderer is PIPELINED now (2026-07-29) — and "the arbiter is not the bottleneck" was wrong
+
+Landed: the renderer memory path and the text drawer are pipelined. All measured
+with `tb_gpu2d_timed` at `CE_DIV=3` (every line renders, so nothing is
+confounded by drops), as `line_busy` occupancy per rendered line — the same
+basis as the 5,829 / 3,255 figures above. Budget is **2,130**.
+
+| bench case | before | after | server busy before | after |
+|---|---|---|---|---|
+| 0 — mode 0, **four text BGs** + sprites | 3,119 | **947** | 2,019 | 592 |
+| 1 — mode 2, affine x2 + text x2 | 4,916 | 4,340 | 2,847 | 2,299 |
+| 2 — mode 5, extended bitmaps | 4,794 | 2,794 | 2,983 | 1,717 |
+| 3 — mode 4, affine + extended | 5,162 | 3,952 | 2,932 | 1,970 |
+
+**Case 0 is the one that matters for Kirby** (mode 0, tiled BGs, sprites) and it
+is now **947 against 2,130 — inside budget with 2.2x margin**, while rendering
+*four* text BGs where Kirby enables one.
+
+### RETRACTED: "the VRAM arbiter is not the bottleneck ... making it parallel buys almost nothing"
+
+That claim (and "the arbiter sits ~88% idle") rested on the same
+count-req-pulses metric this file already retracts for the clkMem section — it
+was never withdrawn from the *conclusion*. Measured with `dbg_rbusy`, the
+metric this file itself introduced as the correct one, the v1 line server was
+busy **58-65% of every rendered line**. It served ONE request at a time through
+a six-state FSM: five cycles for a plain BRAM hit, nothing overlapped.
+
+It was a throughput wall, and it was also why the drawers looked compute-bound:
+with one fetch outstanding a drawer has nothing to do but wait, so its cost
+shows up as its own busy time rather than as memory pressure.
+
+### What changed
+
+- **`nds_vram` renderer server → pipelined.** One request accepted per cycle,
+  several in flight, retired **in issue order** through a completion queue, so a
+  channel may have several outstanding requests and needs no tags on the wire.
+  BRAM hits answer in 2 cycles instead of 5. The A..D (`rsrv`) backing channel
+  is pipelined the same way. New per-channel `accept` handshake: a request is
+  taken on `accept`, not on `done`.
+- **`nds_gpu2d` BG arbiter → pipelined**, with a FIFO of which BG owns each
+  in-flight op. One trap here, and it is the kind that produces plausible
+  output: `bgv_done` is registered a cycle after `srv_bg_done`, but
+  `srv_bg_data` is only valid ON the done cycle. With one op in flight nothing
+  could overwrite it in the gap; with several, the drawer read the NEXT
+  request's word. It shows up as pixels wearing their neighbours' colours. The
+  data is now captured with the done it belongs to.
+- **Palette round robin deleted.** One shared copy served 4 BGs one cycle in
+  four, and the drawers *park* until answered — an average 2.5-cycle stall on
+  every pixel. Now: one 1 KB palette copy per BG (~3 extra M10K), and the 32 KB
+  BG ext-pal split into **four 8 KB slot RAMs**. A BG can only read the slot its
+  BGxCNT selects (BG0 → 0 or 2, BG1 → 1 or 3, BG2 → 2, BG3 → 3), so at most two
+  BGs want any slot — exactly what a dual-port block gives. Static assignment,
+  no arbitration, `valid` is unconditional.
+- **`nds_drawer_text` → decoupled prefetch pipeline.** A tile queue whose
+  entries walk map-fetch → char-fetch → ready, with fetches for several tiles in
+  flight at once, feeding a two-stage pixel path that has no back-pressure.
+- **`NDS.sv`**: the renderer feed on SDRAM ch1 serves one op at a time
+  (`ch1_rq` is a single bit) and silently DROPPED any request arriving while
+  busy. Now exports `vrsrv_ready` and the core throttles. Pipelining ch1 itself
+  is a separate change and wants hardware to validate.
+
+### The drawer, measured in isolation
+
+`sim/run_drawer_text_equiv.sh` drives the new drawer and the old one from
+identical stimulus with a 5-cycle memory latency:
+
+| | cycles/line | per pixel |
+|---|---|---|
+| serial (v1) | 1,183 | 4.6 |
+| pipelined (v2) | **274** | **1.07** |
+
+256 is the floor (one pixel per cycle), so this is within 7% of it. Note 4.6
+rather than 21.7 cycles/pixel for v1: that bench gives it a private palette
+port, so it already excludes the round-robin stall.
+
+### A coverage hole this found: the golden model has no mosaic
+
+`gen_gpu2d_frame.py` states it and means it — "Mosaic stays off" — so **no
+full-frame bench can check the BG mosaic path**, and the rewrite had to change
+it (v1 decided each repeat from `pixeldata(15)`, which a pipelined pixel path
+cannot read, because pixeldata is written a cycle later). That is exactly the
+shape of change that ships broken.
+
+`sim/tb_drawer_text_equiv.vhd` closes it by comparing against v1 directly
+(kept verbatim as `sim/nds_drawer_text_ref.vhd`), which is a proven-correct
+oracle. 64 configurations, 384 lines, identical line buffers: all 16 mosaic
+sizes in both depths, all four screen sizes, both flips, ext-pal on and off, and
+every sub-tile scroll alignment. **Run it after any text-drawer change** — the
+frame benches will not catch a mosaic regression.
+
+### Still to do, with the number attached
+
+**The affine drawer is now the limiting one.** Cases 1 and 3 are affine-heavy
+and still 2x and 1.9x over budget, and case 1 works out at roughly 17 cycles per
+pixel — consistent with paying TWO dependent memory round trips per pixel with
+nothing overlapped (map then char, and rotation defeats its word caches). The
+fix is the same shape as the text drawer: pixel N+1's map fetch overlapped with
+pixel N's char fetch, several pixels in flight. Affine has no 8-pixel locality
+to exploit, so the ceiling is memory throughput — 2 ops/pixel, ~512 ops/line per
+BG — not 1 pixel/cycle.
+
+Also open: the OBJ drawer is untouched (this file measured `obj_busy` at 1,051
+cycles/line in Kirby's mode), and `rsrv`/ch1 could return **two** words per op —
+`NDS.sv` already fetches a 64-bit burst on ch1 and throws the upper half away,
+which is a free halving of A..D renderer traffic.
+
+### Verification state
+
+`tb_gpu2d` / `tb_gpu2d_frame` / `tb_gpu2d_timed` (pixel-exact, 0 dropped lines
+at CE_DIV=3) / `tb_vram_ls` (16 VRAMCNT configs incl. the 8-channel concurrent
+arbiter exercise) / `tb_vram_torture` / `tb_drawer_text_equiv` all pass;
+`run_analyze_all.sh` OK and `tb_top_frame` elaborates. **Not** run: a full
+`tb_top_frame` frame run, and Quartus — so the M10K delta from the palette
+copies and the slot-RAM split is unmeasured, and area/timing are unconfirmed.
+
+---
+
 ## Kirby's real video mode (measured)
 
 Kirby enables its display at melonDS **dump frame 51** — 3-4 s on real hardware.
@@ -527,6 +644,43 @@ whole FSM and only swaps the *values*, via `arm9_entry_eff`/`arm7_entry_eff`.
   0x7000, 0x5000, 0x4000** - assuming 0x4000 upward silently scrambles the secure
   area. KEY2 is deliberately absent: hardware applies and removes it, so it is
   transparent to software and melonDS ignores it too.
+
+### The ARM7 fault at 1.588 s is WRONG MEMORY CONTENTS, not CPU state
+
+Firmware boot reaches 1.588 s and the ARM7 dies on `unhandled opcode 1C0E1C05
+thumb=0 pc=037FE28C lr=00002E10 cpsr=8000001F`. Two wrong diagnoses were
+discarded on the way, both by measurement:
+
+1. *"A decode case GBA titles never reach."* No — `0x1C0E1C05` is two Thumb
+   `add rX,rY,#0`, and `thumb=0`, so it is Thumb code being run as ARM.
+2. *"The ARM7 lost its T bit."* Also no. A new melonDS window probe
+   (`ARM7PROBE_LO`/`ARM7PROBE_HI`, in `tracer.patch`) shows the oracle in **ARM**
+   state there too, and holding **different bytes**:
+
+   | at `0x037FE28C` | instruction |
+   |---|---|
+   | melonDS | `0xE25EF004` = ARM `subs pc, lr, #4` |
+   | our RTL | `0x1C0E1C05` |
+
+**So it is a data/loading bug.** And what melonDS holds is the clue:
+`subs pc, lr, #4` is the canonical exception return, so `0x037FE28C` is inside the
+firmware's **ARM7 exception handler** in ARM7 WRAM.
+
+**That retro-implicates a divergence recorded below as benign.** `loopdiff` put the
+first ARM7 control-flow difference at instruction 2,258,084, where our ARM7
+branches to `pc=0x00000020` — the instruction at `0x18`, the **IRQ vector** — and
+melonDS does not. That was attributed to IRQ delivery timing between two
+non-cycle-equivalent models. Since the eventual fault lands in exception-handler
+code, **treat that as suspect and re-examine it first.** Also unexplained: our
+CPSR is `0x8000001F` (System) where melonDS at `0x037FE280` is `0x000000D3`
+(Supervisor).
+
+Next: find where the firmware's ARM7 handler is written in our RTL and diff the
+written bytes against melonDS. Candidates — `nds_spi`'s firmware read
+address/offset, the BIOS's decompression input, or WRAMCNT mapping the write
+somewhere other than where the read lands. Note the firmware boot code is
+**compressed** in the image, so grepping the raw firmware for expected instruction
+words does not work (tried: 0 hits, inconclusive).
 
 ### The extra KEY1 command: benign, an IRQ timing difference
 
