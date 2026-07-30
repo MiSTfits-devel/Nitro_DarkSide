@@ -33,6 +33,15 @@ entity nds_rtc is
       ce          : in  std_logic;
       reset       : in  std_logic;
 
+      -- '1' = firmware boot. Decides the power-up value of status1 bit 7, the
+      -- power-off/reset-detect flag. On real hardware it is set at power-up and
+      -- auto-clears when status1 is read - and the FIRMWARE is the first reader,
+      -- so a game always sees it already clear. HLE direct boot never runs the
+      -- firmware, so presenting 0x82 there makes the GAME the first reader and
+      -- hands it a flag hardware would never have shown it. Same class of
+      -- post-firmware state as the direct-boot env block fakes.
+      fw_boot     : in  std_logic := '0';
+
       bus7        : in  proc_bus_gb_type;
       wired_out7  : out std_logic_vector(31 downto 0);
       wired_done7 : out std_logic
@@ -58,13 +67,17 @@ architecture arch of nds_rtc is
    signal out_pos    : integer range 0 to 6 := 0;
 
    -- device registers
-   -- 0x82, not 0x02: bit 1 is 24h mode, and bit 7 is the power-off / reset
-   -- detect flag, which a real RTC raises on first power-up and auto-clears
-   -- when status1 is read. The ARM7 BIOS bit-bangs status1 out of 0x04000138
-   -- during firmware boot and branches on bits 7:6 to pick cold boot vs warm
-   -- boot; with bit 7 clear it takes the warm-boot path and the boot diverges
-   -- from the melonDS oracle at ARM7 instruction ~217000 (pc 0x2216).
-   signal status1    : std_logic_vector(7 downto 0) := x"82";  -- 24h + power-off
+   -- status1 bit 1 = 24-hour mode, bit 7 = power-off / reset detect. Bit 7 is
+   -- POWER-UP-STATE-DEPENDENT and the reset block below selects it from fw_boot:
+   --   firmware boot -> 0x82. The ARM7 BIOS bit-bangs status1 out of 0x04000138
+   --     and branches on bits 7:6 to pick cold boot vs warm boot; with bit 7 clear
+   --     it takes the warm-boot path and diverges from the melonDS oracle at ARM7
+   --     instruction ~217000 (pc 0x2216).
+   --   direct boot   -> 0x02. Hardware clears bit 7 when status1 is first read,
+   --     and on hardware the FIRMWARE is that first reader, so a game never sees
+   --     it set. HLE skips the firmware, so 0x82 would make the game the first
+   --     reader and hand it a flag hardware would never have shown it.
+   signal status1    : std_logic_vector(7 downto 0) := x"02";
    signal status2    : std_logic_vector(7 downto 0) := x"00";
    -- DateTime: year, month, day, weekday, hour, minute, second (BCD)
    type t_dt is array (0 to 6) of std_logic_vector(7 downto 0);
@@ -110,7 +123,13 @@ begin
 
             io_reg  <= (others => '0');
             in_bit  <= 0; in_pos <= 0; out_bit <= 0; out_pos <= 0;
-            status1 <= x"82";   -- see the declaration: bit 7 is power-off detect
+            -- power-up value: bit 7 set only for a real firmware boot (see the
+            -- fw_boot port comment)
+            if (fw_boot = '1') then
+               status1 <= x"82";
+            else
+               status1 <= x"02";
+            end if;
             status2 <= x"00";
             datetime <= (x"26", x"07", x"18", x"06", x"06", x"00", x"00");
             sec_div <= 0;

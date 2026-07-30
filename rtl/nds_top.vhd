@@ -1590,7 +1590,7 @@ begin
    irtc : entity work.nds_rtc
    port map
    (
-      clk => clk1x, ce => '1', reset => resetCpu,
+      clk => clk1x, ce => '1', reset => resetCpu, fw_boot => fw_boot,
       bus7 => io_bus7, wired_out7 => rtc_wired_out7, wired_done7 => rtc_wired_done7
    );
 
