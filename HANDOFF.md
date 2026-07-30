@@ -57,6 +57,38 @@ loads.
 
 ---
 
+## SOLVED (pending steady-state confirmation): the pipelined text drawer
+
+**A rendered line now costs 1,027 clk1x cycles against a 2,130 budget — 52% UNDER,
+at `GPUCEDIV=1`, i.e. real frame rate.** Measured on the working tree's pipelined
+`nds_drawer_text` (v2), `sim/tests/nds_2dk.hex`, both engines:
+
+| per rendered line | v1 serial | clkMem (`GPU_FAST=1`) | **v2 pipelined** | budget |
+|---|---|---|---|---|
+| cycles | 5,829 | 3,996 | **1,027** | 2,130 |
+| vs budget | 174% over | 88% over | **52% under** | |
+| `bg/render` | 5,563 | — | **752** | |
+| lines rendered | 66/192 | 94/192 | **188/192** | |
+
+`sim/run_drawer_text_equiv.sh` verifies v2 against v1 directly: **PASS, 64
+configurations, 384 lines, identical line buffers**, 1,183 -> 274 busy cycles/line
+standalone. That bench exists because the golden model leaves BG mosaic off
+entirely, and v2 deliberately changed the mosaic path (v1 read `pixeldata(15)`,
+which a pipelined path cannot, so v2 tracks `last_transp`).
+
+**This supersedes the clkMem work below.** `GPU_FAST` is back to 0 in
+`nds_port_wrap`. It does work — transparency verified, 5,829 -> 3,996 — but it
+bought 31% where the drawer buys 5.7x, so a second clock domain earns nothing. It
+is also incompatible as written: `nds_gpu2d_fast` adapts the OLD done-based VRAM
+protocol and the rework replaced it with an accept-based one, so `GPU_FAST=1` now
+stalls (`ops=3965`, `renders=1`, bg busy 1.2M cycles). Teaching the adapter the
+accept handshake is only worth it if a heavier scene needs the headroom.
+
+Still to confirm: a steady-state frame (the 1,027 above is frame 1, which includes
+boot) and whether `renders` reaches 192/192.
+
+---
+
 ## The real playability item: `GPU_CE_DIV`
 
 Frames take **50.42 ms** against 16.74 ms real — exactly 3.01x, and it is not the
