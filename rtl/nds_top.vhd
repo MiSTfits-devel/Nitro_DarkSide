@@ -270,6 +270,71 @@ architecture arch of nds_top is
    -- B_S9GAP/B_S7GAP - so simply releasing reset without presetting a PC
    -- starts the ARM9 at 0x00000000 and retires nothing at all.
    signal arm9_entry_eff, arm7_entry_eff : std_logic_vector(31 downto 0);
+
+   -- ---- direct-boot register preset ------------------------------------
+   -- Presetting only the PC is not enough. The loader's env block was specced
+   -- against calico homebrew, whose bootstubs set up their own CP15 and stacks;
+   -- a NitroSDK-built cart never sets its own SP, it inherits one from the boot
+   -- ROM. With SP=0 its first function prologue pushes into ITCM at address 0
+   -- and the cart is dead long before it touches a display register - see
+   -- docs/NTR_EVA_TESTER.md, where that is the whole of the failure.
+   --
+   -- Values are the GBATEK default stack pointers. melonDS banks with std::swap
+   -- while this core saves/restores per mode (the CPUMODE_* case in
+   -- gba_cpu.vhd), so its R[13]/R_SVC[0] pair does NOT copy across literally.
+   --
+   -- Translating melonDS's swap model into this one is not a field-by-field
+   -- copy, and getting it wrong costs a whole sim cycle to notice:
+   --
+   --   melonDS R[13]     -> the ACTIVE bank. Boot CPSR reads supervisor but the
+   --                        value there is the USER stack (0x03002F7C).
+   --   melonDS R_SVC[0]  -> the USER/SYSTEM bank. Under swap, while supervisor
+   --                        is active R_SVC holds the stack that swaps in when
+   --                        LEAVING supervisor - so despite the name it is the
+   --                        outer stack, not the supervisor one.
+   --   melonDS R_IRQ[0]  -> the IRQ bank directly (IRQ is not the active mode,
+   --                        so it really is holding IRQ's own stack).
+   --
+   -- Reading R_SVC[0] as "the supervisor bank" diverges at the ROM's first
+   -- MSR CPSR out of supervisor - instruction 69 of this cart, with every other
+   -- column still matching. Matching the oracle exactly is the point:
+   -- sim/tests/compare_trace.py had to document "--ignore cpsr,r13,r14 against
+   -- a melonDS trace" only because this preset was missing, and those ignores
+   -- mask real divergences.
+   --
+   -- Savestate addresses come from rtl/reg_savestates.vhd: REG_SAVESTATE_PC is
+   -- 0, and REG_SAVESTATE_REGS is a size-18 block based at 1, so rN is at 1+N.
+   -- REGS_0_13 = 24 (user/system bank), REGS_2_13 = 34 (IRQ), REGS_3_13 = 37
+   -- (supervisor). Both CPUs come out of reset in supervisor mode
+   -- (SAVESTATE_cpu_mode defaults to CPUMODE_SUPERVISOR), so the plain REGS r13
+   -- at address 14 IS the supervisor stack.
+   constant PRESET_LAST : integer := 6;
+   signal   preset_idx  : integer range 0 to 7 := 0;
+
+   function preset_adr(idx : integer) return integer is
+   begin
+      case idx is
+         when 0      => return  0;   -- fetch PC
+         when 1      => return 13;   -- r12
+         when 2      => return 14;   -- r13, active (supervisor) bank
+         when 3      => return 15;   -- r14
+         when 4      => return 24;   -- r13 user/system bank
+         when 5      => return 34;   -- r13 IRQ bank
+         when others => return 37;   -- r13 supervisor bank
+      end case;
+   end function;
+
+   function preset_val(idx : integer; entry_pc : std_logic_vector(31 downto 0);
+                       is_arm9 : boolean) return std_logic_vector is
+   begin
+      case idx is
+         when 0 | 1 | 3 => return entry_pc;
+         when 2         => if is_arm9 then return x"03002F7C"; else return x"0380FD80"; end if;
+         when 5         => if is_arm9 then return x"03003F80"; else return x"0380FF80"; end if;
+         when others    => if is_arm9 then return x"03003FC0"; else return x"0380FFC0"; end if;
+      end case;
+   end function;
+
    signal ld_cartid  : std_logic_vector(31 downto 0);  -- header-size chip ID -> nds_card B8
    -- on-FPGA debug unit (nds_debug): CPU hold/release, register read-back and
    -- a main-RAM peek muxed onto the ARM9 channel the same way the loader is
@@ -671,19 +736,20 @@ begin
                   if (boot_cnt = 2) then
                      ss_bus9.rst <= '0';
                      boot_cnt    <= 0;
+                     preset_idx  <= 0;
                      boot_state  <= B_S9GAP;
                   else
                      boot_cnt <= boot_cnt + 1;
                   end if;
 
                when B_S9GAP =>
-                  ss_bus9.Adr  <= (others => '0');   -- REG_SAVESTATE_PC
+                  ss_bus9.Adr  <= std_logic_vector(to_unsigned(preset_adr(preset_idx), ss_bus9.Adr'length));
                   -- Firmware boot enters the ARM9 BIOS at its reset vector instead
                   -- of the cart's entry point. This core does not model the ARM
                   -- reset exception at all - both CPUs start from whatever this
                   -- savestate write puts in fetch_PC - so "just release reset and
                   -- let it vector" boots from 0x00000000 and retires nothing.
-                  ss_bus9.Din  <= arm9_entry_eff;
+                  ss_bus9.Din  <= preset_val(preset_idx, arm9_entry_eff, true);
                   ss_bus9.rnw  <= '0';
                   ss_bus9.bEna <= "1111";
                   ss_bus9.ena  <= '1';
@@ -693,7 +759,15 @@ begin
                   ss_bus9.ena <= '0';
                   ss_bus9.rnw <= '1';
                   boot_cnt    <= 0;
-                  boot_state  <= B_S9POST;
+                  -- Firmware boot gets the PC and nothing else: the ARM9 BIOS
+                  -- sets up its own stacks, and presetting them here would mask
+                  -- a BIOS that never reached that point.
+                  if (preset_idx < PRESET_LAST and fw_boot = '0') then
+                     preset_idx <= preset_idx + 1;
+                     boot_state <= B_S9GAP;
+                  else
+                     boot_state <= B_S9POST;
+                  end if;
 
                when B_S9POST =>
                   if (boot_cnt = 2) then
@@ -708,14 +782,15 @@ begin
                   if (boot_cnt = 2) then
                      ss_bus7.rst <= '0';
                      boot_cnt    <= 0;
+                     preset_idx  <= 0;
                      boot_state  <= B_S7GAP;
                   else
                      boot_cnt <= boot_cnt + 1;
                   end if;
 
                when B_S7GAP =>
-                  ss_bus7.Adr  <= (others => '0');
-                  ss_bus7.Din  <= arm7_entry_eff;
+                  ss_bus7.Adr  <= std_logic_vector(to_unsigned(preset_adr(preset_idx), ss_bus7.Adr'length));
+                  ss_bus7.Din  <= preset_val(preset_idx, arm7_entry_eff, false);
                   ss_bus7.rnw  <= '0';
                   ss_bus7.bEna <= "1111";
                   ss_bus7.ena  <= '1';
@@ -725,7 +800,12 @@ begin
                   ss_bus7.ena <= '0';
                   ss_bus7.rnw <= '1';
                   boot_cnt    <= 0;
-                  boot_state  <= B_S7POST;
+                  if (preset_idx < PRESET_LAST and fw_boot = '0') then
+                     preset_idx <= preset_idx + 1;
+                     boot_state <= B_S7GAP;
+                  else
+                     boot_state <= B_S7POST;
+                  end if;
 
                when B_S7POST =>
                   if (boot_cnt = 2) then

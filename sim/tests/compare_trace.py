@@ -9,10 +9,22 @@ that every comparison "diverges" on line 1.
     compare_trace.py rtl_trace.log melonds_trace.log [--context 5]
     compare_trace.py rtl.log melon.log --ignore cpsr,r13,r14
 
-**Against a melonDS trace you almost always want `--ignore cpsr,r13,r14`.**
-melonDS pre-sets SP and LR at boot where the RTL starts from its reset values,
-so those three columns differ from instruction 1 and mask every real
-divergence behind them. Two RTL traces should be compared with nothing ignored.
+**Direct boot now compares with NOTHING ignored - do not reach for --ignore.**
+That used to read "against a melonDS trace you almost always want
+`--ignore cpsr,r13,r14`", because melonDS preset SP and LR at boot while the
+RTL started from reset values, so those columns differed from instruction 1.
+nds_top's boot FSM presets r12/r13/r14 and the banked stacks to match
+SetupDirectBoot, and a direct-boot trace is now column-for-column identical
+from instruction 1 - verified at 300k instructions on the NITRO Tester cart
+(docs/NTR_EVA_TESTER.md). So if a direct-boot comparison only passes with those
+ignores, that is a REAL divergence, not a boot-state artefact; the ignores hide
+exactly the class of bug this script exists to find.
+
+Firmware boot (FWBOOT=1) is the exception: it deliberately presets only the PC,
+because there the ARM7/ARM9 BIOS sets up its own stacks. Those traces can still
+differ in r13 until the BIOS stack setup has run.
+
+Two RTL traces should always be compared with nothing ignored.
 """
 import argparse
 import itertools
