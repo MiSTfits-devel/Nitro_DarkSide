@@ -153,3 +153,41 @@ cart's own Sound Test group:
 
 `nds_syscnt.vhd:130-135` (`preset_direct`) covers WRAMCNT, POSTFLG and POWCNT
 only.
+
+## Current state: boots and executes, but the display never turns on
+
+The cart is NOT green yet. Two separate facts, and it is worth keeping them
+apart:
+
+**The boot fix is done.** 300k ARM9 instructions match melonDS with nothing
+ignored, and RTL frame 0 is pixel-perfect against the golden dump
+(`compare_fb.py --rtl-frame 0 --mds-frame 0` → PASS).
+
+**There is a second, later divergence.** A 75-frame run
+(`GPUCEDIV=1 DIRECT=1 PRELOAD=1`) renders uniform `0x3FFFF` on engine A for
+every frame. That value is not a white backdrop — it is the display-off path at
+`nds_gpu2d.vhd:1487-1489`, which forces all-ones when `dispmode_eff = "00"`.
+So DISPCNT's display mode is still 0 at frame 74.
+
+The colour arithmetic rules out the innocent explanation. melonDS switches from
+`ffffffff` to `fffbfbfb` at frame 34; `0xfb` is 6-bit **62**, which is what
+palette white `0x7FFF` becomes under `c5 << 1`, and `nds_drawer_merge.vhd:251`
+does exactly that same expansion. So melonDS at frame 34+ is rendering a real
+backdrop with the display ON, while the RTL is still emitting forced white.
+
+Pacing does not explain it either. The 300k-instruction trace run covered ~6 ms
+of DS time, i.e. ~835k ARM9 instructions per frame, against ~1.12M cycles/frame
+on real hardware — the same ballpark. A 10-20% shortfall would put display-on
+near frame 40, not past 74. The margin is 2.2x.
+
+This is the same signature as the Kirby stall (DISPCNT display-on write never
+happens), but reached at **frame 34 instead of frame 337** — which makes this
+cart a much cheaper reproduction of that bug than Kirby is.
+
+Next step is a trace bisect, not another blind frame run: `TRACE9STARTFRAME`
+(melonDS) and `TRACE_START_FRAME` (tb_top_frame) both exist precisely to take a
+trace from frame ~30 without a multi-GB from-boot dump. Diff those to find where
+the ARM9 stops agreeing.
+
+Note engine A logged **zero dropped lines** across all 75 frames; the 300 drops
+in that run were all engine B, which this cart never draws to.
