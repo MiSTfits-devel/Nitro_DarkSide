@@ -1,5 +1,5 @@
 diff --git a/src/ARM.cpp b/src/ARM.cpp
-index 827fcb01..614927bb 100644
+index 827fcb01..67679694 100644
 --- a/src/ARM.cpp
 +++ b/src/ARM.cpp
 @@ -21,6 +21,7 @@
@@ -10,7 +10,23 @@ index 827fcb01..614927bb 100644
  #include "ARM.h"
  #include "ARMInterpreter.h"
  #include "AREngine.h"
-@@ -589,6 +590,58 @@ void ARM::CheckGdbIncoming()
+@@ -524,11 +525,15 @@ void ARM::UpdateMode(u32 oldmode, u32 newmode, bool phony)
+     }
+ }
+ 
++extern u64 Arm7IrqDeliver;   // NDS_MiSTfits ARM7 IRQ census (see NDS.cpp)
++
+ void ARM::TriggerIRQ()
+ {
+     if (CPSR & 0x80)
+         return;
+ 
++    if (Num == 1) Arm7IrqDeliver++;
++
+     u32 oldcpsr = CPSR;
+     CPSR &= ~0xFF;
+     CPSR |= 0xD2;
+@@ -589,6 +594,58 @@ void ARM::CheckGdbIncoming()
      GdbCheckA();
  }
  
@@ -69,7 +85,7 @@ index 827fcb01..614927bb 100644
  template <CPUExecuteMode mode>
  void ARMv5::Execute()
  {
-@@ -670,8 +723,10 @@ void ARMv5::Execute()
+@@ -670,8 +727,10 @@ void ARMv5::Execute()
                  else             NextInstr[1] = CodeRead32(R[15], false);
  
                  // actually execute
@@ -80,7 +96,7 @@ index 827fcb01..614927bb 100644
              }
              else
              {
-@@ -685,6 +740,7 @@ void ARMv5::Execute()
+@@ -685,6 +744,7 @@ void ARMv5::Execute()
                  NextInstr[1] = CodeRead32(R[15], false);
  
                  // actually execute
@@ -88,7 +104,7 @@ index 827fcb01..614927bb 100644
                  if (CheckCondition(CurInstr >> 28))
                  {
                      u32 icode = ((CurInstr >> 4) & 0xF) | ((CurInstr >> 16) & 0xFF0);
-@@ -696,6 +752,7 @@ void ARMv5::Execute()
+@@ -696,6 +756,7 @@ void ARMv5::Execute()
                  }
                  else
                      AddCycles_C();
@@ -96,7 +112,7 @@ index 827fcb01..614927bb 100644
              }
  
              // TODO optimize this shit!!!
-@@ -808,8 +865,10 @@ void ARMv4::Execute()
+@@ -808,8 +869,10 @@ void ARMv4::Execute()
                  NextInstr[1] = CodeRead16(R[15]);
  
                  // actually execute
@@ -107,7 +123,7 @@ index 827fcb01..614927bb 100644
              }
              else
              {
-@@ -823,6 +882,7 @@ void ARMv4::Execute()
+@@ -823,6 +886,7 @@ void ARMv4::Execute()
                  NextInstr[1] = CodeRead32(R[15]);
  
                  // actually execute
@@ -115,7 +131,7 @@ index 827fcb01..614927bb 100644
                  if (CheckCondition(CurInstr >> 28))
                  {
                      u32 icode = ((CurInstr >> 4) & 0xF) | ((CurInstr >> 16) & 0xFF0);
-@@ -830,6 +890,7 @@ void ARMv4::Execute()
+@@ -830,6 +894,7 @@ void ARMv4::Execute()
                  }
                  else
                      AddCycles_C();
@@ -150,10 +166,29 @@ index 13d67bff..ec60e2f5 100644
  
      // 0000 0100 0000
 diff --git a/src/NDS.cpp b/src/NDS.cpp
-index f45051e2..8a595b89 100644
+index f45051e2..d7449e45 100644
 --- a/src/NDS.cpp
 +++ b/src/NDS.cpp
-@@ -3704,8 +3704,19 @@ void NDS::ARM9IOWrite32(u32 addr, u32 val)
+@@ -1367,8 +1367,18 @@ void NDS::UpdateIRQ(u32 cpu)
+     }
+ }
+ 
++// --- NDS_MiSTfits ARM7 IRQ census (docs/TICKET-arm7-firmware-wedge.md) ---
++// The RTL side counts irq_in7 pulses per source and cpu7_irq deliveries; these
++// are the same two numbers here, so "which IRQ source asserts in the core and
++// not in melonDS" becomes a column diff. loopdiff.py cannot answer it: it
++// compares control flow, where an IRQ at a different time and an IRQ that
++// should never fire look identical.
++u64 Arm7IrqSrc[32] = {0};
++u64 Arm7IrqDeliver = 0;
++
+ void NDS::SetIRQ(u32 cpu, u32 irq)
+ {
++    if (cpu == 1 && irq < 32) Arm7IrqSrc[irq]++;
+     IF[cpu] |= (1 << irq);
+     UpdateIRQ(cpu);
+ 
+@@ -3704,8 +3714,19 @@ void NDS::ARM9IOWrite32(u32 addr, u32 val)
  }
  
  
@@ -173,7 +208,7 @@ index f45051e2..8a595b89 100644
      switch (addr)
      {
      case 0x04000130: return KeyInput & 0xFF;
-@@ -3809,6 +3820,7 @@ u8 NDS::ARM7IORead8(u32 addr)
+@@ -3809,6 +3830,7 @@ u8 NDS::ARM7IORead8(u32 addr)
  
  u16 NDS::ARM7IORead16(u32 addr)
  {
@@ -181,7 +216,7 @@ index f45051e2..8a595b89 100644
      switch (addr)
      {
      case 0x04000004: return GPU.DispStat[1];
-@@ -4013,6 +4025,7 @@ u32 NDS::ARM7IORead32(u32 addr)
+@@ -4013,6 +4035,7 @@ u32 NDS::ARM7IORead32(u32 addr)
  
  void NDS::ARM7IOWrite8(u32 addr, u8 val)
  {
@@ -189,7 +224,7 @@ index f45051e2..8a595b89 100644
      switch (addr)
      {
      case 0x04000132:
-@@ -4118,6 +4131,7 @@ void NDS::ARM7IOWrite8(u32 addr, u8 val)
+@@ -4118,6 +4141,7 @@ void NDS::ARM7IOWrite8(u32 addr, u8 val)
  
  void NDS::ARM7IOWrite16(u32 addr, u16 val)
  {

@@ -29,7 +29,19 @@ entity tb_gpu2d_timed is
       BANKFILE   : string := "sim/tests/gpu2d_banks.hex";
       VECFILE    : string := "sim/tests/gpu2d_vectors.hex";
       CE_DIV     : integer := 3;
-      TIMEOUT_MS : integer := 600
+      TIMEOUT_MS : integer := 600;
+      -- A..D renderer-feed latency in clk cycles (see prserv). 4 stands in for
+      -- SDRAM; the old fixed behavioural model answered in 2.
+      RSRV_LAT   : integer := 4;
+      -- 1 = model the hardware channel: exactly ONE A..D read in flight, ready
+      -- low from acceptance until done (NDS.sv's `~vr_busy & ~vr_fin`). The
+      -- default (unlimited in flight, ready tied high) is a memory that cannot
+      -- say no, which is why every bench passed while silicon white-screened.
+      RSRV_ONE   : integer := 0;
+      -- >0: fail if one line render stays busy this many clk cycles. A line is
+      -- 2,130 cycles at CE_DIV=3; anything past a few thousand is a wedge, not
+      -- slowness, and the probe dumps who is waiting on whom.
+      STALL_CYC  : integer := 0
    );
 end entity;
 
@@ -83,10 +95,28 @@ architecture sim of tb_gpu2d_timed is
    signal srv_din, srv_dout : std_logic_vector(31 downto 0) := (others => '0');
    signal rsrv_req, rsrv_done : std_logic := '0';
    signal rsrv_bank : std_logic_vector(1 downto 0);
-   signal rsrv_addr : unsigned(16 downto 2);
-   signal rsrv_dout : std_logic_vector(31 downto 0) := (others => '0');
+   signal rsrv_addr : unsigned(16 downto 3);
+   signal rsrv_dout : std_logic_vector(63 downto 0) := (others => '0');
+
+   -- in-order response delay line for the pipelined A..D model (see prserv)
+   type t_rsrvpipe is record
+      v : std_logic;
+      d : std_logic_vector(63 downto 0);
+   end record;
+   type t_rsrvpipe_arr is array (0 to RSRV_LAT - 1) of t_rsrvpipe;
+   signal rsrvpipe : t_rsrvpipe_arr := (others => ('0', (others => '0')));
+   -- RSRV_ONE: hardware-shaped backpressure (one op in flight) + the valid/ready
+   -- protocol checker. A request this model does not take must still be on the
+   -- wire, unchanged, at the next edge; a requester that pulses and forgets
+   -- fails here instead of wedging thousands of cycles later.
+   signal rsrv_busy_m  : std_logic := '0';
+   signal rsrv_ready_s : std_logic;
+   signal rsrv_held      : std_logic := '0';
+   signal rsrv_held_bank : std_logic_vector(1 downto 0) := "00";
+   signal rsrv_held_addr : unsigned(16 downto 3) := (others => '0');
 
    -- renderer channels between nds_vram and nds_gpu2d
+   signal r_bg_accept               : std_logic;
    signal r_bg_req, r_bg_done       : std_logic;
    signal r_bg_addr                 : unsigned(18 downto 2);
    signal r_bg_dout                 : std_logic_vector(31 downto 0);
@@ -130,6 +160,16 @@ architecture sim of tb_gpu2d_timed is
 
    signal drops      : integer := 0;   -- drawline pulses gpu2d had to drop
    signal tests_done : boolean := false;
+
+   -- Render-throughput measurement. The drop count alone only says "over
+   -- budget", not by how much, so it cannot size a pipelining change. These
+   -- are `line_busy` occupancy (the same basis as the 5,829 / 3,255
+   -- cycles-per-line figures in HANDOFF.md) and are therefore comparable
+   -- across configurations: cycles/line = busy_cycles / lines_rendered.
+   signal rvram_busy    : std_logic;
+   signal busy_cycles   : integer := 0;   -- cycles with line_busy high
+   signal rvram_cycles  : integer := 0;   -- cycles nds_vram's renderer FSM was busy
+   signal lines_started : integer := 0;   -- drawlines actually accepted
 
    -- reset-clear handshakes (see the waits in pmain)
    signal vclr_busy : std_logic;
@@ -198,6 +238,7 @@ begin
       clr_busy => vclr_busy,
       rdr_bg_req => r_bg_req, rdr_bg_addr => r_bg_addr,
       rdr_bg_dout => r_bg_dout, rdr_bg_done => r_bg_done,
+      rdr_bg_accept => r_bg_accept,
       rdr_obj_req => r_obj_req, rdr_obj_addr => r_obj_addr,
       rdr_obj_dout => r_obj_dout, rdr_obj_done => r_obj_done,
       rdr_bgep_req => r_bgep_req, rdr_bgep_addr => r_bgep_addr,
@@ -205,7 +246,9 @@ begin
       rdr_objep_req => r_objep_req, rdr_objep_addr => r_objep_addr,
       rdr_objep_dout => r_objep_dout, rdr_objep_done => r_objep_done,
       rsrv_req => rsrv_req, rsrv_bank => rsrv_bank, rsrv_addr => rsrv_addr,
-      rsrv_dout => rsrv_dout, rsrv_done => rsrv_done
+      rsrv_dout => rsrv_dout, rsrv_done => rsrv_done,
+      rsrv_ready => rsrv_ready_s,
+      dbg_rbusy => rvram_busy
    );
 
    r_bg_addr    <= to_unsigned(g_bg_addr, 17);
@@ -228,6 +271,7 @@ begin
       oam_we => oam_we, oam_addr => oam_addr, oam_din => oam_din, oam_be => "1111",
       srv_bg_req => r_bg_req, srv_bg_addr => g_bg_addr,
       srv_bg_data => r_bg_dout, srv_bg_done => r_bg_done,
+      srv_bg_accept => r_bg_accept,
       srv_obj_req => r_obj_req, srv_obj_addr => g_obj_addr,
       srv_obj_data => r_obj_dout, srv_obj_done => r_obj_done,
       srv_bgep_req => r_bgep_req, srv_bgep_addr => g_bgep_addr,
@@ -253,14 +297,110 @@ begin
       srv_done <= '0';
    end process;
 
-   prserv : process
+   -- Renderer A..D feed: a PIPELINED model, one request accepted per cycle,
+   -- answered in issue order RSRV_LAT+1 cycles later. The old model was
+   -- one-op-at-a-time and answered in two cycles, which both understated the
+   -- cost of this channel (on hardware it is SDRAM, tens of cycles) and made
+   -- the renderer's outstanding-request behaviour untestable. RSRV_LAT is a
+   -- generic so a run can be paced at hardware-like latency, and RSRV_ONE
+   -- restricts it to one op in flight the way ch1 does on silicon.
+   rsrv_ready_s <= '1' when RSRV_ONE = 0 else (not rsrv_busy_m);
+
+   prserv : process (clk)
+      variable accept_v : boolean;
    begin
-      wait until rising_edge(clk) and rsrv_req = '1';
-      wait until rising_edge(clk);
-      rsrv_dout <= banks(to_integer(unsigned(rsrv_bank)) * 32768 + to_integer(rsrv_addr));
-      rsrv_done <= '1';
-      wait until rising_edge(clk);
-      rsrv_done <= '0';
+      if rising_edge(clk) then
+         for i in RSRV_LAT - 1 downto 1 loop
+            rsrvpipe(i) <= rsrvpipe(i - 1);
+         end loop;
+         rsrvpipe(0).v <= '0';
+         accept_v := (rsrv_req = '1') and (RSRV_ONE = 0 or rsrv_busy_m = '0');
+         if (accept_v) then
+            rsrvpipe(0).v <= '1';
+            -- 64-bit line: both words of the aligned 8-byte block
+            rsrvpipe(0).d <= banks(to_integer(unsigned(rsrv_bank)) * 32768 +
+                                   to_integer(rsrv_addr) * 2 + 1) &
+                             banks(to_integer(unsigned(rsrv_bank)) * 32768 +
+                                   to_integer(rsrv_addr) * 2);
+            if (RSRV_ONE /= 0) then rsrv_busy_m <= '1'; end if;
+         end if;
+         rsrv_done <= rsrvpipe(RSRV_LAT - 1).v;
+         rsrv_dout <= rsrvpipe(RSRV_LAT - 1).d;
+         if (rsrvpipe(RSRV_LAT - 1).v = '1') then rsrv_busy_m <= '0'; end if;
+
+         -- valid/ready protocol checker (see the signal declarations)
+         assert rsrv_held = '0' or
+                (rsrv_req = '1' and rsrv_bank = rsrv_held_bank and
+                 rsrv_addr = rsrv_held_addr)
+            report "rsrv: request dropped - not held until ready (bank " &
+                   to_string(rsrv_held_bank) & " addr " &
+                   to_hstring(rsrv_held_addr) & ")"
+            severity failure;
+         rsrv_held <= '0';
+         if (rsrv_req = '1' and not accept_v) then
+            rsrv_held      <= '1';
+            rsrv_held_bank <= rsrv_bank;
+            rsrv_held_addr <= rsrv_addr;
+         end if;
+      end if;
+   end process;
+
+   -- ============ stall probe (STALL_CYC > 0) ============
+   -- A wedge and mere slowness end the same way in the frame checker - dropped
+   -- lines - so this separates them: it fires only if ONE line render stays busy
+   -- for STALL_CYC cycles, and dumps the whole chain (drawer -> gpu2d arbiter ->
+   -- nds_vram queue -> rsrv channel) so the party that is waiting on a word that
+   -- will never arrive is named rather than guessed at.
+   p_stall : process (clk)
+      variable busy_run : natural := 0;
+   begin
+      if rising_edge(clk) then
+         if (line_busy = '1') then
+            busy_run := busy_run + 1;
+         else
+            busy_run := 0;
+         end if;
+         if (STALL_CYC > 0 and busy_run = STALL_CYC) then
+            report "STALL after " & integer'image(busy_run) & " busy cycles on line " &
+                   integer'image(linecounter) & LF &
+                   "  gpu2d: cur_y=" & to_string(<< signal .tb_gpu2d_timed.igpu.cur_y : integer range 0 to 191 >>) &
+                   " busy_text=" & to_string(<< signal .tb_gpu2d_timed.igpu.busy_text : std_logic_vector(0 to 3) >>) &
+                   " busy_aff=" & to_string(<< signal .tb_gpu2d_timed.igpu.busy_aff : std_logic_vector(2 to 3) >>) &
+                   " busy_ext=" & to_string(<< signal .tb_gpu2d_timed.igpu.busy_ext : std_logic_vector(2 to 3) >>) &
+                   " obj_busy=" & to_string(<< signal .tb_gpu2d_timed.igpu.obj_busy : std_logic >>) & LF &
+                   "  arb: bgv_req=" & to_string(<< signal .tb_gpu2d_timed.igpu.bgv_req : std_logic_vector(0 to 3) >>) &
+                   " bgv_done=" & to_string(<< signal .tb_gpu2d_timed.igpu.bgv_done : std_logic_vector(0 to 3) >>) &
+                   " pending=" & to_string(<< signal .tb_gpu2d_timed.igpu.b_arb.pending : std_logic_vector(0 to 3) >>) &
+                   " unaccepted=" & to_string(<< signal .tb_gpu2d_timed.igpu.b_arb.unaccepted : std_logic >>) &
+                   " os_count=" & integer'image(<< signal .tb_gpu2d_timed.igpu.b_arb.os_count : integer range 0 to 8 >>) & LF &
+                   "  text0: tq=" & integer'image(<< signal .tb_gpu2d_timed.igpu.gen_text(0).itext.tq_count : integer range 0 to 4 >>) &
+                   " tag=" & integer'image(<< signal .tb_gpu2d_timed.igpu.gen_text(0).itext.tag_count : integer range 0 to 8 >>) &
+                   " f_tile=" & integer'image(<< signal .tb_gpu2d_timed.igpu.gen_text(0).itext.f_tile : integer range 0 to 33 >>) &
+                   " unacc=" & to_string(<< signal .tb_gpu2d_timed.igpu.gen_text(0).itext.unaccepted : std_logic >>) &
+                   " p_active=" & to_string(<< signal .tb_gpu2d_timed.igpu.gen_text(0).itext.p_active : std_logic >>) &
+                   " p_x=" & integer'image(<< signal .tb_gpu2d_timed.igpu.gen_text(0).itext.p_x : integer range 0 to 256 >>) & LF &
+                   "  text1: tq=" & integer'image(<< signal .tb_gpu2d_timed.igpu.gen_text(1).itext.tq_count : integer range 0 to 4 >>) &
+                   " tag=" & integer'image(<< signal .tb_gpu2d_timed.igpu.gen_text(1).itext.tag_count : integer range 0 to 8 >>) &
+                   " f_tile=" & integer'image(<< signal .tb_gpu2d_timed.igpu.gen_text(1).itext.f_tile : integer range 0 to 33 >>) &
+                   " unacc=" & to_string(<< signal .tb_gpu2d_timed.igpu.gen_text(1).itext.unaccepted : std_logic >>) &
+                   " p_active=" & to_string(<< signal .tb_gpu2d_timed.igpu.gen_text(1).itext.p_active : std_logic >>) &
+                   " p_x=" & integer'image(<< signal .tb_gpu2d_timed.igpu.gen_text(1).itext.p_x : integer range 0 to 256 >>) & LF &
+                   "  vram: rq_count=" & integer'image(<< signal .tb_gpu2d_timed.ivram.rq_count : integer range 0 to 8 >>) &
+                   " adq_count=" & integer'image(<< signal .tb_gpu2d_timed.ivram.adq_count : integer range 0 to 4 >>) &
+                   " rdispatch=" & to_string(<< signal .tb_gpu2d_timed.ivram.rdispatch : std_logic >>) &
+                   " rpend=" & to_string(<< signal .tb_gpu2d_timed.ivram.rpend : std_logic_vector(7 downto 0) >>) &
+                   " rreq_now=" & to_string(<< signal .tb_gpu2d_timed.ivram.rreq_now : std_logic_vector(7 downto 0) >>) & LF &
+                   "  rsrv: req=" & to_string(rsrv_req) & " ready=" & to_string(rsrv_ready_s) &
+                   " done=" & to_string(rsrv_done) & " busy_m=" & to_string(rsrv_busy_m) &
+                   " bank=" & to_string(rsrv_bank) & " addr=" & to_hstring(rsrv_addr) & LF &
+                   "  chan: bg(req=" & to_string(r_bg_req) & ",done=" & to_string(r_bg_done) &
+                   ",acc=" & to_string(r_bg_accept) & ")" &
+                   " obj(req=" & to_string(r_obj_req) & ",done=" & to_string(r_obj_done) & ")" &
+                   " bgep(req=" & to_string(r_bgep_req) & ",done=" & to_string(r_bgep_done) & ")" &
+                   " objep(req=" & to_string(r_objep_req) & ",done=" & to_string(r_objep_done) & ")"
+               severity failure;
+         end if;
+      end if;
    end process;
 
    -- pixel collect
@@ -282,6 +422,15 @@ begin
             drops <= drops + 1;
             report "tb_gpu2d_timed: line " & integer'image(linecounter) &
                    " drawline dropped (previous line still busy)" severity warning;
+         end if;
+
+         -- throughput: line occupancy, accepted lines, and renderer-side VRAM
+         -- occupancy (dbg_rbusy, NOT srv_*_req - req is a pulse and counting it
+         -- counts requests, not waiting; see nds_vram's port comment)
+         if (line_busy = '1')  then busy_cycles  <= busy_cycles  + 1; end if;
+         if (rvram_busy = '1') then rvram_cycles <= rvram_cycles + 1; end if;
+         if (drawline = '1' and line_busy = '0') then
+            lines_started <= lines_started + 1;
          end if;
       end if;
    end process;
@@ -338,6 +487,13 @@ begin
          end loop;
          report "case " & integer'image(c) & " done, fails so far " & integer'image(nfail) &
                 ", drops so far " & integer'image(drops) severity note;
+         if (lines_started > 0) then
+            report "THROUGHPUT case " & integer'image(c) &
+                   ": lines " & integer'image(lines_started) &
+                   ", cycles/line " & integer'image(busy_cycles / lines_started) &
+                   ", rvram cycles/line " & integer'image(rvram_cycles / lines_started) &
+                   ", budget " & integer'image(355 * 6 * CE_DIV) severity note;
+         end if;
       end procedure;
 
       variable ncases, nregs, p : integer;

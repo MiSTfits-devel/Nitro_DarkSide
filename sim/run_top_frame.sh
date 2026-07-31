@@ -53,6 +53,16 @@ CYCLE_HIST="${CYCLE_HIST:-0}"
 # of simulating nds_loader's word-by-word copy. Identical end state; removes
 # ~70 ms of simulated time (443k word copies for Kirby) from every boot.
 PRELOAD="${PRELOAD:-0}"
+# >0: fail with a full renderer-chain dump if one engine-A line render stays busy
+# that many clk1x cycles (wedge vs over-budget). GPUFAST=0 only - see the generic.
+STALL_CYC="${STALL_CYC:-0}"
+# ARM7 firmware-boot instruments: IRQ source census + ARM7 WRAM write watch on
+# ARM7WATCH (default the faulting word of the first ticket). Trace-free.
+ARM7DBG="${ARM7DBG:-0}"
+# Give this in HEX and let the shell convert. Writing the decimal out by hand put
+# the watch on 0x0380108C for one run - a hand-converted address is a silent way
+# to watch the wrong memory for four hours.
+ARM7WATCH="${ARM7WATCH:-0x0380E28C}"
 NVCHEAP="${NVCHEAP:-2g}"
 NVCOPT="${NVCOPT:--O2}"
 GPUCEDIV="${GPUCEDIV:-3}"
@@ -118,7 +128,7 @@ TRACEGEN=""
 [ -n "$TRACEFILE7" ] && TRACEGEN="$TRACEGEN -gTRACEFILE7=$TRACEFILE7"
 
 nvc -H "$NVCHEAP" -L "$WORK" --work="$WORK/work" -e "$NVCOPT" tb_top_frame \
-   -gCARD_WORDS="$CARDWORDS" -gCARD_LAT="$CARD_LAT" -gFW_LAT="$FW_LAT" -gMEM_LAT="$MEM_LAT" -gCYCLE_HIST="$CYCLE_HIST" -gPRELOAD="$PRELOAD" \
+   -gCARD_WORDS="$CARDWORDS" -gCARD_LAT="$CARD_LAT" -gFW_LAT="$FW_LAT" -gMEM_LAT="$MEM_LAT" -gCYCLE_HIST="$CYCLE_HIST" -gPRELOAD="$PRELOAD" -gSTALL_CYC="$STALL_CYC" -gARM7DBG="$ARM7DBG" -gARM7WATCH="$((ARM7WATCH))" \
    -gGPUCEDIV="$GPUCEDIV" -gHEXFILE="$HEXFILE" -gFWFILE="$FWFILE" -gFRAMES="$FRAMES" -gTIMEOUT_MS="$TIMEOUT_MS" \
    -gDUMPFILE="$DUMPFILE" -gDUMPFILE_B="$DUMPFILE_B" -gDUMP_START_FRAME="$DUMP_START_FRAME" -gDIRECT="$DIRECT" -gFWBOOT="$FWBOOT" -gHEARTBEAT_MS="$HEARTBEAT_MS" -gVRAMOPS="$VRAMOPS" -gGPUFAST="$GPUFAST" -gVRSRV_LAT="$VRSRV_LAT" -gVRSRV_ONE="$VRSRV_ONE" -gISLAND="$ISLAND" -gISLAND_HALF_PS="$ISLAND_HALF_PS" \
    -gMAXINSTR="$MAXINSTR" -gTRACE_START_FRAME="$TRACE_START_FRAME" -gTRACE7_START_FRAME="$TRACE7_START_FRAME" -gDUMP_STATE="$DUMP_STATE" \

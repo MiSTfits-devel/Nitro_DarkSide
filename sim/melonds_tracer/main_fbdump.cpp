@@ -37,6 +37,21 @@ extern u64 ARM9TraceMax;
 extern FILE* ARM7TraceFile;
 extern u64 ARM7TraceCount;
 extern u64 ARM7TraceMax;
+// ARM7 IRQ census (see the NDS.cpp hook). IRQ7CENSUS=<n> prints the counts every
+// n dump frames; the RTL side prints the same two numbers from irq_in7 and
+// cpu7_irq every 10 ms of DS time, so the columns are directly comparable.
+extern u64 Arm7IrqSrc[32];
+extern u64 Arm7IrqDeliver;
+
+static void printIrq7Census(int frame)
+{
+    printf("IRQ7 census frame %d deliveries=%llu", frame,
+           (unsigned long long)Arm7IrqDeliver);
+    for (int i = 0; i < 32; i++)
+        if (Arm7IrqSrc[i]) printf("  b%d=%llu", i, (unsigned long long)Arm7IrqSrc[i]);
+    printf("\n");
+    fflush(stdout);
+}
 }
 
 using namespace melonDS;
@@ -218,8 +233,12 @@ int main(int argc, char** argv)
     std::unique_ptr<u32[]> snapBG, snapOBJ, snapPAL, snapOAM;
     u32 snapRegs[22] = {};
     int lastfb = 0;
+    int irq7census = 0;
+    if (const char* ic = getenv("IRQ7CENSUS")) irq7census = atoi(ic);
+
     for (int n = 0; n < frames; n++)
     {
+        if (irq7census > 0 && (n % irq7census) == 0) printIrq7Census(n);
         if (trace9path && n == trace9start && !ARM9TraceFile)
             ARM9TraceFile = fopen(trace9path, "w");
         if (trace7path && n == trace7start && !ARM7TraceFile)
@@ -279,6 +298,31 @@ int main(int argc, char** argv)
                         "DISPSTAT7=%04X (vblIRQ=%u)\n", n, ds9, (ds9>>3)&1,
                         ds7, (ds7>>3)&1);
                 pds9 = ds9; pds7 = ds7;
+            }
+            // IRQ controllers, both CPUs, reported on change. Directly comparable
+            // to `nitrodbg.sh irq` (mailbox op 0x0C) on hardware, which is the only
+            // way to read these there - PEEK borrows the ARM9 main-RAM channel and
+            // returns garbage for IO space. The question this answers: our hardware
+            // sits with IE9=0x00040001 (VBlank + IPC-recv only) while IF9 bit 19
+            // (card transfer complete) is latched and unacknowledged. If the oracle
+            // never enables bit 19 either, the card driver polls and that latched
+            // flag is a red herring; if it does enable it, the ARM9's card-done
+            // wakeup is simply missing and the blocked main thread is explained.
+            {
+                static u32 pi[6] = {0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+                                    0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF};
+                u32 c[6] = { nds.ARM9Read32(0x04000208), nds.ARM9Read32(0x04000210),
+                             nds.ARM9Read32(0x04000214), nds.ARM7Read32(0x04000208),
+                             nds.ARM7Read32(0x04000210), nds.ARM7Read32(0x04000214) };
+                bool ch = false;
+                for (int i = 0; i < 6; i++) if (c[i] != pi[i]) ch = true;
+                if (ch)
+                {
+                    fprintf(stderr, "IRQREG frame=%d IME9=%08X IE9=%08X IF9=%08X"
+                            "  IME7=%08X IE7=%08X IF7=%08X\n",
+                            n, c[0], c[1], c[2], c[3], c[4], c[5]);
+                    for (int i = 0; i < 6; i++) pi[i] = c[i];
+                }
             }
             if (da != pa || db != pb || pw != ppw)
             {
@@ -404,6 +448,7 @@ int main(int argc, char** argv)
         fclose(f);
         printf("snapshot dumped with prefix %s\n", prefix);
     }
+    if (irq7census > 0) printIrq7Census(frames);
     printf("dumped %d frames to %s\n", frames, dumppath);
     return 0;
 }

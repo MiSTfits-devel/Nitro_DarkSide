@@ -101,7 +101,32 @@ entity tb_top_frame is
       -- /=0: stage the ARM9/ARM7 main-RAM sections directly into the SDRAM model
       -- and let nds_loader skip copying them. Same end state, ~70 ms of simulated
       -- time cheaper per boot. See preload_main below.
-      PRELOAD    : integer := 0
+      PRELOAD    : integer := 0;
+      -- >0: fail with a full dump if ONE engine-A line render stays busy this
+      -- many clk1x cycles. A line is 2,130 cycles at GPUCEDIV=1, so a few
+      -- thousand is over budget and tens of thousands is a wedge - and the two
+      -- are indistinguishable in the frame output, which is what made the
+      -- renderer's backpressure failure so hard to place. Reaches into the
+      -- GPU_FAST=0 pass-through branch, so use it with GPUFAST=0 only; the
+      -- generate guard keeps every other run from elaborating those names.
+      STALL_CYC  : integer := 0;
+      -- /=0: ARM7 firmware-boot instruments (docs/TICKET-arm7-firmware-wedge.md,
+      -- first ticket). Both are trace-free on purpose: the fault is at 1.588 s,
+      -- ~30M ARM7 instructions, and TRACEFILE costs ~40x, so the answers have to
+      -- come out of counters and a write watch rather than out of a trace.
+      --   * IRQ census - every ARM7 source's pulse count plus each delivery.
+      --     "Which IRQ source asserts here and not in melonDS" needs exactly
+      --     this: loopdiff.py compares control flow and cannot tell an IRQ at a
+      --     different time from an IRQ that should never have fired.
+      --   * ARM7 WRAM write watch on the faulting word, so "the bytes simply
+      --     differ" becomes "this store, at this time, from this PC, put them
+      --     there" - or nothing ever wrote it, which is just as decisive.
+      ARM7DBG    : integer := 0;
+      -- byte address to watch, ARM7-visible. 0x0380E28C is the faulting
+      -- 0x037FE28C reached through the ARM7-WRAM 64 KB mirror: nds_membus7 masks
+      -- both with 0xFFFF (w7p_addr <= cpu_adr(15 downto 2)), exactly as melonDS
+      -- does, so the two addresses are the same storage.
+      ARM7WATCH  : integer := 16#0380E28C#
    );
 end entity;
 
@@ -248,19 +273,34 @@ architecture sim of tb_top_frame is
    signal vsrv_din, vsrv_dout : std_logic_vector(31 downto 0) := (others => '0');
    signal vrsrv_req, vrsrv_done : std_logic := '0';
    signal vrsrv_bank : std_logic_vector(1 downto 0);
-   signal vrsrv_addr : unsigned(16 downto 2);
-   signal vrsrv_dout : std_logic_vector(31 downto 0) := (others => '0');
+   signal vrsrv_addr : unsigned(16 downto 3);
+   signal vrsrv_dout : std_logic_vector(63 downto 0) := (others => '0');
 
    -- in-order response delay line for the pipelined A..D model (see prserv)
    type t_vrsrvpipe is record
       v : std_logic;
-      d : std_logic_vector(31 downto 0);
+      d : std_logic_vector(63 downto 0);
    end record;
    type t_vrsrvpipe_arr is array (0 to VRSRV_LAT - 1) of t_vrsrvpipe;
    signal vrsrvpipe : t_vrsrvpipe_arr := (others => ('0', (others => '0')));
    -- VRSRV_ONE: hardware-shaped backpressure (one op in flight)
    signal vrsrv_busy_m  : std_logic := '0';
    signal vrsrv_ready_s : std_logic;
+   -- protocol checker: a request this model did not take must still be on the
+   -- wire, unchanged, at the next edge (valid/ready). A requester that pulses
+   -- and forgets fails here instead of silently losing the word.
+   signal vrsrv_held      : std_logic := '0';
+   signal vrsrv_held_bank : std_logic_vector(1 downto 0) := "00";
+   signal vrsrv_held_addr : unsigned(16 downto 3) := (others => '0');
+   -- 64-bit-line hit-rate probe (VRAMOPS /= 0). sdram.sv's ch1 already returns
+   -- FOUR halfwords per read (BURST_LENGTH=4, ACCESS_TYPE sequential, so the
+   -- aligned 8-byte block containing the request) and NDS.sv uses 32 bits of it.
+   -- This measures what a line cache of each size WOULD have saved before any of
+   -- it is built: eight renderer channels interleave, so a one-line cache would
+   -- thrash, and the fitter has no room for a guess.
+   constant NPROBE : integer := 5;
+   type t_probe_sizes is array (0 to NPROBE-1) of integer;
+   constant PROBE_SIZES : t_probe_sizes := (1, 2, 4, 8, 16);
 
    signal pixel_out_x    : integer range 0 to 255;
    signal pixel_out_y    : integer range 0 to 191;
@@ -1395,11 +1435,30 @@ begin
    -- (NDS.sv's vrsrv handler on ch1), so the old two-cycle blocking model both
    -- understated its cost and hid the renderer's outstanding-request behaviour.
    -- ready mirrors NDS.sv's `~vr_busy & ~vr_fin` when VRSRV_ONE is set, and is
-   -- tied high otherwise (the historical behaviour)
+   -- tied high otherwise (the historical behaviour).
+   --
+   -- The handshake is valid/ready: a request is taken on the edge at which the
+   -- model sees req high and is able to accept, which is the same edge the core
+   -- samples ready on, so both ends agree. This model does NOT latch a request
+   -- it could not take - if the core stops holding it, the word is lost, which
+   -- is exactly what silicon does, and the checker below turns that into a
+   -- failure rather than a wedge 400,000 cycles later.
    vrsrv_ready_s <= '1' when VRSRV_ONE = 0 else (not vrsrv_busy_m);
 
    prserv : process (clk1x)
       variable accept_v : boolean;
+      -- line-cache hit-rate model, one per candidate size. Fully associative with
+      -- round-robin replacement, which is the cheapest thing worth building and so
+      -- the honest thing to measure. tags hold bank & addr(16 downto 3).
+      type t_tags is array (0 to NPROBE-1, 0 to 15) of integer;
+      variable ptag  : t_tags := (others => (others => -1));
+      variable pnext : integer_vector(0 to NPROBE-1) := (others => 0);
+      variable phit  : integer_vector(0 to NPROBE-1) := (others => 0);
+      variable pops  : natural := 0;
+      variable pline : integer;
+      variable found : boolean;
+      variable pcyc  : natural := 0;
+      variable l     : line;
    begin
       if rising_edge(clk1x) then
          for k in VRSRV_LAT - 1 downto 1 loop
@@ -1410,13 +1469,73 @@ begin
                      (VRSRV_ONE = 0 or vrsrv_busy_m = '0');
          if (accept_v) then
             vrsrvpipe(0).v <= '1';
+            -- 64-bit line: both words of the aligned 8-byte block, which is what
+            -- sdram.sv's four-halfword burst actually delivers
             vrsrvpipe(0).d <= banks(to_integer(unsigned(vrsrv_bank)) * 32768 +
-                                    to_integer(vrsrv_addr));
+                                    to_integer(vrsrv_addr) * 2 + 1) &
+                              banks(to_integer(unsigned(vrsrv_bank)) * 32768 +
+                                    to_integer(vrsrv_addr) * 2);
             if (VRSRV_ONE /= 0) then vrsrv_busy_m <= '1'; end if;
          end if;
          vrsrv_done <= vrsrvpipe(VRSRV_LAT - 1).v;
          vrsrv_dout <= vrsrvpipe(VRSRV_LAT - 1).d;
          if (vrsrvpipe(VRSRV_LAT - 1).v = '1') then vrsrv_busy_m <= '0'; end if;
+
+         -- ---- valid/ready protocol checker (see the header above)
+         assert vrsrv_held = '0' or
+                (vrsrv_req = '1' and vrsrv_bank = vrsrv_held_bank and
+                 vrsrv_addr = vrsrv_held_addr)
+            report "vrsrv: request dropped - not held until ready (bank " &
+                   to_string(vrsrv_held_bank) & " addr " &
+                   to_hstring(vrsrv_held_addr) & ")"
+            severity failure;
+         vrsrv_held <= '0';
+         if (vrsrv_req = '1' and not accept_v) then
+            vrsrv_held      <= '1';
+            vrsrv_held_bank <= vrsrv_bank;
+            vrsrv_held_addr <= vrsrv_addr;
+         end if;
+
+         -- ---- 64-bit-line hit-rate probe. Counted per ACCEPTED request, which is
+         -- one SDRAM read today; a hit is a read that would not have happened.
+         if (VRAMOPS /= 0 and accept_v) then
+            pops  := pops + 1;
+            pline := to_integer(unsigned(vrsrv_bank)) * 16384 +
+                     to_integer(vrsrv_addr);
+            for s in 0 to NPROBE-1 loop
+               found := false;
+               for e in 0 to PROBE_SIZES(s) - 1 loop
+                  if (not found and ptag(s, e) = pline) then found := true; end if;
+               end loop;
+               if (found) then
+                  phit(s) := phit(s) + 1;
+               else
+                  ptag(s, pnext(s)) := pline;
+                  pnext(s) := (pnext(s) + 1) mod PROBE_SIZES(s);
+               end if;
+            end loop;
+         end if;
+         pcyc := pcyc + 1;
+         if (VRAMOPS /= 0 and pcyc = 560190) then   -- one frame
+            pcyc := 0;
+            write(l, string'("LINEPROBE ops="));
+            write(l, pops);
+            for s in 0 to NPROBE-1 loop
+               write(l, string'("  n="));
+               write(l, PROBE_SIZES(s));
+               write(l, string'(":"));
+               if (pops = 0) then
+                  write(l, string'("-"));
+               else
+                  write(l, phit(s) * 100 / pops);
+                  write(l, string'("%"));
+               end if;
+            end loop;
+            report l.all severity note;
+            deallocate(l);
+            pops := 0;
+            phit := (others => 0);
+         end if;
       end if;
    end process;
 
@@ -1485,6 +1604,7 @@ begin
       variable ops, cyc, blocked, blk_a, blk_b : natural := 0;
       variable busy_a, busy_b, lines : natural := 0;
       variable starts_a, starts_b : natural := 0;
+      variable dones_a, drops_a   : natural := 0;
       variable bgcyc, objcyc : natural := 0;
       variable prev_abusy, prev_bbusy : std_logic := '0';
       variable nlines, nstarts : positive := 1;
@@ -1524,6 +1644,13 @@ begin
          if (a_objbusy = '1') then objcyc := objcyc + 1; end if;
          if (a_busy = '1' and prev_abusy = '0') then starts_a := starts_a + 1; end if;
          if (b_busy = '1' and prev_bbusy = '0') then starts_b := starts_b + 1; end if;
+         -- renders STARTED is a rising-edge count, so a renderer that never goes
+         -- idle reports ONE render per frame however many lines it actually
+         -- finished - which reads exactly like a wedge and is not one. These two
+         -- say what really happened: line renders COMPLETED (falling edges) and
+         -- drawlines DROPPED because the previous line was still busy.
+         if (a_busy = '0' and prev_abusy = '1') then dones_a := dones_a + 1; end if;
+         if (a_draw = '1' and a_busy = '1')     then drops_a := drops_a + 1; end if;
          prev_abusy := a_busy;
          prev_bbusy := b_busy;
          if (vblank_out = '1' and cyc > 1000) then
@@ -1543,6 +1670,8 @@ begin
                    " busy/line A=" & integer'image(busy_a / nlines) &
                    " B=" & integer'image(busy_b / nlines) &
                    "  renders=" & integer'image(starts_a) &
+                   " done=" & integer'image(dones_a) &
+                   " dropped=" & integer'image(drops_a) &
                    " cyc/render A=" & integer'image(busy_a / nstarts) &
                    " (budget 2130, " &
                    integer'image(busy_a / (nstarts * 256)) &
@@ -1559,11 +1688,291 @@ begin
             lines := 0;
             starts_a := 0;
             starts_b := 0;
+            dones_a := 0;
+            drops_a := 0;
             bgcyc := 0;
             objcyc := 0;
          end if;
       end loop;
    end process;
+
+   -- ============ ARM7 firmware-boot instruments (ARM7DBG /= 0) ============
+   garm7dbg : if ARM7DBG /= 0 generate
+
+      -- ---- IRQ census. irq_in7 is the per-source pulse vector nds_irq ORs into
+      -- IF; cpu7_irq is a delivery. Counts per source over the whole boot are
+      -- directly comparable with the oracle, and a source that fires here and
+      -- never there is the answer to next step 1.
+      p_irq7log : process (clk1x)
+         alias a_irqin7 is << signal .tb_top_frame.idut.irq_in7 : std_logic_vector(31 downto 0) >>;
+         alias a_irq7   is << signal .tb_top_frame.idut.cpu7_irq : std_logic >>;
+         alias a_ie7    is << signal .tb_top_frame.idut.irq7_dbg_ie  : std_logic_vector(31 downto 0) >>;
+         alias a_if7    is << signal .tb_top_frame.idut.irq7_dbg_if  : std_logic_vector(31 downto 0) >>;
+         alias a_ime7   is << signal .tb_top_frame.idut.irq7_dbg_ime : std_logic_vector(31 downto 0) >>;
+         variable src   : integer_vector(0 to 31) := (others => 0);
+         variable deliv : natural := 0;
+         variable prev  : std_logic := '0';
+         variable cyc   : natural := 0;
+         variable l     : line;
+      begin
+         if rising_edge(clk1x) then
+            for i in 0 to 31 loop
+               if (a_irqin7(i) = '1') then src(i) := src(i) + 1; end if;
+            end loop;
+            if (a_irq7 = '1' and prev = '0') then
+               deliv := deliv + 1;
+               -- the first few in full; after that the counters carry it
+               if (deliv <= 32) then
+                  report "IRQ7 deliver #" & integer'image(deliv) &
+                         " IF=" & to_hstring(a_if7) & " IE=" & to_hstring(a_ie7) &
+                         " IME=" & to_hstring(a_ime7) &
+                         " pc=" & to_hstring(dbg_export7.pc) severity note;
+               end if;
+            end if;
+            prev := a_irq7;
+
+            -- census every 10 ms of DS time; a source firing here and not in the
+            -- oracle shows up as a count that has no business being non-zero
+            cyc := cyc + 1;
+            if (cyc = 335140) then
+               cyc := 0;
+               write(l, string'("IRQ7 census deliveries="));
+               write(l, deliv);
+               for i in 0 to 31 loop
+                  if (src(i) /= 0) then
+                     write(l, string'("  b"));
+                     write(l, i);
+                     write(l, string'("="));
+                     write(l, src(i));
+                  end if;
+               end loop;
+               report l.all severity note;
+               deallocate(l);
+            end if;
+         end if;
+      end process;
+
+      -- ---- Write watch on the faulting word, in BOTH memories it can live in.
+      -- This is the part that is easy to get half right: which storage an ARM7
+      -- fetch from 0x037FE28C lands in depends on WRAMCNT. melonDS's ARM7 read
+      -- of the 0x03000000 region is
+      --     if (SWRAM_ARM7.Mem) SWRAM_ARM7.Mem[addr & SWRAM_ARM7.Mask]
+      --     else                ARM7WRAM[addr & 0xFFFF]
+      -- and nds_membus7 decodes the same way (`cpu_adr(23) = '1' or
+      -- wsh_mapped = '0'` picks ARM7-WRAM). So watching only ARM7-WRAM 0xE28C
+      -- would have watched the wrong memory for a whole 4.5 h run if the
+      -- firmware runs with shared WRAM mapped to the ARM7. Both are watched, and
+      -- WRAMCNT is printed so the census says which one was live.
+      --
+      -- w7m_* is the ARM7-WRAM write port after the loader mux, so it sees CPU
+      -- stores and nds_loader staging both; wsh7/wsh9 are nds_wram's two ports.
+      -- The shadow copies are what make "nothing ever wrote it" reportable -
+      -- there is no way to read the BRAMs back from here - and that answer would
+      -- be just as decisive as a wrong value: the fault would then be executing
+      -- WRAM nobody filled.
+      p_wramwatch : process (clk1x)
+         alias a_we    is << signal .tb_top_frame.idut.w7m_we        : std_logic >>;
+         alias a_addr  is << signal .tb_top_frame.idut.w7m_addr      : unsigned(15 downto 2) >>;
+         alias a_din   is << signal .tb_top_frame.idut.w7m_writedata : std_logic_vector(31 downto 0) >>;
+         alias a_be    is << signal .tb_top_frame.idut.w7m_be        : std_logic_vector(3 downto 0) >>;
+         alias s7_ena  is << signal .tb_top_frame.idut.wsh7_ena  : std_logic >>;
+         alias s7_rnw  is << signal .tb_top_frame.idut.wsh7_rnw  : std_logic >>;
+         alias s7_addr is << signal .tb_top_frame.idut.wsh7_addr : unsigned(14 downto 2) >>;
+         alias s7_din  is << signal .tb_top_frame.idut.wsh7_din  : std_logic_vector(31 downto 0) >>;
+         alias s9_ena  is << signal .tb_top_frame.idut.i9_wsh_ena : std_logic >>;
+         alias s9_rnw  is << signal .tb_top_frame.idut.wsh9_rnw   : std_logic >>;
+         alias s9_addr is << signal .tb_top_frame.idut.wsh9_addr  : unsigned(14 downto 2) >>;
+         alias s9_din  is << signal .tb_top_frame.idut.wsh9_din   : std_logic_vector(31 downto 0) >>;
+         alias a_wcnt  is << signal .tb_top_frame.idut.wramcnt : std_logic_vector(1 downto 0) >>;
+         -- the watched word plus three either side in each memory, so a copy loop
+         -- that lands next to it rather than on it is still visible
+         constant P_LO : integer := (ARM7WATCH mod 65536) / 4 - 3;   -- ARM7 WRAM, &0xFFFF
+         constant P_HI : integer := (ARM7WATCH mod 65536) / 4 + 3;
+         constant S_LO : integer := (ARM7WATCH mod 32768) / 4 - 3;   -- shared WRAM, &0x7FFF
+         constant S_HI : integer := (ARM7WATCH mod 32768) / 4 + 3;
+         -- shadows are std_logic_vector, NOT integer: to_integer on a word with
+         -- bit 31 set overflows VHDL's 32-bit signed INTEGER and kills the run
+         -- (it killed one at 1.070 s, 35 minutes in, on the first write it saw).
+         type t_shadow is array (integer range <>) of std_logic_vector(31 downto 0);
+         variable pshad : t_shadow(P_LO to P_HI) := (others => (others => '0'));
+         variable sshad : t_shadow(S_LO to S_HI) := (others => (others => '0'));
+         variable pwrit : integer_vector(P_LO to P_HI) := (others => 0);
+         variable swrit : integer_vector(S_LO to S_HI) := (others => 0);
+         variable idx    : integer;
+         variable hits   : natural := 0;
+         variable cyc    : natural := 0;
+         variable l      : line;
+      begin
+         if rising_edge(clk1x) then
+            -- ARM7-private WRAM
+            if (a_we = '1') then
+               idx := to_integer(a_addr);
+               if (idx >= P_LO and idx <= P_HI) then
+                  hits := hits + 1;
+                  pwrit(idx) := pwrit(idx) + 1;
+                  pshad(idx) := a_din;
+                  if (hits <= 64) then
+                     report "WRAMWATCH arm7wram byte=" & integer'image(idx * 4) &
+                            " data=" & to_hstring(a_din) & " be=" & to_string(a_be) &
+                            " wramcnt=" & to_string(a_wcnt) &
+                            " pc7=" & to_hstring(dbg_export7.pc) severity note;
+                  end if;
+               end if;
+            end if;
+            -- shared WRAM, either port (the ARM9 can only reach it here, and if
+            -- the ARM9 is the one filling the ARM7's handler that is the finding)
+            if (s7_ena = '1' and s7_rnw = '0') then
+               idx := to_integer(s7_addr);
+               if (idx >= S_LO and idx <= S_HI) then
+                  hits := hits + 1;
+                  swrit(idx) := swrit(idx) + 1;
+                  sshad(idx) := s7_din;
+                  if (hits <= 64) then
+                     report "WRAMWATCH shared(arm7) byte=" & integer'image(idx * 4) &
+                            " data=" & to_hstring(s7_din) &
+                            " wramcnt=" & to_string(a_wcnt) &
+                            " pc7=" & to_hstring(dbg_export7.pc) severity note;
+                  end if;
+               end if;
+            end if;
+            if (s9_ena = '1' and s9_rnw = '0') then
+               idx := to_integer(s9_addr);
+               if (idx >= S_LO and idx <= S_HI) then
+                  hits := hits + 1;
+                  swrit(idx) := swrit(idx) + 1;
+                  sshad(idx) := s9_din;
+                  if (hits <= 64) then
+                     report "WRAMWATCH shared(arm9) byte=" & integer'image(idx * 4) &
+                            " data=" & to_hstring(s9_din) &
+                            " wramcnt=" & to_string(a_wcnt) &
+                            " pc9=" & to_hstring(dbg_export9.pc) severity note;
+                  end if;
+               end if;
+            end if;
+
+            cyc := cyc + 1;
+            if (cyc = 3351398) then   -- every 100 ms of DS time
+               cyc := 0;
+               write(l, string'("WRAMWATCH writes="));
+               write(l, hits);
+               write(l, string'(" wramcnt="));
+               write(l, to_string(a_wcnt));
+               write(l, string'("  arm7wram:"));
+               for i in P_LO to P_HI loop
+                  write(l, string'(" ["));
+                  write(l, i * 4);
+                  write(l, string'("]="));
+                  if (pwrit(i) = 0) then
+                     write(l, string'("never"));
+                  else
+                     write(l, to_hstring(pshad(i)));
+                     write(l, string'("/"));
+                     write(l, pwrit(i));
+                  end if;
+               end loop;
+               write(l, string'("  shared:"));
+               for i in S_LO to S_HI loop
+                  write(l, string'(" ["));
+                  write(l, i * 4);
+                  write(l, string'("]="));
+                  if (swrit(i) = 0) then
+                     write(l, string'("never"));
+                  else
+                     write(l, to_hstring(sshad(i)));
+                     write(l, string'("/"));
+                     write(l, swrit(i));
+                  end if;
+               end loop;
+               report l.all severity note;
+               deallocate(l);
+            end if;
+         end if;
+      end process;
+
+   end generate;
+
+   -- ============ engine-A stall probe (STALL_CYC > 0) ============
+   -- Names the party that is waiting. The chain is
+   --   text drawer -> gpu2d BG arbiter -> nds_vram queue -> rsrv channel
+   -- and every layer is a one-deep present/accept handshake over a latch, so a
+   -- lost request or a lost done anywhere in it looks identical from outside:
+   -- line_busy never falls. Each layer's occupancy is printed so the first one
+   -- holding something that will never complete is visible directly.
+   gstall : if STALL_CYC > 0 generate
+      p_stall : process (clk1x)
+         alias s_rdisp is << signal .tb_top_frame.idut.ivram.rdispatch : std_logic >>;
+         alias s_rpick is << signal .tb_top_frame.idut.ivram.rpick : integer range 0 to 7 >>;
+         variable busy_run : natural := 0;
+         -- where the renderer's service actually went during this line: one
+         -- counter per nds_vram renderer channel, in rpick order
+         --   0 bgA 1 objA 2 bgepA 3 objepA 4 bgB 5 objB 6 bgepB 7 objepB
+         variable chan_ops : integer_vector(0 to 7) := (others => 0);
+         variable tot_ops  : natural := 0;
+      begin
+         if rising_edge(clk1x) then
+            if (<< signal .tb_top_frame.idut.line_busy : std_logic >> = '1') then
+               busy_run := busy_run + 1;
+            else
+               busy_run := 0;
+               chan_ops := (others => 0);
+               tot_ops  := 0;
+            end if;
+            if (s_rdisp = '1') then
+               chan_ops(s_rpick) := chan_ops(s_rpick) + 1;
+               tot_ops := tot_ops + 1;
+            end if;
+            if (busy_run = STALL_CYC) then
+               report "STALL: engine A busy " & integer'image(busy_run) & " cycles" & LF &
+                  "  gpu2d: busy_text=" & to_string(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.busy_text : std_logic_vector(0 to 3) >>) &
+                  " obj_busy=" & to_string(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.obj_busy : std_logic >>) &
+                  " cur_y=" & integer'image(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.cur_y : integer range 0 to 191 >>) & LF &
+                  "  arb: bgv_req=" & to_string(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.bgv_req : std_logic_vector(0 to 3) >>) &
+                  " bgv_done=" & to_string(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.bgv_done : std_logic_vector(0 to 3) >>) &
+                  " pending=" & to_string(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.b_arb.pending : std_logic_vector(0 to 3) >>) &
+                  " unaccepted=" & to_string(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.b_arb.unaccepted : std_logic >>) &
+                  " os_count=" & integer'image(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.b_arb.os_count : integer range 0 to 8 >>) & LF &
+                  "  text0: tq=" & integer'image(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.gen_text(0).itext.tq_count : integer range 0 to 4 >>) &
+                  " tag=" & integer'image(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.gen_text(0).itext.tag_count : integer range 0 to 8 >>) &
+                  " f_tile=" & integer'image(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.gen_text(0).itext.f_tile : integer range 0 to 33 >>) &
+                  " unacc=" & to_string(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.gen_text(0).itext.unaccepted : std_logic >>) &
+                  " p_active=" & to_string(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.gen_text(0).itext.p_active : std_logic >>) &
+                  " p_x=" & integer'image(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.gen_text(0).itext.p_x : integer range 0 to 256 >>) & LF &
+                  "  text1: tq=" & integer'image(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.gen_text(1).itext.tq_count : integer range 0 to 4 >>) &
+                  " tag=" & integer'image(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.gen_text(1).itext.tag_count : integer range 0 to 8 >>) &
+                  " f_tile=" & integer'image(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.gen_text(1).itext.f_tile : integer range 0 to 33 >>) &
+                  " unacc=" & to_string(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.gen_text(1).itext.unaccepted : std_logic >>) &
+                  " p_active=" & to_string(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.gen_text(1).itext.p_active : std_logic >>) & LF &
+                  "  text2: tq=" & integer'image(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.gen_text(2).itext.tq_count : integer range 0 to 4 >>) &
+                  " tag=" & integer'image(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.gen_text(2).itext.tag_count : integer range 0 to 8 >>) &
+                  " unacc=" & to_string(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.gen_text(2).itext.unaccepted : std_logic >>) &
+                  "  text3: tq=" & integer'image(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.gen_text(3).itext.tq_count : integer range 0 to 4 >>) &
+                  " tag=" & integer'image(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.gen_text(3).itext.tag_count : integer range 0 to 8 >>) &
+                  " unacc=" & to_string(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.gen_text(3).itext.unaccepted : std_logic >>) & LF &
+                  "  vram: rq_count=" & integer'image(<< signal .tb_top_frame.idut.ivram.rq_count : integer range 0 to 8 >>) &
+                  " adq_count=" & integer'image(<< signal .tb_top_frame.idut.ivram.adq_count : integer range 0 to 4 >>) &
+                  " rdispatch=" & to_string(<< signal .tb_top_frame.idut.ivram.rdispatch : std_logic >>) &
+                  " rpick=" & integer'image(<< signal .tb_top_frame.idut.ivram.rpick : integer range 0 to 7 >>) &
+                  " rpend=" & to_string(<< signal .tb_top_frame.idut.ivram.rpend : std_logic_vector(7 downto 0) >>) &
+                  " rreq_now=" & to_string(<< signal .tb_top_frame.idut.ivram.rreq_now : std_logic_vector(7 downto 0) >>) & LF &
+                  "  rsrv: req=" & to_string(vrsrv_req) & " ready=" & to_string(vrsrv_ready_s) &
+                  " done=" & to_string(vrsrv_done) & " busy_m=" & to_string(vrsrv_busy_m) &
+                  " bank=" & to_string(vrsrv_bank) & " addr=" & to_hstring(vrsrv_addr) & LF &
+                  "  epfill: A=" & to_string(<< signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.epfill_busy : std_logic >>) &
+                  " B=" & to_string(<< signal .tb_top_frame.idut.igpu2d_b.gslow.igpu.epfill_busy : std_logic >>) & LF &
+                  "  dispatches this line: total=" & integer'image(tot_ops) &
+                  "  bgA=" & integer'image(chan_ops(0)) &
+                  " objA=" & integer'image(chan_ops(1)) &
+                  " bgepA=" & integer'image(chan_ops(2)) &
+                  " objepA=" & integer'image(chan_ops(3)) &
+                  "  bgB=" & integer'image(chan_ops(4)) &
+                  " objB=" & integer'image(chan_ops(5)) &
+                  " bgepB=" & integer'image(chan_ops(6)) &
+                  " objepB=" & integer'image(chan_ops(7))
+                  severity failure;
+            end if;
+         end if;
+      end process;
+   end generate;
 
    -- Video-mode registers, reported when they CHANGE. The melonDS side of this
    -- (VIDLOG in main_fbdump) is what turned "is the screen white because the

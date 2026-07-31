@@ -100,10 +100,22 @@ architecture sim of tb_vram_ls is
    signal rdr_objepb_addr               : unsigned(12 downto 2) := (others => '0');
    signal rdr_objepb_dout               : std_logic_vector(31 downto 0);
 
+   -- per-channel accept pulses (see the request procedures)
+   signal rdr_bg_accept, rdr_obj_accept, rdr_bgep_accept, rdr_objep_accept   : std_logic;
+   signal rdr_bgb_accept, rdr_objb_accept, rdr_bgepb_accept, rdr_objepb_accept : std_logic;
    signal rsrv_req, rsrv_done : std_logic := '0';
    signal rsrv_bank : std_logic_vector(1 downto 0);
-   signal rsrv_addr : unsigned(16 downto 2);
-   signal rsrv_dout : std_logic_vector(31 downto 0) := (others => '0');
+   signal rsrv_addr : unsigned(16 downto 3);
+   signal rsrv_dout : std_logic_vector(63 downto 0) := (others => '0');
+
+   -- in-order response delay line for the pipelined A..D model (see prserv)
+   constant RSRV_LAT : integer := 4;
+   type t_rsrvpipe is record
+      v : std_logic;
+      d : std_logic_vector(63 downto 0);
+   end record;
+   type t_rsrvpipe_arr is array (0 to RSRV_LAT - 1) of t_rsrvpipe;
+   signal rsrvpipe : t_rsrvpipe_arr := (others => ('0', (others => '0')));
 
    signal tests_done : boolean := false;
 
@@ -143,7 +155,11 @@ begin
       rdr_objepb_req => rdr_objepb_req, rdr_objepb_addr => rdr_objepb_addr,
       rdr_objepb_dout => rdr_objepb_dout, rdr_objepb_done => rdr_objepb_done,
       rsrv_req => rsrv_req, rsrv_bank => rsrv_bank, rsrv_addr => rsrv_addr,
-      rsrv_dout => rsrv_dout, rsrv_done => rsrv_done
+      rsrv_dout => rsrv_dout, rsrv_done => rsrv_done,
+      rdr_bg_accept => rdr_bg_accept, rdr_obj_accept => rdr_obj_accept,
+      rdr_bgep_accept => rdr_bgep_accept, rdr_objep_accept => rdr_objep_accept,
+      rdr_bgb_accept => rdr_bgb_accept, rdr_objb_accept => rdr_objb_accept,
+      rdr_bgepb_accept => rdr_bgepb_accept, rdr_objepb_accept => rdr_objepb_accept
    );
 
    -- behavioral A..D backing store, CPU side (reads only in this TB)
@@ -165,19 +181,28 @@ begin
       srv_done <= '0';
    end process;
 
-   -- behavioral A..D backing store, renderer side (read-only channel)
-   prserv : process
-      variable rs : unsigned(31 downto 0) := to_unsigned(777, 32);
+   -- Behavioral A..D backing store, renderer side (read-only channel).
+   -- PIPELINED: one request accepted per cycle, answered in issue order
+   -- RSRV_LAT+1 cycles later. The old model was blocking and randomised its
+   -- latency, which cannot represent an in-order pipelined channel.
+   prserv : process (clk)
    begin
-      wait until rising_edge(clk) and rsrv_req = '1';
-      rs := rs xor shift_left(rs, 13); rs := rs xor shift_right(rs, 17); rs := rs xor shift_left(rs, 5);
-      for k in 1 to 1 + to_integer(rs(1 downto 0)) loop
-         wait until rising_edge(clk);
-      end loop;
-      rsrv_dout <= fillword(to_integer(unsigned(rsrv_bank)), to_integer(rsrv_addr));
-      rsrv_done <= '1';
-      wait until rising_edge(clk);
-      rsrv_done <= '0';
+      if rising_edge(clk) then
+         for k in RSRV_LAT - 1 downto 1 loop
+            rsrvpipe(k) <= rsrvpipe(k - 1);
+         end loop;
+         rsrvpipe(0).v <= '0';
+         if (rsrv_req = '1') then
+            rsrvpipe(0).v <= '1';
+            -- 64-bit line: both words of the aligned 8-byte block
+            rsrvpipe(0).d <= fillword(to_integer(unsigned(rsrv_bank)),
+                                      to_integer(rsrv_addr) * 2 + 1) &
+                             fillword(to_integer(unsigned(rsrv_bank)),
+                                      to_integer(rsrv_addr) * 2);
+         end if;
+         rsrv_done <= rsrvpipe(RSRV_LAT - 1).v;
+         rsrv_dout <= rsrvpipe(RSRV_LAT - 1).d;
+      end if;
    end process;
 
    pmain : process
@@ -220,50 +245,74 @@ begin
             when 0 =>
                rdr_bg_addr <= to_unsigned(byteaddr, 19)(18 downto 2);
                rdr_bg_req  <= '1';
-               wait until rising_edge(clk) and rdr_bg_done = '1';
+               -- drop req on ACCEPT: the server latches one request per
+               -- accept, and a level still high afterwards is a NEW request
+               wait until rising_edge(clk) and rdr_bg_accept = '1';
                rdr_bg_req  <= '0';
+               wait until rising_edge(clk) and rdr_bg_done = '1';
                data := rdr_bg_dout;
             when 1 =>
                rdr_obj_addr <= to_unsigned(byteaddr, 18)(17 downto 2);
                rdr_obj_req  <= '1';
-               wait until rising_edge(clk) and rdr_obj_done = '1';
+               -- drop req on ACCEPT: the server latches one request per
+               -- accept, and a level still high afterwards is a NEW request
+               wait until rising_edge(clk) and rdr_obj_accept = '1';
                rdr_obj_req  <= '0';
+               wait until rising_edge(clk) and rdr_obj_done = '1';
                data := rdr_obj_dout;
             when 2 =>
                rdr_bgep_addr <= to_unsigned(byteaddr, 15)(14 downto 2);
                rdr_bgep_req  <= '1';
-               wait until rising_edge(clk) and rdr_bgep_done = '1';
+               -- drop req on ACCEPT: the server latches one request per
+               -- accept, and a level still high afterwards is a NEW request
+               wait until rising_edge(clk) and rdr_bgep_accept = '1';
                rdr_bgep_req  <= '0';
+               wait until rising_edge(clk) and rdr_bgep_done = '1';
                data := rdr_bgep_dout;
             when 3 =>
                rdr_objep_addr <= to_unsigned(byteaddr, 13)(12 downto 2);
                rdr_objep_req  <= '1';
-               wait until rising_edge(clk) and rdr_objep_done = '1';
+               -- drop req on ACCEPT: the server latches one request per
+               -- accept, and a level still high afterwards is a NEW request
+               wait until rising_edge(clk) and rdr_objep_accept = '1';
                rdr_objep_req  <= '0';
+               wait until rising_edge(clk) and rdr_objep_done = '1';
                data := rdr_objep_dout;
             when 4 =>
                rdr_bgb_addr <= to_unsigned(byteaddr, 17)(16 downto 2);
                rdr_bgb_req  <= '1';
-               wait until rising_edge(clk) and rdr_bgb_done = '1';
+               -- drop req on ACCEPT: the server latches one request per
+               -- accept, and a level still high afterwards is a NEW request
+               wait until rising_edge(clk) and rdr_bgb_accept = '1';
                rdr_bgb_req  <= '0';
+               wait until rising_edge(clk) and rdr_bgb_done = '1';
                data := rdr_bgb_dout;
             when 5 =>
                rdr_objb_addr <= to_unsigned(byteaddr, 17)(16 downto 2);
                rdr_objb_req  <= '1';
-               wait until rising_edge(clk) and rdr_objb_done = '1';
+               -- drop req on ACCEPT: the server latches one request per
+               -- accept, and a level still high afterwards is a NEW request
+               wait until rising_edge(clk) and rdr_objb_accept = '1';
                rdr_objb_req  <= '0';
+               wait until rising_edge(clk) and rdr_objb_done = '1';
                data := rdr_objb_dout;
             when 6 =>
                rdr_bgepb_addr <= to_unsigned(byteaddr, 15)(14 downto 2);
                rdr_bgepb_req  <= '1';
-               wait until rising_edge(clk) and rdr_bgepb_done = '1';
+               -- drop req on ACCEPT: the server latches one request per
+               -- accept, and a level still high afterwards is a NEW request
+               wait until rising_edge(clk) and rdr_bgepb_accept = '1';
                rdr_bgepb_req  <= '0';
+               wait until rising_edge(clk) and rdr_bgepb_done = '1';
                data := rdr_bgepb_dout;
             when others =>
                rdr_objepb_addr <= to_unsigned(byteaddr, 13)(12 downto 2);
                rdr_objepb_req  <= '1';
-               wait until rising_edge(clk) and rdr_objepb_done = '1';
+               -- drop req on ACCEPT: the server latches one request per
+               -- accept, and a level still high afterwards is a NEW request
+               wait until rising_edge(clk) and rdr_objepb_accept = '1';
                rdr_objepb_req  <= '0';
+               wait until rising_edge(clk) and rdr_objepb_done = '1';
                data := rdr_objepb_dout;
          end case;
       end procedure;
@@ -287,6 +336,7 @@ begin
       variable cc_exp             : t_words(0 to 7);
       variable cc_got             : t_words(0 to 7);
       variable cc_done            : std_logic_vector(7 downto 0);
+      variable cc_acc  : std_logic_vector(7 downto 0);
       variable cc_n               : integer;
    begin
       -- reset
@@ -370,16 +420,29 @@ begin
          rdr_bgepb_req  <= '1';
          rdr_objepb_req <= '1';
          cc_done := x"00";
+         cc_acc  := x"00";
+         -- All eight channels present their requests at once. Drop each req on
+         -- its own ACCEPT (a level still high after accept would read as a new
+         -- request), and collect the data on its own done - which the server
+         -- delivers in the order it accepted them.
          while cc_done /= x"FF" loop
             wait until rising_edge(clk);
-            if (rdr_bg_done = '1')     then cc_got(0) := rdr_bg_dout;     cc_done(0) := '1'; rdr_bg_req     <= '0'; end if;
-            if (rdr_obj_done = '1')    then cc_got(1) := rdr_obj_dout;    cc_done(1) := '1'; rdr_obj_req    <= '0'; end if;
-            if (rdr_bgep_done = '1')   then cc_got(2) := rdr_bgep_dout;   cc_done(2) := '1'; rdr_bgep_req   <= '0'; end if;
-            if (rdr_objep_done = '1')  then cc_got(3) := rdr_objep_dout;  cc_done(3) := '1'; rdr_objep_req  <= '0'; end if;
-            if (rdr_bgb_done = '1')    then cc_got(4) := rdr_bgb_dout;    cc_done(4) := '1'; rdr_bgb_req    <= '0'; end if;
-            if (rdr_objb_done = '1')   then cc_got(5) := rdr_objb_dout;   cc_done(5) := '1'; rdr_objb_req   <= '0'; end if;
-            if (rdr_bgepb_done = '1')  then cc_got(6) := rdr_bgepb_dout;  cc_done(6) := '1'; rdr_bgepb_req  <= '0'; end if;
-            if (rdr_objepb_done = '1') then cc_got(7) := rdr_objepb_dout; cc_done(7) := '1'; rdr_objepb_req <= '0'; end if;
+            if (rdr_bg_accept = '1') then cc_acc(0) := '1'; rdr_bg_req <= '0'; end if;
+            if (rdr_obj_accept = '1') then cc_acc(1) := '1'; rdr_obj_req <= '0'; end if;
+            if (rdr_bgep_accept = '1') then cc_acc(2) := '1'; rdr_bgep_req <= '0'; end if;
+            if (rdr_objep_accept = '1') then cc_acc(3) := '1'; rdr_objep_req <= '0'; end if;
+            if (rdr_bgb_accept = '1') then cc_acc(4) := '1'; rdr_bgb_req <= '0'; end if;
+            if (rdr_objb_accept = '1') then cc_acc(5) := '1'; rdr_objb_req <= '0'; end if;
+            if (rdr_bgepb_accept = '1') then cc_acc(6) := '1'; rdr_bgepb_req <= '0'; end if;
+            if (rdr_objepb_accept = '1') then cc_acc(7) := '1'; rdr_objepb_req <= '0'; end if;
+            if (rdr_bg_done = '1')   then cc_got(0) := rdr_bg_dout; cc_done(0) := '1'; end if;
+            if (rdr_obj_done = '1')   then cc_got(1) := rdr_obj_dout; cc_done(1) := '1'; end if;
+            if (rdr_bgep_done = '1')   then cc_got(2) := rdr_bgep_dout; cc_done(2) := '1'; end if;
+            if (rdr_objep_done = '1')   then cc_got(3) := rdr_objep_dout; cc_done(3) := '1'; end if;
+            if (rdr_bgb_done = '1')   then cc_got(4) := rdr_bgb_dout; cc_done(4) := '1'; end if;
+            if (rdr_objb_done = '1')   then cc_got(5) := rdr_objb_dout; cc_done(5) := '1'; end if;
+            if (rdr_bgepb_done = '1')   then cc_got(6) := rdr_bgepb_dout; cc_done(6) := '1'; end if;
+            if (rdr_objepb_done = '1')   then cc_got(7) := rdr_objepb_dout; cc_done(7) := '1'; end if;
          end loop;
          for k in 0 to 7 loop
             check(c, 1000 + k, "concurrent chan " & integer'image(k), cc_got(k), cc_exp(k));

@@ -790,10 +790,11 @@ wire  [3:0] vsrv_be_c;
 wire [31:0] vsrv_din_c;
 wire        vrsrv_req_c;
 wire  [1:0] vrsrv_bank_c;
-wire [14:0] vrsrv_addr_c;
+wire [13:0] vrsrv_addr_c;
 wire        vrsrv_ready_c;
 
-reg  [31:0] vsrv_dout_r,  vrsrv_dout_r;
+reg  [31:0] vsrv_dout_r;
+reg  [63:0] vrsrv_dout_r;   // 64-bit A..D line, see nds_vram's rsrv_* port
 reg         vsrv_done_r,  vrsrv_done_r;
 
 wire        sd_ch2_ready;
@@ -874,13 +875,40 @@ end
 
 // ---- vrsrv: renderer read feed on ch1 (no scheduler needed) ----
 // sdram.sv's ch1 holds ONE request at a time (ch1_rq is a single bit), while
-// nds_vram's renderer server now issues its A..D reads pipelined. Without a
-// ready line, every request arriving while ch1 was busy was simply dropped -
-// the core would then wait forever for a word that was never asked for. So the
-// channel exports back-pressure and the core throttles itself to what ch1 can
-// actually take. Pipelining ch1 itself is a separate change and needs hardware
-// to validate; this makes the current depth correct rather than lucky.
-reg        vr_req_d = 0, vr_busy = 0, vr_fin = 0;
+// nds_vram's renderer server issues its A..D reads pipelined. Without a ready
+// line, every request arriving while ch1 was busy was simply dropped - the core
+// would then wait forever for a word that was never asked for. So the channel
+// exports back-pressure and the core throttles itself to what ch1 can actually
+// take. Pipelining ch1 itself is a separate change and needs hardware to
+// validate; this makes the current depth correct rather than lucky.
+//
+// req/ready is now a proper VALID/READY handshake: nds_vram HOLDS the request
+// until an edge at which ready is high, and that edge is the transfer. It gave
+// up pulsing because a pulse is issued on a ready sampled BEFORE the request
+// exists, so its correctness depends on how fast ready falls after acceptance -
+// see nds_vram's port comment for the drop that produced in simulation.
+//
+// This side had to change with it, and the edge detect it replaces is why:
+// `vrsrv_req_c & ~vr_req_d` needs the request to go low between requests. A held
+// request never does, so the first would have been taken and every later one
+// silently ignored - a wedge on hardware only. It is not an independent fix.
+//
+// For both ends to agree on WHICH edge the transfer was, this side must sample
+// the interface at exactly the edge the core does: clkMemIndex == 2 is the clkMem
+// edge coincident with the clk1x rising edge (see the counter's contract at the
+// top of this file). Accepting at any other phase would take a request the core
+// goes on holding, and then serve it twice.
+//
+// Note what is NOT claimed here. The old pulse scheme did not drop on hardware:
+// vr_busy rises, and so ready falls, one clkMem cycle after acceptance, a third
+// of a clk1x period before the core samples again - so the core never issued
+// into a busy channel. It was correct by a timing coincidence between two
+// domains, and this removes the reliance on it rather than fixing a silicon bug.
+// The hardware white screen was a livelock in nds_gpu2d's drawline routing.
+//
+// It also removes the need to latch a dropped request the way the firmware
+// channel does with fwr_pend: with a held request there is nothing to drop.
+reg        vr_busy = 0, vr_fin = 0;
 reg        sd_vr_req = 0;
 reg [25:0] vr_adr;
 
@@ -889,17 +917,20 @@ reg [25:0] vr_adr;
 assign vrsrv_ready_c = ~vr_busy & ~vr_fin;
 
 always @(posedge clk_mem) begin
-	vr_req_d  <= vrsrv_req_c;
 	sd_vr_req <= 0;
 
-	if (vrsrv_req_c & ~vr_req_d & ~vr_busy) begin
-		vr_adr    <= {8'd0, vrsrv_bank_c, vrsrv_addr_c, 1'b0};  // halfword addr [26:1]
+	if (vrsrv_req_c & vrsrv_ready_c & (clkMemIndex == 2'd2)) begin
+		// halfword addr [26:1]; the line address makes it 8-byte aligned, which is
+		// what lets the whole burst be used - a sequential SDRAM burst wraps inside
+		// its aligned block, so an unaligned request returns these same eight bytes
+		// rotated and dout[63:32] would not be the neighbouring word.
+		vr_adr    <= {8'd0, vrsrv_bank_c, vrsrv_addr_c, 2'b00};
 		sd_vr_req <= 1;
 		vr_busy   <= 1;
 	end
 
 	if (vr_busy & sd_ch1_ready) begin
-		vrsrv_dout_r <= sd_ch1_dout[31:0];   // first word of the burst = word at the requested address
+		vrsrv_dout_r <= sd_ch1_dout;   // the whole aligned 8-byte line
 		vr_fin       <= 1;
 		vr_busy      <= 0;
 	end

@@ -75,7 +75,16 @@ architecture sim of tb_gpu2d is
    signal pal_addr, oam_addr : integer range 0 to 255 := 0;
    signal pal_din, oam_din : std_logic_vector(31 downto 0) := (others => '0');
 
+   signal srv_bg_accept             : std_logic := '0';
    signal srv_bg_req, srv_bg_done   : std_logic := '0';
+   -- in-order response delay line for the pipelined BG model (see p_srv_bg)
+   constant BGSRV_LAT : integer := 3;
+   type t_bgpipe is record
+      v : std_logic;
+      d : std_logic_vector(31 downto 0);
+   end record;
+   type t_bgpipe_arr is array (0 to BGSRV_LAT - 1) of t_bgpipe;
+   signal bgpipe : t_bgpipe_arr := (others => ('0', (others => '0')));
    signal srv_bg_addr   : integer range 0 to 131071;
    signal srv_bg_data   : std_logic_vector(31 downto 0);
    signal srv_obj_req, srv_obj_done : std_logic := '0';
@@ -133,6 +142,7 @@ begin
       srv_bg_addr     => srv_bg_addr,
       srv_bg_data     => srv_bg_data,
       srv_bg_done     => srv_bg_done,
+      srv_bg_accept   => srv_bg_accept,
       srv_obj_req     => srv_obj_req,
       srv_obj_addr    => srv_obj_addr,
       srv_obj_data    => srv_obj_data,
@@ -151,17 +161,27 @@ begin
       pixel_out_we    => px_we
    );
 
-   -- ================= channel servers (randomized short latency) =================
-   p_srv_bg : process
-      variable seed : unsigned(31 downto 0) := to_unsigned(1234501, 32);
+   -- ================= channel servers =================
+   -- BG: pipelined, one request accepted per cycle, answered in issue order
+   -- BGSRV_LAT+1 cycles later. gpu2d's arbiter may keep several BG fetches in
+   -- flight (that is what lets the drawers prefetch), so a blocking
+   -- one-at-a-time model would silently drop requests here.
+   srv_bg_accept <= srv_bg_req;
+
+   p_srv_bg : process (clk)
    begin
-      wait until rising_edge(clk) and srv_bg_req = '1';
-      seed := seed xor shift_left(seed, 13); seed := seed xor shift_right(seed, 17); seed := seed xor shift_left(seed, 5);
-      for k in 0 to to_integer(seed(0 downto 0)) loop wait until rising_edge(clk); end loop;
-      srv_bg_data <= bgvram(srv_bg_addr);
-      srv_bg_done <= '1';
-      wait until rising_edge(clk);
-      srv_bg_done <= '0';
+      if rising_edge(clk) then
+         for k in BGSRV_LAT - 1 downto 1 loop
+            bgpipe(k) <= bgpipe(k - 1);
+         end loop;
+         bgpipe(0).v <= '0';
+         if (srv_bg_req = '1') then
+            bgpipe(0).v <= '1';
+            bgpipe(0).d <= bgvram(srv_bg_addr);
+         end if;
+         srv_bg_done <= bgpipe(BGSRV_LAT - 1).v;
+         srv_bg_data <= bgpipe(BGSRV_LAT - 1).d;
+      end if;
    end process;
 
    p_srv_obj : process

@@ -100,8 +100,8 @@ entity nds_port_wrap is
       vsrv_done        : in  std_logic;
       vrsrv_req        : out std_logic;
       vrsrv_bank       : out std_logic_vector(1 downto 0);
-      vrsrv_addr       : out std_logic_vector(14 downto 0);
-      vrsrv_dout       : in  std_logic_vector(31 downto 0);
+      vrsrv_addr       : out std_logic_vector(13 downto 0);
+      vrsrv_dout       : in  std_logic_vector(63 downto 0);
       vrsrv_done       : in  std_logic;
       vrsrv_ready      : in  std_logic := '1';
 
@@ -146,7 +146,7 @@ architecture arch of nds_port_wrap is
    signal pixb_x_i, pixb_y_i : integer range 0 to 255;
    signal fw_addr_u          : unsigned(17 downto 2);
    signal vsrv_addr_u        : unsigned(16 downto 2);
-   signal vrsrv_addr_u       : unsigned(16 downto 2);
+   signal vrsrv_addr_u       : unsigned(16 downto 3);
 
 begin
 

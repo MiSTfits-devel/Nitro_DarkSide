@@ -25,18 +25,29 @@
 --   rdr_objb   128 KB sub-OBJ space   (D MST=4, I MST=2)
 --   rdr_bgepb   32 KB BG ext palette  (H MST=2, all 4 slots)
 --   rdr_objepb   8 KB OBJ ext palette (I MST=3)
--- Protocol per channel: hold req with stable addr until done pulses (1 cycle,
--- dout valid with done); deassert req on the done cycle unless another request
--- follows. Channels are arbitrated round-robin, one op in flight; E..I hits are
--- BRAM port-B reads, A..D hits go through the read-only rsrv_* channel (the
--- future SDRAM line-cache/prefetch client; behavioral model in sim). Multi-hit
--- reads OR, unmapped reads return 0 — same semantics as the CPU side.
--- v1 is correctness-first (one op at a time, ~4 cycles/op); the per-line
--- prefetch/parallelism pass is deferred to the hardware bring-up milestone.
+-- Protocol per channel: present req with stable addr; the server pulses accept
+-- on the cycle it takes the request, and done (1 cycle, dout valid with done)
+-- when the word is ready. A channel may hold req until accept, or pulse it for
+-- one cycle - either way exactly one request is taken per accept.
+--
+-- The renderer server is PIPELINED (v2, see the block comment at the pipeline
+-- itself): one request accepted per cycle, several in flight, retired IN ISSUE
+-- ORDER, so a channel may have several outstanding requests and needs no tags
+-- to match answers to asks. E..I hits are BRAM port-B reads (2-cycle
+-- latency); A..D hits go through the read-only rsrv_* channel, which is itself
+-- pipelined (one op issued per cycle, up to AD_DEPTH outstanding, answered in
+-- order, held until rsrv_ready takes them). Multi-hit reads OR, unmapped reads
+-- return 0 — same semantics as the CPU side, and the same semantics v1 had.
+--
+-- v1 was one op at a time through a six-state FSM: five cycles for a BRAM hit,
+-- nothing overlapped. On tb_gpu2d_timed it occupied 58-61% of every rendered
+-- line. Throughput, not latency, was the problem, so v2 pipelines rather than
+-- shortens: latency is now hidden by the clients' prefetch FIFOs instead.
 -- Engine B roles (H/I, C/D sub) come with M6.
 --
--- Timing is NOT cycle-accurate yet (M1): BRAM ops take ~3 cycles, A..D ops
--- depend on the server. Accuracy pass comes with the membus integration.
+-- Timing is NOT cycle-accurate (M1): a BRAM op answers in 2 cycles, A..D ops
+-- in whatever the backing channel takes. Accuracy pass comes with the membus
+-- integration.
 --
 -- Reset clear pass (CLR_BRAM / CLR_SRV / CLR_SRVWAIT). On a MiSTer the FPGA is
 -- NOT reconfigured between ROM loads - only the loader re-runs - so every bank
@@ -103,61 +114,117 @@ entity nds_vram is
       srv_dout  : in  std_logic_vector(31 downto 0);
       srv_done  : in  std_logic;
 
-      -- renderer line-server channels (read-only; see header)
+      -- renderer line-server channels (read-only; see header). accept pulses
+      -- the cycle the server takes the request - a client may present the
+      -- next one immediately and have several outstanding, answered in order.
       rdr_bg_req     : in  std_logic := '0';
       rdr_bg_addr    : in  unsigned(18 downto 2) := (others => '0');
       rdr_bg_dout    : out std_logic_vector(31 downto 0) := (others => '0');
       rdr_bg_done    : out std_logic := '0';
+      rdr_bg_accept  : out std_logic := '0';
 
       rdr_obj_req    : in  std_logic := '0';
       rdr_obj_addr   : in  unsigned(17 downto 2) := (others => '0');
       rdr_obj_dout   : out std_logic_vector(31 downto 0) := (others => '0');
       rdr_obj_done   : out std_logic := '0';
+      rdr_obj_accept : out std_logic := '0';
 
       rdr_bgep_req   : in  std_logic := '0';
       rdr_bgep_addr  : in  unsigned(14 downto 2) := (others => '0');
       rdr_bgep_dout  : out std_logic_vector(31 downto 0) := (others => '0');
       rdr_bgep_done  : out std_logic := '0';
+      rdr_bgep_accept : out std_logic := '0';
 
       rdr_objep_req  : in  std_logic := '0';
       rdr_objep_addr : in  unsigned(12 downto 2) := (others => '0');
       rdr_objep_dout : out std_logic_vector(31 downto 0) := (others => '0');
       rdr_objep_done : out std_logic := '0';
+      rdr_objep_accept : out std_logic := '0';
 
       rdr_bgb_req    : in  std_logic := '0';
       rdr_bgb_addr   : in  unsigned(16 downto 2) := (others => '0');
       rdr_bgb_dout   : out std_logic_vector(31 downto 0) := (others => '0');
       rdr_bgb_done   : out std_logic := '0';
+      rdr_bgb_accept : out std_logic := '0';
 
       rdr_objb_req   : in  std_logic := '0';
       rdr_objb_addr  : in  unsigned(16 downto 2) := (others => '0');
       rdr_objb_dout  : out std_logic_vector(31 downto 0) := (others => '0');
       rdr_objb_done  : out std_logic := '0';
+      rdr_objb_accept : out std_logic := '0';
 
       rdr_bgepb_req  : in  std_logic := '0';
       rdr_bgepb_addr : in  unsigned(14 downto 2) := (others => '0');
       rdr_bgepb_dout : out std_logic_vector(31 downto 0) := (others => '0');
       rdr_bgepb_done : out std_logic := '0';
+      rdr_bgepb_accept : out std_logic := '0';
 
       rdr_objepb_req : in  std_logic := '0';
       rdr_objepb_addr: in  unsigned(12 downto 2) := (others => '0');
       rdr_objepb_dout: out std_logic_vector(31 downto 0) := (others => '0');
       rdr_objepb_done: out std_logic := '0';
+      rdr_objepb_accept : out std_logic := '0';
 
       -- high from reset until the reset clear pass has zeroed every bank;
       -- nds_top holds the CPUs until it drops (see the header)
       clr_busy  : out std_logic := '1';
 
-      -- renderer A..D backing channel (read-only)
-      rsrv_req  : out std_logic := '0';
-      rsrv_bank : out std_logic_vector(1 downto 0) := "00";
-      rsrv_addr : out unsigned(16 downto 2) := (others => '0');
-      rsrv_dout : in  std_logic_vector(31 downto 0) := (others => '0');
-      rsrv_done : in  std_logic := '0';
+      -- Renderer A..D backing channel (read-only), PIPELINED: up to AD_DEPTH
+      -- ops may be outstanding and rsrv_done pulses once per completed op IN
+      -- ISSUE ORDER. v1 held req until done and allowed exactly one op, which
+      -- on hardware means the renderer pays full SDRAM latency per word with
+      -- nothing overlapped - the dominant cost of the whole render path there,
+      -- since for a typical title all BG char/map data lives in banks A..D.
+      --
+      -- rsrv_req/rsrv_ready is a VALID/READY handshake: the request is
+      -- presented and HELD until a rising edge at which rsrv_ready is high,
+      -- and that edge is the transfer. It is the same edge the channel samples
+      -- rsrv_req on, so the two ends can never disagree about which requests
+      -- were taken.
+      --
+      -- It must be a held level, not a pulse. rsrv_ready cannot reflect a
+      -- request that has not been presented yet, so a pulse is always issued on
+      -- a STALE ready, and whether that is safe depends on how quickly ready
+      -- falls after the channel accepts. It was not safe against the bench's
+      -- model of the hardware channel, whose busy rises only once it has SAMPLED
+      -- the request: ready then reads high for two consecutive cycles, the core
+      -- issues a second op into a one-deep channel, that op is dropped, and the
+      -- queue entry owes a word forever. A held request has no such dependence,
+      -- and needs no knowledge of the channel's depth or latency.
+      --
+      -- (On hardware the same pulse scheme happened NOT to drop - NDS.sv's ready
+      -- is combinational and falls a third of a clk1x period before the core
+      -- samples again. It was correct by coincidence. The hardware white screen
+      -- was the drawline livelock in nds_gpu2d, not this.)
+      --
+      -- rsrv_ready defaults high so a backing model that is always ready needs
+      -- no wiring change: with ready tied high the wire frees every cycle, so
+      -- this degenerates to exactly the old one-op-per-cycle pulse stream.
+      --
+      -- The channel is 64 BITS WIDE and addressed by 8-byte LINE, not by word.
+      -- sdram.sv's ch1 already reads four halfwords per access (BURST_LENGTH=4,
+      -- sequential, so the aligned 8-byte block containing the request) and
+      -- NDS.sv was using 32 bits of it and throwing the rest away. Asking for the
+      -- aligned line makes the burst wrap irrelevant - a sequential SDRAM burst
+      -- wraps inside its aligned block, so an unaligned request would return the
+      -- same eight bytes rotated - and doubles what one access yields.
+      --
+      -- Paired with the per-channel line cache below, this removed 76% of A..D
+      -- reads on the mode-0 bench (measured, LINEPROBE in tb_top_frame). A single
+      -- SHARED line would have been worthless: measured 1%, because the eight
+      -- renderer channels interleave and each evicts the others. Each channel
+      -- walking its own address run is exactly what a per-channel line fits.
+      rsrv_req   : out std_logic := '0';
+      rsrv_bank  : out std_logic_vector(1 downto 0) := "00";
+      rsrv_addr  : out unsigned(16 downto 3) := (others => '0');
+      rsrv_dout  : in  std_logic_vector(63 downto 0) := (others => '0');
+      rsrv_done  : in  std_logic := '0';
+      rsrv_ready : in  std_logic := '1';
 
-      -- Renderer-side arbiter busy. Exposed as a PORT because rstate's type is
-      -- declared in this architecture and cannot be reached by a bench external
-      -- name, and because measuring occupancy from srv_*_req does NOT work:
+      -- Renderer-side server busy: work is in flight in the completion queue.
+      -- Exposed as a PORT because the queue is declared in this architecture
+      -- and cannot be reached by a bench external name, and because measuring
+      -- occupancy from srv_*_req does NOT work:
       -- nds_gpu2d drives req as a one-cycle pulse, so counting req-asserted
       -- cycles counts REQUESTS, not waiting time (measured 0.94 cycles per op
       -- where an op takes ~4).
@@ -259,16 +326,75 @@ architecture arch of nds_vram is
    signal objepb_hit  : std_logic_vector(8 downto 0);
    signal objepb_offs : t_vram_offs;
 
-   type rtstate is
-   (
-      RIDLE,
-      RBRAMWAIT,
-      RBRAMREAD,
-      RSRVSCAN,
-      RSRVWAIT,
-      RFINISH
-   );
-   signal rstate : rtstate := RIDLE;
+   -- ---------------- pipelined renderer server (v2) ----------------
+   -- v1 was a six-state FSM serving ONE request at a time: RIDLE -> RBRAMWAIT
+   -- -> RBRAMREAD -> RSRVSCAN -> RFINISH, five cycles per op even for a plain
+   -- BRAM hit, with nothing overlapped. Measured on tb_gpu2d_timed it was busy
+   -- 2,847-2,983 cycles of a 4,794-5,162-cycle rendered line - 58-61% of the
+   -- line, against a 2,130-cycle budget for the whole line. That is the wall.
+   --
+   -- v2 is a pipeline. One request is accepted per cycle and retires IN ORDER
+   -- through a completion queue:
+   --
+   --   S0 (issue)   rotating-priority pick over channels with a pending req;
+   --                allocate a queue entry; drive BRAM port B combinationally
+   --   S1 (bram)    port-B q is valid one cycle later -> OR into that entry
+   --   A..D         entries needing banks A..D issue rsrv ops in queue order;
+   --                rsrv returns in order, so each op ORs into its own entry
+   --   retire       the HEAD entry, once it has every word it needs, drives
+   --                that channel's dout and pulses its done
+   --
+   -- In-order retirement is what keeps this safe: a channel is allowed several
+   -- outstanding requests (the prefetching drawers depend on that) and they
+   -- come back in issue order, so no client needs tags. Head-of-line blocking
+   -- costs latency, never throughput, because the backing channel is itself
+   -- pipelined and the clients' FIFOs absorb latency.
+   --
+   -- Semantics preserved from v1 exactly: multi-hit reads OR every hit bank,
+   -- unmapped reads return 0, done pulses one cycle with dout valid.
+   constant RQ_DEPTH : integer := 8;   -- completion queue entries
+   constant AD_DEPTH : integer := 4;   -- rsrv ops allowed in flight
+
+   type t_rq_entry is record
+      valid    : std_logic;
+      chan     : integer range 0 to 7;
+      need_br  : std_logic;                           -- waiting on the BRAM stage
+      ad_todo  : std_logic_vector(BANK_A to BANK_D);  -- A..D words not yet issued
+      ad_owed  : integer range 0 to 4;                -- A..D words not yet returned
+      acc      : std_logic_vector(31 downto 0);
+   end record;
+   constant RQ_INIT : t_rq_entry :=
+      ('0', 0, '0', (others => '0'), 0, (others => '0'));
+   type t_rq is array (0 to RQ_DEPTH-1) of t_rq_entry;
+   signal rq       : t_rq := (others => RQ_INIT);
+   signal rq_head  : integer range 0 to RQ_DEPTH-1 := 0;
+   signal rq_tail  : integer range 0 to RQ_DEPTH-1 := 0;
+   signal rq_count : integer range 0 to RQ_DEPTH := 0;
+
+   -- the BRAM stage holds at most one entry (one set of port-B reads)
+   signal br_valid : std_logic := '0';
+   signal br_slot  : integer range 0 to RQ_DEPTH-1 := 0;
+   signal br_hit   : std_logic_vector(BANK_E to BANK_I) := (others => '0');
+
+   -- A..D issue walker: which queue slot and which bank it is working on
+   signal ad_scan  : integer range 0 to RQ_DEPTH-1 := 0;
+   signal ad_hit   : std_logic_vector(BANK_A to BANK_D) := (others => '0');
+   signal ad_armed : std_logic := '0';   -- ad_hit/ad_scan describe a live entry
+   -- in-flight rsrv ops, in issue order (rsrv returns in order). The response is
+   -- an 8-byte line, so the entry also carries which word of it was wanted and
+   -- the line's identity, for the cache fill.
+   type t_adq_entry is record
+      slot : integer range 0 to RQ_DEPTH-1;
+      bank : integer range BANK_A to BANK_D;
+      hi   : std_logic;                    -- wanted the high word of the line
+      chan : integer range 0 to 7;         -- which renderer channel owns the line
+      line : unsigned(16 downto 3);
+   end record;
+   type t_adq is array (0 to AD_DEPTH-1) of t_adq_entry;
+   signal adq       : t_adq := (others => (0, BANK_A, '0', 0, (others => '0')));
+   signal adq_head  : integer range 0 to AD_DEPTH-1 := 0;
+   signal adq_tail  : integer range 0 to AD_DEPTH-1 := 0;
+   signal adq_count : integer range 0 to AD_DEPTH := 0;
 
    signal rreq_vec     : std_logic_vector(7 downto 0);
    signal rpend        : std_logic_vector(7 downto 0) := (others => '0');
@@ -279,11 +405,47 @@ architecture arch of nds_vram is
    signal rchosen_offs : t_vram_offs;
    signal rr_pri       : integer range 0 to 7 := 0;
 
-   signal rcur_hit  : std_logic_vector(8 downto 0) := (others => '0');
-   signal rcur_offs : t_vram_offs := (others => (others => '0'));
-   signal rcur_chan : integer range 0 to 7 := 0;
-   signal racc      : std_logic_vector(31 downto 0) := (others => '0');
-   signal rsrv_idx  : integer range 0 to 4 := 0;
+   -- per-request A..D word addresses have to survive until the walker issues
+   -- them, so the offsets are held per queue slot
+   type t_adaddr is array (0 to RQ_DEPTH-1, BANK_A to BANK_D) of unsigned(16 downto 2);
+   signal ad_addr : t_adaddr := (others => (others => (others => '0')));
+
+   -- ---- per-channel A..D line cache (see the rsrv_* port comment) ----
+   -- One 8-byte line per renderer channel, indexed by channel, so there is no
+   -- associative search and no channel can evict another's line: each of the
+   -- eight walks its own address run, and the second word of every line it asks
+   -- for costs no memory access at all. Measured on the mode-0 bench: 76% of A..D
+   -- reads removed. A single shared line measured 1% - the interleave destroys it.
+   type t_adline is record
+      valid : std_logic;
+      bank  : integer range BANK_A to BANK_D;
+      line  : unsigned(16 downto 3);
+      data  : std_logic_vector(63 downto 0);
+   end record;
+   constant ADLINE_INIT : t_adline := ('0', BANK_A, (others => '0'), (others => '0'));
+   type t_adlines is array (0 to 7) of t_adline;
+   signal adline : t_adlines := (others => ADLINE_INIT);
+
+   -- rsrv response staged one cycle before it is used. The completion path
+   -- (64:32 mux, OR into acc, retire compare, channel dout register) used to run
+   -- in the SAME cycle the response arrived, and rsrv_done is driven from the
+   -- clk_mem side: on hardware that made vrsrv_done_r -> rdr_*_dout a cross-domain
+   -- path whose setup budget is ONE clkMem period (9.94 ns at 100.5 MHz), not a
+   -- clk_sys period, and it needed 13.42 ns - which is how the line cache came in
+   -- at -4.50 ns slack. Staging moves all of that arithmetic inside clk_sys with a
+   -- full period. It costs one cycle on a path that already takes five and nothing
+   -- at all on throughput: one response in per cycle, one consumed per cycle.
+   signal rsp_valid : std_logic := '0';
+   signal rsp_data  : std_logic_vector(63 downto 0) := (others => '0');
+
+   -- false: no cache, every word costs a memory access (the 64-bit channel still
+   -- carries the line, only its low word is used). It was false for one build:
+   -- the cache landed at -4.50 ns clk_sys slack where the same tree closed at
+   -- +0.91 ns without it. The cache was not really the cause - the completion path
+   -- was already crossing clk_mem -> clk_sys and computing in one cycle, with only
+   -- one clkMem period of budget, and the cache's mux was simply the straw. See
+   -- rsp_valid/rsp_data above.
+   constant AD_CACHE_EN : boolean := true;
 
    signal bram_dout_b : t_bram_dout;
    signal rbram_ce    : std_logic_vector(BANK_E to BANK_I);
@@ -377,24 +539,27 @@ begin
       end if;
    end process;
 
-   -- renderer channel arbitration: round-robin, one op in flight. Each req is
-   -- masked with its own done pulse so a requester that deasserts on the done
-   -- cycle is never spuriously re-dispatched.
-   -- channels hold req (stable addr) until their done pulse; requests landing
-   -- while the FSM serves another channel are latched in rpend (cleared on
-   -- dispatch). rpend must NOT re-latch from the still-held req of the
-   -- request being served / just completed - that re-dispatched a stale
-   -- address whose straggler done could answer the channel's next request
-   -- with the previous data (a real bug tb_vram_ls caught with interleaved
-   -- CPU reads; back-to-back requests keep req high across done and DO
-   -- relatch the cycle after, which is the correct new-request case)
+   -- renderer channel arbitration: rotating priority, ONE REQUEST PER CYCLE
+   -- accepted, several in flight.
+   --
+   -- rpend is a one-deep per-channel request latch, cleared when the server
+   -- accepts (rdr_*_accept). It serves two client styles at once:
+   --   * pulse-per-request (the drawers, the ext-pal fill): the pulse is
+   --     latched, so a request is never dropped because the queue was full,
+   --     and the client may pulse again immediately - giving it as many
+   --     outstanding requests as the prefetch pipelines need
+   --   * hold-until-accept (nds_gpu2d_fast across the clkMem crossing): the
+   --     level is latched once and re-latching is blocked while rpend is
+   --     still set, so a held req is never counted twice
+   -- v1 blocked re-latching for as long as an op for that channel was IN
+   -- FLIGHT, which is what limited a channel to one outstanding request. That
+   -- restriction is gone; the narrower rpend guard replaces it, and in-order
+   -- retirement is what keeps a channel's responses matched to its requests.
    rreq_now <= rdr_objepb_req & rdr_bgepb_req & rdr_objb_req & rdr_bgb_req &
                rdr_objep_req & rdr_bgep_req & rdr_obj_req & rdr_bg_req;
 
    grreq : for i in 0 to 7 generate
-      rreq_vec(i) <= '1' when ((rreq_now(i) = '1' or rpend(i) = '1') and
-                               rdone_int(i) = '0' and
-                               not (rstate /= RIDLE and rcur_chan = i)) else '0';
+      rreq_vec(i) <= '1' when (rreq_now(i) = '1' or rpend(i) = '1') else '0';
    end generate;
 
    prpend : process (clk)
@@ -404,8 +569,9 @@ begin
             rpend <= (others => '0');
          else
             for i in 0 to 7 loop
-               if (rreq_now(i) = '1' and rdone_int(i) = '0' and
-                   not (rstate /= RIDLE and rcur_chan = i)) then
+               -- latch a fresh request; do not re-latch a still-held level
+               -- that is already pending
+               if (rreq_now(i) = '1' and rpend(i) = '0') then
                   rpend(i) <= '1';
                end if;
             end loop;
@@ -415,6 +581,16 @@ begin
          end if;
       end if;
    end process;
+
+   -- accept pulses: the client's request was taken this cycle
+   rdr_bg_accept     <= rdispatch when rpick = 0 else '0';
+   rdr_obj_accept    <= rdispatch when rpick = 1 else '0';
+   rdr_bgep_accept   <= rdispatch when rpick = 2 else '0';
+   rdr_objep_accept  <= rdispatch when rpick = 3 else '0';
+   rdr_bgb_accept    <= rdispatch when rpick = 4 else '0';
+   rdr_objb_accept   <= rdispatch when rpick = 5 else '0';
+   rdr_bgepb_accept  <= rdispatch when rpick = 6 else '0';
+   rdr_objepb_accept <= rdispatch when rpick = 7 else '0';
 
    rdr_bg_done     <= rdone_int(0);
    rdr_obj_done    <= rdone_int(1);
@@ -441,10 +617,14 @@ begin
       rpick_valid <= got;
    end process;
 
-   rdispatch <= '1' when (rstate = RIDLE and rpick_valid = '1') else '0';
+   -- accept a request whenever the completion queue has room. The BRAM stage
+   -- is free by construction (it holds at most the request issued last cycle
+   -- and drains every cycle), so queue space is the only back-pressure.
+   rdispatch <= '1' when (rq_count < RQ_DEPTH and rpick_valid = '1') else '0';
 
-   -- true renderer-memory occupancy, for the bench (see the port comment)
-   dbg_rbusy <= '0' when rstate = RIDLE else '1';
+   -- true renderer-memory occupancy, for the bench (see the port comment):
+   -- anything still in the queue counts as work in flight
+   dbg_rbusy <= '0' when rq_count = 0 else '1';
 
    rchosen_hit  <= rdec_bg_hit    when rpick = 0 else
                    rdec_obj_hit   when rpick = 1 else
@@ -526,93 +706,257 @@ begin
       );
    end generate;
 
-   -- renderer FSM: mirror of the CPU datapath, read-only, own backing channel
+   -- A..D issue selection: the OLDEST queue entry that still owes a word,
+   -- scanned from the head so rsrv ops are issued in queue order (rsrv answers
+   -- in order, so op order and entry order stay matched with no tags).
+   pad_pick : process (all)
+      variable idx   : integer range 0 to RQ_DEPTH-1;
+      variable found : boolean;
+   begin
+      idx   := 0;
+      found := false;
+      for k in 0 to RQ_DEPTH-1 loop
+         if (not found) then
+            idx := (rq_head + k) mod RQ_DEPTH;
+            if (rq(idx).valid = '1' and rq(idx).ad_todo /= "0000") then
+               found := true;
+            end if;
+         end if;
+      end loop;
+      if (found) then
+         ad_scan  <= idx;
+         ad_hit   <= rq(idx).ad_todo;
+         ad_armed <= '1';
+      else
+         ad_scan  <= 0;
+         ad_hit   <= (others => '0');
+         ad_armed <= '0';
+      end if;
+   end process;
+
+   -- renderer pipeline: issue / BRAM collect / A..D collect / in-order retire.
+   -- All four happen every cycle; they touch different fields of the queue.
    prdr : process (clk)
-      variable v_racc : std_logic_vector(31 downto 0);
-      variable v_next : integer range 0 to 4;
+      variable v_rq    : t_rq;
+      variable v_cnt   : integer range 0 to RQ_DEPTH;
+      variable v_head  : integer range 0 to RQ_DEPTH-1;
+      variable v_tail  : integer range 0 to RQ_DEPTH-1;
+      variable v_acc   : std_logic_vector(31 downto 0);
+      variable v_adcnt : integer range 0 to AD_DEPTH;
+      variable v_adh   : integer range 0 to AD_DEPTH-1;
+      variable v_adt   : integer range 0 to AD_DEPTH-1;
+      variable v_bank  : integer range BANK_A to BANK_D;
+      variable v_nad   : integer range 0 to 4;
+      variable v_slot  : integer range 0 to RQ_DEPTH-1;
+      -- A..D line cache working copy, plus the pieces of one line lookup
+      variable v_adl   : t_adlines;
+      variable v_word  : std_logic_vector(31 downto 0);
+      variable v_chan  : integer range 0 to 7;
+      variable v_line  : unsigned(16 downto 3);
+      variable v_hi    : std_logic;
    begin
       if rising_edge(clk) then
 
          rdone_int <= (others => '0');
+         -- stage the response: unconditional, so one arrival per cycle is carried
+         -- and one is consumed per cycle below - nothing can queue up behind it
+         rsp_valid <= rsrv_done;
+         rsp_data  <= rsrv_dout;
+         -- NOTE: rsrv_req is deliberately NOT defaulted low here - it is a held
+         -- level and only the issue stage below may clear it (see the port).
 
          if (reset = '1') then
 
-            rstate   <= RIDLE;
-            rsrv_req <= '0';
-            rr_pri   <= 0;
+            rq        <= (others => RQ_INIT);
+            rq_head   <= 0;
+            rq_tail   <= 0;
+            rq_count  <= 0;
+            br_valid  <= '0';
+            adq_head  <= 0;
+            adq_tail  <= 0;
+            adq_count <= 0;
+            rr_pri    <= 0;
+            rsrv_req  <= '0';
+            adline    <= (others => ADLINE_INIT);
+            rsp_valid <= '0';
 
          else
 
-            case rstate is
+            v_rq    := rq;
+            v_cnt   := rq_count;
+            v_head  := rq_head;
+            v_tail  := rq_tail;
+            v_adcnt := adq_count;
+            v_adh   := adq_head;
+            v_adt   := adq_tail;
+            v_adl   := adline;
 
-               when RIDLE =>
-                  if (rdispatch = '1') then
-                     rcur_hit  <= rchosen_hit;
-                     rcur_offs <= rchosen_offs;
-                     rcur_chan <= rpick;
-                     racc      <= (others => '0');
-                     rsrv_idx  <= 0;
-                     rr_pri    <= (rpick + 1) mod 8;
-                     if ((rchosen_hit(BANK_E) or rchosen_hit(BANK_F) or rchosen_hit(BANK_G) or
-                          rchosen_hit(BANK_H) or rchosen_hit(BANK_I)) = '1') then
-                        rstate <= RBRAMWAIT;
-                     else
-                        rstate <= RSRVSCAN;
-                     end if;
+            -- ---- A..D line cache invalidation. The CPU reaches A..D through the
+            -- srv channel, which HOLDS req for the whole write, so invalidating on
+            -- the level covers the whole window in which a fill could otherwise
+            -- capture pre-write data. Everything that writes A..D goes through
+            -- here, including the reset clear pass, so this is the only hole to
+            -- close. It is a full flush rather than a tag match because A..D CPU
+            -- writes are graphics uploads - bursts, and not while a line is being
+            -- drawn - so precision buys nothing and costs comparators.
+            if (srv_req = '1' and srv_rnw = '0') then
+               for i in 0 to 7 loop
+                  v_adl(i).valid := '0';
+               end loop;
+            end if;
+
+            -- ---- S1: the BRAM stage. port-B q is valid the cycle after the
+            -- address was presented, so this collects the request issued last
+            -- cycle. It runs before the new issue below, which re-drives the
+            -- port for the NEXT request - the two do not conflict because the
+            -- address register and q are one cycle apart.
+            if (br_valid = '1') then
+               v_acc := v_rq(br_slot).acc;
+               for i in BANK_E to BANK_I loop
+                  if (br_hit(i) = '1') then
+                     v_acc := v_acc or bram_dout_b(i);
                   end if;
+               end loop;
+               v_rq(br_slot).acc     := v_acc;
+               v_rq(br_slot).need_br := '0';
+            end if;
+            br_valid <= '0';
 
-               when RBRAMWAIT =>
-                  rstate <= RBRAMREAD;
+            -- ---- A..D completions: rsrv answers in issue order, so the
+            -- oldest in-flight op owns this word. The response is an 8-byte line;
+            -- take the half that was wanted and keep the whole line for the
+            -- channel, which is where the other half gets used for free.
+            if (rsp_valid = '1' and v_adcnt > 0) then
+               v_slot := adq(v_adh).slot;
+               if (adq(v_adh).hi = '1') then
+                  v_word := rsp_data(63 downto 32);
+               else
+                  v_word := rsp_data(31 downto 0);
+               end if;
+               v_rq(v_slot).acc     := v_rq(v_slot).acc or v_word;
+               v_rq(v_slot).ad_owed := v_rq(v_slot).ad_owed - 1;
+               if (AD_CACHE_EN) then
+                  v_adl(adq(v_adh).chan) := ('1', adq(v_adh).bank, adq(v_adh).line,
+                                             rsp_data);
+               end if;
+               v_adh   := (v_adh + 1) mod AD_DEPTH;
+               v_adcnt := v_adcnt - 1;
+            end if;
 
-               when RBRAMREAD =>
-                  v_racc := racc;
-                  for i in BANK_E to BANK_I loop
-                     if (rcur_hit(i) = '1') then
-                        v_racc := v_racc or bram_dout_b(i);
-                     end if;
-                  end loop;
-                  racc   <= v_racc;
-                  rstate <= RSRVSCAN;
-
-               when RSRVSCAN =>
-                  v_next := 4;
+            -- ---- A..D issue: present the next op when the request wire is
+            -- free - either nothing is on it, or what was on it is taken by
+            -- THIS edge (rsrv_ready high). Bookkeeping happens at presentation
+            -- because a presented request is transferred exactly once: it is
+            -- held until the channel takes it. Never gate presentation on
+            -- rsrv_ready alone - that is the stale-ready wedge (see the port).
+            if (rsrv_req = '0' or rsrv_ready = '1') then
+               if (ad_armed = '1' and v_adcnt < AD_DEPTH) then
+                  v_bank := BANK_A;
                   for i in BANK_D downto BANK_A loop
-                     if (i >= rsrv_idx and rcur_hit(i) = '1') then
-                        v_next := i;
+                     if (ad_hit(i) = '1') then
+                        v_bank := i;
                      end if;
                   end loop;
-                  if (v_next = 4) then
-                     rstate <= RFINISH;
+                  v_chan := v_rq(ad_scan).chan;
+                  v_line := ad_addr(ad_scan, v_bank)(16 downto 3);
+                  v_hi   := ad_addr(ad_scan, v_bank)(2);
+
+                  -- the channel's own cached line already holds this word: take it
+                  -- now and issue nothing. This is the whole point of the 64-bit
+                  -- line - the memory access for the neighbouring word already
+                  -- happened.
+                  if (AD_CACHE_EN and v_adl(v_chan).valid = '1' and
+                      v_adl(v_chan).bank = v_bank and v_adl(v_chan).line = v_line) then
+                     if (v_hi = '1') then
+                        v_word := v_adl(v_chan).data(63 downto 32);
+                     else
+                        v_word := v_adl(v_chan).data(31 downto 0);
+                     end if;
+                     v_rq(ad_scan).acc     := v_rq(ad_scan).acc or v_word;
+                     v_rq(ad_scan).ad_owed := v_rq(ad_scan).ad_owed - 1;
+                     v_rq(ad_scan).ad_todo(v_bank) := '0';
+                     -- the wire was free when we got here, so it must be released:
+                     -- leaving it asserted would re-present the request that was
+                     -- just taken and fetch the same line twice
+                     rsrv_req <= '0';
                   else
                      rsrv_req  <= '1';
-                     rsrv_bank <= std_logic_vector(to_unsigned(v_next, 2));
-                     rsrv_addr <= rcur_offs(v_next)(16 downto 2);
-                     rsrv_idx  <= v_next + 1;
-                     rstate    <= RSRVWAIT;
+                     rsrv_bank <= std_logic_vector(to_unsigned(v_bank, 2));
+                     rsrv_addr <= v_line;
+                     v_rq(ad_scan).ad_todo(v_bank) := '0';
+                     adq(v_adt) <= (ad_scan, v_bank, v_hi, v_chan, v_line);
+                     v_adt   := (v_adt + 1) mod AD_DEPTH;
+                     v_adcnt := v_adcnt + 1;
                   end if;
+               else
+                  rsrv_req <= '0';
+               end if;
+            end if;
 
-               when RSRVWAIT =>
-                  if (rsrv_done = '1') then
-                     rsrv_req <= '0';
-                     racc     <= racc or rsrv_dout;
-                     rstate   <= RSRVSCAN;
+            -- ---- S0: issue. One request per cycle into the queue tail.
+            if (rdispatch = '1') then
+               v_nad := 0;
+               for i in BANK_A to BANK_D loop
+                  if (rchosen_hit(i) = '1') then
+                     v_nad := v_nad + 1;
                   end if;
+               end loop;
 
-               when RFINISH =>
-                  case rcur_chan is
-                     when 0 => rdr_bg_dout     <= racc;
-                     when 1 => rdr_obj_dout    <= racc;
-                     when 2 => rdr_bgep_dout   <= racc;
-                     when 3 => rdr_objep_dout  <= racc;
-                     when 4 => rdr_bgb_dout    <= racc;
-                     when 5 => rdr_objb_dout   <= racc;
-                     when 6 => rdr_bgepb_dout  <= racc;
-                     when 7 => rdr_objepb_dout <= racc;
-                  end case;
-                  rdone_int(rcur_chan) <= '1';
-                  rstate <= RIDLE;
+               v_rq(v_tail).valid   := '1';
+               v_rq(v_tail).chan    := rpick;
+               v_rq(v_tail).acc     := (others => '0');
+               v_rq(v_tail).ad_owed := v_nad;
+               for i in BANK_A to BANK_D loop
+                  v_rq(v_tail).ad_todo(i) := rchosen_hit(i);
+                  ad_addr(v_tail, i) <= rchosen_offs(i)(16 downto 2);
+               end loop;
+               v_rq(v_tail).need_br := rchosen_hit(BANK_E) or rchosen_hit(BANK_F) or
+                                       rchosen_hit(BANK_G) or rchosen_hit(BANK_H) or
+                                       rchosen_hit(BANK_I);
 
-            end case;
+               -- hand the BRAM stage this request (port B was driven
+               -- combinationally by rbram_ce/addr_b this same cycle)
+               if (v_rq(v_tail).need_br = '1') then
+                  br_valid <= '1';
+                  br_slot  <= v_tail;
+                  for i in BANK_E to BANK_I loop
+                     br_hit(i) <= rchosen_hit(i);
+                  end loop;
+               end if;
+
+               rr_pri  <= (rpick + 1) mod 8;
+               v_tail  := (v_tail + 1) mod RQ_DEPTH;
+               v_cnt   := v_cnt + 1;
+            end if;
+
+            -- ---- retire: only the head, and only when it owes nothing. In
+            -- order, so a channel's responses arrive in the order it asked.
+            if (v_cnt > 0 and v_rq(v_head).valid = '1' and
+                v_rq(v_head).need_br = '0' and v_rq(v_head).ad_owed = 0) then
+               case v_rq(v_head).chan is
+                  when 0 => rdr_bg_dout     <= v_rq(v_head).acc;
+                  when 1 => rdr_obj_dout    <= v_rq(v_head).acc;
+                  when 2 => rdr_bgep_dout   <= v_rq(v_head).acc;
+                  when 3 => rdr_objep_dout  <= v_rq(v_head).acc;
+                  when 4 => rdr_bgb_dout    <= v_rq(v_head).acc;
+                  when 5 => rdr_objb_dout   <= v_rq(v_head).acc;
+                  when 6 => rdr_bgepb_dout  <= v_rq(v_head).acc;
+                  when 7 => rdr_objepb_dout <= v_rq(v_head).acc;
+               end case;
+               rdone_int(v_rq(v_head).chan) <= '1';
+               v_rq(v_head).valid := '0';
+               v_head := (v_head + 1) mod RQ_DEPTH;
+               v_cnt  := v_cnt - 1;
+            end if;
+
+            rq        <= v_rq;
+            rq_head   <= v_head;
+            rq_tail   <= v_tail;
+            rq_count  <= v_cnt;
+            adq_head  <= v_adh;
+            adq_tail  <= v_adt;
+            adq_count <= v_adcnt;
+            adline    <= v_adl;
 
          end if;
       end if;

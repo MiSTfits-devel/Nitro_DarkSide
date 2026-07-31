@@ -22,7 +22,10 @@ entity tb_gpu2d_frame is
    (
       BANKFILE   : string := "sim/tests/gpu2d_banks.hex";
       VECFILE    : string := "sim/tests/gpu2d_vectors.hex";
-      TIMEOUT_MS : integer := 400
+      TIMEOUT_MS : integer := 400;
+      -- A..D renderer-feed latency in clk cycles (see prserv). 4 stands in for
+      -- SDRAM; the old fixed behavioural model answered in 2.
+      RSRV_LAT   : integer := 4
    );
 end entity;
 
@@ -75,10 +78,19 @@ architecture sim of tb_gpu2d_frame is
    signal srv_din, srv_dout : std_logic_vector(31 downto 0) := (others => '0');
    signal rsrv_req, rsrv_done : std_logic := '0';
    signal rsrv_bank : std_logic_vector(1 downto 0);
-   signal rsrv_addr : unsigned(16 downto 2);
-   signal rsrv_dout : std_logic_vector(31 downto 0) := (others => '0');
+   signal rsrv_addr : unsigned(16 downto 3);
+   signal rsrv_dout : std_logic_vector(63 downto 0) := (others => '0');
+
+   -- in-order response delay line for the pipelined A..D model (see prserv)
+   type t_rsrvpipe is record
+      v : std_logic;
+      d : std_logic_vector(63 downto 0);
+   end record;
+   type t_rsrvpipe_arr is array (0 to RSRV_LAT - 1) of t_rsrvpipe;
+   signal rsrvpipe : t_rsrvpipe_arr := (others => ('0', (others => '0')));
 
    -- renderer channels between nds_vram and nds_gpu2d
+   signal r_bg_accept               : std_logic;
    signal r_bg_req, r_bg_done       : std_logic;
    signal r_bg_addr                 : unsigned(18 downto 2);
    signal r_bg_dout                 : std_logic_vector(31 downto 0);
@@ -141,6 +153,7 @@ begin
       clr_busy => vclr_busy,
       rdr_bg_req => r_bg_req, rdr_bg_addr => r_bg_addr,
       rdr_bg_dout => r_bg_dout, rdr_bg_done => r_bg_done,
+      rdr_bg_accept => r_bg_accept,
       rdr_obj_req => r_obj_req, rdr_obj_addr => r_obj_addr,
       rdr_obj_dout => r_obj_dout, rdr_obj_done => r_obj_done,
       rdr_bgep_req => r_bgep_req, rdr_bgep_addr => r_bgep_addr,
@@ -171,6 +184,7 @@ begin
       oam_we => oam_we, oam_addr => oam_addr, oam_din => oam_din, oam_be => "1111",
       srv_bg_req => r_bg_req, srv_bg_addr => g_bg_addr,
       srv_bg_data => r_bg_dout, srv_bg_done => r_bg_done,
+      srv_bg_accept => r_bg_accept,
       srv_obj_req => r_obj_req, srv_obj_addr => g_obj_addr,
       srv_obj_data => r_obj_dout, srv_obj_done => r_obj_done,
       srv_bgep_req => r_bgep_req, srv_bgep_addr => g_bgep_addr,
@@ -196,14 +210,29 @@ begin
       srv_done <= '0';
    end process;
 
-   prserv : process
+   -- Renderer A..D feed: a PIPELINED model, one request accepted per cycle,
+   -- answered in issue order RSRV_LAT+1 cycles later. The old model was
+   -- one-op-at-a-time and answered in two cycles, which both understated the
+   -- cost of this channel (on hardware it is SDRAM, tens of cycles) and made
+   -- the renderer's outstanding-request behaviour untestable.
+   prserv : process (clk)
    begin
-      wait until rising_edge(clk) and rsrv_req = '1';
-      wait until rising_edge(clk);
-      rsrv_dout <= banks(to_integer(unsigned(rsrv_bank)) * 32768 + to_integer(rsrv_addr));
-      rsrv_done <= '1';
-      wait until rising_edge(clk);
-      rsrv_done <= '0';
+      if rising_edge(clk) then
+         for i in RSRV_LAT - 1 downto 1 loop
+            rsrvpipe(i) <= rsrvpipe(i - 1);
+         end loop;
+         rsrvpipe(0).v <= '0';
+         if (rsrv_req = '1') then
+            rsrvpipe(0).v <= '1';
+            -- 64-bit line: both words of the aligned 8-byte block
+            rsrvpipe(0).d <= banks(to_integer(unsigned(rsrv_bank)) * 32768 +
+                                   to_integer(rsrv_addr) * 2 + 1) &
+                             banks(to_integer(unsigned(rsrv_bank)) * 32768 +
+                                   to_integer(rsrv_addr) * 2);
+         end if;
+         rsrv_done <= rsrvpipe(RSRV_LAT - 1).v;
+         rsrv_dout <= rsrvpipe(RSRV_LAT - 1).d;
+      end if;
    end process;
 
    -- pixel collect
