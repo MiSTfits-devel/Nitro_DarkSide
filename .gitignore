@@ -42,6 +42,8 @@ sim/tests/firmware_retail.hex
 
 # game ROM conversions (copyrighted - generate locally from your own dumps)
 sim/tests/kirby_*.hex
+# NITRO Tester (Nitro EVA) self-checker cart, via sim/tests/make_test_cart.sh
+sim/tests/ntr_eva*.hex
 
 # session debug logs
 pipe_debug.log
