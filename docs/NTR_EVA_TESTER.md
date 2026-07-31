@@ -106,9 +106,50 @@ from `arm9_entry`/`arm7_entry`" — PCs only. A NitroSDK-built commercial cart
 like this one never sets its own SP; it inherits one from the boot ROM. With
 `SP=0` the first function prologue pushes into ITCM at address 0.
 
-So the loader's direct-boot env needs the register preset extended from
-`{PC}` to `{PC, SP, LR}`, with the banked SVC/IRQ stacks, to match
-`SetupDirectBoot`. This is adjacent to — and independent of — the known CP15
-direct-boot gap; fixing CP15 alone will not boot this cart.
+CP15 is **not** part of this. `rtl/nds_cpu9.vhd:142-159` already initialises the
+control register to `x"00012078"`, DTCM to `x"0300000A"`, ITCM to `x"00000020"`
+and every PU register to the same values `SetupDirectBoot` writes — and the cart
+reconfigures CP15 itself at `0x02000a80` regardless, both paths converging on a
+write of `0x00002078`. The gap was only ever the register preset.
 
-Until that lands, this cart cannot run on the core, in sim or on hardware.
+## Fix: preset the banked stacks, translated between two banking models
+
+`rtl/nds_top.vhd`'s boot FSM wrote a single savestate address (the PC) and
+stopped. It now walks a 7-entry table per CPU — r12, r14, the active r13, and
+the user/system, IRQ and supervisor banked r13s.
+
+The translation is the part worth reading before touching this code. melonDS
+banks by `std::swap`; this core saves and restores per mode
+(`gba_cpu.vhd:2724-2800`). So the fields do **not** copy across by name:
+
+| melonDS | maps to | because |
+|---------|---------|---------|
+| `R[13]` | active bank | boot CPSR reads supervisor, but the value is the *user* stack `0x03002F7C` |
+| `R_SVC[0]` | **user/system** bank | under swap, while supervisor is active this holds what swaps in on *leaving* supervisor — the outer stack, not the supervisor one |
+| `R_IRQ[0]` | IRQ bank | IRQ is not the active mode, so it genuinely holds IRQ's own stack |
+
+Reading `R_SVC[0]` as "the supervisor bank" — the obvious reading — diverges at
+the cart's first `MSR CPSR,r0` out of supervisor, which is instruction **69**,
+with every other column still matching.
+
+Both CPUs leave reset in supervisor mode (`SAVESTATE_cpu_mode` defaults to
+`CPUMODE_SUPERVISOR`), so the plain REGS r13 at savestate address 14 is the
+active bank. Firmware boot (`FWBOOT=1`) still gets the PC only: the BIOS sets up
+its own stacks, and presetting them would mask a BIOS that never got that far.
+
+**Verified: 300,000 ARM9 instructions against melonDS, zero divergence, with no
+columns ignored** — `sim/tests/compare_trace.py simout/isl9.txt <melonds.log>`.
+
+## Still missing from SetupDirectBoot
+
+Not needed to boot, but real gaps, and the first is a plausible failure in this
+cart's own Sound Test group:
+
+| melonDS | RTL |
+|---------|-----|
+| `SPU.SetBias(0x200)` | `nds_sound.vhd:144` `soundbias` initialises to `0` |
+| `ARM7BIOSProt = 0x1204` | no BIOSPROT preset |
+| `NDSCartSlot.SetSPICnt(0x8000)` | no preset in `nds_spi.vhd` |
+
+`nds_syscnt.vhd:130-135` (`preset_direct`) covers WRAMCNT, POSTFLG and POWCNT
+only.
