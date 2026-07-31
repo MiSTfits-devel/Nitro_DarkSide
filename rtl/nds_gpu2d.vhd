@@ -81,10 +81,15 @@ entity nds_gpu2d is
       oam_be            : in  std_logic_vector(3 downto 0);
 
       -- VRAM line-server channels (req/done, one in flight each)
+      -- BG channel: srv_bg_accept pulses when the line server takes the
+      -- request. The server's per-channel request latch is one deep, so a
+      -- second request may only be presented once the first is accepted -
+      -- after that any number may be in flight, answered in issue order.
       srv_bg_req        : out std_logic := '0';
       srv_bg_addr       : out integer range 0 to 131071;
       srv_bg_data       : in  std_logic_vector(31 downto 0);
       srv_bg_done       : in  std_logic;
+      srv_bg_accept     : in  std_logic := '1';
       srv_obj_req       : out std_logic := '0';
       srv_obj_addr      : out integer range 0 to 65535;
       srv_obj_data      : in  std_logic_vector(31 downto 0);
@@ -208,6 +213,9 @@ architecture arch of nds_gpu2d is
    signal drawline_text : std_logic_vector(0 to 3);
    signal drawline_aff  : std_logic_vector(2 to 3);
    signal drawline_ext  : std_logic_vector(2 to 3);
+   -- drawline/drawObj after the drop gate (see the drawline routing section)
+   signal drawline_acc  : std_logic;
+   signal drawobj_acc   : std_logic;
 
    signal busy_text : std_logic_vector(0 to 3);
    signal busy_aff  : std_logic_vector(2 to 3);
@@ -230,6 +238,12 @@ architecture arch of nds_gpu2d is
    signal bgv_req   : std_logic_vector(0 to 3);
    signal bgv_addr  : t_vaddr_arr;
    signal bgv_done  : std_logic_vector(0 to 3);
+   -- BG fetch data, captured with its own done pulse (see the arbiter block)
+   signal bgv_data  : std_logic_vector(31 downto 0);
+   -- per-BG accept: the arbiter took that BG's request this cycle, so it may
+   -- present the next one. This is what lets a drawer prefetch - without it a
+   -- drawer would have to wait for done, i.e. one fetch at a time.
+   signal bgv_accept : std_logic_vector(0 to 3);
    type t_vaddrt_arr is array (0 to 3) of integer range 0 to 131071;
    signal v_req_text : std_logic_vector(0 to 3);
    signal v_addr_text : t_vaddrt_arr;
@@ -242,16 +256,18 @@ architecture arch of nds_gpu2d is
    type t_paddr_arr is array (0 to 3) of integer range 0 to 127;
    signal p_addr_text, p_addr_aff, p_addr_ext : t_paddr_arr;
    signal bgp_addr  : t_paddr_arr;
-   signal bgp_data  : std_logic_vector(31 downto 0);
-   signal bgp_valid : std_logic_vector(0 to 3) := (others => '0');
+   -- per-BG palette read data / valid. valid is now unconditional: with a
+   -- private read port the answer always lands the cycle after the address,
+   -- so no drawer ever waits for its turn (see gpal_bg).
+   type t_pdata_arr is array (0 to 3) of std_logic_vector(31 downto 0);
+   signal bgp_data  : t_pdata_arr;
+   signal bgp_valid : std_logic_vector(0 to 3) := (others => '1');
 
    type t_epaddr_arr is array (0 to 3) of integer range 0 to 8191;
    signal ep_addr_text, ep_addr_ext : t_epaddr_arr;
    signal bgep_addr  : t_epaddr_arr;
-   signal bgep_data  : std_logic_vector(31 downto 0);
-   signal bgep_valid : std_logic_vector(0 to 3) := (others => '0');
-
-   signal pal_serve_cnt : unsigned(1 downto 0) := "00";
+   signal bgep_data  : t_pdata_arr;                     -- per-BG, private port
+   signal bgep_valid : std_logic_vector(0 to 3) := (others => '1');
 
    -- OBJ drawer wiring
    signal obj_pal_addr    : integer range 0 to 127;
@@ -283,8 +299,35 @@ architecture arch of nds_gpu2d is
    signal clr_addr : unsigned(7 downto 0) := (others => '0');
    signal reset_d  : std_logic := '1';
 
-   type t_bgep is array (0 to 8191) of std_logic_vector(31 downto 0);
-   signal bgep_shadow : t_bgep := (others => (others => '0'));
+   -- BG extended palette: 32 KB as FOUR 8 KB SLOT RAMS instead of one array.
+   -- Same total storage, but each slot gets its own dual-port block, and a BG
+   -- can only ever read the one slot its BGxCNT selects - BG0 slot 0 or 2, BG1
+   -- slot 1 or 3, BG2 slot 2, BG3 slot 3. So at most two BGs can want any one
+   -- slot (BG0+BG2 for slot 2, BG1+BG3 for slot 3), which is exactly what a
+   -- dual-port block provides:
+   --
+   --   port A reader: BG0 for slots 0 and 2, BG1 for slots 1 and 3
+   --   port B reader: BG2 for slot 2, BG3 for slot 3 (idle for slots 0, 1)
+   --
+   -- That is a STATIC assignment with no arbitration anywhere - every BG has an
+   -- unconditional ext-pal read port, one lookup per cycle, and the blocking
+   -- round robin that used to answer one BG in four is gone.
+   --
+   -- The vblank refill writes through port A (muxed with its read). Safe by
+   -- phase: epfill only runs from vblank_trigger, when no drawer is reading.
+   constant EPSLOT_WORDS : integer := 2048;   -- 8 KB per slot
+   type t_epslot_data is array (0 to 3) of std_logic_vector(31 downto 0);
+   signal epslot_qa, epslot_qb : t_epslot_data;
+   type t_epslot_addr is array (0 to 3) of integer range 0 to EPSLOT_WORDS - 1;
+   signal epslot_addr_a : t_epslot_addr;   -- within-slot word address, port A
+   signal epslot_addr_b : t_epslot_addr;   -- within-slot word address, port B
+   signal epslot_pa     : t_epslot_addr;   -- port A after the refill-write mux
+   signal epslot_we     : std_logic_vector(0 to 3);
+   -- slot select delayed one cycle, to line the data mux up with the RAM's
+   -- one-cycle read latency
+   type t_slot_d is array (0 to 3) of unsigned(1 downto 0);
+   signal extslot_d : t_slot_d := (others => "00");
+
    type t_objep is array (0 to 2047) of std_logic_vector(31 downto 0);
    signal objep_shadow : t_objep := (others => (others => '0'));
 
@@ -554,12 +597,35 @@ begin
    end process;
 
    -- ================= drawline routing =================
+   -- A drawline that lands while the previous line is still rendering is DROPPED:
+   -- the line FSM below only leaves LIDLE on drawline, so it already ignores one.
+   -- The DRAWERS must ignore the same one, which is what these gates are for.
+   --
+   -- Every drawer restarts its whole line on drawline - nds_drawer_text's
+   -- `if (drawline = '1')` clears the tile queue, the tag queue and the fetch
+   -- walk. Ungated, an over-budget line is therefore restarted from tile 0 every
+   -- time the next drawline arrives, so it can never reach the end: any_bg_busy
+   -- never falls, LDRAW never completes, line_busy never falls, and every
+   -- following drawline is dropped as well. That is a LIVELOCK, not slowness, and
+   -- it is latency-independent - it starts the moment a line first needs more
+   -- than its budget, and from then on no line ever completes. It is what stopped
+   -- the renderer dead under real VRAM backpressure while the old always-ready
+   -- memory model hid it: no line ever exceeded budget there, so a drawline never
+   -- landed on a busy drawer. See docs/TICKET-arm7-firmware-wedge.md.
+   --
+   -- Dropping it instead leaves that row at the previous frame's content, which is
+   -- what a dropped line means everywhere else here, and progress continues.
+   drawline_acc <= drawline when linestate = LIDLE else '0';
+   -- OBJ pre-renders the NEXT line while this one is still in LDRAW, so it cannot
+   -- use the same gate; its own busy is the right one.
+   drawobj_acc  <= drawObj  when obj_busy = '0' else '0';
+
    gen_dl_text : for i in 0 to 3 generate
-      drawline_text(i) <= drawline when (bgtype(i) = 1) else '0';
+      drawline_text(i) <= drawline_acc when (bgtype(i) = 1) else '0';
    end generate;
    gen_dl_a : for i in 2 to 3 generate
-      drawline_aff(i) <= drawline when (bgtype(i) = 2) else '0';
-      drawline_ext(i) <= drawline when (bgtype(i) = 3) else '0';
+      drawline_aff(i) <= drawline_acc when (bgtype(i) = 2) else '0';
+      drawline_ext(i) <= drawline_acc when (bgtype(i) = 3) else '0';
    end generate;
 
    any_bg_busy <= busy_text(0) or busy_text(1) or busy_text(2) or busy_text(3)
@@ -589,15 +655,16 @@ begin
          pixeldata            => pix_text(i),
          pixel_x              => pixx_text(i),
          PALETTE_Drawer_addr  => p_addr_text(i),
-         PALETTE_Drawer_data  => bgp_data,
+         PALETTE_Drawer_data  => bgp_data(i),
          PALETTE_Drawer_valid => bgp_valid(i),
          EXTPAL_Drawer_addr   => ep_addr_text(i),
-         EXTPAL_Drawer_data   => bgep_data,
+         EXTPAL_Drawer_data   => bgep_data(i),
          EXTPAL_Drawer_valid  => bgep_valid(i),
          VRAM_Drawer_req      => v_req_text(i),
          VRAM_Drawer_addr     => v_addr_text(i),
-         VRAM_Drawer_data     => srv_bg_data,
-         VRAM_Drawer_done     => bgv_done(i)
+         VRAM_Drawer_data     => bgv_data,
+         VRAM_Drawer_done     => bgv_done(i),
+         VRAM_Drawer_accept   => bgv_accept(i)
       );
    end generate;
 
@@ -625,11 +692,11 @@ begin
          pixeldata            => pix_aff(i),
          pixel_x              => pixx_aff(i),
          PALETTE_Drawer_addr  => p_addr_aff(i),
-         PALETTE_Drawer_data  => bgp_data,
+         PALETTE_Drawer_data  => bgp_data(i),
          PALETTE_Drawer_valid => bgp_valid(i),
          VRAM_Drawer_req      => v_req_aff(i),
          VRAM_Drawer_addr     => v_addr_aff(i),
-         VRAM_Drawer_data     => srv_bg_data,
+         VRAM_Drawer_data     => bgv_data,
          VRAM_Drawer_done     => bgv_done(i)
       );
 
@@ -659,14 +726,14 @@ begin
          pixeldata            => pix_ext(i),
          pixel_x              => pixx_ext(i),
          PALETTE_Drawer_addr  => p_addr_ext(i),
-         PALETTE_Drawer_data  => bgp_data,
+         PALETTE_Drawer_data  => bgp_data(i),
          PALETTE_Drawer_valid => bgp_valid(i),
          EXTPAL_Drawer_addr   => ep_addr_ext(i),
-         EXTPAL_Drawer_data   => bgep_data,
+         EXTPAL_Drawer_data   => bgep_data(i),
          EXTPAL_Drawer_valid  => bgep_valid(i),
          VRAM_Drawer_req      => v_req_ext(i),
          VRAM_Drawer_addr     => v_addr_ext(i),
-         VRAM_Drawer_data     => srv_bg_data,
+         VRAM_Drawer_data     => bgv_data,
          VRAM_Drawer_done     => bgv_done(i)
       );
    end generate;
@@ -676,7 +743,7 @@ begin
    port map
    (
       clk                  => clk,
-      drawline             => drawObj,
+      drawline             => drawobj_acc,
       busy                 => obj_busy,
       ypos                 => linecounter_obj,
       ypos_mosaic          => ypos_mosaic_obj,
@@ -774,28 +841,43 @@ begin
       be_b      => "0000"
    );
 
-   ipal_bg : entity MEM.SyncRamDualByteEnable
-   generic map ( is_simu => is_simu, is_cyclone5 => '1',
-                 BYTE_WIDTH => 8, ADDR_WIDTH => 8, BYTES => 4 )
-   port map
-   (
-      clk       => clk,
-      ce_a      => '1',
-      addr_a    => pal_addr_i,
-      datain_a0 => pal_din_i( 7 downto  0),
-      datain_a1 => pal_din_i(15 downto  8),
-      datain_a2 => pal_din_i(23 downto 16),
-      datain_a3 => pal_din_i(31 downto 24),
-      dataout_a => open,
-      we_a      => pal_we_i,
-      be_a      => pal_be_i,
-      ce_b      => '1',
-      addr_b    => bgp_addr(to_integer(pal_serve_cnt)),
-      datain_b0 => x"00", datain_b1 => x"00", datain_b2 => x"00", datain_b3 => x"00",
-      dataout_b => bgp_data,
-      we_b      => '0',
-      be_b      => "0000"
-   );
+   -- BG standard palette: ONE COPY PER BG, so every BG has an unshared read
+   -- port. The single shared copy was served by a blind 4-phase round robin
+   -- (pal_serve_cnt), which meant a BG's lookup was answered only one cycle in
+   -- four - and because the drawers park in their WAITREAD state until the
+   -- answer arrives, that round robin STALLED THE PIXEL LOOP for an average of
+   -- 2.5 cycles on every single pixel. It was the largest single term in the
+   -- text drawer's ~21.7 cycles per pixel.
+   --
+   -- These are 256x32 = 1 KB each, about one M10K, and the CPU write port fans
+   -- out to all of them (it already did to two). Four private ports cost ~3
+   -- extra M10K against ~80 free and delete the stall completely: with a
+   -- private port the answer is simply the registered read, valid the cycle
+   -- after the address, every cycle, for every BG at once.
+   gpal_bg : for i in 0 to 3 generate
+      ipal_bg : entity MEM.SyncRamDualByteEnable
+      generic map ( is_simu => is_simu, is_cyclone5 => '1',
+                    BYTE_WIDTH => 8, ADDR_WIDTH => 8, BYTES => 4 )
+      port map
+      (
+         clk       => clk,
+         ce_a      => '1',
+         addr_a    => pal_addr_i,
+         datain_a0 => pal_din_i( 7 downto  0),
+         datain_a1 => pal_din_i(15 downto  8),
+         datain_a2 => pal_din_i(23 downto 16),
+         datain_a3 => pal_din_i(31 downto 24),
+         dataout_a => open,
+         we_a      => pal_we_i,
+         be_a      => pal_be_i,
+         ce_b      => '1',
+         addr_b    => bgp_addr(i),
+         datain_b0 => x"00", datain_b1 => x"00", datain_b2 => x"00", datain_b3 => x"00",
+         dataout_b => bgp_data(i),
+         we_b      => '0',
+         be_b      => "0000"
+      );
+   end generate;
 
    ioam : entity MEM.SyncRamDualByteEnable
    generic map ( is_simu => is_simu, is_cyclone5 => '1',
@@ -843,19 +925,75 @@ begin
                       ep_addr_ext(i)  when (i >= 2 and bgtype(i) = 3) else 0;
    end generate;
 
-   -- bgp_data comes from ipal_bg's port B: the address is registered at the
-   -- same edge the valid flag is set, so data and valid still land together
+   -- Every BG now has a private read port into both the standard palette and
+   -- its ext-pal slot, so both answers are simply the registered read: valid
+   -- the cycle after the address, unconditionally, for all four BGs at once.
+   -- The drawers' existing "present address, then wait one state for valid"
+   -- sequence is unchanged - it just never waits more than that one state now.
+   bgp_valid  <= (others => '1');
+   bgep_valid <= (others => '1');
+
+   -- ---- BG ext-palette slot RAMs ----
+   -- Port A serves BG0 (slots 0,2) or BG1 (slots 1,3) and the vblank refill
+   -- write; port B serves BG2 (slot 2) or BG3 (slot 3).
+   gep_addr : for s in 0 to 3 generate
+      -- port A: the low half of the slot word address from BG0 / BG1
+      epslot_addr_a(s) <= (bgep_addr(0) mod EPSLOT_WORDS) when (s = 0 or s = 2) else
+                          (bgep_addr(1) mod EPSLOT_WORDS);
+      -- port B: BG2 owns slot 2, BG3 owns slot 3; the others never read here
+      epslot_addr_b(s) <= (bgep_addr(2) mod EPSLOT_WORDS) when (s = 2) else
+                          (bgep_addr(3) mod EPSLOT_WORDS) when (s = 3) else 0;
+      epslot_we(s)     <= '1' when (epfill = EPBG_WAIT and srv_bgep_done = '1' and
+                                    epfill_addr / EPSLOT_WORDS = s) else '0';
+      epslot_pa(s)     <= (epfill_addr mod EPSLOT_WORDS) when epslot_we(s) = '1'
+                          else epslot_addr_a(s);
+   end generate;
+
+   gepslot : for s in 0 to 3 generate
+      iep : entity MEM.SyncRamDualByteEnable
+      generic map ( is_simu => is_simu, is_cyclone5 => '1',
+                    BYTE_WIDTH => 8, ADDR_WIDTH => 11, BYTES => 4 )
+      port map
+      (
+         clk       => clk,
+         -- port A: refill write, otherwise BG0/BG1's read
+         ce_a      => '1',
+         addr_a    => epslot_pa(s),
+         datain_a0 => srv_bgep_data( 7 downto  0),
+         datain_a1 => srv_bgep_data(15 downto  8),
+         datain_a2 => srv_bgep_data(23 downto 16),
+         datain_a3 => srv_bgep_data(31 downto 24),
+         dataout_a => epslot_qa(s),
+         we_a      => epslot_we(s),
+         be_a      => "1111",
+         -- port B: BG2/BG3's read
+         ce_b      => '1',
+         addr_b    => epslot_addr_b(s),
+         datain_b0 => x"00", datain_b1 => x"00", datain_b2 => x"00", datain_b3 => x"00",
+         dataout_b => epslot_qb(s),
+         we_b      => '0',
+         be_b      => "0000"
+      );
+   end generate;
+
+   -- Slot select, delayed one cycle so the mux below picks with the same slot
+   -- configuration that was current when the address was presented.
    process (clk)
    begin
       if rising_edge(clk) then
-         pal_serve_cnt <= pal_serve_cnt + 1;
-         bgep_data <= bgep_shadow(bgep_addr(to_integer(pal_serve_cnt)));
-         bgp_valid  <= (others => '0');
-         bgep_valid <= (others => '0');
-         bgp_valid(to_integer(pal_serve_cnt))  <= '1';
-         bgep_valid(to_integer(pal_serve_cnt)) <= '1';
+         for i in 0 to 3 loop
+            extslot_d(i) <= cfg_extslot(i);
+         end loop;
       end if;
    end process;
+
+   -- Each BG reads the one slot it is configured for; the mux is
+   -- combinational on the RAM outputs, so the total read latency stays at the
+   -- single cycle the drawers expect.
+   bgep_data(0) <= epslot_qa(0) when extslot_d(0) = "00" else epslot_qa(2);
+   bgep_data(1) <= epslot_qa(1) when extslot_d(1) = "01" else epslot_qa(3);
+   bgep_data(2) <= epslot_qb(2);
+   bgep_data(3) <= epslot_qb(3);
 
    -- ================= BG VRAM channel arbiter =================
    gen_vmux01 : for i in 0 to 1 generate
@@ -871,24 +1009,55 @@ begin
                      v_addr_ext(i)  when bgtype(i) = 3 else 0;
    end generate;
 
+   -- Pipelined BG channel arbiter. v1 was ARB_IDLE -> ARB_WAIT: one request in
+   -- flight across ALL FOUR BGs, so a BG's fetch latency was serialised behind
+   -- every other BG's, and the two extra states cost a further ~2 cycles per
+   -- op on top of the line server's own.
+   --
+   -- v2 issues one request per cycle and keeps a FIFO of which BG owns each
+   -- op. nds_vram retires in issue order, so popping the FIFO on each
+   -- srv_bg_done routes the answer back to the right BG with no tag on the
+   -- wire. A BG may therefore have several fetches outstanding, which is what
+   -- lets the drawers run their fetch stage ahead of their pixel stage.
    b_arb : block
-      type t_arbstate is (ARB_IDLE, ARB_WAIT);
-      signal arbstate : t_arbstate := ARB_IDLE;
-      signal arb_sel  : integer range 0 to 3 := 0;
+      constant OS_DEPTH : integer := 8;   -- ops trackable in flight
+      type t_owner is array (0 to OS_DEPTH-1) of integer range 0 to 3;
+      signal owner    : t_owner := (others => 0);
+      signal os_head  : integer range 0 to OS_DEPTH-1 := 0;
+      signal os_tail  : integer range 0 to OS_DEPTH-1 := 0;
+      signal os_count : integer range 0 to OS_DEPTH := 0;
       signal arb_rr   : integer range 0 to 3 := 0;
-      signal arb_busy : std_logic;   -- probe-friendly mirror of arbstate
+      signal arb_busy : std_logic;   -- probe-friendly: ops in flight
       signal pending  : std_logic_vector(0 to 3) := (others => '0');
+      -- a request has been presented to the server and not yet accepted; the
+      -- server's request latch is one deep, so a second one would coalesce
+      -- with it and be lost
+      signal unaccepted : std_logic := '0';
+      signal bg_data_r  : std_logic_vector(31 downto 0) := (others => '0');
    begin
-      arb_busy <= '1' when arbstate = ARB_WAIT else '0';
+      arb_busy <= '0' when os_count = 0 else '1';
+
+      -- bgv_done is registered, so a drawer sees it one cycle after
+      -- srv_bg_done - but srv_bg_data is only valid ON the done cycle, because
+      -- the line server overwrites it at the next retire. With one op in
+      -- flight that never mattered (nothing could retire in the gap); with
+      -- several it means the drawer reads the NEXT request's word, which shows
+      -- up as pixels wearing their neighbours' colours. So capture the data at
+      -- the same edge as the done it belongs to, and hand the drawers that.
+      bgv_data <= bg_data_r;
 
       process (clk)
          variable pend_v : std_logic_vector(0 to 3);
          variable sel    : integer range 0 to 3;
          variable found  : boolean;
+         variable v_cnt  : integer range 0 to OS_DEPTH;
+         variable v_head : integer range 0 to OS_DEPTH-1;
+         variable v_tail : integer range 0 to OS_DEPTH-1;
       begin
          if rising_edge(clk) then
             srv_bg_req <= '0';
             bgv_done   <= (others => '0');
+            bgv_accept <= (others => '0');
 
             pend_v := pending;
             for i in 0 to 3 loop
@@ -897,34 +1066,55 @@ begin
                end if;
             end loop;
 
+            if (srv_bg_accept = '1') then
+               unaccepted <= '0';
+            end if;
+
             if (reset = '1') then
-               arbstate <= ARB_IDLE;
-               pending  <= (others => '0');
+               pending    <= (others => '0');
+               os_head    <= 0;
+               os_tail    <= 0;
+               os_count   <= 0;
+               unaccepted <= '0';
             else
-               case arbstate is
-                  when ARB_IDLE =>
-                     found := false;
-                     sel   := 0;
-                     for k in 0 to 3 loop
-                        if (not found and pend_v((arb_rr + k) mod 4) = '1') then
-                           sel   := (arb_rr + k) mod 4;
-                           found := true;
-                        end if;
-                     end loop;
-                     if (found) then
-                        arb_sel     <= sel;
-                        arb_rr      <= (sel + 1) mod 4;
-                        srv_bg_addr <= bgv_addr(sel);
-                        srv_bg_req  <= '1';
-                        pend_v(sel) := '0';
-                        arbstate    <= ARB_WAIT;
-                     end if;
-                  when ARB_WAIT =>
-                     if (srv_bg_done = '1') then
-                        bgv_done(arb_sel) <= '1';
-                        arbstate          <= ARB_IDLE;
-                     end if;
-               end case;
+               v_cnt  := os_count;
+               v_head := os_head;
+               v_tail := os_tail;
+
+               -- completion: in-order, so the oldest op owns this answer
+               if (srv_bg_done = '1' and v_cnt > 0) then
+                  bgv_done(owner(v_head)) <= '1';
+                  bg_data_r               <= srv_bg_data;
+                  v_head := (v_head + 1) mod OS_DEPTH;
+                  v_cnt  := v_cnt - 1;
+               end if;
+
+               -- issue: one per cycle, rotating priority, while the server has
+               -- room for it and we can still track it
+               found := false;
+               sel   := 0;
+               for k in 0 to 3 loop
+                  if (not found and pend_v((arb_rr + k) mod 4) = '1') then
+                     sel   := (arb_rr + k) mod 4;
+                     found := true;
+                  end if;
+               end loop;
+               if (found and v_cnt < OS_DEPTH and
+                   (unaccepted = '0' or srv_bg_accept = '1')) then
+                  arb_rr      <= (sel + 1) mod 4;
+                  srv_bg_addr <= bgv_addr(sel);
+                  srv_bg_req  <= '1';
+                  unaccepted  <= '1';
+                  bgv_accept(sel) <= '1';
+                  pend_v(sel) := '0';
+                  owner(v_tail) <= sel;
+                  v_tail := (v_tail + 1) mod OS_DEPTH;
+                  v_cnt  := v_cnt + 1;
+               end if;
+
+               os_head  <= v_head;
+               os_tail  <= v_tail;
+               os_count <= v_cnt;
             end if;
 
             pending <= pend_v;
@@ -953,7 +1143,8 @@ begin
                   epfill        <= EPBG_WAIT;
                when EPBG_WAIT =>
                   if (srv_bgep_done = '1') then
-                     bgep_shadow(epfill_addr) <= srv_bgep_data;
+                     -- the write itself goes into the slot RAMs through
+                     -- epslot_we / epslot_pa (see the slot RAM block)
                      if (epfill_addr = 8191) then
                         epfill_addr <= 0;
                         epfill      <= EPOBJ_REQ;
@@ -1104,11 +1295,13 @@ begin
 
    -- objwnd + the col/set valid masks: flop double buffers (3 x 512 bits),
    -- one-cycle row clear on drawObj (per-element loop - the Quartus-safe
-   -- shape for a dynamically-indexed row clear), registered merge reads
+   -- shape for a dynamically-indexed row clear), registered merge reads.
+   -- The ACCEPTED drawObj, so the row clear and the drawer's restart stay the
+   -- same event: a dropped drawObj must not clear a row nobody is going to fill.
    process (clk)
    begin
       if rising_edge(clk) then
-         if (drawObj = '1') then
+         if (drawobj_acc = '1') then
             for i in 0 to 255 loop
                linebuf_objwnd(linecounter_obj mod 2)(i)  <= '0';
                linebuf_objcolv(linecounter_obj mod 2)(i) <= '0';

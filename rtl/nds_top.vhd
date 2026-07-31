@@ -181,8 +181,8 @@ entity nds_top is
       vsrv_done        : in  std_logic;
       vrsrv_req        : out std_logic;
       vrsrv_bank       : out std_logic_vector(1 downto 0);
-      vrsrv_addr       : out unsigned(16 downto 2);
-      vrsrv_dout       : in  std_logic_vector(31 downto 0);
+      vrsrv_addr       : out unsigned(16 downto 3);
+      vrsrv_dout       : in  std_logic_vector(63 downto 0);
       vrsrv_done       : in  std_logic;
       -- back-pressure for the renderer VRAM feed. nds_vram's renderer server
       -- now issues A..D reads PIPELINED, so the channel has to say when it can

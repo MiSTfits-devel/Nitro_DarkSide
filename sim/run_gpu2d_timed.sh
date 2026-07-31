@@ -9,7 +9,13 @@ cd "$(dirname "$0")/.."
 
 TIMEOUT_MS="${TIMEOUT_MS:-600}"
 CE_DIV="${CE_DIV:-3}"
-WORK=sim/nvc_work
+# A..D renderer feed: RSRV_ONE=1 models the hardware channel (one op in flight,
+# ready low from acceptance to done); STALL_CYC>0 fails with a full dump if one
+# line render stays busy that many cycles, which tells a wedge from slowness.
+RSRV_LAT="${RSRV_LAT:-4}"
+RSRV_ONE="${RSRV_ONE:-0}"
+STALL_CYC="${STALL_CYC:-0}"
+WORK="${WORK:-sim/nvc_work}"
 mkdir -p "$WORK"
 
 [ -f sim/tests/gpu2d_vectors.hex ] || { echo "vectors missing: python3 sim/tests/gen_gpu2d_frame.py"; exit 1; }
@@ -30,5 +36,6 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_gpu2d.vhd \
    sim/tb_gpu2d_timed.vhd
 
-nvc -H 2g -L "$WORK" --work="$WORK/work" -e tb_gpu2d_timed -gTIMEOUT_MS="$TIMEOUT_MS" -gCE_DIV="$CE_DIV"
+nvc -H 2g -L "$WORK" --work="$WORK/work" -e tb_gpu2d_timed -gTIMEOUT_MS="$TIMEOUT_MS" -gCE_DIV="$CE_DIV" \
+   -gRSRV_LAT="$RSRV_LAT" -gRSRV_ONE="$RSRV_ONE" -gSTALL_CYC="$STALL_CYC"
 nvc -H 2g -L "$WORK" --work="$WORK/work" -r tb_gpu2d_timed --ieee-warnings=off --exit-severity=failure

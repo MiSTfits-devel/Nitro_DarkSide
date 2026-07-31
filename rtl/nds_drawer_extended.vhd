@@ -402,7 +402,14 @@ begin
 
             when STARTREAD =>
                palettefetch     <= WAITREAD;
-               palette_readwait <= 1;
+               -- The palette answers ONE cycle after the address, and the
+               -- address became present on entering STARTREAD - so the first
+               -- WAITREAD cycle already has the word. This budgeted a second
+               -- cycle, which only ever mattered when the shared palette port
+               -- was round-robin served and the wait was hidden anyway; with a
+               -- private read port per BG (nds_gpu2d gpal_bg) it is one wasted
+               -- cycle on every single pixel.
+               palette_readwait <= 0;
 
             when WAITREAD =>
                if (palette_readwait > 0) then

@@ -31,6 +31,7 @@ sim/tests/sim/
 
 # gpu2d TB dump outputs
 gpu2d_frame_fb.txt
+gpu2d_timed_fb.txt
 gpu2d_dbg_line.txt
 simout/
 
