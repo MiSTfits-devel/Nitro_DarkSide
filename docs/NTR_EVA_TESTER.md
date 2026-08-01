@@ -154,16 +154,13 @@ cart's own Sound Test group:
 `nds_syscnt.vhd:130-135` (`preset_direct`) covers WRAMCNT, POSTFLG and POWCNT
 only.
 
-## Current state: boots and executes, but the display never turns on
+## Current state: executes correctly, but ~2.3x too slow per frame
 
-The cart is NOT green yet. Two separate facts, and it is worth keeping them
-apart:
-
-**The boot fix is done.** 300k ARM9 instructions match melonDS with nothing
+**The boot fix is done.** 7.5M ARM9 instructions match melonDS with nothing
 ignored, and RTL frame 0 is pixel-perfect against the golden dump
 (`compare_fb.py --rtl-frame 0 --mds-frame 0` → PASS).
 
-**There is a second, later divergence.** A 75-frame run
+**What a short run looks like, and why it misleads.** A 75-frame run
 (`GPUCEDIV=1 DIRECT=1 PRELOAD=1`) renders uniform `0x3FFFF` on engine A for
 every frame. That value is not a white backdrop — it is the display-off path at
 `nds_gpu2d.vhd:1487-1489`, which forces all-ones when `dispmode_eff = "00"`.
@@ -175,19 +172,53 @@ palette white `0x7FFF` becomes under `c5 << 1`, and `nds_drawer_merge.vhd:251`
 does exactly that same expansion. So melonDS at frame 34+ is rendering a real
 backdrop with the display ON, while the RTL is still emitting forced white.
 
-Pacing does not explain it either. The 300k-instruction trace run covered ~6 ms
-of DS time, i.e. ~835k ARM9 instructions per frame, against ~1.12M cycles/frame
-on real hardware — the same ballpark. A 10-20% shortfall would put display-on
-near frame 40, not past 74. The margin is 2.2x.
+### RETRACTED: pacing *is* the explanation, and there is no second divergence
 
-This is the same signature as the Kirby stall (DISPCNT display-on write never
-happens), but reached at **frame 34 instead of frame 337** — which makes this
-cart a much cheaper reproduction of that bug than Kirby is.
+An earlier revision of this file claimed pacing could not explain the white
+screen, on the grounds that the RTL runs ~835k ARM9 instructions per frame and
+so a mere 10-20% shortfall could not push display-on past frame 74. **That was
+wrong, and the way it was wrong is worth recording.** The 835k figure came from
+a 300k-instruction run that covered only ~6 ms — entirely inside the busy boot
+phase. Steady state is nothing like it.
 
-Next step is a trace bisect, not another blind frame run: `TRACE9STARTFRAME`
-(melonDS) and `TRACE_START_FRAME` (tb_top_frame) both exist precisely to take a
-trace from frame ~30 without a multi-GB from-boot dump. Diff those to find where
-the ARM9 stops agreeing.
+The block bisect settled it. Over a 1.1 s run:
+
+| | instructions | frames | per frame |
+|---|---|---|---|
+| melonDS | 10,683,333 | 40 | ~267k |
+| RTL     |  7,557,449 | ~65 | ~116k |
+
+**All 75 full blocks match — 7,500,000 instructions bit-exact, no columns
+ignored.** There is no functional divergence. The RTL's ARM9 simply retires
+~2.3x fewer instructions per frame, so every event lands ~2.3x later in frame
+terms. At 116k/frame the display-on write at instruction 10,616,585 falls near
+frame **91**, not 34, and a 75-frame run stops just short of it.
+
+That is a CPI gap, not a stall: ~1.126M ARM9 cycles per frame at 67 MHz gives
+the RTL a CPI near 9.7 against melonDS's ~4.2. It is a performance problem in
+known territory, not the Kirby display-on bug — so **do not** read this cart's
+white screen as a reproduction of that. The two look identical on screen and
+have nothing to do with each other.
+
+Method note, because it cost a run to notice: neither trace stops on a block
+boundary, so the last block on *either* side is short and will always mismatch.
+`sim/run_ntr_trace_blocks.sh` now excludes short tails on both sides. Before
+that fix it reported "FIRST DIVERGING BLOCK: 75" — which is the RTL's truncated
+final block, and reads exactly like a real divergence at the far end of the run.
+
+### Anchoring, for whoever bisects this next
+
+Anchor from boot, not by frame. `TRACE9STARTFRAME` / `TRACE_START_FRAME` look
+like the right tool but frame-anchored traces only line up if the CPU-to-video
+rate matches on both sides — which is precisely what was in question here, and
+it is off by 2.3x. From-boot traces align by construction.
+
+That is affordable because the two sides are byte-identical once the RTL's
+uppercase hex is lowercased (verified: same MD5 over 300k instructions), so
+11M instructions reduce to a 107-line hash file and only the one disagreeing
+block has to travel. The display-on write is `STR r0,[r1]` at PC `0x02039928`
+(`r1=04000000`, `r0=00010100`, returning to `0x02000c5c`), instruction
+**10,616,585** from boot.
 
 Note engine A logged **zero dropped lines** across all 75 frames; the 300 drops
 in that run were all engine B, which this cart never draws to.

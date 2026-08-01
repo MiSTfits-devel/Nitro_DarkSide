@@ -78,3 +78,6 @@ fix7.txt
 # by every parallel sim pod. sim/nvc_work/ and _pre were listed individually,
 # which stopped covering anything once runs started using distinct WORK= names.
 sim/nvc_work_*/
+
+# generated trace-bisect reference (from a copyrighted cart dump)
+sim/tests/ntr_eva_mds_blocks.md5
