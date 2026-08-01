@@ -220,5 +220,36 @@ block has to travel. The display-on write is `STR r0,[r1]` at PC `0x02039928`
 (`r1=04000000`, `r0=00010100`, returning to `0x02000c5c`), instruction
 **10,616,585** from boot.
 
+## Confirmed: the display does come on, at frame 86
+
+A 100-frame run (`DUMP_START_FRAME=85`) settles it by direct observation:
+
+| frame | engine A |
+|-------|----------|
+| 85    | `3FFFF` — forced white, display off |
+| 86    | mixed `3EFBE` / `3FFFF` — the display switches on mid-frame |
+| 87–99 | `3EFBE` |
+
+`0x3EFBE` is 6-bit **(62, 62, 62)**, which is exactly melonDS's `fffbfbfb`:
+palette white `0x7FFF` under `c5 << 1`. And the frames compare pixel-perfect
+against the golden dump at the corresponding points:
+
+    compare_fb.py ntr_late_fb.txt <golden> --rtl-frame 2  --mds-frame 40  → PASS
+    compare_fb.py ntr_late_fb.txt <golden> --rtl-frame 14 --mds-frame 60  → PASS
+
+(`--rtl-frame` is an index into the dump, not a frame number — this dump starts
+at 85, so index 2 is frame 87.)
+
+Display-on lands at RTL frame 86 against melonDS's 34, a ratio of **2.53** —
+the CPI gap, and nothing else. There is no functional bug here at all.
+
+**Cost of a full green run.** Scaling by 2.53: the first `PROGRESS[nnn/058]`
+text screen (melonDS frame 71) arrives near RTL frame **180**, and the `[07-01]`
+halt (melonDS frame 123) near frame **311** — roughly 6.5 hours at the ~1.2
+min/frame this configuration sustains. Closing the CPI gap is the thing that
+makes this cart a practical regression vector rather than an overnight job.
+
+Engine A logged **zero dropped lines** across all 100 frames.
+
 Note engine A logged **zero dropped lines** across all 75 frames; the 300 drops
 in that run were all engine B, which this cart never draws to.
