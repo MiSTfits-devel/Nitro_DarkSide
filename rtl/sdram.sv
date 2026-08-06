@@ -19,11 +19,36 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 module sdram
+#(
+	// 1 inserts a register stage between the pin capture (dq_reg, which the
+	// fitter puts in an I/O cell at the die edge) and the wide ch*_dout banks
+	// (which it puts next to their consumers, deep in the fabric). That hop is
+	// ~5.8ns of pure interconnect with ZERO logic levels in it, so it cannot be
+	// optimised - only split, by giving the fitter a register it may place
+	// halfway. Costs one clk of read latency, so leave it 0 unless clk is fast
+	// enough that the hop misses setup: at 100.5MHz it has +1.16ns of slack.
+	parameter integer DQ_PIPE = 0,
+
+	// The two chip-protocol knobs. Both are sized for <=100MHz as they stand,
+	// and neither is visible to FPGA static timing analysis - STA checks the
+	// fabric, not whether the SDRAM part is being given the nanoseconds it
+	// needs. Raising clk without revisiting these buys a core that closes
+	// timing and reads the wrong data.
+	//
+	// CAS_LATENCY: the original's own comment is "2 for < 100MHz, 3 for
+	// >100MHz". RDLY tracks it, so the read taps follow automatically.
+	parameter integer CAS_LATENCY = 2,
+
+	// TRCD_WAIT: clk cycles inserted between ACTIVE and READ/WRITE. 1 gives the
+	// original's fixed 2-clock gap - 19.9ns at 100.5MHz, but only 14.9ns at
+	// 134.1MHz, which is under the tRCD of every SDR part MiSTer ships with.
+	parameter integer TRCD_WAIT = 1
+)
 (
 	input             init,        // reset to initialize RAM
 	input             clk,         // clock ~100MHz
 
-	inout  reg [15:0] SDRAM_DQ,    // 16 bit bidirectional data bus
+	inout     [15:0] SDRAM_DQ,    // 16 bit bidirectional data bus
 	output reg [12:0] SDRAM_A,     // 13 bit multiplexed address bus
 	output            SDRAM_DQML,  // two byte masks
 	output            SDRAM_DQMH,  // 
@@ -62,22 +87,19 @@ module sdram
 	output reg        ch3_ready
 );
 
-assign SDRAM_nCS  = chip;
-assign SDRAM_nRAS = command[2];
-assign SDRAM_nCAS = command[1];
-assign SDRAM_nWE  = command[0];
-assign SDRAM_CKE  = 1;
-assign {SDRAM_DQMH,SDRAM_DQML} = SDRAM_A[12:11];
-
-
 // Burst length = 4
 localparam BURST_LENGTH        = 4;
 localparam BURST_CODE          = (BURST_LENGTH == 8) ? 3'b011 : (BURST_LENGTH == 4) ? 3'b010 : (BURST_LENGTH == 2) ? 3'b001 : 3'b000;  // 000=1, 001=2, 010=4, 011=8
 localparam ACCESS_TYPE         = 1'b0;     // 0=sequential, 1=interleaved
-localparam CAS_LATENCY         = 3'd2;     // 2 for < 100MHz, 3 for >100MHz
 localparam OP_MODE             = 2'b00;    // only 00 (standard operation) allowed
 localparam NO_WRITE_BURST      = 1'b1;     // 0= write burst enabled, 1=only single access write
-localparam MODE                = {3'b000, NO_WRITE_BURST, OP_MODE, CAS_LATENCY, ACCESS_TYPE, BURST_CODE};
+localparam [2:0] CAS_LAT_B     = CAS_LATENCY[2:0];
+localparam MODE                = {3'b000, NO_WRITE_BURST, OP_MODE, CAS_LAT_B, ACCESS_TYPE, BURST_CODE};
+
+// Where the read-return delay line starts. Every DQ_PIPE stage pushes the whole
+// line one bit up, which makes each tap fire one clk later - so the taps below
+// stay put and the pipeline depth is expressed in exactly one place.
+localparam RDLY                = CAS_LATENCY + BURST_LENGTH + DQ_PIPE;
 
 localparam sdram_startup_cycles= 14'd12100;// 100us, plus a little more, @ 100MHz
 localparam cycles_per_refresh  = 14'd750;  // (64000*100)/8192-1 Calc'd as (64ms @ 100MHz)/8192 rose
@@ -96,6 +118,52 @@ reg [13:0] refresh_count = startup_refresh_max - sdram_startup_cycles;
 reg  [2:0] command;
 reg        chip;
 
+// Registered "the refresh interval has elapsed". The comparison used to sit
+// inline in STATE_IDLE, which put a 14-bit magnitude compare in the same cone as
+// the three-channel grant arbitration that drives command[] - the third-worst
+// path family in the 134MHz fit. Registering it is exact, not approximate:
+// (count >= N) sampled at count==N is visible in the cycle where count==N+1,
+// which is precisely when (count > N) used to first evaluate true.
+reg        refresh_due = 0;
+
+// Pin capture, and the optional pipeline copies. These live at module scope
+// only so the dqu* selects below can be written once instead of at every tap;
+// dq_reg is still assigned in exactly one place. One copy per channel: fanout
+// is not the problem (dq_reg drives 6 loads), distance is, and three copies let
+// the fitter place each near its own channel's dout bank rather than at the
+// compromise centroid of all three. All optimised away when DQ_PIPE=0.
+reg [15:0] dq_reg;
+reg [15:0] dq_p1, dq_p2, dq_p3;
+
+wire [15:0] dqu1 = DQ_PIPE ? dq_p1 : dq_reg;
+wire [15:0] dqu2 = DQ_PIPE ? dq_p2 : dq_reg;
+wire [15:0] dqu3 = DQ_PIPE ? dq_p3 : dq_reg;
+
+// DQ is driven through an explicit registered tristate rather than the
+// "inout reg SDRAM_DQ" the original used. Quartus accepts inout reg and infers
+// exactly this, but it is not legal in any Verilog standard, so no simulator
+// would elaborate the file - which is a large part of why this controller had
+// no bench. Same hardware, one that can be tested.
+reg [15:0] dq_out;
+reg        dq_oe;
+assign SDRAM_DQ = dq_oe ? dq_out : 16'bZ;
+
+// dq_out is packed into the I/O cell, so whatever feeds it pays a route out to
+// the pin ring. It used to be fed by a state-selected mux between the low and
+// high halves of saved_data, which put "state -> SDRAM_DQ[n]~reg0" in the 134MHz
+// violation list. dq_pre carries the word that is due next, so the I/O register
+// is now fed by one plain flop with no select in the way; the fitter is then
+// free to place dq_pre right against the pin bank.
+reg [15:0] dq_pre;
+
+// these reference command/chip, so they must follow the declarations
+assign SDRAM_nCS  = chip;
+assign SDRAM_nRAS = command[2];
+assign SDRAM_nCAS = command[1];
+assign SDRAM_nWE  = command[0];
+assign SDRAM_CKE  = 1;
+assign {SDRAM_DQMH,SDRAM_DQML} = SDRAM_A[12:11];
+
 localparam STATE_STARTUP = 0;
 localparam STATE_WAIT    = 1;
 localparam STATE_RW1     = 2;
@@ -107,16 +175,16 @@ localparam STATE_IDLE_3  = 7;
 localparam STATE_IDLE_4  = 8;
 localparam STATE_IDLE_5  = 9;
 localparam STATE_RFSH    = 10;
+localparam STATE_WAIT2   = 11;   // second tRCD cycle, only entered when TRCD_WAIT > 1
 
 
 always @(posedge clk) begin
-	reg [CAS_LATENCY+BURST_LENGTH:0] data_ready_delay1, data_ready_delay2, data_ready_delay3;
+	reg [RDLY:0] data_ready_delay1, data_ready_delay2, data_ready_delay3;
 
 	reg        saved_wr;
 	reg [12:0] cas_addr;
 	reg [31:0] saved_data;
 	reg  [3:0] saved_be;
-	reg [15:0] dq_reg;
 	reg  [3:0] state = STATE_STARTUP;
 
 	reg       ch1_rq, ch2_rq, ch3_rq;
@@ -154,29 +222,40 @@ always @(posedge clk) begin
 	ch3_ready   <= 0;
 
 	refresh_count <= refresh_count+1'b1;
+	refresh_due   <= (refresh_count >= cycles_per_refresh);
 
 	data_ready_delay1 <= data_ready_delay1>>1;
 	data_ready_delay2 <= data_ready_delay2>>1;
 	data_ready_delay3 <= data_ready_delay3>>1;
 
 	dq_reg <= SDRAM_DQ;
+	dq_p1  <= dq_reg;
+	dq_p2  <= dq_reg;
+	dq_p3  <= dq_reg;
 
-	if(data_ready_delay1[3]) ch1_dout[15:00] <= dq_reg;
-	if(data_ready_delay1[2]) ch1_dout[31:16] <= dq_reg;
-	if(data_ready_delay1[1]) ch1_dout[47:32] <= dq_reg;
-	if(data_ready_delay1[0]) ch1_dout[63:48] <= dq_reg;
-	if(data_ready_delay1[1]) ch1_ready <= 1;
+	if(data_ready_delay1[3]) ch1_dout[15:00] <= dqu1;
+	if(data_ready_delay1[2]) ch1_dout[31:16] <= dqu1;
+	if(data_ready_delay1[1]) ch1_dout[47:32] <= dqu1;
+	if(data_ready_delay1[0]) ch1_dout[63:48] <= dqu1;
+	// tap [0], not [1]. The last word lands on the [0] edge, so a consumer that
+	// samples dout on the cycle ready is high - which is what NDS.sv:984 does,
+	// and what any synchronous consumer does - must not be told "ready" until
+	// the cycle after that. On [1] it read ch1_dout[63:48] from the PREVIOUS
+	// burst. [1] was correct while ch1_dout was 48 bits wide; widening it to 64
+	// added the [0] tap without moving ready. sim/tb_sdram_ch.sv covers this.
+	if(data_ready_delay1[0]) ch1_ready <= 1;
 
-	if(data_ready_delay2[3]) ch2_dout[15:00] <= dq_reg;
-	if(data_ready_delay2[2]) ch2_dout[31:16] <= dq_reg;
+	if(data_ready_delay2[3]) ch2_dout[15:00] <= dqu2;
+	if(data_ready_delay2[2]) ch2_dout[31:16] <= dqu2;
 	if(data_ready_delay2[2]) ch2_ready   <= 1;
 	if(data_ready_delay2[3]) ch2_ready16 <= 1;
 
-	if(data_ready_delay3[3]) ch3_dout[07:00] <= dq_reg[7:0];
-	if(data_ready_delay3[1]) ch3_dout[15:08] <= dq_reg[7:0];
+	if(data_ready_delay3[3]) ch3_dout[07:00] <= dqu3[7:0];
+	if(data_ready_delay3[1]) ch3_dout[15:08] <= dqu3[7:0];
 	if(data_ready_delay3[1]) ch3_ready <= 1;
 
-	SDRAM_DQ <= 16'bZ;
+	dq_oe  <= 0;
+	dq_out <= dq_pre;   // unconditional: the enable lives on dq_oe, not on a mux
 
 	command <= CMD_NOP;
 	case (state)
@@ -210,6 +289,7 @@ always @(posedge clk) begin
 			if (!refresh_count) begin
 				state   <= STATE_IDLE;
 				refresh_count <= 0;
+				refresh_due   <= 0;   // count is being cleared; keep the flag in step
 			end
 		end
 
@@ -226,10 +306,11 @@ always @(posedge clk) begin
 		end
 
 		STATE_IDLE: begin
-			if (refresh_req || (refresh_count > cycles_per_refresh)) begin
+			if (refresh_req || refresh_due) begin
 				state         <= STATE_RFSH;
 				command       <= CMD_AUTO_REFRESH;
 				refresh_count <= 0;
+				refresh_due   <= 0;
 				chip          <= 0;
 			end
 			else if(ch1_rq) begin
@@ -283,12 +364,19 @@ always @(posedge clk) begin
 			end
 		end
 
-		STATE_WAIT: state <= STATE_RW1;
+		// dq_pre survives any number of wait states - it is only overwritten in
+		// RW1 - so loading it here works for both TRCD_WAIT settings.
+		STATE_WAIT: begin
+			state  <= (TRCD_WAIT > 1) ? STATE_WAIT2 : STATE_RW1;
+			dq_pre <= saved_data[15:0];   // due on the bus with the first WRITE
+		end
+		STATE_WAIT2: state <= STATE_RW1;
 		STATE_RW1: begin
 			SDRAM_A <= cas_addr;
 			if(saved_wr) begin
 				command  <= CMD_WRITE;
-				SDRAM_DQ <= saved_data[15:0];
+				dq_pre   <= saved_data[31:16];  // due with the second
+				dq_oe    <= 1;
 				SDRAM_A[12:11] <= ~saved_be[1:0]; // DQM byte masks for the low word
 				if(!ch) begin
 					ch1_ready  <= 1;
@@ -301,13 +389,13 @@ always @(posedge clk) begin
 			else begin
 				command <= CMD_READ;
 				state   <= STATE_IDLE_5;
-				     if(ch == 0) data_ready_delay1[CAS_LATENCY+BURST_LENGTH] <= 1;
+				     if(ch == 0) data_ready_delay1[RDLY] <= 1;
 				else if(ch == 1) begin
 					// a cancel since grant means nobody wants this data:
 					// let the burst run out silently, fire no ready
-					if (~ch2_kill) data_ready_delay2[CAS_LATENCY+BURST_LENGTH] <= 1;
+					if (~ch2_kill) data_ready_delay2[RDLY] <= 1;
 				end
-				else             data_ready_delay3[CAS_LATENCY+BURST_LENGTH] <= 1;
+				else             data_ready_delay3[RDLY] <= 1;
 			end
 		end
 
@@ -324,7 +412,7 @@ always @(posedge clk) begin
 				SDRAM_A[0]  <= 1;
 				SDRAM_A[12:11] <= ~saved_be[3:2]; // DQM byte masks for the high word
 				command     <= CMD_WRITE;
-				SDRAM_DQ    <= saved_data[31:16];
+				dq_oe       <= 1;
 				ch2_ready   <= 1;
 				ch2_ready16 <= 1;
 			end
@@ -333,7 +421,7 @@ always @(posedge clk) begin
 				SDRAM_A[10] <= 1;
 				SDRAM_A[1]  <= 1;
 				command     <= CMD_WRITE;
-				SDRAM_DQ    <= saved_data[31:16];
+				dq_oe       <= 1;
 				ch3_ready   <= 1;
 			end
 		end
@@ -342,6 +430,7 @@ always @(posedge clk) begin
 	if (init) begin
 		state <= STATE_STARTUP;
 		refresh_count <= startup_refresh_max - sdram_startup_cycles;
+		refresh_due   <= 0;
 	end
    
    if (ch2_cancel) begin
