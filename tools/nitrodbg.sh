@@ -44,6 +44,8 @@
 #   nitrodbg.sh status
 #   nitrodbg.sh where9                PC + CPSR + the word at the PC, decoded a little
 #   nitrodbg.sh softreset             restart the boot FSM; both cores held at t=0
+#   nitrodbg.sh card                  nds_card FSM state (op 0x0D) - the ONLY way
+#                                     to see a stalled card transfer
 #   nitrodbg.sh probe                 decode the ARM9 memory path's FSMs (op 0x0A):
 #                                     tells a wedged CPU apart from a merely slow one
 #   nitrodbg.sh forcecart             claim the card image is already in DDR3 (op 0x0B),
@@ -255,6 +257,25 @@ do_irq() {
 # A CPU whose PC has stopped moving is either parked in one of these waits
 # (a lost request or a lost done) or is not waiting on memory at all - and
 # nothing else visible from the host tells those two apart.
+do_card() {
+	# op 0x0D, laid out by nds_card's dbg_card assign
+	_v=$(cmd 0D 0); _n=$(printf '%d' "0x$_v")
+	_st=$(((_n >> 29) & 7)); _busy=$(((_n >> 28) & 1)); _wr=$(((_n >> 27) & 1))
+	_o9=$(((_n >> 26) & 1)); _o7=$(((_n >> 25) & 1)); _ien=$(((_n >> 24) & 1))
+	_pop=$(((_n >> 23) & 1)); _len=$(((_n >> 16) & 127)); _pos=$((_n & 8191))
+	case $_st in
+		0) _sn=IDLE ;;      1) _sn=CMDDELAY ;;  2) _sn=FETCH ;;
+		3) _sn=DATAREADY ;; 4) _sn=WORDDELAY ;; 5) _sn=FINISH ;;
+		*) _sn="?$_st" ;;
+	esac
+	echo "card 0x$_v"
+	echo "  state    : $_sn"
+	echo "  busy=$_busy word_ready=$_wr pop_req=$_pop  xferpos=$_pos xferlen(lo7)=$_len"
+	echo "  own9=$_o9 own7=$_o7  AUXSPICNT.14 xfer-irq-en=$_ien"
+	echo "  DATAREADY + busy=1 that never advances = the card is waiting for a"
+	echo "  data-port pop that is not coming (CPU poll or DMA never drained it)."
+}
+
 do_probe() {
 	_v=$(cmd 0A 0); _n=$(printf '%d' "0x$_v")
 	_cs=$((_n & 15)); _cbeat=$(((_n >> 4) & 7)); _ccode=$(((_n >> 7) & 1))
@@ -391,6 +412,7 @@ case "$1" in
 	reach7)  [ -n "$2" ] || die "reach7 needs a hex address"; do_reach 7 "$2" "$3" ;;
 	status)  do_status ;;
 	probe)     do_probe ;;
+	card)      do_card ;;
 	forcecart) do_forcecart ;;
 	irq)       do_irq ;;
 	where9)  do_where 9 ;;

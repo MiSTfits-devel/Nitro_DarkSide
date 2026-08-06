@@ -368,6 +368,7 @@ architecture arch of nds_top is
    signal dbg_regsel_s         : unsigned(4 downto 0);
    signal dbg_regval9, dbg_regval7 : std_logic_vector(31 downto 0);
    signal dbg_pk_ena, dbg_pk_act, dbg_pk_sel : std_logic;
+   signal dbg_card_s : std_logic_vector(31 downto 0);
 
    -- Everything the CPUs' resetCpu does not cover, but which a from-reset probe
    -- must still start clean. nds_mainram in particular latches req9/req7_pending
@@ -895,6 +896,7 @@ begin
       bus7 => io_bus7, wired_out7 => card_wired_out7, wired_done7 => card_wired_done7,
       irq9_xfer => irq9_card, irq7_xfer => irq7_card,
       dma9_card => dma9_card_trig, dma7_card => dma7_card_trig,
+      dbg_card => dbg_card_s,
       card_ena => cardm_ena, card_addr => cardm_addr,
       card_din => card_din, card_done => card_done
    );
@@ -1204,6 +1206,7 @@ begin
       pc9      => pc9_s,
       pc7      => pc7_s,
       probe    => dbg_probe,
+      cardstat => dbg_card_s,
       irq9_ime => irq9_dbg_ime, irq9_ie => irq9_dbg_ie, irq9_if => irq9_dbg_if,
       irq7_ime => irq7_dbg_ime, irq7_ie => irq7_dbg_ie, irq7_if => irq7_dbg_if,
       pk_ena   => dbg_pk_ena,

@@ -95,6 +95,13 @@ entity nds_card is
 
       irq9_xfer    : out std_logic := '0';   -- IRQ bit 19, one-cycle pulses
       irq7_xfer    : out std_logic := '0';
+
+      -- Debug tap (nds_debug op 0x0D). This unit had NO visibility at all, which
+      -- is why a game hang mid-card-transfer is indistinguishable from a healthy
+      -- core through `probe`: every FSM it decodes sits in the ARM9 memory path,
+      -- and a card stall never reaches there - the CPU just never gets told to
+      -- continue. Behaviourally inert.
+      dbg_card     : out std_logic_vector(31 downto 0) := (others => '0');
       dma9_card    : out std_logic := '0';   -- DMA start-mode 5 word-ready pulses
       dma7_card    : out std_logic := '0';
 
@@ -197,6 +204,16 @@ begin
 
    -- ================= combinational read data =================
    romctrl_rd <= busy & romctrl(30 downto 24) & word_ready & romctrl(22 downto 0);
+
+   -- [31:29] state  [28] busy  [27] word_ready  [26] own9  [25] own7
+   -- [24] spicnt(14) xfer-ready-IRQ enable   [23] pop_req
+   -- [12:0] xferpos ... but xferlen matters as much, so pack both halves:
+   -- [22:16] xferlen(6..0)   [12:0] xferpos
+   dbg_card <= std_logic_vector(to_unsigned(tstate'pos(state), 3))
+               & busy & word_ready & own9 & own7 & spicnt(14) & pop_req
+               & std_logic_vector(xferlen(6 downto 0))
+               & "000"
+               & std_logic_vector(xferpos);
 
    -- AUXSPICNT with the live SPI-busy bit, AUXSPIDATA in the upper half
    spi_busy_bit <= '1' when (spi_busy /= 0) else '0';

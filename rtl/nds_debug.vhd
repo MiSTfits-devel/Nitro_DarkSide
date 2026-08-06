@@ -87,6 +87,9 @@ entity nds_debug is
       -- waiting on one of these or is not waiting on memory at all, and that
       -- distinction is not otherwise observable on hardware.
       probe     : in  std_logic_vector(31 downto 0) := (others => '0');
+      -- op 0x0D: nds_card's FSM. Nothing else in this unit can see the card, so
+      -- a hang waiting on a card transfer looks identical to a healthy core.
+      cardstat  : in  std_logic_vector(31 downto 0) := (others => '0');
 
       -- interrupt controller state for both CPUs, returned by op 0x0C with
       -- arg = 0..5. PEEK cannot read these: it borrows the ARM9 main-RAM
@@ -269,6 +272,10 @@ begin
 
                         when "0001010" =>            -- PROBE (memory-path FSMs)
                            answer <= probe;
+                           state  <= RESPOND;
+
+                        when "0001101" =>            -- CARDSTAT (op 0x0D)
+                           answer <= cardstat;
                            state  <= RESPOND;
 
                         when "0001100" =>            -- IRQSTAT, arg selects
