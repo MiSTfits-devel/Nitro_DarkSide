@@ -56,6 +56,18 @@ entity nds_top is
       -- the renderer 6390 cycles per scanline instead of 2130. A rendered line
       -- measures 5829 cycles, so it only fits the former. See nds_gpu2d_fast.
       GPU_FAST                 : integer   := 0;
+      -- clkMem : clk1x ratio (NDS.sv CLKMEM_RATIO, moved by NDS_CLKMEM_4X).
+      -- Only reaches nds_gpu2d_fast's phase gates, which exist only when
+      -- GPU_FAST /= 0 - so nds_port_wrap deliberately leaves this at its
+      -- default, as it does every other generic. If GPU_FAST is ever switched
+      -- on in a 4x build, this has to be raised with it.
+      CLKMEM_RATIO             : integer   := 3;
+      -- 0 = compile nds_sound out entirely. It is 10,032 combinational ALUTs,
+      -- 16% of the design's logic and as much as a whole 2D engine, so this is
+      -- the cheapest way to get a FITTING image while main is over the device
+      -- (see FITTING.md; the fitter is short by ~470 ALMs). Diagnostic images
+      -- only - there is no audio at all with this off.
+      SOUND_ENABLE             : integer   := 1;
       -- simulation only: the testbench has staged the ARM9/ARM7 main-RAM sections
       -- itself, so nds_loader may skip copying them (see nds_loader.skip_copy)
       skip_copy                : std_logic := '0'
@@ -1674,24 +1686,45 @@ begin
       bus7 => io_bus7, wired_out7 => rtc_wired_out7, wired_done7 => rtc_wired_done7
    );
 
-   isound : entity work.nds_sound
-   generic map ( is_simu => is_simu )
-   port map
-   (
-      clk => clk1x, ce => '1', reset => resetCpu,
-      bus7 => io_bus7, wired_out7 => snd_wired_out7, wired_done7 => snd_wired_done7,
-      snd_bus_req => snd_bus_req,
-      snd_bus_ok  => snd_bus_ok,
-      snd_bus_own => snd_bus_own,
-      mb_ena      => sndb7_ena,
-      mb_adr      => sndb7_adr,
-      mb_din      => cpu7_din,
-      mb_done     => cpu7_done,
-      sample_l     => sound_out_left,
-      sample_r     => sound_out_right,
-      sample_valid => open,
-      snd_enable => open, snd_active => open
-   );
+   gsound : if SOUND_ENABLE /= 0 generate
+      isound : entity work.nds_sound
+      generic map ( is_simu => is_simu )
+      port map
+      (
+         clk => clk1x, ce => '1', reset => resetCpu,
+         bus7 => io_bus7, wired_out7 => snd_wired_out7, wired_done7 => snd_wired_done7,
+         snd_bus_req => snd_bus_req,
+         snd_bus_ok  => snd_bus_ok,
+         snd_bus_own => snd_bus_own,
+         mb_ena      => sndb7_ena,
+         mb_adr      => sndb7_adr,
+         mb_din      => cpu7_din,
+         mb_done     => cpu7_done,
+         sample_l     => sound_out_left,
+         sample_r     => sound_out_right,
+         sample_valid => open,
+         snd_enable => open, snd_active => open
+      );
+   end generate;
+
+   -- SOUND_ENABLE = 0: the stub is NOT optional decoration. wired_done7 on this
+   -- bus is a combinational ADDRESS CLAIM, not a handshake - key_wired_done7 two
+   -- screens up is literally `'1' when Adr = ...` - and io_wired_done7 is the OR
+   -- of every peripheral's claim. With nothing claiming 0x400-0x5FF the ARM7's
+   -- first sound-register access would never complete and the CPU would hang
+   -- forever, which would look like a boot bug rather than a missing peripheral.
+   -- So claim exactly the range nds_sound claims and read back zero.
+   gnosound : if SOUND_ENABLE = 0 generate
+      snd_wired_done7 <= '1' when (io_bus7.Adr(27 downto 9) = "0000000000000000010") else '0';
+      snd_wired_out7  <= (others => '0');
+      -- never ask for the ARM7 membus, so cpu7_pause/dma7_idle_ok are unaffected
+      snd_bus_req     <= '0';
+      snd_bus_own     <= '0';
+      sndb7_ena       <= '0';
+      sndb7_adr       <= (others => '0');
+      sound_out_left  <= (others => '0');
+      sound_out_right <= (others => '0');
+   end generate;
 
    ispi : entity work.nds_spi
    port map
@@ -1884,7 +1917,7 @@ begin
    r_objep_addr <= to_unsigned(g_objep_addr, 11);
 
    igpu2d_a : entity work.nds_gpu2d_fast
-   generic map ( is_simu => is_simu, GPU_FAST => GPU_FAST )
+   generic map ( is_simu => is_simu, GPU_FAST => GPU_FAST, CLKMEM_RATIO => CLKMEM_RATIO )
    port map
    (
       clk1x => clk1x, clkMem => clkMem, clkMemIndex => clkMemIndex, reset => resetCpu,
@@ -1938,7 +1971,7 @@ begin
    rb_objep_addr <= to_unsigned(gb_objep_addr, 11);
 
    igpu2d_b : entity work.nds_gpu2d_fast
-   generic map ( is_engine_b => '1', is_simu => is_simu, GPU_FAST => GPU_FAST )
+   generic map ( is_engine_b => '1', is_simu => is_simu, GPU_FAST => GPU_FAST, CLKMEM_RATIO => CLKMEM_RATIO )
    port map
    (
       clk1x => clk1x, clkMem => clkMem, clkMemIndex => clkMemIndex, reset => resetCpu,

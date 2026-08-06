@@ -46,6 +46,10 @@ entity tb_top_frame is
       VRAMOPS      : integer := 0;
       -- 1 = run both 2D engines on clkMem (3x). See rtl/nds_gpu2d_fast.vhd.
       GPUFAST      : integer := 0;
+      -- 0 = compile nds_sound out (nds_top SOUND_ENABLE). Sim-side A/B for the
+      -- area switch: a run with sound gated out must behave identically in
+      -- everything that is not audio, and this is how that gets checked.
+      SOUND        : integer := 1;
       -- A..D renderer read model (vrsrv_*). The default has been UNLIMITED
       -- IN-FLIGHT with a fixed 4-cycle pipe and vrsrv_ready never driven at all,
       -- which does not resemble the hardware: NDS.sv assigns
@@ -79,6 +83,16 @@ entity tb_top_frame is
       TRACEFILE7 : string  := "";        -- non-empty: ARM7 retired-instruction trace (same format)
       TRACE_START_FRAME  : integer := 0;  -- defer ARM9 trace until this dump-frame interval
       TRACE7_START_FRAME : integer := 0;  -- defer ARM7 trace until this dump-frame interval
+      -- Time-gated ARM7 trace window, in us. TRACE7_T1 > 0 enables it and
+      -- REPLACES the dump-frame gate above. Firmware boot needs a time gate:
+      -- dump_frame_index only advances once the display is running, and the
+      -- fault worth tracing is at 1.588 s with POWCNT1 not initialised until
+      -- 1.49 s, so a frame-gated trace comes out empty or starts in the wrong
+      -- place. Lines are flushed as they are written and the file is closed at
+      -- T1, so the trace survives the fatal decode assertion in gba_cpu - an
+      -- unflushed trace of the instructions leading to a crash is worth nothing.
+      TRACE7_T0  : integer := 0;
+      TRACE7_T1  : integer := 0;
       DUMP_STATE : integer := 0;          -- dump final raw VRAM/palette/OAM/register state
       MAXINSTR   : integer := 20000000;  -- trace line cap (per CPU)
       -- Card/firmware read latency injection. The donor models answer in one
@@ -126,7 +140,21 @@ entity tb_top_frame is
       -- 0x037FE28C reached through the ARM7-WRAM 64 KB mirror: nds_membus7 masks
       -- both with 0xFFFF (w7p_addr <= cpu_adr(15 downto 2)), exactly as melonDS
       -- does, so the two addresses are the same storage.
-      ARM7WATCH  : integer := 16#0380E28C#
+      ARM7WATCH  : integer := 16#0380E28C#;
+      -- /=0: catch the ARM7 PC RUNNING AWAY, and print the instructions that led
+      -- to it. Nothing legitimately executes at or above 0x04000000 on the ARM7 -
+      -- that is the I/O region - so the first retire there is unambiguous
+      -- corruption, and it reads as 0x00000000 = `andeq r0,r0,r0`, which decodes
+      -- happily. So a derailed ARM7 does not crash: it marches +4 through the
+      -- address space, 16384 instructions per 64 KB, until it finally lands on a
+      -- word that will not decode, thousands of instructions and hundreds of
+      -- milliseconds later, in code that has nothing to do with the bug.
+      --
+      -- That is what the 1.588 s "unhandled opcode 1C0E1C05" fault is: by 1.55 s
+      -- the ARM7 was already walking 0x0439xxxx..0x0483xxxx. This trigger fires at
+      -- the moment of departure instead, which no trace window can be aimed at
+      -- without knowing the answer first.
+      ARM7RUNAWAY : integer := 0
    );
 end entity;
 
@@ -473,6 +501,7 @@ begin
       Softmap_NDS_MAINRAM_ADDR => MAINRAM_BASE,
       GPU_CE_DIV               => GPUCEDIV,
       GPU_FAST                 => GPUFAST,
+      SOUND_ENABLE             => SOUND,
       skip_copy                => itosl(PRELOAD)
    )
    port map
@@ -1233,7 +1262,17 @@ begin
          file_open(tf, TRACEFILE7, write_mode);
          loop
             wait until rising_edge(clk1x);
-            if (dbg_export7_done = '1' and dump_frame_index >= TRACE7_START_FRAME) then
+            -- close on leaving a time window, so the file is complete even
+            -- though the run goes on (and may then die on an assertion)
+            if (TRACE7_T1 > 0 and now > TRACE7_T1 * 1 us) then
+               report "tb_top_frame: ARM7 trace window closed, " &
+                      integer'image(n) & " instructions in " & TRACEFILE7 severity note;
+               file_close(tf);
+               wait;
+            end if;
+            if (dbg_export7_done = '1' and
+                ((TRACE7_T1 > 0 and now >= TRACE7_T0 * 1 us) or
+                 (TRACE7_T1 = 0 and dump_frame_index >= TRACE7_START_FRAME))) then
                write(l, to_hstring(dbg_export7.pc));
                write(l, ' ');
                write(l, to_hstring(dbg_export7.opcode));
@@ -1244,6 +1283,11 @@ begin
                   write(l, to_hstring(dbg_export7.regs(i)));
                end loop;
                writeline(tf, l);
+               -- a windowed trace exists to be read after a crash, so pay the
+               -- flush per line rather than lose the tail that matters
+               if (TRACE7_T1 > 0) then
+                  flush(tf);
+               end if;
                n := n + 1;
                if (n mod 10000 = 0) then
                   report "T7 " & integer'image(n) & " " & time'image(now) severity note;
@@ -1889,6 +1933,67 @@ begin
          end if;
       end process;
 
+   end generate;
+
+   -- ============ ARM7 runaway-PC catcher (ARM7RUNAWAY /= 0) ============
+   garm7runaway : if ARM7RUNAWAY /= 0 generate
+      p_runaway : process (clk1x)
+         constant DEPTH : integer := 96;
+         type t_ring is array (0 to DEPTH - 1) of std_logic_vector(31 downto 0);
+         variable rpc, rop, rps : t_ring := (others => (others => '0'));
+         variable rtm  : integer_vector(0 to DEPTH - 1) := (others => 0);
+         variable head : integer := 0;
+         variable n    : natural := 0;
+         variable fired : boolean := false;
+         variable idx   : integer;
+         variable l     : line;
+      begin
+         if rising_edge(clk1x) then
+            if (dbg_export7_done = '1') then
+               if (not fired) then
+                  rpc(head) := std_logic_vector(dbg_export7.pc);
+                  rop(head) := std_logic_vector(dbg_export7.opcode);
+                  rps(head) := std_logic_vector(dbg_export7.CPSR);
+                  -- us, not ns and certainly not fs: VHDL INTEGER is 32-bit
+                  -- signed, so ns overflows past ~2.1 s of simulated time and fs
+                  -- overflows in 2 us. A 32-bit value in an INTEGER already
+                  -- killed one 35-minute run on this ticket. The exact instant is
+                  -- printed with time'image in the header line; the ring index is
+                  -- what gives the ordering.
+                  rtm(head) := now / 1 us;
+                  head := (head + 1) mod DEPTH;
+                  if (n < DEPTH) then n := n + 1; end if;
+
+                  if (dbg_export7.pc >= unsigned'(x"04000000")) then
+                     fired := true;
+                     report "ARM7RUNAWAY: pc=" & to_hstring(dbg_export7.pc) &
+                            " at " & time'image(now) &
+                            " - dumping the " & integer'image(n) &
+                            " retires that led here (oldest first)" severity note;
+                     for i in 0 to n - 1 loop
+                        idx := (head + DEPTH - n + i) mod DEPTH;
+                        write(l, string'("  R7 "));
+                        write(l, i - (n - 1));            -- 0 is the offending one
+                        write(l, string'("  t="));
+                        write(l, rtm(idx));
+                        write(l, string'("us pc="));
+                        write(l, to_hstring(rpc(idx)));
+                        write(l, string'(" op="));
+                        write(l, to_hstring(rop(idx)));
+                        write(l, string'(" cpsr="));
+                        write(l, to_hstring(rps(idx)));
+                        report l.all severity note;
+                        deallocate(l);
+                     end loop;
+                     -- Stop here. Letting it run costs hours and lands on an
+                     -- unrelated instruction, which is exactly how this bug got
+                     -- diagnosed at the wrong address twice.
+                     report "ARM7RUNAWAY: stopping at the point of departure" severity failure;
+                  end if;
+               end if;
+            end if;
+         end if;
+      end process;
    end generate;
 
    -- ============ engine-A stall probe (STALL_CYC > 0) ============

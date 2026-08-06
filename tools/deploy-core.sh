@@ -8,20 +8,23 @@
 #   NOLOAD=1 ...                                          # upload + verify, do not load
 #
 # This replaces the lost scratchpad/deploy-probe.sh. It lives in tools/ ON PURPOSE:
-# the original was untracked, went missing with the rest of scratchpad/, and its
-# production-core guard went with it.
+# the original was untracked and went missing with the rest of scratchpad/.
 #
 # Guards, in order of how badly you would regret losing them:
-#   1. PROTECTED never gets written, whatever you pass.
-#   2. No EXISTING remote .rbf is overwritten at all - the target name must be new.
+#   1. No EXISTING remote .rbf is overwritten at all - the target name must be new.
 #      Old test cores are evidence from past sessions; do not clobber them.
-#   3. The upload is staged to a .tmp name and only moved into place after its
+#   2. The upload is staged to a .tmp name and only moved into place after its
 #      sha256 is verified ON THE DEVICE against the local file. A truncated scp
 #      over a flaky link otherwise gives you a core that fails to configure and an
 #      afternoon of debugging the wrong thing.
+#
+# There used to be a third guard here refusing to write NDS_20260719.rbf, described
+# as "the known-good production core". It was not one - it does not work - so the
+# rule protected nothing and only added a name that had to be kept in sync by hand.
+# Removed 2026-08-05 at the owner's instruction. Guard 1 already stops any existing
+# core, that one included, from being clobbered.
 set -eu
 
-PROTECTED="NDS_20260719.rbf"       # the known-good production core. Never touch.
 HOST="${HOST:-192.168.1.243}"
 CORE_DIR="${CORE_DIR:-/media/fat/_Console}"
 SSH="ssh -o ConnectTimeout=25 -o StrictHostKeyChecking=accept-new"
@@ -33,14 +36,7 @@ REMOTE="$CORE_DIR/$NAME.rbf"
 
 [ -f "$LOCAL" ] || { echo "no such file: $LOCAL" >&2; exit 1; }
 
-# --- guard 1: the production core, by name, case-insensitively ---
-case "$(echo "$NAME.rbf" | tr 'A-Z' 'a-z')" in
-   "$(echo "$PROTECTED" | tr 'A-Z' 'a-z')")
-      echo "REFUSING: $PROTECTED is the production core and is never a deploy target." >&2
-      exit 2 ;;
-esac
-
-# --- guard 2: never overwrite anything that already exists ---
+# --- guard 1: never overwrite anything that already exists ---
 if $SSH "root@$HOST" "[ -e '$REMOTE' ]" 2>/dev/null; then
    echo "REFUSING: $REMOTE already exists. Pick a new name - existing cores are" >&2
    echo "          evidence from earlier sessions and are not overwritten here." >&2
@@ -66,11 +62,6 @@ echo "== sha256 OK"
 
 $SSH "root@$HOST" "mv '$REMOTE.tmp' '$REMOTE'"
 echo "== in place: $REMOTE"
-
-# re-assert guard 1 after the fact: if the protected core's checksum ever changes,
-# something in this flow was wrong and you want to know immediately, not later.
-$SSH "root@$HOST" "[ -e '$CORE_DIR/$PROTECTED' ] && sha256sum '$CORE_DIR/$PROTECTED'" \
-   | sed 's/^/== production core still: /' || echo "== (production core not present?)"
 
 if [ -n "${NOLOAD:-}" ]; then
    echo "== NOLOAD set, not loading"

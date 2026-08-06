@@ -72,6 +72,54 @@ set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ADAPTIVE=1"
 # Disable ALSA audio output to save some resources
 set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ALSA=1"
 
+# clkMem 4x = 134.055928 MHz instead of 3x = 100.541946 MHz. This ONE macro
+# moves both the PLL (rtl/pll/pll_0002.v) and every clk1x-crossing phase index
+# (NDS.sv CLKMEM_RATIO), because a 4x PLL with 3x indices would accept a
+# renderer read the core is still holding and serve it twice.
+#
+# Measured on this machine's SDRAM module: 134 MHz pinned, zero MemTest errors
+# over ~3 hours. That is the MODULE side only. The official MiSTer bar is
+# 130 MHz, so comment this out for a build meant for anyone else - the renderer
+# is already under its line budget at 3x and 4x only closes the last few
+# dropped lines.
+#
+# FPGA side, and the reason this is worth a timing check every time it moves:
+# the clk_mem -> clk_sys setup budget is ONE clkMem period, so it shrinks
+# 9.94 -> 7.46 ns. At 3x the worst such path (vr_busy -> nds_vram|rdr_*_dout)
+# had only +1.107 ns, so it is the first thing expected to fail here.
+#
+# MEASURED 2026-08-05.
+#
+# 1. Area is NOT this macro's fault. At 100% ALM neither ratio fitted, and 4x was
+#    the smaller of the two (41,724 ALMs / 4223 LABs against 41,837 / 4238; the
+#    device has 4191 LABs). The overflow was pre-existing on main. With
+#    SOUND_ENABLE=0 the design drops to 34,324 ALMs (82%) and fits comfortably.
+#
+# 2. Timing before the sdram.sv work (build/artifacts-nosnd-4x):
+#
+#      outclk_0 clk_mem 134.056 MHz : setup -0.846 ns, TNS -9.496
+#      outclk_2 clk_sys  33.514 MHz : setup -0.508 ns, TNS -26.268
+#      outclk_1 video    67.028 MHz : setup +5.630 ns  (fine)
+#      plus a hold violation on clk_sys, -0.364 ns
+#
+#    Those numbers are a measurement, not a veto - the owner's call is that small
+#    negative slack is tolerable on this machine, so re-measure when this moves
+#    and judge the size, rather than treating any red as blocking. See
+#    docs/SDRAM.md for what the sdram.sv side of that gap turned out to be.
+# set_global_assignment -name VERILOG_MACRO "NDS_CLKMEM_4X=1"
+
+# HPS lightweight-bridge debug window at physical 0xFF200000
+# (rtl/hps_lw_bridge.sv). Gives the ARM direct register access to nds_debug and
+# to live PC/CPSR/status taps: ~150-300 ns per access against the DDR3 mailbox's
+# ~122 us poll, and the live taps need no command at all, which is what makes a
+# renderer counter watchable while it wedges.
+#
+# UNVERIFIED ON SILICON. The HPS end has to be enabled by the running Linux; if
+# it is held in reset an access HANGS rather than failing. Run
+# `nitrodbg.sh lwtest` before relying on it, and see the header of
+# rtl/hps_lw_bridge.sv. Costs area, so leave it off for a release image.
+set_global_assignment -name VERILOG_MACRO "NDS_LW_DEBUG=1"
+
 # Diagnostic images only: drops ascal + pll_hdmi (~2k ALMs) so the debug
 # mailbox fits and routes, and removes the HDMI clock domain that fails
 # setup on nearly every seed. No HDMI out; direct_video carries analog.

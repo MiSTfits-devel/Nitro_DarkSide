@@ -53,6 +53,9 @@ set_global_assignment -name VHDL_FILE rtl/nds_top.vhd
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ddram.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/nds_fb_ddr3.sv
+# HPS lightweight-bridge slave (AXI-3 at 0xFF200000). Instantiates the
+# cyclonev_hps_interface_hps2fpga_light_weight WYSIWYG, so it is Cyclone V only.
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/hps_lw_bridge.sv
 set_global_assignment -name VHDL_FILE nds_port_wrap.vhd
 set_global_assignment -name SYSTEMVERILOG_FILE NDS.sv
 set_global_assignment -name SDC_FILE NDS.sdc

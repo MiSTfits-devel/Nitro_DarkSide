@@ -18,6 +18,8 @@ FWBOOT="${FWBOOT:-0}"
 HEARTBEAT_MS="${HEARTBEAT_MS:-0}"
 VRAMOPS="${VRAMOPS:-0}"
 GPUFAST="${GPUFAST:-0}"
+# 0 = compile nds_sound out, matching nds_port_wrap's SOUND_ENABLE=0 build switch
+SOUND="${SOUND:-1}"
 # A..D renderer read model: LAT cycles, ONE=1 models hardware (one op in flight)
 VRSRV_LAT="${VRSRV_LAT:-4}"
 VRSRV_ONE="${VRSRV_ONE:-0}"
@@ -33,6 +35,11 @@ TRACEFILE="${TRACEFILE:-}"
 TRACEFILE7="${TRACEFILE7:-}"
 TRACE_START_FRAME="${TRACE_START_FRAME:-0}"
 TRACE7_START_FRAME="${TRACE7_START_FRAME:-0}"
+# ARM7 trace window in us. TRACE7_T1>0 replaces the frame gate above, which is
+# useless for firmware boot: the dump-frame counter does not advance until the
+# display runs (POWCNT1 at 1.49 s), long after the interesting code.
+TRACE7_T0="${TRACE7_T0:-0}"
+TRACE7_T1="${TRACE7_T1:-0}"
 DUMP_STATE="${DUMP_STATE:-0}"
 MAXINSTR="${MAXINSTR:-20000000}"
 DBG_T0="${DBG_T0:-0}"
@@ -63,6 +70,11 @@ ARM7DBG="${ARM7DBG:-0}"
 # the watch on 0x0380108C for one run - a hand-converted address is a silent way
 # to watch the wrong memory for four hours.
 ARM7WATCH="${ARM7WATCH:-0x0380E28C}"
+# 1: stop the run at the instant the ARM7 PC first retires at >=0x04000000,
+# printing the last 96 retires. The 1.588 s decode fault is ~100 ms and over a
+# million instructions downstream of the actual departure, so this is the only
+# probe that points at the cause rather than the crash site.
+ARM7RUNAWAY="${ARM7RUNAWAY:-0}"
 NVCHEAP="${NVCHEAP:-2g}"
 NVCOPT="${NVCOPT:--O2}"
 GPUCEDIV="${GPUCEDIV:-3}"
@@ -128,9 +140,10 @@ TRACEGEN=""
 [ -n "$TRACEFILE7" ] && TRACEGEN="$TRACEGEN -gTRACEFILE7=$TRACEFILE7"
 
 nvc -H "$NVCHEAP" -L "$WORK" --work="$WORK/work" -e "$NVCOPT" tb_top_frame \
-   -gCARD_WORDS="$CARDWORDS" -gCARD_LAT="$CARD_LAT" -gFW_LAT="$FW_LAT" -gMEM_LAT="$MEM_LAT" -gCYCLE_HIST="$CYCLE_HIST" -gPRELOAD="$PRELOAD" -gSTALL_CYC="$STALL_CYC" -gARM7DBG="$ARM7DBG" -gARM7WATCH="$((ARM7WATCH))" \
+   -gCARD_WORDS="$CARDWORDS" -gCARD_LAT="$CARD_LAT" -gFW_LAT="$FW_LAT" -gMEM_LAT="$MEM_LAT" -gCYCLE_HIST="$CYCLE_HIST" -gPRELOAD="$PRELOAD" -gSTALL_CYC="$STALL_CYC" -gARM7DBG="$ARM7DBG" -gARM7WATCH="$((ARM7WATCH))" -gARM7RUNAWAY="$ARM7RUNAWAY" \
    -gGPUCEDIV="$GPUCEDIV" -gHEXFILE="$HEXFILE" -gFWFILE="$FWFILE" -gFRAMES="$FRAMES" -gTIMEOUT_MS="$TIMEOUT_MS" \
-   -gDUMPFILE="$DUMPFILE" -gDUMPFILE_B="$DUMPFILE_B" -gDUMP_START_FRAME="$DUMP_START_FRAME" -gDIRECT="$DIRECT" -gFWBOOT="$FWBOOT" -gHEARTBEAT_MS="$HEARTBEAT_MS" -gVRAMOPS="$VRAMOPS" -gGPUFAST="$GPUFAST" -gVRSRV_LAT="$VRSRV_LAT" -gVRSRV_ONE="$VRSRV_ONE" -gISLAND="$ISLAND" -gISLAND_HALF_PS="$ISLAND_HALF_PS" \
+   -gDUMPFILE="$DUMPFILE" -gDUMPFILE_B="$DUMPFILE_B" -gDUMP_START_FRAME="$DUMP_START_FRAME" -gDIRECT="$DIRECT" -gFWBOOT="$FWBOOT" -gHEARTBEAT_MS="$HEARTBEAT_MS" -gVRAMOPS="$VRAMOPS" -gGPUFAST="$GPUFAST" -gSOUND="$SOUND" -gVRSRV_LAT="$VRSRV_LAT" -gVRSRV_ONE="$VRSRV_ONE" -gISLAND="$ISLAND" -gISLAND_HALF_PS="$ISLAND_HALF_PS" \
    -gMAXINSTR="$MAXINSTR" -gTRACE_START_FRAME="$TRACE_START_FRAME" -gTRACE7_START_FRAME="$TRACE7_START_FRAME" -gDUMP_STATE="$DUMP_STATE" \
+   -gTRACE7_T0="$TRACE7_T0" -gTRACE7_T1="$TRACE7_T1" \
    -gDBG_T0="$DBG_T0" -gDBG_T1="$DBG_T1" -gDBG_TRIGPC="$DBG_TRIGPC" $TRACEGEN
 nvc -H "$NVCHEAP" -L "$WORK" --work="$WORK/work" -r tb_top_frame --ieee-warnings=off --exit-severity=failure

@@ -5,9 +5,10 @@
 -- only anyway), converts the pixel coordinates to plain vectors, and exposes
 -- everything else 1:1 as std_logic/std_logic_vector.
 --
--- No logic lives here. All generics keep their nds_top defaults (is_simu='0',
--- main RAM at SDRAM byte offset 8 MB, GPU_CE_DIV=3, GPU_FAST=0) - see the note on
--- the generic map for why GPU_FAST is deliberately left off.
+-- No logic lives here. Generics keep their nds_top defaults (is_simu='0', main
+-- RAM at SDRAM byte offset 8 MB, GPU_CE_DIV=3) except the two set explicitly on
+-- the generic map below - GPU_FAST=0 and SOUND_ENABLE=0 - each with its reason
+-- written out there.
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -173,7 +174,18 @@ begin
    -- GPU_FAST=1 now stalls the renderer (ops=3965, renders=1, bg busy 1.2M cycles).
    -- Fixing that means teaching the adapter the accept handshake - not worth doing
    -- unless a heavier scene turns out to need the headroom.
-   generic map ( GPU_FAST => 0 )
+   --
+   -- SOUND_ENABLE = 0 compiles nds_sound out. It is 10,032 combinational ALUTs -
+   -- 16% of the design's logic, as much as a whole 2D engine - and main is
+   -- currently OVER the device: the fitter wants 4238 LABs against 4191, so it is
+   -- short by only ~470 ALMs (1.1%) and nothing can be built at all, at either
+   -- clkMem ratio. Dropping sound is by far the cheapest way to a fitting image,
+   -- and it is what makes the 134 MHz switch measurable instead of theoretical.
+   --
+   -- THERE IS NO AUDIO with this at 0. Set it back to 1 once the real fix lands -
+   -- FITTING.md flagged nds_sound at 11.2K ALUTs with "per-channel state likely
+   -- muxed the same way; audit after gpu2d", and that audit has never been done.
+   generic map ( GPU_FAST => 0, SOUND_ENABLE => 0 )
    port map
    (
       clk1x            => clk1x,
