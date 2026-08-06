@@ -367,6 +367,31 @@ int main(int argc, char** argv)
     if (ARM9TraceFile) { fclose(ARM9TraceFile); ARM9TraceFile = nullptr; }
     if (ARM7TraceFile) { fclose(ARM7TraceFile); ARM7TraceFile = nullptr; }
 
+    // NDS_MiSTfits: ARM7WRAMDUMP=<file> writes the ARM7's view of
+    // 0x037F8000..0x0380FFFF, one hex word per line, so the RTL's shared/private
+    // WRAM can be diffed against the oracle word for word. This covers the
+    // firmware's decompressed ARM7 boot block (the ARM7 BIOS puts it at
+    // 0x03810000 - hdr[0x12]*256 = 0x037FA800) and, at the top, the BIOS IRQ
+    // handler's user-handler pointer at 0x0380FFFC.
+    //
+    // Read through ARM7Read32 on purpose, not off the raw arrays: it is the CPU's
+    // own decode, so whatever WRAMCNT is doing to the shared bank is applied
+    // exactly as the RTL's nds_membus7 applies it. Reading ARM7WRAM[] directly
+    // would answer a different question.
+    if (const char* wp = getenv("ARM7WRAMDUMP"))
+    {
+        FILE* wf = fopen(wp, "w");
+        if (wf)
+        {
+            for (u32 a = 0x037F8000; a < 0x03810000; a += 4)
+                fprintf(wf, "%08X\n", nds.ARM7Read32(a));
+            fclose(wf);
+            printf("ARM7WRAMDUMP wrote 0x037F8000..0x0380FFFF to %s\n", wp);
+        }
+    }
+    printf("ARM7 irq handler ptr [0380FFFC]=%08X  [0380FFF8]=%08X\n",
+           nds.ARM7Read32(0x0380FFFC), nds.ARM7Read32(0x0380FFF8));
+
     // scene-debug peeks (harmless noise for real runs)
     printf("DISPCNT=%08X POWCNT=%08X mail=%08X/%08X vb=%u\n",
            nds.ARM9Read32(0x04000000), nds.ARM9Read32(0x04000304),

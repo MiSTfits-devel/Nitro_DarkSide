@@ -95,7 +95,11 @@ entity nds_gpu2d_fast is
       is_engine_b : std_logic := '0';
       is_simu     : std_logic := '0';
       -- 1 = render on clkMem (3x). 0 = render on clk1x, pass-through.
-      GPU_FAST    : integer := 0
+      GPU_FAST    : integer := 0;
+      -- clkMem : clk1x ratio, so the phase gates below stay right if clkMem
+      -- moves (NDS.sv CLKMEM_RATIO / the NDS_CLKMEM_4X macro). Only the
+      -- GPU_FAST branch uses it; the pass-through branch has no phase gate.
+      CLKMEM_RATIO : integer := 3
    );
    port
    (
@@ -410,12 +414,12 @@ begin
       );
 
       -- one pixel per clk1x period, presented for the whole period
-      fifo_rd <= '1' when (fifo_empty = '0' and clkMemIndex = 2) else '0';
+      fifo_rd <= '1' when (fifo_empty = '0' and clkMemIndex = CLKMEM_RATIO - 1) else '0';
 
       p_px : process (clkMem)
       begin
          if rising_edge(clkMem) then
-            if (clkMemIndex = 2) then
+            if (clkMemIndex = CLKMEM_RATIO - 1) then
                px_we_r <= '0';
                if (fifo_empty = '0') then
                   px_d_r  <= fifo_dout(PXW - 1 downto 16);
@@ -441,8 +445,8 @@ begin
          variable s_idx2, s_draw, s_ireq, s_oreq, s_done : boolean := false;
       begin
          if rising_edge(clkMem) then
-            if (clkMemIndex = 2 and not s_idx2) then
-               report "GF: clkMemIndex reached 2 at " & time'image(now) severity note;
+            if (clkMemIndex = CLKMEM_RATIO - 1 and not s_idx2) then
+               report "GF: clkMemIndex reached last phase at " & time'image(now) severity note;
                s_idx2 := true;
             end if;
             if (i_drawline = '1' and not s_draw) then

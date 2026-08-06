@@ -1,5 +1,5 @@
 diff --git a/src/ARM.cpp b/src/ARM.cpp
-index 827fcb01..67679694 100644
+index 827fcb01..2c16e076 100644
 --- a/src/ARM.cpp
 +++ b/src/ARM.cpp
 @@ -21,6 +21,7 @@
@@ -26,7 +26,7 @@ index 827fcb01..67679694 100644
      u32 oldcpsr = CPSR;
      CPSR &= ~0xFF;
      CPSR |= 0xD2;
-@@ -589,6 +594,58 @@ void ARM::CheckGdbIncoming()
+@@ -589,6 +594,107 @@ void ARM::CheckGdbIncoming()
      GdbCheckA();
  }
  
@@ -75,6 +75,55 @@ index 827fcb01..67679694 100644
 +            }
 +        }
 +    }
++    // NDS_MiSTfits: ARM7CB=1 logs the ARM7 BIOS's callback trampolines. The
++    // BIOS SWI dispatcher (0x2ddc -> 0x2de0) does `bx ip` off a table, so lr is
++    // always 0x2E10 and CPSR is always System/ARM inside any SWI handler - which
++    // is the state the RTL faults in. The *ReadByCallback SWIs (0x12/0x13/0x15)
++    // then reach a caller-supplied function pointer through two one-instruction
++    // Thumb trampolines in BIOS:
++    //     0x3300: bx r1     (the readbyte callback, struct[8])
++    //     0x3304: bx r3     (the open callback,     struct[0])
++    // pc here is R15 = addr+4 in Thumb, hence 0x3304 / 0x3308.
++    //
++    // Only targets outside the BIOS are logged: the BIOS's own firmware-boot
++    // callback struct lives at 0x33E0, so a RAM target means the FIRMWARE'S OWN
++    // code is calling a decompression SWI with its own callbacks. bit0 of the
++    // target is the whole question - it is what puts `bx` into Thumb state.
++    if (const char* cbmin = getenv("ARM7CB"))
++    {
++        static int cbn = 0;
++        u32 lo = (u32)strtoul(cbmin, nullptr, 16);   // ARM7CB=0 logs every hit
++        u32 tgt = 0; const char* which = nullptr;
++        if      (pc == 0x3304) { tgt = r[1]; which = "bx r1 (readbyte)"; }
++        else if (pc == 0x3308) { tgt = r[3]; which = "bx r3 (open)"; }
++        if (which && tgt >= lo && cbn < 64)
++        {
++            printf("ARM7CB %-17s target=%08x thumb_bit=%d cpsr=%08x lr=%08x\n",
++                   which, tgt, tgt & 1, cpsr, r[14]);
++            fflush(stdout);
++            cbn++;
++        }
++    }
++    // NDS_MiSTfits: ARM7REGS_AT=<hex R15> dumps every execution of one
++    // instruction with all of r0..r14. Give it the R15 value, not the address:
++    // pc here is addr+8 in ARM and addr+4 in Thumb, which is the same bias the
++    // RTL's dbg_export uses - and mixing the two up is what made the earlier
++    // ARM7PROBE readings look like an 8-byte memory displacement when the two
++    // memories were in fact identical.
++    if (const char* rp = getenv("ARM7REGS_AT"))
++    {
++        static int rn = 0;
++        if (pc == (u32)strtoul(rp, nullptr, 16) && rn < 24)
++        {
++            printf("ARM7REGS pc=%08x instr=%08x cpsr=%08x mode=%02x T=%d\n",
++                   pc, instr, cpsr, cpsr & 0x1F, (cpsr >> 5) & 1);
++            for (int i = 0; i < 15; i += 5)
++                printf("   r%-2d %08x  r%-2d %08x  r%-2d %08x  r%-2d %08x  r%-2d %08x\n",
++                       i, r[i], i+1, r[i+1], i+2, r[i+2], i+3, r[i+3], i+4, r[i+4]);
++            fflush(stdout);
++            rn++;
++        }
++    }
 +    if (!ARM7TraceFile || ARM7TraceCount >= ARM7TraceMax) return;
 +    fprintf(ARM7TraceFile, "%08x %08x %08x", pc, instr, cpsr);
 +    for (int i = 0; i < 15; i++) fprintf(ARM7TraceFile, " %08x", r[i]);
@@ -85,7 +134,7 @@ index 827fcb01..67679694 100644
  template <CPUExecuteMode mode>
  void ARMv5::Execute()
  {
-@@ -670,8 +727,10 @@ void ARMv5::Execute()
+@@ -670,8 +776,10 @@ void ARMv5::Execute()
                  else             NextInstr[1] = CodeRead32(R[15], false);
  
                  // actually execute
@@ -96,7 +145,7 @@ index 827fcb01..67679694 100644
              }
              else
              {
-@@ -685,6 +744,7 @@ void ARMv5::Execute()
+@@ -685,6 +793,7 @@ void ARMv5::Execute()
                  NextInstr[1] = CodeRead32(R[15], false);
  
                  // actually execute
@@ -104,7 +153,7 @@ index 827fcb01..67679694 100644
                  if (CheckCondition(CurInstr >> 28))
                  {
                      u32 icode = ((CurInstr >> 4) & 0xF) | ((CurInstr >> 16) & 0xFF0);
-@@ -696,6 +756,7 @@ void ARMv5::Execute()
+@@ -696,6 +805,7 @@ void ARMv5::Execute()
                  }
                  else
                      AddCycles_C();
@@ -112,7 +161,7 @@ index 827fcb01..67679694 100644
              }
  
              // TODO optimize this shit!!!
-@@ -808,8 +869,10 @@ void ARMv4::Execute()
+@@ -808,8 +918,10 @@ void ARMv4::Execute()
                  NextInstr[1] = CodeRead16(R[15]);
  
                  // actually execute
@@ -123,7 +172,7 @@ index 827fcb01..67679694 100644
              }
              else
              {
-@@ -823,6 +886,7 @@ void ARMv4::Execute()
+@@ -823,6 +935,7 @@ void ARMv4::Execute()
                  NextInstr[1] = CodeRead32(R[15]);
  
                  // actually execute
@@ -131,7 +180,7 @@ index 827fcb01..67679694 100644
                  if (CheckCondition(CurInstr >> 28))
                  {
                      u32 icode = ((CurInstr >> 4) & 0xF) | ((CurInstr >> 16) & 0xFF0);
-@@ -830,6 +894,7 @@ void ARMv4::Execute()
+@@ -830,6 +943,7 @@ void ARMv4::Execute()
                  }
                  else
                      AddCycles_C();

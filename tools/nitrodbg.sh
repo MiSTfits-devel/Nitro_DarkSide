@@ -32,6 +32,12 @@
 #                                     read IO space, so this is the only way to see them
 #   nitrodbg.sh reach9 <hex> [secs]   from t=0, is that PC ever executed? (bisect probe)
 #   nitrodbg.sh reach7 <hex> [secs]
+#   nitrodbg.sh lwtest                probe the HPS lightweight bridge at 0xFF200000
+#   nitrodbg.sh live                  live PC/CPSR/status taps, no command, no halt
+#
+# NITRODBG_LW=1 routes every command over the lightweight bridge instead of the
+# DDR3 mailbox (~100x faster). Run `lwtest` FIRST: if the bridge is disabled on
+# the host, the access hangs rather than failing.
 #
 # PEEK reads through the CPU's memory port, which means a peek issued while a
 # core is RUNNING can swallow that core's own bus completion and wedge it.
@@ -68,8 +74,8 @@ next_seq() {
 	echo "$s"
 }
 
-# cmd <op-hex-byte> <arg-hex-32>  ->  prints the 8-hex-digit response payload
-cmd() {
+# cmd_ddr3 <op-hex-byte> <arg-hex-32>  ->  prints the 8-hex-digit response payload
+cmd_ddr3() {
 	_op=$1
 	_arg=$2
 	_seq=$(next_seq)
@@ -93,6 +99,93 @@ cmd() {
 		_i=$((_i + 1))
 	done
 	die "no response to op $_op (seq $_seq, last header '$_h') - is a debug-enabled core loaded?"
+}
+
+# ---- transport 2: HPS lightweight bridge (rtl/hps_lw_bridge.sv) ---------
+#
+# Physical 0xFF200000. Roughly 100x faster than the DDR3 mailbox (~150-300ns per
+# access against a ~122us poll interval), and it also exposes live taps that need
+# no command at all - see `live`.
+#
+# OPT-IN ON PURPOSE. If the HPS end of the bridge is held in reset, an access to
+# 0xFF200000 does not return garbage, it HANGS - and a hung devmem would take
+# every nitrodbg invocation with it. So the DDR3 mailbox stays the default and
+# this is selected explicitly:
+#
+#   nitrodbg.sh lwtest             # try the bridge once, report what happened
+#   NITRODBG_LW=1 nitrodbg.sh regs9
+#
+# If lwtest hangs, the bridge is not enabled. On MiSTer's Linux the bridge state
+# is usually visible under /sys/class/fpga_bridge/*/state; `echo 1 > .../enable`
+# on the hps2fpga-lw entry is the usual fix, and it is a HOST configuration
+# matter, not something the core can do for itself.
+LW_ID=0xFF200000      # RO 0x4E44534C "NDSL"
+LW_STATUS=0xFF200004  # RO {31'b0, busy}
+LW_CMD=0xFF200008     # WO write fires op = data[7:0]
+LW_ARG=0xFF20000C     # RW argument - write BEFORE the command
+LW_RSP=0xFF200010     # RO response of the last completed command
+LW_ACK=0xFF200014     # RO completion counter, +1 per answered command
+
+# Live taps: no command, no handshake. Readable while a core runs.
+LW_PC9=0xFF200020
+LW_PC7=0xFF200024
+LW_CPSR9=0xFF200028
+LW_LR9=0xFF20002C
+LW_R09=0xFF200030
+LW_HWSTAT=0xFF200034
+LW_VFYBAD=0xFF200038
+LW_VFYADDR=0xFF20003C
+
+cmd_lw() {
+	_op=$1
+	_arg=$2
+	# ACK is a COUNTER here, not a seq echo: sample it, fire, wait for a change.
+	_a0=$(devmem $LW_ACK 32)
+	devmem $LW_ARG 32 "$(printf '0x%08X' "0x$_arg")"
+	devmem $LW_CMD 32 "$(printf '0x%08X' "0x$_op")"
+	_i=0
+	while [ $_i -lt 400 ]; do
+		_a=$(devmem $LW_ACK 32)
+		if [ "$_a" != "$_a0" ]; then
+			devmem $LW_RSP 32 | cut -c3-10
+			return 0
+		fi
+		_i=$((_i + 1))
+	done
+	die "no response to op $_op over the LW bridge (ack stuck at $_a0)"
+}
+
+# Dispatcher. NITRODBG_LW=1 picks the bridge; anything else keeps the mailbox.
+cmd() {
+	if [ "${NITRODBG_LW:-0}" = "1" ]; then cmd_lw "$@"; else cmd_ddr3 "$@"; fi
+}
+
+do_lwtest() {
+	echo "reading $LW_ID - if this hangs, the HPS bridge is held in reset"
+	_id=$(devmem $LW_ID 32) || die "read failed"
+	echo "  ID      = $_id"
+	if [ "$_id" != "0x4E44534C" ]; then
+		echo "  expected 0x4E44534C (\"NDSL\") - wrong core, or the bridge is"
+		echo "  answering with something that is not this register window."
+		exit 1
+	fi
+	echo "  bridge is UP. Use NITRODBG_LW=1 for the fast transport."
+	do_live
+}
+
+do_live() {
+	# These are direct loads of fabric registers, so they are valid even with
+	# both cores running - unlike anything that goes through nds_debug.
+	echo "live taps (no command issued):"
+	echo "  PC9      = $(devmem $LW_PC9 32)"
+	echo "  PC7      = $(devmem $LW_PC7 32)"
+	echo "  CPSR9    = $(devmem $LW_CPSR9 32)"
+	echo "  LR9      = $(devmem $LW_LR9 32)"
+	echo "  R0_9     = $(devmem $LW_R09 32)"
+	echo "  HWSTAT   = $(devmem $LW_HWSTAT 32)"
+	echo "  VFY_BAD  = $(devmem $LW_VFYBAD 32)"
+	echo "  VFY_ADDR = $(devmem $LW_VFYADDR 32)"
+	echo "  busy     = $(devmem $LW_STATUS 32)"
 }
 
 # op(7) selects the CPU: 0 = ARM9, 1 = ARM7
@@ -246,8 +339,11 @@ do_where() {
 # status plus "printf: 0x: invalid hex number". Probe once here, in this
 # shell, where exiting actually works, so a core without the debug unit in
 # it produces exactly one honest error.
+# lwtest and live are excluded: their whole purpose is to answer "is the
+# lightweight bridge usable at all", so they must not first require a working
+# DDR3 mailbox round-trip.
 case "$1" in
-	""|help|-h|--help) ;;
+	""|help|-h|--help|lwtest|live) ;;
 	*) cmd 08 0 >/dev/null ;;
 esac
 
@@ -279,6 +375,8 @@ case "$1" in
 	irq)       do_irq ;;
 	where9)  do_where 9 ;;
 	where7)  do_where 7 ;;
+	lwtest)  do_lwtest ;;
+	live)    do_live ;;
 	raw)     [ -n "$3" ] || die "raw needs <op-hex> <arg-hex>"; cmd "$2" "$3" ;;
 	*)       sed -n '4,40p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac

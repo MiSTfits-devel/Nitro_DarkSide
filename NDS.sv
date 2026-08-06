@@ -198,8 +198,40 @@ assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 ///////////////////////  CLOCK/RESET  ///////////////////////////////////
 
 // NDS clock plan (docs/ROADMAP.md M9): render/memory fabric 100.542 MHz,
-// video 67.028 MHz (2x system), system clk1x 33.514 MHz. clkMem is exactly
-// 3x clk1x from the same VCO, phase-locked - nds_top's clkMemIndex contract.
+// video 67.028 MHz (2x system), system clk1x 33.514 MHz. clkMem is an exact
+// INTEGER multiple of clk1x from the same VCO, phase-locked - nds_top's
+// clkMemIndex contract. Only integer ratios are possible: the cross-domain
+// budget is set by edge alignment, not period, so a non-integer ratio makes
+// timing far worse (measured - see the .clk2x comment below).
+//
+// CLKMEM_RATIO is the one place the ratio is written down. Every phase index
+// in the clk1x-crossing handshakes below is derived from it, because the PLL
+// frequency and the phase contract must not be able to disagree: a 4x PLL with
+// 3x indices accepts a request the core is still holding and serves it twice.
+//
+//   3 (default) = 100.541946 MHz
+//   4           = 134.055928 MHz, enabled by the NDS_CLKMEM_4X macro
+//
+// 4x is an OPTIONAL overclock, never a requirement. This particular SDRAM
+// module passed MemTest pinned at 134 MHz with zero errors over ~3 hours, but
+// the official MiSTer quality bar is 130 MHz, so other people's modules may
+// not manage it. The renderer is already under its line budget at 3x; 4x buys
+// ~25% off the clk1x-cycle cost of each A..D renderer read, which closes the
+// last few dropped lines rather than rescuing anything.
+`ifdef NDS_CLKMEM_4X
+localparam CLKMEM_RATIO = 4;
+`else
+localparam CLKMEM_RATIO = 3;
+`endif
+// The clkMem cycle whose END is the clk1x rising edge. An edge at which this
+// index is the current value is therefore the clkMem edge coincident with the
+// clk1x rising edge - the only edge at which both ends of a clk1x-crossing
+// handshake are looking at the same values.
+localparam IDX_ACCEPT = CLKMEM_RATIO - 1;
+// One edge earlier, so a done pulse raised here spans the whole IDX_ACCEPT
+// cycle and is thus high at, and sampled by, the clk1x rising edge.
+localparam IDX_DONE   = CLKMEM_RATIO - 2;
+
 wire pll_locked;
 wire clk_mem;
 wire clk_sys;
@@ -222,10 +254,11 @@ pll pll
 	.locked(pll_locked)
 );
 
-// clkMemIndex: which of the 3 clkMem phases inside one clk1x period, 0 on
-// the clk1x rising edge. A clk1x-domain toggle re-locks the mod-3 counter
-// every clk1x edge (same-VCO related clocks, so the cross-sample is a
-// timed path, not a synchronizer).
+// clkMemIndex: which of the CLKMEM_RATIO clkMem phases inside one clk1x
+// period, 0 on the clk1x rising edge. A clk1x-domain toggle re-locks the
+// counter every clk1x edge (same-VCO related clocks, so the cross-sample is a
+// timed path, not a synchronizer). Two bits hold both 0..2 and 0..3, so 4x
+// needs no width change.
 reg tgl_1x = 0;
 always @(posedge clk_sys) tgl_1x <= ~tgl_1x;
 
@@ -234,7 +267,7 @@ reg [1:0] clkMemIndex = 0;
 always @(posedge clk_mem) begin
 	tgl_mem <= tgl_1x;
 	if (tgl_mem != tgl_1x) clkMemIndex <= 2'd1;
-	else                   clkMemIndex <= (clkMemIndex == 2'd2) ? 2'd0 : clkMemIndex + 2'd1;
+	else                   clkMemIndex <= (clkMemIndex == IDX_ACCEPT[1:0]) ? 2'd0 : clkMemIndex + 2'd1;
 end
 
 wire reset = RESET | buttons[1] | status[0] | cart_download;
@@ -617,9 +650,22 @@ localparam [27:1] DBG_RSP_ADDR = 27'h7FF8004;   // byte 0x0FFF0008 >> 1
 
 wire [31:0] dbg_rsp_data;
 wire        dbg_rsp_stb;
-reg         dbg_cmd_stb = 0;
-reg   [7:0] dbg_cmd_op;
-reg  [31:0] dbg_cmd_arg;
+reg         mb_cmd_stb = 0;
+reg   [7:0] mb_cmd_op;
+reg  [31:0] mb_cmd_arg;
+
+// Second command source: the HPS lightweight bridge (see the HPS
+// LIGHTWEIGHT-BRIDGE DEBUG WINDOW section further down, which drives these).
+// Declared here so the mux below, and cart_force, can see them.
+reg         lw_cmd_stb = 0;
+reg   [7:0] lw_cmd_op  = 0;
+reg  [31:0] lw_cmd_arg = 0;
+
+// Either transport may drive nds_debug; the LW path wins a tie. ONE AT A TIME:
+// both watch dbg_rsp_stb, so overlapping commands cross their responses.
+wire        dbg_cmd_stb = mb_cmd_stb | lw_cmd_stb;
+wire  [7:0] dbg_cmd_op  = lw_cmd_stb ? lw_cmd_op  : mb_cmd_op;
+wire [31:0] dbg_cmd_arg = lw_cmd_stb ? lw_cmd_arg : mb_cmd_arg;
 
 reg  [27:1] mb_addr;
 reg  [63:0] mb_din;
@@ -645,10 +691,11 @@ reg         mb_issued = 0;    // response write posted, waiting on ch4 ready
 // so the host gets an ack like any other command.
 assign cart_force = dbg_cmd_stb && (dbg_cmd_op == 8'h0B);
 
+
 always @(posedge clk_sys) begin
-	mb_req      <= 0;
-	dbg_cmd_stb <= 0;
-	mb_tmr      <= mb_tmr + 1'd1;
+	mb_req     <= 0;
+	mb_cmd_stb <= 0;
+	mb_tmr     <= mb_tmr + 1'd1;
 
 	case (mb_state)
 		2'd0: if (mb_tmr == 0) begin
@@ -660,9 +707,9 @@ always @(posedge clk_sys) begin
 
 		2'd1: if (mb_ready) begin
 			if ((mb_dout[63:48] == 16'hDB90) && (mb_dout[47:40] != mb_seq)) begin
-				dbg_cmd_op  <= mb_dout[39:32];
-				dbg_cmd_arg <= mb_dout[31:0];
-				dbg_cmd_stb <= 1;
+				mb_cmd_op   <= mb_dout[39:32];
+				mb_cmd_arg  <= mb_dout[31:0];
+				mb_cmd_stb  <= 1;
 				mb_ack      <= mb_dout[47:40];
 				mb_watchdog <= 0;
 				mb_state    <= 2'd2;
@@ -823,7 +870,7 @@ always @(posedge clk_mem) begin
 	vs_req_d  <= vsrv_req_c;
 	sd_vs_req <= 0;
 
-	// vsrv_req is clk1x-registered (3 clkMem cycles wide) - edge detect
+	// vsrv_req is clk1x-registered (CLKMEM_RATIO clkMem cycles wide) - edge detect
 	if (vsrv_req_c & ~vs_req_d) begin
 		vs_pend <= 1;
 		vs_adr  <= {8'd0, vsrv_bank_c, vsrv_addr_c, 2'b00};
@@ -845,8 +892,11 @@ always @(posedge clk_mem) begin
 		A_DRAIN: begin
 			// allow has been low through at least one full clk1x period and
 			// no main-RAM op is in flight -> ch2 is ours
+			// strictly MORE than one clk1x period of clkMem cycles, so the
+			// count has to move with the ratio (it was a bare 4 at 3x, which
+			// is exactly one period at 4x and no longer a full drain)
 			if (~&drain_cnt) drain_cnt <= drain_cnt + 1'd1;
-			if (!mainram_busy && drain_cnt >= 3'd4) begin
+			if (!mainram_busy && drain_cnt >= CLKMEM_RATIO[2:0] + 3'd1) begin
 				sd_vs_req <= 1;
 				vs_pend   <= 0;
 				arb_state <= A_WAIT;
@@ -865,9 +915,10 @@ always @(posedge clk_mem) begin
 	endcase
 
 	// done pulse aligned to exactly one clk1x period: raise it during the
-	// clkMem cycle whose end is the clk1x rising edge (index 2)
+	// clkMem cycle whose end is the clk1x rising edge (index IDX_ACCEPT),
+	// which means triggering one edge earlier, at IDX_DONE
 	vsrv_done_r <= 0;
-	if (vs_fin && clkMemIndex == 2'd1) begin
+	if (vs_fin && clkMemIndex == IDX_DONE[1:0]) begin
 		vsrv_done_r <= 1;
 		vs_fin      <= 0;
 	end
@@ -894,15 +945,16 @@ end
 // silently ignored - a wedge on hardware only. It is not an independent fix.
 //
 // For both ends to agree on WHICH edge the transfer was, this side must sample
-// the interface at exactly the edge the core does: clkMemIndex == 2 is the clkMem
-// edge coincident with the clk1x rising edge (see the counter's contract at the
-// top of this file). Accepting at any other phase would take a request the core
-// goes on holding, and then serve it twice.
+// the interface at exactly the edge the core does: IDX_ACCEPT is the clkMem edge
+// coincident with the clk1x rising edge (see the counter's contract at the top of
+// this file). Accepting at any other phase would take a request the core goes on
+// holding, and then serve it twice - which is exactly why the index is derived
+// from CLKMEM_RATIO rather than written as a literal 2.
 //
 // Note what is NOT claimed here. The old pulse scheme did not drop on hardware:
-// vr_busy rises, and so ready falls, one clkMem cycle after acceptance, a third
-// of a clk1x period before the core samples again - so the core never issued
-// into a busy channel. It was correct by a timing coincidence between two
+// vr_busy rises, and so ready falls, one clkMem cycle after acceptance, i.e.
+// 1/CLKMEM_RATIO of a clk1x period before the core samples again - so the core
+// never issued into a busy channel. It was correct by a coincidence between two
 // domains, and this removes the reliance on it rather than fixing a silicon bug.
 // The hardware white screen was a livelock in nds_gpu2d's drawline routing.
 //
@@ -919,7 +971,7 @@ assign vrsrv_ready_c = ~vr_busy & ~vr_fin;
 always @(posedge clk_mem) begin
 	sd_vr_req <= 0;
 
-	if (vrsrv_req_c & vrsrv_ready_c & (clkMemIndex == 2'd2)) begin
+	if (vrsrv_req_c & vrsrv_ready_c & (clkMemIndex == IDX_ACCEPT[1:0])) begin
 		// halfword addr [26:1]; the line address makes it 8-byte aligned, which is
 		// what lets the whole burst be used - a sequential SDRAM burst wraps inside
 		// its aligned block, so an unaligned request returns these same eight bytes
@@ -936,13 +988,26 @@ always @(posedge clk_mem) begin
 	end
 
 	vrsrv_done_r <= 0;
-	if (vr_fin && clkMemIndex == 2'd1) begin
+	if (vr_fin && clkMemIndex == IDX_DONE[1:0]) begin
 		vrsrv_done_r <= 1;
 		vr_fin       <= 0;
 	end
 end
 
-sdram sdram
+// The SDRAM controller's three clock-rate-dependent knobs, all derived from the
+// one ratio. At 3x these are the values the file has always had, so 3x builds
+// are unchanged. At 4x:
+//   DQ_PIPE     splits the pin-capture -> ch*_dout hop, which is ~5.8ns of pure
+//               interconnect with zero logic in it and the worst path in the fit
+//   CAS_LATENCY the part needs 3 above 100MHz, per the controller's own comment
+//   TRCD_WAIT   2 clocks of ACTIVE->READ is 14.9ns at 134MHz, under tRCD
+// The last two are chip-protocol, invisible to STA: timing can close while the
+// SDRAM returns wrong data. See sim/run_sdram_ch.sh.
+sdram #(
+	.DQ_PIPE    (CLKMEM_RATIO >= 4 ? 1 : 0),
+	.CAS_LATENCY(CLKMEM_RATIO >= 4 ? 3 : 2),
+	.TRCD_WAIT  (CLKMEM_RATIO >= 4 ? 2 : 1)
+) sdram
 (
 	.*,
 	.init(~pll_locked),
@@ -989,6 +1054,126 @@ wire [31:0] dbg_r0_9, dbg_lr9, dbg_cpsr9;
 wire [17:0] dbg_vfy_bad;
 wire [31:0] dbg_vfy_addr;
 wire [17:0] dbg_hwstat;
+
+///////////////////  HPS LIGHTWEIGHT-BRIDGE DEBUG WINDOW  /////////////////////
+
+// A second, much faster transport for the same nds_debug unit, plus something
+// the DDR3 mailbox structurally cannot offer: registers that are ALWAYS live and
+// need no command at all. Physical HPS address 0xFF200000 (see
+// rtl/hps_lw_bridge.sv for the primitive and the AXI details).
+//
+// Why bother when the mailbox works: the mailbox polls ch4 once per 4096
+// clk_sys cycles, so ~122 us per command minimum, and each poll takes a DDR3
+// grant. An access here is ~150-300 ns and a live read is just a load. That is
+// what makes "watch the renderer counter while it wedges" possible.
+//
+// Byte map, HPS 0xFF200000 + offset:
+//   0x00 RO  ID       0x4E44534C "NDSL" - proves the bridge is actually up
+//   0x04 RO  STATUS   {31'b0, busy}
+//   0x08 WO  CMD      write fires op = data[7:0]  (write ARG first)
+//   0x0C RW  ARG      command argument
+//   0x10 RO  RSP      response data of the last completed command
+//   0x14 RO  ACK      completion counter, +1 per answered command
+//   0x20 RO  PC9      \
+//   0x24 RO  PC7       |
+//   0x28 RO  CPSR9     | live taps - no command, no handshake, no waiting
+//   0x2C RO  LR9       |
+//   0x30 RO  R0_9      |
+//   0x34 RO  HWSTAT    |
+//   0x38 RO  VFY_BAD   |
+//   0x3C RO  VFY_ADDR /
+//
+// ARG-before-CMD is the same ordering rule the DDR3 mailbox has, for the same
+// reason: CMD is the trigger, so a stale ARG must never be able to ride with a
+// fresh op.
+//
+// ONE TRANSPORT AT A TIME. Both this and the DDR3 mailbox drive nds_debug and
+// both watch dbg_rsp_stb, so a command in flight on one while the other fires
+// will cross responses. The LW path wins the command mux. In practice a human
+// drives one or the other; nothing arbitrates it.
+//
+// Byte enables are ignored for these registers - devmem writes whole words.
+
+// Gated by NDS_LW_DEBUG. Off by default: the HPS end of this bridge is not
+// verified on silicon yet (an access hangs if Linux holds the bridge in reset),
+// and the slave costs area in a design that has been at the edge of the device.
+// With the macro off, lw_cmd_stb has no driver, stays at its initial 0, and the
+// command mux above degenerates to the DDR3 mailbox exactly as before.
+`ifdef NDS_LW_DEBUG
+wire [18:0] lwreg_addr;
+wire        lwreg_wr;
+wire [31:0] lwreg_wdata;
+wire  [3:0] lwreg_wstrb;
+wire [31:0] lwreg_rdata;
+
+reg         lw_busy    = 0;
+reg  [31:0] lw_rsp     = 0;
+reg   [7:0] lw_ack     = 0;
+// Same shape and reason as the mailbox's outer timeout: nds_debug's PEEK can
+// wait on the ARM9 bus forever for an unmapped address, and without this the
+// completion counter would simply stop advancing with no way to tell that from
+// a very slow command.
+reg  [17:0] lw_watchdog = 0;
+
+always @(posedge clk_sys) begin
+	lw_cmd_stb <= 0;
+
+	if (lwreg_wr) begin
+		case (lwreg_addr)
+			19'd3: lw_cmd_arg <= lwreg_wdata;
+			19'd2: begin
+				lw_cmd_op   <= lwreg_wdata[7:0];
+				lw_cmd_stb  <= 1;
+				lw_busy     <= 1;
+				lw_watchdog <= 0;
+			end
+			default: ;
+		endcase
+	end
+
+	if (lw_busy) begin
+		lw_watchdog <= lw_watchdog + 1'd1;
+		if (dbg_rsp_stb) begin
+			lw_rsp  <= dbg_rsp_data;
+			lw_ack  <= lw_ack + 1'd1;
+			lw_busy <= 0;
+		end
+		else if (lw_watchdog == 18'h3FFFF) begin
+			lw_rsp  <= 32'hBADACCE5;
+			lw_ack  <= lw_ack + 1'd1;
+			lw_busy <= 0;
+		end
+	end
+end
+
+assign lwreg_rdata = (lwreg_addr == 19'd0)  ? 32'h4E44534C          :
+                     (lwreg_addr == 19'd1)  ? {31'd0, lw_busy}      :
+                     (lwreg_addr == 19'd3)  ? lw_cmd_arg            :
+                     (lwreg_addr == 19'd4)  ? lw_rsp                :
+                     (lwreg_addr == 19'd5)  ? {24'd0, lw_ack}       :
+                     (lwreg_addr == 19'd8)  ? dbg_pc9               :
+                     (lwreg_addr == 19'd9)  ? dbg_pc7               :
+                     (lwreg_addr == 19'd10) ? dbg_cpsr9             :
+                     (lwreg_addr == 19'd11) ? dbg_lr9               :
+                     (lwreg_addr == 19'd12) ? dbg_r0_9              :
+                     (lwreg_addr == 19'd13) ? {14'd0, dbg_hwstat}   :
+                     (lwreg_addr == 19'd14) ? {14'd0, dbg_vfy_bad}  :
+                     (lwreg_addr == 19'd15) ? dbg_vfy_addr          :
+                                              32'h00000000;
+
+hps_lw_bridge hps_lw_bridge
+(
+	.clk       (clk_sys),
+	.reg_addr  (lwreg_addr),
+	.reg_wr    (lwreg_wr),
+	.reg_wdata (lwreg_wdata),
+	.reg_wstrb (lwreg_wstrb),
+	.reg_rdata (lwreg_rdata)
+);
+
+`endif
+
+
 
 // touchscreen v1: left analog stick as the pen, "Touch" button as pen-down
 wire [7:0] touch_x = {~joystick_analog_0[7],  joystick_analog_0[6:0]};

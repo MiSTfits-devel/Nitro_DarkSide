@@ -25,7 +25,19 @@ module  pll_0002(
 		.reference_clock_frequency("50.0 MHz"),
 		.operation_mode("direct"),
 		.number_of_clocks(3),
+		// outclk_0 = clkMem, an exact integer multiple of clk1x (outclk_2,
+		// 33.513982 MHz) from this same VCO. Kept in step with NDS.sv's
+		// CLKMEM_RATIO by the one macro: raising the PLL without raising the
+		// phase indices would double-serve renderer reads, so neither is
+		// allowed to move on its own.
+		//   3x = 100.541946 MHz (default)
+		//   4x = 134.055928 MHz (NDS_CLKMEM_4X - optional SDRAM overclock,
+		//        above the 130 MHz MiSTer bar, so not everyone's module holds it)
+`ifdef NDS_CLKMEM_4X
+		.output_clock_frequency0("134.055928 MHz"),
+`else
 		.output_clock_frequency0("100.541946 MHz"),
+`endif
 		.phase_shift0("0 ps"),
 		.duty_cycle0(50),
 		.output_clock_frequency1("67.027964 MHz"),
