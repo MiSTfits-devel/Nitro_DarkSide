@@ -99,6 +99,9 @@ architecture sim of tb_gpu_obj is
    signal ownd     : std_logic_vector(255 downto 0) := (others => '0');
    signal clear_line : std_logic := '0';
 
+   signal vram_reqs_case  : integer := 0;   -- VRAM fetches in the current case
+   signal vram_reqs_total : integer := 0;
+
    signal tests_done : boolean := false;
 
 begin
@@ -167,6 +170,22 @@ begin
       o_vram_done <= '1';
       wait until rising_edge(clk);
       o_vram_done <= '0';
+   end process;
+
+   -- VRAM request counter. Correctness is what the golden model checks; this is
+   -- the other half - a drawer that fetches the same word repeatedly is right
+   -- and slow, and nothing else here would notice. Reported per case so an
+   -- affine case can be told apart from a tile one.
+   p_vramcount : process (clk)
+   begin
+      if rising_edge(clk) then
+         if (clear_line = '1') then
+            vram_reqs_case <= 0;
+         elsif (o_vram_req = '1') then
+            vram_reqs_case  <= vram_reqs_case + 1;
+            vram_reqs_total <= vram_reqs_total + 1;
+         end if;
+      end if;
    end process;
 
    -- pixel collect
@@ -257,11 +276,13 @@ begin
                       " got=" & to_hstring(got_s) severity error;
             end if;
          end loop;
-         report "case " & integer'image(c) & " done" severity note;
+         report "case " & integer'image(c) & " done  vram_reqs=" &
+                integer'image(vram_reqs_case) severity note;
       end loop;
 
       if (nfail = 0) then
-         report "tb_gpu_obj: PASS  " & integer'image(ncases) & " cases" severity note;
+         report "tb_gpu_obj: PASS  " & integer'image(ncases) & " cases  total vram_reqs=" &
+                integer'image(vram_reqs_total) severity note;
       else
          report "tb_gpu_obj: FAIL  " & integer'image(nfail) & " mismatches" severity failure;
       end if;

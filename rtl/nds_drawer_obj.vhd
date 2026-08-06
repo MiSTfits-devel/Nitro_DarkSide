@@ -527,6 +527,9 @@ begin
       variable yyy               : integer range 0 to 63;
       variable pixeladdr_calc    : integer;
       variable skip_var          : std_logic;
+      -- AFF_SUM needs the summed address as a value before it can decide whether
+      -- to fetch it, so it can no longer assign straight into pixeladdr_x
+      variable v_affaddr         : integer range 0 to 262143;
    begin
       if rising_edge(clk) then
 
@@ -661,20 +664,50 @@ begin
 
             when AFF_SUM =>
                if (is_bitmap = '1') then
-                  pixeladdr_x <= to_unsigned((pixeladdr_base
+                  v_affaddr := (pixeladdr_base
                                  + to_integer(pixeladdr_x_aff0)
-                                 + to_integer(pixeladdr_x_aff4)) mod 262144, 18);
+                                 + to_integer(pixeladdr_x_aff4)) mod 262144;
                elsif (one_dim_mapping = '1') then
-                  pixeladdr_x <= to_unsigned((pixeladdr_base
+                  v_affaddr := (pixeladdr_base
                                  + to_integer(pixeladdr_x_aff0) + to_integer(pixeladdr_x_aff1)
-                                 + to_integer(pixeladdr_x_aff4) + to_integer(pixeladdr_x_aff5)) mod 262144, 18);
+                                 + to_integer(pixeladdr_x_aff4) + to_integer(pixeladdr_x_aff5)) mod 262144;
                else
-                  pixeladdr_x <= to_unsigned((pixeladdr_base
+                  v_affaddr := (pixeladdr_base
                                  + to_integer(pixeladdr_x_aff2) + to_integer(pixeladdr_x_aff3)
-                                 + to_integer(pixeladdr_x_aff4) + to_integer(pixeladdr_x_aff5)) mod 262144, 18);
+                                 + to_integer(pixeladdr_x_aff4) + to_integer(pixeladdr_x_aff5)) mod 262144;
                end if;
-               VRAM_Drawer_req <= '1';
-               PIXELGen        <= PIXELWAIT;
+               pixeladdr_x <= to_unsigned(v_affaddr, 18);
+
+               -- Word reuse. Until now this state fetched unconditionally, so an
+               -- affine sprite cost ONE VRAM ROUND TRIP PER PIXEL while the
+               -- non-affine path (NEXTADDR below) reused its fetched word - 4
+               -- pixels per fetch at 4bpp. That asymmetry, on top of this drawer
+               -- never getting the accept-based pipelined protocol, is what makes
+               -- rotated/scaled sprites miss the line budget.
+               --
+               -- The granularity is the WORD, not the halfword the non-affine
+               -- compare uses: VRAM_Drawer_addr is pixeladdr_x(17 downto 2) and
+               -- readaddr_mux_eval is pixeladdr_x(1 downto 0), so one fetched
+               -- word serves every address sharing bits 17..2. Rotation just
+               -- makes consecutive pixels land in different words, and then this
+               -- falls back to fetching exactly as before - never wrong, only
+               -- less effective.
+               --
+               -- Guarded on spr_seen, NOT firstpix: firstpix is already cleared
+               -- by the time this state runs, and more importantly spr_seen is
+               -- the only flag that means "a fetch for THIS sprite has landed in
+               -- VRAM_data_next". A sprite whose first pixels are all skipped
+               -- (routine for affine, the corners fall outside the source) would
+               -- otherwise compare against the PREVIOUS sprite's address.
+               if (spr_seen = '1' and
+                   v_affaddr / 4 = pixeladdr_x(pixeladdr_x'left downto 2)) then
+                  issue_pixel <= '1';
+                  issue_first <= not spr_seen;
+                  PIXELGen    <= NEXTADDR;
+               else
+                  VRAM_Drawer_req <= '1';
+                  PIXELGen        <= PIXELWAIT;
+               end if;
 
             when PIXELWAIT =>
                if (VRAM_Drawer_done = '1') then
