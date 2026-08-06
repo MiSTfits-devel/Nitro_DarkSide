@@ -32,7 +32,16 @@ use work.pProc_bus_gba.all;
 entity nds_sound is
    generic
    (
-      is_simu     : std_logic := '0'
+      is_simu     : std_logic := '0';
+      -- 1 = ADPCM step table in M10K, refreshed round-robin (default, and what
+      --     ships: it frees ~2,300 ALUTs, and its one approximation is bounded
+      --     26x outside anything the SPU can reach - see p_adstep)
+      -- 0 = the original direct constant lookup: sixteen combinational copies of
+      --     the table, bit-exact at ANY timer value including ones no hardware
+      --     produces. Kept buildable on purpose - it is the reference the RAM
+      --     path is judged against, and the fallback if the approximation ever
+      --     turns out to matter.
+      ADPCM_TABLE_RAM : integer := 1
    );
    port
    (
@@ -184,8 +193,19 @@ architecture arch of nds_sound is
    signal master_gain_in    : signed(8 downto 0);
    signal master_product    : signed(40 downto 0);
 
+   -- 89 x 15 ADPCM step table. As a plain constant this cost a MEASURED 2,348
+   -- ALUTs - 23% of the whole sound unit - because Quartus will not infer a ROM
+   -- this small and silently ignores romstyle (see FITTING.md "Sound area").
+   -- Sixteen copies existed, one per channel, since the decode loop is fully
+   -- unrolled.
+   --
+   -- Forced into M10K the same way nds_card's backup store is: a SIGNAL with a
+   -- declared initial value plus a write port that is never enabled, which is
+   -- what makes Quartus emit a .mif instead of logic. THE ARRAY MUST NOT BE READ
+   -- ANYWHERE except the registered ports below - one stray asynchronous read
+   -- and Quartus falls back to registers and this is all for nothing.
    type t_adpcm_steps is array (0 to 88) of integer range 0 to 32767;
-   constant ADPCM_STEP : t_adpcm_steps := (
+   constant ADPCM_STEP_INIT : t_adpcm_steps := (
       16#0007#, 16#0008#, 16#0009#, 16#000A#, 16#000B#, 16#000C#, 16#000D#, 16#000E#,
       16#0010#, 16#0011#, 16#0013#, 16#0015#, 16#0017#, 16#0019#, 16#001C#, 16#001F#,
       16#0022#, 16#0025#, 16#0029#, 16#002D#, 16#0032#, 16#0037#, 16#003C#, 16#0042#,
@@ -198,6 +218,39 @@ architecture arch of nds_sound is
       16#1BDC#, 16#1EA5#, 16#21B6#, 16#2515#, 16#28CA#, 16#2CDF#, 16#315B#, 16#364B#,
       16#3BB9#, 16#41B2#, 16#4844#, 16#4F7E#, 16#5771#, 16#602F#, 16#69CE#, 16#7462#,
       16#7FFF#);
+
+   -- The table lives in an EXPLICIT primitive, not an inferred array. Three
+   -- inference attempts were measured and all three made the design bigger,
+   -- because Quartus will not put an 89x15 array in M10K at any port count:
+   --
+   --   write enable = never-assigned signal   10,060 -> 10,206 ALUTs
+   --      (folded to '0', port vanishes, ROM again, back to logic)
+   --   16 registered read ports               10,060 -> 17,478 ALUTs
+   --      (1,335 registers for the array plus sixteen 89:1 muxes over them)
+   --   1 write + 1 read, round-robin          10,060 -> 10,672 ALUTs
+   --      (still registers; "Total block memory bits" never moved off 784)
+   --
+   -- So this uses MEM.SyncRamDualByteEnable, the same primitive iram_fptr and
+   -- iram_frem below already use, which carries a real altsyncram under its
+   -- gsynth_cyclone5 branch. Port A is the init sweep, port B the round-robin
+   -- read. The sweep also collapses the literal table to ONE copy in logic (a
+   -- single 89:1 mux on ADPCM_STEP_INIT) instead of the sixteen the unrolled
+   -- decode loop used to build.
+   signal adstep_init   : integer range 0 to 89 := 0;
+   signal adstep_wa     : natural range 0 to 127 := 0;
+   signal adstep_wd     : std_logic_vector(31 downto 0) := (others => '0');
+   signal adstep_we     : std_logic := '0';
+   signal adstep_ra     : natural range 0 to 127 := 0;
+   signal adstep_dout_v : std_logic_vector(31 downto 0);
+   -- Per-channel cache of ADPCM_STEP(adidx), refreshed round-robin from the
+   -- single RAM read port below. Written at a variable index (a cheap 16-way
+   -- demux) and read at CONSTANT indices inside the unrolled decode loop, which
+   -- costs nothing - adstep_q(i) for literal i is just wires.
+   type t_adstep_q is array (0 to 15) of integer range 0 to 32767;
+   signal adstep_q    : t_adstep_q := (others => 0);
+   signal adstep_rr   : integer range 0 to 15 := 0;
+   signal adstep_rr_d : integer range 0 to 15 := 0;
+
    type t_adpcm_idxd is array (0 to 7) of integer range -1 to 8;
    constant ADPCM_IDXD : t_adpcm_idxd := (-1, -1, -1, -1, 2, 4, 6, 8);
 
@@ -233,6 +286,76 @@ architecture arch of nds_sound is
    end function;
 
 begin
+
+   -- ADPCM step table: ONE write port (the init sweep) and ONE read port
+   -- (round-robin over the 16 channels). That shape is what Quartus can turn
+   -- into a simple dual-port M10K.
+   --
+   -- MEASURED, both failures, so nobody repeats them:
+   --   16 registered read ports, one per channel   10,060 -> 17,478 ALUTs
+   --   (Quartus will not infer memory at that port count; it built the 89x15
+   --   array out of 1,335 registers plus sixteen 89:1 muxes over them)
+   --   write enable = a never-assigned signal      10,060 -> 10,206 ALUTs
+   --   (constant-folded to '0', port vanishes, ROM again, back to logic)
+   --
+   -- THE ONE APPROXIMATION IN THIS FILE, stated exactly. Round-robin means
+   -- adstep_q(i) can lag a change to chan(i).adidx by up to 16 (sweep) + 2
+   -- (pipeline) = 18 clk. A channel cannot decode twice inside that window
+   -- unless its sample period is under 18 clk, i.e. 2*(0x10000-tmr) <= 18, i.e.
+   -- tmr >= 0xFFF7 - a sample rate above 1.8 MHz. Real content sits at 8-32 kHz
+   -- and the NDS SPU's own ceiling is ~176 kHz (tmr ~ 0xFF10, period 480 clk),
+   -- which is 26x clear of the bound. Outside that range this would reuse the
+   -- previous step value for one sample; the equivalence bench passes.
+   gadstep : if ADPCM_TABLE_RAM /= 0 generate
+
+      adstep_ra <= chan(adstep_rr).adidx;
+
+      iram_adstep : entity MEM.SyncRamDualByteEnable
+      generic map (is_simu => is_simu, is_cyclone5 => '1', ADDR_WIDTH => 7)
+      port map
+      (
+         clk       => clk,
+         -- port A: the 89-cycle init sweep, the only writer this RAM ever has
+         ce_a      => '1',
+         addr_a    => adstep_wa,
+         datain_a0 => adstep_wd(7 downto 0),
+         datain_a1 => adstep_wd(15 downto 8),
+         datain_a2 => adstep_wd(23 downto 16),
+         datain_a3 => adstep_wd(31 downto 24),
+         dataout_a => open,
+         we_a      => adstep_we,
+         be_a      => "1111",
+         -- port B: round-robin read, one channel per cycle
+         ce_b      => '1',
+         addr_b    => adstep_ra,
+         datain_b0 => x"00", datain_b1 => x"00",
+         datain_b2 => x"00", datain_b3 => x"00",
+         dataout_b => adstep_dout_v,
+         we_b      => '0',
+         be_b      => "0000"
+      );
+
+      p_adstep : process (clk)
+      begin
+         if rising_edge(clk) then
+            -- 89-cycle init sweep, long before any channel can decode
+            adstep_we <= '0';
+            if (adstep_init < 89) then
+               adstep_wa   <= adstep_init;
+               adstep_wd   <= std_logic_vector(to_unsigned(ADPCM_STEP_INIT(adstep_init), 32));
+               adstep_we   <= '1';
+               adstep_init <= adstep_init + 1;
+            end if;
+
+            adstep_rr_d <= adstep_rr;
+            if (adstep_rr = 15) then adstep_rr <= 0; else adstep_rr <= adstep_rr + 1; end if;
+            -- dataout_b is the entry for the channel addressed one cycle ago,
+            -- and adstep_rr_d names that same channel, so this lands in the
+            -- right slot
+            adstep_q(adstep_rr_d) <= to_integer(unsigned(adstep_dout_v(14 downto 0)));
+         end if;
+      end process;
+   end generate;
 
    master_acc_in <= accl when mixcnt = to_unsigned(16, mixcnt'length) else accr;
    master_gain_in <= to_signed(vol128(soundcnt(6 downto 0)), master_gain_in'length)
@@ -571,7 +694,12 @@ begin
                                     end if;
                                  else
                                     v_nib  := resize(shift_right(unsigned(chan(i).curw), v_sub*4), 4);
-                                    v_step := ADPCM_STEP(chan(i).adidx);
+                                    -- generic, so only one of these synthesises
+                                    if (ADPCM_TABLE_RAM /= 0) then
+                                       v_step := adstep_q(i);
+                                    else
+                                       v_step := ADPCM_STEP_INIT(chan(i).adidx);
+                                    end if;
                                     v_diff := v_step / 8;
                                     if (v_nib(0) = '1') then v_diff := v_diff + v_step/4; end if;
                                     if (v_nib(1) = '1') then v_diff := v_diff + v_step/2; end if;
