@@ -257,6 +257,23 @@ do_irq() {
 # A CPU whose PC has stopped moving is either parked in one of these waits
 # (a lost request or a lost done) or is not waiting on memory at all - and
 # nothing else visible from the host tells those two apart.
+do_ipc() {
+	_v=$(cmd 0E 0); _n=$(printf '%d' "0x$_v")
+	_s9=$(((_n >> 28) & 15)); _s7=$(((_n >> 24) & 15))
+	_s9i=$(((_n >> 23) & 1)); _s7i=$(((_n >> 22) & 1))
+	_e9=$(((_n >> 21) & 1)); _e7=$(((_n >> 20) & 1))
+	_er9=$(((_n >> 19) & 1)); _er7=$(((_n >> 18) & 1))
+	_r9=$(((_n >> 17) & 1)); _r7=$(((_n >> 16) & 1))
+	_si9=$(((_n >> 15) & 1)); _si7=$(((_n >> 14) & 1))
+	_c97=$(((_n >> 8) & 31)); _c79=$((_n & 31))
+	echo "ipc 0x$_v"
+	echo "  IPCSYNC  : 9->7 data=$_s9 (irq_en=$_s9i)   7->9 data=$_s7 (irq_en=$_s7i)"
+	echo "  FIFO     : 9->7 depth=$_c79   7->9 depth=$_c97   (16 = full)"
+	echo "  enable   : en9=$_e9 en7=$_e7   recv-irq: r9=$_r9 r7=$_r7   sendempty-irq: s9=$_si9 s7=$_si7"
+	echo "  error    : err9=$_er9 err7=$_er7   <- a set error bit means a read-when-empty"
+	echo "              or a write-when-full was dropped: a LOST MESSAGE."
+}
+
 do_card() {
 	# op 0x0D, laid out by nds_card's dbg_card assign
 	_v=$(cmd 0D 0); _n=$(printf '%d' "0x$_v")
@@ -413,6 +430,7 @@ case "$1" in
 	status)  do_status ;;
 	probe)     do_probe ;;
 	card)      do_card ;;
+	ipc)       do_ipc ;;
 	forcecart) do_forcecart ;;
 	irq)       do_irq ;;
 	where9)  do_where 9 ;;
