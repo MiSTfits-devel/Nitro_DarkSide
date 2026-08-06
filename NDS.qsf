@@ -64,9 +64,9 @@ set_global_assignment -name PLACEMENT_EFFORT_MULTIPLIER 1.0
 # gone at 41,241 ALMs) but the ROUTER gives up: peak interconnect 79% around
 # X11_Y35..X21_Y45, "Fitter routing phase terminated due to routing congestion".
 # This is Quartus's own first suggestion for 188026, and it only costs fit time.
-# set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
+set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
 set_global_assignment -name SEED 0
-# set_global_assignment -name VERILOG_MACRO "MISTER_DEBUG_NOHDMI=1"
+set_global_assignment -name VERILOG_MACRO "MISTER_DEBUG_NOHDMI=1"
 set_global_assignment -name VERILOG_MACRO "MISTER_FB=0"
 
 # disable bilinear filtering when downscaling
@@ -115,6 +115,46 @@ set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ALSA=1"
 #    negative slack is tolerable on this machine, so re-measure when this moves
 #    and judge the size, rather than treating any red as blocking. See
 #    docs/SDRAM.md for what the sdram.sv side of that gap turned out to be.
+#
+# 3. RE-MEASURED 2026-08-06 on current main, both shipping configs. It FITS in
+#    both and MISSES TIMING in both, and the two configs fail on DIFFERENT
+#    families - which is what says this is two separate pieces of work, not one:
+#
+#      audio (97% ALM, build/artifacts-4x-audio)
+#        clk_sys -1.166  clk_mem -0.756
+#        48 of the top 50 paths: vr_pend / vr_out[1] (clk_mem)
+#          -> nds_vram|rdr_*_dout[*] (clk_sys), required 7.459 ns
+#      debug (91% ALM, build/artifacts-4x-dbg)
+#        clk_sys +0.052  clk_mem -0.733
+#        top family entirely inside sdram.sv: ch1_rq / state.* -> SDRAM_A[7:8]
+#
+#    -0.75 ns is 10% of the 134 MHz period. That is the "different thing from a
+#    -0.05 ns nick" class, not the tolerable class.
+#
+#    The core-side family is the cost of the vrsrv pipelining (e092dc4): rsrv_ready
+#    gates nds_vram's ISSUE stage, the issue stage updates v_rq/v_tail/v_cnt, and
+#    the RETIRE stage reads those same variables in the same cycle to drive
+#    rdr_*_dout - so ready reaches the data registers combinationally, across the
+#    domain, with only one clkMem period to do it in. Registering rsrv_ready is NOT
+#    the fix; nds_vram.vhd:851 names that as the stale-ready wedge. The fix is to
+#    retire from the PRE-issue queue state (the `rq` signal, not the `v_rq`
+#    variable), which costs one cycle on an empty queue and breaks the cone.
+#
+# 4. WHAT 4x IS WORTH, measured before doing any of that work (sim, CE_DIV=1,
+#    channel modelled at its real depth and slot throughput, RSRV_OUT=2 with
+#    RSRV_GAP 3 -> 2):
+#
+#      scene            cyc/line 3x -> 4x      dropped lines 3x -> 4x
+#      nds_2dk (system)   1349 -> 1064 (-21%)      4 -> 4
+#      vectors case 0     1019 ->  814 (-20%)      4 -> 4
+#      vectors case 1     1578 -> 1326 (-16%)    132 -> 132
+#
+#    So it is a real 16-21% off the renderer line - far more than a latency-only
+#    model suggests, because this channel is THROUGHPUT-bound - and it saves
+#    ZERO dropped lines. Drops come from a heavy tail (case 1 drops 23% of lines
+#    at a mean of 74% of budget), and shaving 20% off every line does not bring
+#    an outlier at 2x budget back inside it. Overclocking buys headroom to spend
+#    later; it is not the fix for dropped lines.
 # set_global_assignment -name VERILOG_MACRO "NDS_CLKMEM_4X=1"
 
 # HPS lightweight-bridge debug window at physical 0xFF200000
