@@ -68,6 +68,17 @@ entity nds_top is
       -- (see FITTING.md; the fitter is short by ~470 ALMs). Diagnostic images
       -- only - there is no audio at all with this off.
       SOUND_ENABLE             : integer   := 1;
+      -- DEBUG_ENABLE = 0 compiles nds_debug (the IS-NITRO-style halt/step/peek
+      -- unit) out: 474 ALMs, ~47 LABs. That is enough to close the 27-LAB gap
+      -- that SOUND_ENABLE=1 opens, which is the only reason to turn it off.
+      --
+      -- What is LOST: halt/step/breakpoints, register read-back, and PEEK - i.e.
+      -- every hardware bisect tool. What SURVIVES: mailbox op 0x0B (FORCE_CART),
+      -- because NDS.sv answers that one itself rather than nds_debug (see the
+      -- cart_force assign there), so deploy -> declare -> softreset still boots
+      -- a staged card image with nobody at the OSD. Other mailbox ops stop
+      -- answering and fall to NDS.sv's outer timeout rather than hanging.
+      DEBUG_ENABLE             : integer   := 1;
       -- simulation only: the testbench has staged the ARM9/ARM7 main-RAM sections
       -- itself, so nds_loader may skip copying them (see nds_loader.skip_copy)
       skip_copy                : std_logic := '0'
@@ -1159,6 +1170,7 @@ begin
                 dbg_mr_s(7 downto 3) & dbg_vbl_ena9 & dbg_mr_s(1 downto 0) &
                 dbg_mb9 & dbg_cache9;
 
+   gdebug : if DEBUG_ENABLE /= 0 generate
    idebug : entity work.nds_debug
    generic map
    (
@@ -1199,6 +1211,26 @@ begin
       pk_done  => dbg_pk_done_s,
       pk_data  => mem9_readdata
    );
+   end generate;
+
+   -- DEBUG_ENABLE = 0: drive every nds_debug OUTPUT to its inactive value. This
+   -- is the whole list - an undriven one here does not fail elaboration, it
+   -- quietly becomes 'U'/'X' and takes a build to find (see the domain-split
+   -- driver audit). dbg_pk_act/dbg_pk_sel are NOT in this list on purpose: they
+   -- are derived from dbg_pk_ena by the process above, so pinning pk_ena low
+   -- settles both and hands the ARM9 main-RAM mux straight back to mr9_*.
+   gnodebug : if DEBUG_ENABLE = 0 generate
+      dbg_rsp_data  <= (others => '0');
+      dbg_rsp_stb   <= '0';    -- never answers; NDS.sv's outer timeout covers it
+      dbg_hold9     <= '0';    -- -> cpu9 new_halt: never hold a core
+      dbg_rel9      <= '0';    -- -> cpu9 unhalt (OR'd with cpu9_unhalt)
+      dbg_hold7     <= '0';
+      dbg_rel7      <= '0';
+      dbg_boot_rst  <= '0';    -- -> boot FSM restart AND reset_boot
+      dbg_regsel_s  <= (others => '0');
+      dbg_pk_ena    <= '0';
+      dbg_pk_addr_s <= (others => '0');
+   end generate;
 
    process (clk1x)
    begin

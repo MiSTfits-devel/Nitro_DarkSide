@@ -6,9 +6,10 @@
 -- everything else 1:1 as std_logic/std_logic_vector.
 --
 -- No logic lives here. Generics keep their nds_top defaults (is_simu='0', main
--- RAM at SDRAM byte offset 8 MB, GPU_CE_DIV=3) except the two set explicitly on
--- the generic map below - GPU_FAST=0 and SOUND_ENABLE=0 - each with its reason
--- written out there.
+-- RAM at SDRAM byte offset 8 MB, GPU_CE_DIV=3) except the three set explicitly
+-- on the generic map below - GPU_FAST, SOUND_ENABLE and DEBUG_ENABLE - each
+-- with its reason written out there. SOUND_ENABLE and DEBUG_ENABLE are the two
+-- that select which of the two shipping images this tree builds.
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -182,10 +183,22 @@ begin
    -- clkMem ratio. Dropping sound is by far the cheapest way to a fitting image,
    -- and it is what makes the 134 MHz switch measurable instead of theoretical.
    --
-   -- THERE IS NO AUDIO with this at 0. Set it back to 1 once the real fix lands -
-   -- FITTING.md flagged nds_sound at 11.2K ALUTs with "per-channel state likely
-   -- muxed the same way; audit after gpu2d", and that audit has never been done.
-   generic map ( GPU_FAST => 0, SOUND_ENABLE => 0 )
+   -- THERE IS NO AUDIO with this at 0.
+   --
+   -- 2026-08-06: SOUND_ENABLE=1 now BUILDS AND SHIPS. The audit this comment
+   -- asked for has been done (FITTING.md "Sound area, measured"): nds_sound is
+   -- 10,060 ALUTs / 4,909 registers, and the ADPCM_STEP table alone is 2,348 of
+   -- them. Nothing has been cut yet - what made it fit was area elsewhere plus
+   -- FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION.
+   --
+   -- THE TWO SHIPPING CONFIGURATIONS - this generic map plus two QSF macros:
+   --   audio : SOUND_ENABLE=>1, DEBUG_ENABLE=>0, MISTER_DEBUG_NOHDMI=1,
+   --           FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
+   --           -> 41,024 ALMs (98%), all slack positive. NO HDMI OUT.
+   --   hdmi  : SOUND_ENABLE=>0, DEBUG_ENABLE=>1, NOHDMI commented out, SEED 3
+   --           -> 38,176 ALMs (91%), all slack positive. NO AUDIO.
+   -- They do not combine; see the HDMI note in NDS.qsf for the arithmetic.
+   generic map ( GPU_FAST => 0, SOUND_ENABLE => 0, DEBUG_ENABLE => 1 )
    port map
    (
       clk1x            => clk1x,

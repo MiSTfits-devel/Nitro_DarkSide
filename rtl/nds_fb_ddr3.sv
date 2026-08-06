@@ -132,7 +132,23 @@ reg        ack_a = 0, ack_b = 0;
 reg        fb5_req_r = 0;
 reg        tjob = 0;
 reg [21:0] telem_ctr = 0;
+// NDS_FB_TELEMETRY: the telemetry burst below is a DEBUG-ONLY hack and it is
+// VISIBLE. It reuses the ordinary line drain, so it writes a full 128-word
+// (256-pixel) burst to screen A line 191 - the last visible scanline of the top
+// screen - but telem_q_r only carries real data for feed_idx 0..5. Every word
+// past that is {36{1'b1}}, i.e. white. telem_ctr is 22 bits at clk_sys
+// (33.514 MHz), so that line is blown white every ~125 ms: an 8 Hz flicker
+// along the bottom of the top screen.
+//
+// Off by default. Define NDS_FB_TELEMETRY to get the twelve state words back at
+// 0x3FE2FC20 for devmem/SSH probing (see the NDS.sv dbg0..dbg11 map) - it is
+// still the only channel that reports the main-RAM verify result without
+// depending on rendering.
+`ifdef NDS_FB_TELEMETRY
 reg        telem_pending = 1;
+`else
+reg        telem_pending = 0;
+`endif
 wire       pend_a = job_tgl_a != ack_a;
 wire       pend_b = job_tgl_b != ack_b;
 
@@ -173,7 +189,9 @@ assign fb5_addr = FB_HW_BASE + {dscr, dy, 9'd0} + {17'd0, dsent, 2'd0};
 
 always @(posedge clk_sys) begin
 	telem_ctr <= telem_ctr + 1'd1;
+`ifdef NDS_FB_TELEMETRY
 	if (&telem_ctr) telem_pending <= 1;
+`endif
 	fb5_req_r <= 0;
 	if (!dbusy) begin
 		if (telem_pending) begin

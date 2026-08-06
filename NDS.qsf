@@ -47,6 +47,10 @@ set_global_assignment -name ROUTER_CLOCKING_TOPOLOGY_ANALYSIS ON
 set_global_assignment -name ECO_OPTIMIZE_TIMING ON
 set_global_assignment -name PERIPHERY_TO_CORE_PLACEMENT_AND_ROUTING_OPTIMIZATION ON
 set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
+# MEASURED 2026-08-06, do not retry: with SOUND_ENABLE=1 the design misses by
+# 27 LABs (4218 vs 4191). Setting this to HIGH *and* PHYSICAL_SYNTHESIS_COMBO_
+# LOGIC_FOR_AREA to ON made it WORSE, not better - 4218 -> 4223 LABs, 41,644 ->
+# 41,652 ALMs. Neither lever buys area here; the fix was gating nds_debug.
 set_global_assignment -name ALM_REGISTER_PACKING_EFFORT LOW
 # Tried PLACEMENT_EFFORT_MULTIPLIER 3.0 with ROUTER_TIMING_OPTIMIZATION_LEVEL
 # MAXIMUM (build artifacts-t3): worst slack -2.499 -> -4.104, TNS -790 -> -3356,
@@ -56,8 +60,13 @@ set_global_assignment -name ALM_REGISTER_PACKING_EFFORT LOW
 # setting as harmful - only that it did not help and cost build time. Left at
 # the default; sweeping seeds is measurably worth more than placer effort.
 set_global_assignment -name PLACEMENT_EFFORT_MULTIPLIER 1.0
+# With SOUND_ENABLE=1 + DEBUG_ENABLE=0 the design PLACES (the 170012 LAB error is
+# gone at 41,241 ALMs) but the ROUTER gives up: peak interconnect 79% around
+# X11_Y35..X21_Y45, "Fitter routing phase terminated due to routing congestion".
+# This is Quartus's own first suggestion for 188026, and it only costs fit time.
+# set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
 set_global_assignment -name SEED 0
-set_global_assignment -name VERILOG_MACRO "MISTER_DEBUG_NOHDMI=1"
+# set_global_assignment -name VERILOG_MACRO "MISTER_DEBUG_NOHDMI=1"
 set_global_assignment -name VERILOG_MACRO "MISTER_FB=0"
 
 # disable bilinear filtering when downscaling
@@ -118,11 +127,20 @@ set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ALSA=1"
 # it is held in reset an access HANGS rather than failing. Run
 # `nitrodbg.sh lwtest` before relying on it, and see the header of
 # rtl/hps_lw_bridge.sv. Costs area, so leave it off for a release image.
-set_global_assignment -name VERILOG_MACRO "NDS_LW_DEBUG=1"
+# set_global_assignment -name VERILOG_MACRO "NDS_LW_DEBUG=1"
 
-# Diagnostic images only: drops ascal + pll_hdmi (~2k ALMs) so the debug
-# mailbox fits and routes, and removes the HDMI clock domain that fails
-# setup on nearly every seed. No HDMI out; direct_video carries analog.
+# Drops ascal + pll_hdmi so the design fits, and removes the HDMI clock domain.
+# No HDMI out; direct_video carries analog.
+#
+# COST MEASURED 2026-08-06: ~3,600 ALMs, not the "~2k" this comment claimed for
+# months (37,958 with HDMI + sound off, against 34,386 with neither). That
+# matters because it is what decides whether audio and HDMI can coexist: the
+# audio image is 41,024, so +3,600 lands at ~44,600 against 41,910. THEY CANNOT
+# BOTH BE ON until nds_sound shrinks by ~2,700 ALMs. See FITTING.md.
+#
+# The old note here also said this domain "fails setup on nearly every seed".
+# It closed at +0.352 on seed 3 and +0.242 before that, so treat that as
+# folklore rather than a reason not to try. No HDMI out; direct_video carries analog.
 
 source sys/sys.tcl
 source sys/sys_analog.tcl
