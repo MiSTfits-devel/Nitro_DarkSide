@@ -1977,7 +1977,23 @@ begin
       if (decode_functions_detail = block_read or decode_functions_detail = block_write) then
          execute_RW_data <= std_logic_vector(execute_op2);
          
-         if (unsigned(decode_RM_op2) >= 8 and unsigned(decode_RM_op2) <= 14 and decode_block_usermoderegs = '1' and cpu_mode /= CPUMODE_USER and cpu_mode /= CPUMODE_SYSTEM) then
+         -- USER-BANK REDIRECT for ldm^/stm^. r8-r12 are banked ONLY in FIQ on
+         -- ARM7TDMI; r13/r14 are banked in every privileged mode. This register
+         -- file is SWAP-based - regs() is the live view and regs_0_8..12 are
+         -- backing store that only means anything while in FIQ (see the
+         -- FIQ-entry swap below) - so redirecting r8-r12 to regs_0_* from, say,
+         -- Supervisor writes storage nothing reads, and the live r8-r12 keep
+         -- their old values.
+         --
+         -- That was the firmware-boot bug: the DS firmware's scheduler restores
+         -- a task with `ldm r0,{r0-lr}^` from Supervisor, so r8-r12 never
+         -- arrived. It resumed inside the BIOS SWI dispatcher one instruction
+         -- before `bx ip` with a stale r12, branched to 0x04000138, and the PC
+         -- ran away through I/O space until it hit a word that would not decode
+         -- ~67 ms later. sim/tests/arm7_ctxrestore reproduces it in ~30 s.
+         if (decode_block_usermoderegs = '1' and cpu_mode /= CPUMODE_USER and cpu_mode /= CPUMODE_SYSTEM and
+             ((unsigned(decode_RM_op2) >= 13 and unsigned(decode_RM_op2) <= 14) or
+              (unsigned(decode_RM_op2) >= 8  and unsigned(decode_RM_op2) <= 12 and cpu_mode = CPUMODE_FIQ))) then
             case (to_integer(unsigned(decode_RM_op2))) is
                when 8  => execute_RW_data <= std_logic_vector(regs_0_8);
                when 9  => execute_RW_data <= std_logic_vector(regs_0_9);
@@ -2354,7 +2370,11 @@ begin
 
                if (decode_functions_detail = block_read) then
                   if (busState = BUSSTATE_WAITDATA and gb_bus_done = '1') then
-                     if (execute_blockRW_writereg < 8 or execute_blockRW_writereg > 14 or decode_block_usermoderegs = '0' or cpu_mode = CPUMODE_USER or cpu_mode = CPUMODE_SYSTEM) then
+                     -- writes the LIVE regs(); the complement of the user-bank
+                     -- redirect below, so r8-r12 land here in every mode but FIQ
+                     if (decode_block_usermoderegs = '0' or cpu_mode = CPUMODE_USER or cpu_mode = CPUMODE_SYSTEM or
+                         execute_blockRW_writereg < 8 or execute_blockRW_writereg > 14 or
+                         (execute_blockRW_writereg <= 12 and cpu_mode /= CPUMODE_FIQ)) then
                         execute_writeback <= '1';
                      end if;
                      execute_writereg  <= execute_blockRW_writereg;
@@ -2501,7 +2521,9 @@ begin
                
                if (decode_functions_detail = block_read) then
                   if (busState = BUSSTATE_WAITDATA and gb_bus_done = '1') then
-                     if (execute_blockRW_writereg >= 8 and execute_blockRW_writereg <= 14 and decode_block_usermoderegs = '1' and cpu_mode /= CPUMODE_USER and cpu_mode /= CPUMODE_SYSTEM) then
+                     if (decode_block_usermoderegs = '1' and cpu_mode /= CPUMODE_USER and cpu_mode /= CPUMODE_SYSTEM and
+                         ((execute_blockRW_writereg >= 13 and execute_blockRW_writereg <= 14) or
+                          (execute_blockRW_writereg >= 8  and execute_blockRW_writereg <= 12 and cpu_mode = CPUMODE_FIQ))) then
                         case (to_integer(unsigned(execute_blockRW_writereg))) is
                            when 8  => regs_0_8  <= unsigned(gb_bus_din);
                            when 9  => regs_0_9  <= unsigned(gb_bus_din);

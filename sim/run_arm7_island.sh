@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.."
 # clear alone costs ~26 ms of simulated time (measured: 131072 word writes at
 # ~200 ns each).
 TIMEOUT_MS="${TIMEOUT_MS:-45}"
-WORK=sim/nvc_work
+WORK="${WORK:-sim/nvc_work}"
 mkdir -p "$WORK"
 
 nvc --work="$WORK/altera_mf" -a --relaxed sim/altera_mf_stub.vhd
@@ -41,5 +41,11 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_membus7.vhd \
    sim/tb_arm7_island.vhd
 
-nvc -H 1g -L "$WORK" --work="$WORK/work" -e tb_arm7_island -gTIMEOUT_MS="$TIMEOUT_MS"
+# HEXFILE selects which ARM7 image runs as the "BIOS": the island smoke test
+# by default, or e.g. sim/tests/arm7_ctxrestore.hex for the exception-return
+# regression. Without this the tb silently ran arm7_island whatever was asked
+# for, which makes a new test look like it passed (or failed) on its own.
+HEXFILE="${HEXFILE:-sim/tests/arm7_island.hex}"
+
+nvc -H 1g -L "$WORK" --work="$WORK/work" -e tb_arm7_island -gTIMEOUT_MS="$TIMEOUT_MS" -gHEXFILE="$HEXFILE"
 nvc -H 1g -L "$WORK" --work="$WORK/work" -r tb_arm7_island --ieee-warnings=off --exit-severity=failure

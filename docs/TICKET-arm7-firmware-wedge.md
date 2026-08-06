@@ -1,4 +1,9 @@
-# Firmware boot wedges: wrong bytes in the ARM7 exception handler at 0x037FE28C
+# Firmware boot: `ldm ^` never restored r8-r12 (FIXED 2026-08-05)
+
+The 1.588 s "unhandled opcode" fault is only where a runaway PC landed, ~67 ms and
+1.2M instructions after the real bug. Read the ROOT CAUSE section near the end
+first; the material above it is a record of three wrong answers, kept because each
+one is a trap that looked convincing.
 
 **Filed** 2026-07-29 · **Blocks** firmware boot (`FWBOOT=1` / OSD `Boot: Firmware`)
 · **Does not affect** direct boot
@@ -102,8 +107,21 @@ ARM7PROBE_LO=037FE28C ARM7PROBE_HI=037FE28C \
    rather than halting, so the core arguably should vector. **Do not fix that
    first** — it would hide this.
 
-> **ROOT CAUSE FOUND 2026-07-30. The bytes are correct and written 8 bytes too
-> low.** `0x6284` holds `E25EF004` — exactly what the oracle expects at `0x628C`.
+> **RETRACTED 2026-08-05. There is no displacement. The memories are identical.**
+> The oracle's ARM7-visible WRAM was dumped word for word (`ARM7WRAMDUMP`) and
+> compared: every one of the seven watched words matches this core exactly,
+> `E25EF004` included, at `0x037FE284` in **both**. Across all 96 KB of
+> ARM7-visible WRAM the oracle contains `E25EF004` exactly **once**, at
+> `0x037FE284` — precisely where this core has it. The "8 bytes low" reading came
+> from comparing an `ARM7PROBE` **R15** value against a raw address: R15 is
+> address **+8** in ARM, so "the oracle has `E25EF004` at `0x628C`" was the oracle
+> *executing* `0x6284`. The other probe reading confirms the same bias — "at
+> `0x037FE280`, `instr=E590E03C`" is `0x037FE278`, which the dump holds. So the
+> whole displacement, and the search for what wrote the bytes 8 bytes low, was an
+> artifact. See "Retraction and the real mechanism" at the end.
+>
+> ~~**ROOT CAUSE FOUND 2026-07-30. The bytes are correct and written 8 bytes too
+> low.**~~ `0x6284` holds `E25EF004` — exactly what the oracle expects at `0x628C`.
 > Everything below about wrong bytes, decompression, the SPI read path and the IRQ
 > divergence is **retired**; see "Root cause" at the end. This is a displacement
 > bug in where the ARM7 BIOS installs the firmware's exception handler, and the
@@ -314,6 +332,276 @@ So this is the last known blocker between firmware boot and the firmware menu.
   the whole raw + KEY1 boot command sequence
 - The KEY1 command sequence is **ROM-dependent** (7 commands retail, 2 for homebrew
   with no secure area) — see `nds_card.vhd`'s header
+
+## Retraction and the real mechanism (2026-08-05)
+
+### The memories are identical — measured, not argued
+
+`sim/melonds_tracer` grew `ARM7WRAMDUMP=<file>`, which writes the ARM7's view of
+`0x037F8000..0x0380FFFF` through `ARM7Read32` (the CPU's own decode, so WRAMCNT is
+applied exactly as `nds_membus7` applies it). Against this core's watched words:
+
+| address | oracle | this core |
+|---|---|---|
+| `037FE280` | `E1A00000` | `E1A00000` |
+| `037FE284` | `E25EF004` | `E25EF004` |
+| `037FE288` | `B081B5F0` | `B081B5F0` |
+| `037FE28C` | `1C0E1C05` | `1C0E1C05` |
+| `037FE290` | `F7FF1C14` | `F7FF1C14` |
+| `037FE294` | `1C07FD25` | `1C07FD25` |
+| `037FE298` | `40042001` | `40042001` |
+
+All seven match. `E25EF004` appears **once** in the oracle's whole 96 KB, at
+`0x037FE284`. **Nothing is displaced, nothing is corrupt, and the decompressed
+firmware image is right.** Everything this ticket said about where the handler was
+installed, which PCs wrote it, and the LZ77 output pointer is retired with it.
+
+### What the address actually is
+
+`0x037FE270..0x037FE284` is the DS firmware's ARM7 **task-switch context restore**:
+
+```
+037FE270  E16FF001  msr  spsr_fsxc, r1     @ saved CPSR of the task to resume
+037FE274  E590D040  ldr  sp, [r0, #0x40]   @ handler-mode sp
+037FE278  E590E03C  ldr  lr, [r0, #0x3C]   @ handler-mode lr = resume address
+037FE27C  E8D07FFF  ldm  r0, {r0-lr}^      @ restore the USER/SYSTEM bank
+037FE280  E1A00000  nop                    @ delay slot required after ldm ^
+037FE284  E25EF004  subs pc, lr, #4        @ return: pc = lr-4, CPSR = SPSR
+```
+
+and `0x037FE288` is a **Thumb** function (`push {r4-r7,lr}; sub sp,#4`), which the
+oracle enters with odd `r14` values (`03802d69`, `037ff9f3`, `0380227f`) and runs
+straight through `0x037FE28C`. Verified with `ARM7REGS_AT=037FE290`.
+
+So the two cores do different things at the same correct bytes: the oracle executes
+`0x037FE284` and returns into Thumb; this core executes `0x037FE28C` **as ARM**.
+`1C0E1C05` is condition NE with bits 27-25 = `110`, a coprocessor load/store
+ARM7TDMI does not implement, so the decoder is right to reject it — wrong diagnosis
+#1 said this from the start and was correct.
+
+### The reported state, decoded
+
+- `lr=0x00002E10` is **not** an exception handler address. The ARM7 BIOS **SWI
+  dispatcher** does `add lr, pc, #0` at `0x2E08`, giving exactly `0x2E10`, then
+  `bx ip` at `0x2E0C`. The IRQ handler is a different routine (`0x2DC4`) whose
+  equivalent value is `0x2DD4` and which stays in IRQ mode — so `lr=0x2E10` plus
+  `cpsr` mode `0x1F` means **inside a SWI**, not inside an IRQ.
+- `cpsr=0x8000001F` is System/ARM. The dispatcher's `msr` at `0x2E00` builds
+  `SPSR & 0x80 | 0x1F`, which clears N/Z/C/V, so N=1 was set by instructions that
+  ran after it — consistent with being deep inside a handler.
+- `pc` in the assertion is `regs(15)`, and the opcode printed is the word **at**
+  that address, so the pipeline had just been refilled: the core had **branched**
+  to `0x037FE28C`.
+- The oracle's restored CPSR here is `0x0000003F` (System **+ T**), against
+  `0x8000001F` (System, no T) in this core.
+
+That made "the exception return lost the T bit" the obvious suspect: same address,
+right instruction, wrong instruction set.
+
+### That suspect is now disproved, by a test that runs in one second
+
+`sim/tests/arm7_ctxrestore/` is the sequence above, verbatim, as an ARM7 image for
+`tb_arm7_island`, with a context block whose `+0x38` (r14_user) and `+0x3C` (resume
+address) differ so a wrong `ldm ^` bank cannot pass by luck, and whose resume target
+opens with the raw halfwords `1C05`/`1C0E` — so a lost T bit reports
+`unhandled opcode 1C0E1C05 thumb=0`, the firmware symptom byte for byte.
+
+```bash
+HEXFILE=sim/tests/arm7_ctxrestore.hex TIMEOUT_MS=45 WORK=sim/nvc_work_ctx \
+  sim/run_arm7_island.sh
+```
+
+**Result: `tb_arm7_island: PASS bitmask=0000000F`.** Four sub-tests:
+
+0. `msr spsr_fsxc` → `mrs spsr` round-trips the T bit.
+1. **Save side, `swi` from Thumb.** `mrs r1, spsr` in the handler shows T set and
+   the caller's mode preserved, and `movs pc, lr` returns into Thumb. So exception
+   *entry* records T correctly - which matters because sub-test 3 writes SPSR by
+   hand and so cannot see an entry bug.
+2. **Save side, IRQ from Thumb** - how a preemptive scheduler actually gets in,
+   and a different decode path in `gba_cpu` (`decode_functions_detail = IRQ` vs
+   `software_interrupt_detail`, with its own lr arithmetic). Three timer-0 IRQs
+   are taken from a Thumb loop; each handler checks SPSR.T and returns with
+   `subs pc, lr, #4`, and the Thumb loop keeps counting, so all three returned in
+   Thumb state.
+3. The full firmware restore resumes in Thumb at the right address.
+
+(The IRQ sub-test needs its own `sp_irq`: the handler pushes, and with sp_irq left
+at 0 the push lands at address 0 and the test hangs at bitmask 3. That is a bug in
+the test, not the core, but it is an easy one to re-introduce.)
+
+Reading `gba_cpu.vhd` agrees:
+`execute_nextIsthumb` takes T from `execute_msr_setvalue(5)` = `SPSR(5)` for the
+`decode_leaveirp` path (:2143), `msr` to SPSR commits all four fields to the current
+mode's bank (:2627-2637), and `ldm ^` writes the `regs_0_*` user bank for r8-r14
+(:2504-2515). **So `msr spsr` / `ldm ^` / `subs pc, lr, #4` is not the bug.**
+
+`sim/run_arm7_island.sh` had to be fixed to make this runnable at all: it ignored
+`HEXFILE` and always ran `arm7_island.hex`, so a new ARM7 test silently reported the
+old test's result. Noted separately: `arm7_island.hex` itself currently ends
+`FAIL magic=BADBAD00 bitmask=0000003F` — it clears six sub-tests and fails the IPC
+FIFO receive. That is a pre-existing harness result, unrelated to this ticket, but
+it means this tb has no clean all-pass baseline.
+
+### The fault address is not the bug either: the ARM7 PC has RUN AWAY
+
+A time-gated ARM7 trace of 1.550–1.588 s (1,246,281 instructions) settles it. The
+run reproduces the fault byte-identically —
+`1588231865ns: unhandled opcode 1C0E1C05 thumb=0 pc=037FE28C lr=00002E10
+cpsr=8000001F` — and the trace shows what the ARM7 was doing on the way in:
+
+```
+04390AA8 00000000 8000001F
+04390AAC 00000000 8000001F
+04390AB0 00000000 8000001F      ... and so on, +4 every instruction
+```
+
+**Exactly 16384 retires in every 64 KB block, marching 0x0439xxxx up to
+0x0483xxxx, with no branch anywhere in it.** The ARM7 is executing the I/O region as
+code. It reads back `0x00000000`, which as ARM is `andeq r0, r0, r0` — a perfectly
+legal instruction — so nothing stops it. A derailed ARM7 does not crash; it walks.
+
+By the time the window opened at 1.550 s the ARM7 had **already been lost for tens
+of milliseconds**. So the 1.588 s decode failure is only where the walking PC finally
+hit a word that would not decode, over a million instructions downstream of the
+actual bug, in code that has nothing to do with it.
+
+The last ~1900 instructions of the trace are all correct behaviour on a corrupt
+machine, and worth reading as a check on the rest of the core:
+
+```
+048432FC -> 00000020   op=EA000B69 cpsr=80000092   IRQ taken; pc 0x20 = vector 0x18
+00000020 -> 00002DCC                              BIOS IRQ handler at 0x2DC4
+00002DD8 -> 037FD7E4                              firmware's own IRQ handler
+```
+
+`0x037FD7DC` is **exactly** the oracle's `[0x0380FFFC]`, measured independently. So
+IRQ delivery, the BIOS dispatch and the handler pointer are all right. The handler
+runs its Thumb body, reaches the context restore at `0x037FE270`, and restores the
+context it interrupted — which is the runaway's: `r1 = 0x8000001F` at
+`0x037FE278`, i.e. the firmware is handed T-clear/System because that is genuinely
+what the runaway CPSR was. `subs pc, lr, #4` returns into it and dies.
+
+Every register value the original ticket reasoned from is therefore a *consequence*
+of the runaway, not evidence about its cause.
+
+### ROOT CAUSE (2026-08-05): `ldm ^` never restored r8-r12
+
+`ARM7RUNAWAY=1` fired at **1.521 s** with `pc=0x04000140` (R15, so the instruction
+is at **0x04000138**) and printed the 96 retires that led there. Subtracting the
++8 ARM bias, they read:
+
+```
+037FE25C  mrs r1, cpsr / bic r1,#0x1F / orr r1,#0xD3 / msr cpsr,r1   -> Supervisor
+037FE26C  ldr  r1, [r0], #4          saved CPSR out of the context block
+037FE270  msr  spsr_fsxc, r1
+037FE274  ldr  sp, [r0, #0x40]
+037FE278  ldr  lr, [r0, #0x3C]
+037FE27C  ldm  r0, {r0-lr}^
+037FE280  nop
+037FE284  subs pc, lr, #4            -> CPSR = 0x0000001F (System, ARM)
+00002E08  add  lr, pc, #0            <- BIOS SWI dispatcher
+00002E0C  bx   ip                    <- branches to r12
+04000138  runaway                    <- the RTC register, executed as code
+```
+
+The task being resumed had been preempted **inside the BIOS SWI dispatcher, one
+instruction before `bx ip`**. So r12 had to survive the restore. It did not.
+
+**The bug:** `ldm ^` / `stm ^` redirected **r8-r12** to `regs_0_8..regs_0_12`
+whenever the mode was not User/System. On ARM7TDMI **r8-r12 are banked ONLY in
+FIQ**; r13/r14 are banked in every privileged mode. And this register file is
+**swap-based** - `regs()` is the live view, `regs_0_8..12` are backing store that
+only means anything while in FIQ (the `execute_switchmode_new = CPUMODE_FIQ` swap
+at gba_cpu.vhd:2716). So the redirect wrote storage nothing reads and the live
+r8-r12 kept stale values.
+
+Fixed at three sites per CPU - the `stm^` read side, the "write the live regs()"
+gate, and the `ldm^` user-bank write side: `rtl/gba_cpu.vhd` (~1980, ~2357, ~2504)
+and **`rtl/nds_cpu9.vhd` (~2588, ~3051, ~3277), which had the identical bug** and
+runs the game code. The redirect now covers r13/r14 in any privileged non-System
+mode, and r8-r12 only in FIQ.
+
+### Why 1.588 s was such a bad place to look
+
+Every earlier diagnosis anchored on the undecodable word at 1.588 s, which is
+**~67 ms and 1.2 million instructions downstream of the cause**. The ARM7 does not
+stop when it derails: I/O space reads back `0x00000000`, which is a legal ARM
+`andeq r0,r0,r0`, so the PC just marches +4 - 16384 retires per 64 KB - until it
+lands on a word that will not decode. Everything the original report reasoned from
+(the address, `lr=0x2E10`, `cpsr=0x8000001F`, the bytes in WRAM) is a *consequence*
+of the walk.
+
+### Regression test, and the way it first lied
+
+`sim/tests/arm7_ctxrestore/` - four sub-tests, ~30 s:
+
+```bash
+HEXFILE=sim/tests/arm7_ctxrestore.hex TIMEOUT_MS=60 sim/run_arm7_island.sh
+# expect: tb_arm7_island: PASS  bitmask=0000000F
+```
+
+Sub-test 3 loads distinctive values for r7-r12 into the context block and reports a
+bitmask of **which** registers came back wrong (`0x10000 | 1<<N`). Against the bug
+it printed **`0x00011F00`** - r8,r9,r10,r11,r12 wrong, r7 right, which is the
+banking rule restated as a measurement.
+
+**An earlier version of this exact test PASSED**, and was used here to declare the
+`msr spsr` / `ldm ^` / `subs pc,lr,#4` family clear. It checked the resume address
+and the T bit and nothing else. Verifying that control flow resumes is not
+verifying that the context resumed - and that mistaken all-clear sent the
+investigation looking for a second cause that did not exist.
+
+Note also that the existing ARM9 regression `sim/tests/ldm_bx_irq` produces a
+**byte-identical trace before and after** the ARM9 fix: it exercises `ldm^` with
+pc, never r8-r12 outside FIQ. So it is no evidence either way, and its passing
+never protected this.
+
+### Lead this opens
+
+`nds-kirby-idle-thread-rootcause` records Kirby sitting in the NitroSDK idle
+thread, never rescheduling, with the DISPCNT display-on write never happening. A
+scheduler whose context restore loses r8-r12 is a very plausible cause of exactly
+that. Re-test Kirby direct boot against this fix before treating it as separate.
+
+
+Instruments now in place for the next attempt, none of which existed before:
+
+- `TRACE7_T0`/`TRACE7_T1` (us) on `tb_top_frame`: a **time-gated** ARM7 trace,
+  flushed per line and closed at T1 so it survives the fatal decode assertion. The
+  frame gate cannot be used here — `dump_frame_index` does not advance until the
+  display runs at 1.49 s, so a frame-gated trace of a 1.588 s fault is empty.
+- Oracle side: `ARM7WRAMDUMP`, `ARM7REGS_AT=<hex R15>` (all of r0-r14 at one
+  instruction), `ARM7CB=<hex>` (the BIOS callback trampolines `0x3300: bx r1` /
+  `0x3304: bx r3`, filtered by target). All run in seconds.
+
+Firmware facts established on the way, all measured rather than assumed:
+
+- ARM9 boot block: firmware offset `0x200` → `0x02320000`. ARM7 boot block:
+  firmware offset `0xCCB0` → `0x037FA800`. Both from the ARM7 BIOS at `0x2462`,
+  which reads the firmware header copied to `0x027FF830` and computes
+  `src = hdr * (4 << shift)`, `dest = TOP - hdr * (4 << shift)` with the 3-bit
+  shifts packed in `hdr[0x14]` (`0x2CB2` → 2, 6, 2, 6, 2) and TOP `0x02800000`
+  (ARM9) / `0x03810000` (ARM7, literal at `0x25B0`).
+- The faulting word is therefore output offset `0x3A8C` of the ARM7 block.
+- The blocks are **encrypted**, not merely compressed: no LZ77 header validates
+  anywhere in the 256 KB image, and even `E1A00000` does not occur in it. So
+  "search the firmware image for the bytes" cannot work in either direction, and
+  the earlier note that they are "compressed" understates it.
+- SWI jump table at `0x2E38`, 34 live entries; `swi 0x12` = `0x2A2B` =
+  LZ77UnCompReadByCallback, whose destination is `r1` taken verbatim
+  (`0x2A2E: adds r6, r1, #0`). The ARM7 destination granularity is 256 bytes,
+  so no destination error can ever be 8 bytes — which is what first showed the
+  displacement story could not be right.
+- Oracle's ARM7 user IRQ handler pointer `[0x0380FFFC] = 0x037FD7DC`, and the
+  oracle reaches `POWCNT1=0x820F` — the firmware menu is up in the oracle.
+
+**Method note worth keeping.** `ARM7PROBE` reports R15. `docs/TRACE_DIFF.md` and the
+ARM7 trace already carry the same +8/+4 bias, and it is already written down — and
+it still cost this ticket a root cause, three "retired" hypotheses, and a 4.5 h run
+budget, because an R15 value was compared against a raw address once and never
+rechecked. Dump the memory and compare it directly before concluding anything about
+what is *in* memory.
 
 ---
 
