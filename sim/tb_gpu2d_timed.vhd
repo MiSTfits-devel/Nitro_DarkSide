@@ -38,6 +38,19 @@ entity tb_gpu2d_timed is
       -- default (unlimited in flight, ready tied high) is a memory that cannot
       -- say no, which is why every bench passed while silicon white-screened.
       RSRV_ONE   : integer := 0;
+      --   RSRV_OUT : max ops outstanding (0 = unlimited). NDS.sv allows 2, which
+      --              is what sdram.sv's ch1 can hold: one awaiting grant plus one
+      --              in service.
+      --   RSRV_GAP : minimum clk cycles between accepts, i.e. the channel's
+      --              THROUGHPUT rather than its latency. The ch1 slot is 8 clkMem
+      --              cycles (grant, WAIT, RW1, IDLE_5..IDLE): 2.67 clk1x at 3x,
+      --              2.00 at 4x. Latency alone cannot answer what a clkMem
+      --              overclock buys - a channel that is throughput-bound barely
+      --              moves when only RSRV_LAT drops. Mirrors tb_top_frame.
+      --              NOTE 3x rounds UP to 3, so a 3-vs-2 comparison FLATTERS 4x
+      --              by ~12%; the true 3x gap is 2.67.
+      RSRV_OUT   : integer := 0;
+      RSRV_GAP   : integer := 0;
       -- >0: fail if one line render stays busy this many clk cycles. A line is
       -- 2,130 cycles at CE_DIV=3; anything past a few thousand is a wedge, not
       -- slowness, and the probe dumps who is waiting on whom.
@@ -110,6 +123,8 @@ architecture sim of tb_gpu2d_timed is
    -- wire, unchanged, at the next edge; a requester that pulses and forgets
    -- fails here instead of wedging thousands of cycles later.
    signal rsrv_busy_m  : std_logic := '0';
+   signal rsrv_out_m   : integer range 0 to 15 := 0;
+   signal rsrv_gap_m   : integer range 0 to 15 := 0;
    signal rsrv_ready_s : std_logic;
    signal rsrv_held      : std_logic := '0';
    signal rsrv_held_bank : std_logic_vector(1 downto 0) := "00";
@@ -304,7 +319,14 @@ begin
    -- the renderer's outstanding-request behaviour untestable. RSRV_LAT is a
    -- generic so a run can be paced at hardware-like latency, and RSRV_ONE
    -- restricts it to one op in flight the way ch1 does on silicon.
-   rsrv_ready_s <= '1' when RSRV_ONE = 0 else (not rsrv_busy_m);
+   -- three models, in precedence order: explicit depth/gap, then the legacy
+   -- one-in-flight bit, then always-ready.
+   rsrv_ready_s <= '1' when (RSRV_OUT /= 0 or RSRV_GAP /= 0) and
+                            (RSRV_OUT = 0 or rsrv_out_m < RSRV_OUT) and
+                            (rsrv_gap_m = 0)
+              else '0' when (RSRV_OUT /= 0 or RSRV_GAP /= 0)
+              else '1' when RSRV_ONE = 0
+              else (not rsrv_busy_m);
 
    prserv : process (clk)
       variable accept_v : boolean;
@@ -314,7 +336,8 @@ begin
             rsrvpipe(i) <= rsrvpipe(i - 1);
          end loop;
          rsrvpipe(0).v <= '0';
-         accept_v := (rsrv_req = '1') and (RSRV_ONE = 0 or rsrv_busy_m = '0');
+         accept_v := (rsrv_req = '1') and (rsrv_ready_s = '1');
+         if (rsrv_gap_m > 0) then rsrv_gap_m <= rsrv_gap_m - 1; end if;
          if (accept_v) then
             rsrvpipe(0).v <= '1';
             -- 64-bit line: both words of the aligned 8-byte block
@@ -323,10 +346,17 @@ begin
                              banks(to_integer(unsigned(rsrv_bank)) * 32768 +
                                    to_integer(rsrv_addr) * 2);
             if (RSRV_ONE /= 0) then rsrv_busy_m <= '1'; end if;
+            if (RSRV_GAP > 1) then rsrv_gap_m <= RSRV_GAP - 1; end if;
          end if;
          rsrv_done <= rsrvpipe(RSRV_LAT - 1).v;
          rsrv_dout <= rsrvpipe(RSRV_LAT - 1).d;
          if (rsrvpipe(RSRV_LAT - 1).v = '1') then rsrv_busy_m <= '0'; end if;
+         -- outstanding counter, handling accept and completion on the same edge
+         if (accept_v and rsrvpipe(RSRV_LAT - 1).v = '0') then
+            rsrv_out_m <= rsrv_out_m + 1;
+         elsif (not accept_v and rsrvpipe(RSRV_LAT - 1).v = '1') then
+            rsrv_out_m <= rsrv_out_m - 1;
+         end if;
 
          -- valid/ready protocol checker (see the signal declarations)
          assert rsrv_held = '0' or

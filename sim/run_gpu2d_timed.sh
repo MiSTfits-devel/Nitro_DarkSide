@@ -14,6 +14,12 @@ CE_DIV="${CE_DIV:-3}"
 # line render stays busy that many cycles, which tells a wedge from slowness.
 RSRV_LAT="${RSRV_LAT:-4}"
 RSRV_ONE="${RSRV_ONE:-0}"
+# RSRV_OUT/RSRV_GAP model the channel's DEPTH and THROUGHPUT rather than its
+# latency - the pair that says what a clkMem overclock actually buys.
+#   3x clkMem: RSRV_OUT=2 RSRV_GAP=3 RSRV_LAT=4
+#   4x clkMem: RSRV_OUT=2 RSRV_GAP=2 RSRV_LAT=3
+RSRV_OUT="${RSRV_OUT:-0}"
+RSRV_GAP="${RSRV_GAP:-0}"
 STALL_CYC="${STALL_CYC:-0}"
 WORK="${WORK:-sim/nvc_work}"
 mkdir -p "$WORK"
@@ -37,5 +43,6 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    sim/tb_gpu2d_timed.vhd
 
 nvc -H 2g -L "$WORK" --work="$WORK/work" -e tb_gpu2d_timed -gTIMEOUT_MS="$TIMEOUT_MS" -gCE_DIV="$CE_DIV" \
-   -gRSRV_LAT="$RSRV_LAT" -gRSRV_ONE="$RSRV_ONE" -gSTALL_CYC="$STALL_CYC"
+   -gRSRV_LAT="$RSRV_LAT" -gRSRV_ONE="$RSRV_ONE" -gRSRV_OUT="$RSRV_OUT" \
+   -gRSRV_GAP="$RSRV_GAP" -gSTALL_CYC="$STALL_CYC"
 nvc -H 2g -L "$WORK" --work="$WORK/work" -r tb_gpu2d_timed --ieee-warnings=off --exit-severity=failure
