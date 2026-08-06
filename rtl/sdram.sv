@@ -68,6 +68,13 @@ module sdram
 	input             ch1_req,     // request
 	input             ch1_rnw,     // 1 - read, 0 - write
 	output reg        ch1_ready,
+	// Pulses on the edge this channel takes a request into service. ch1_addr is
+	// sampled LIVE at that grant (unlike ch2, which latches its attributes at
+	// request time), so a requester must hold the address until it sees this -
+	// and without it there is no way to know when the single ch1_rq slot has
+	// freed, which is what forced callers to wait for ch1_ready and so pay full
+	// SDRAM latency on every read with nothing overlapped.
+	output reg        ch1_accept,
 	
 	input      [26:1] ch2_addr,    // 25 bit address for 8bit mode. addr[0] = 0 for 16bit mode for correct operations.
 	output reg [31:0] ch2_dout,    // data output to cpu
@@ -217,6 +224,7 @@ always @(posedge clk) begin
 	end
 
 	ch1_ready   <= 0;
+	ch1_accept  <= 0;
 	ch2_ready   <= 0;
 	ch2_ready16 <= 0;
 	ch3_ready   <= 0;
@@ -321,6 +329,7 @@ always @(posedge clk) begin
 				saved_wr   <= ~ch1_rnw;
 				ch         <= 0;
 				ch1_rq     <= 0;
+				ch1_accept <= 1;   // address has been captured; caller may present the next
 				command    <= CMD_ACTIVE;
 				state      <= STATE_WAIT;
 			end

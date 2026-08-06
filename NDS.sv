@@ -848,6 +848,7 @@ wire        sd_ch2_ready;
 wire [31:0] sd_ch2_dout;
 wire        sd_ch1_ready;
 wire [63:0] sd_ch1_dout;
+wire        sd_ch1_accept;
 
 // ---- vsrv arbiter: park main RAM, run one ch2 op, hand ch2 back ----
 localparam A_IDLE  = 2'd0;
@@ -952,7 +953,7 @@ end
 // from CLKMEM_RATIO rather than written as a literal 2.
 //
 // Note what is NOT claimed here. The old pulse scheme did not drop on hardware:
-// vr_busy rises, and so ready falls, one clkMem cycle after acceptance, i.e.
+// the busy flag rose, and so ready fell, one clkMem cycle after acceptance, i.e.
 // 1/CLKMEM_RATIO of a clk1x period before the core samples again - so the core
 // never issued into a busy channel. It was correct by a coincidence between two
 // domains, and this removes the reliance on it rather than fixing a silicon bug.
@@ -960,16 +961,44 @@ end
 //
 // It also removes the need to latch a dropped request the way the firmware
 // channel does with fwr_pend: with a held request there is nothing to drop.
-reg        vr_busy = 0, vr_fin = 0;
+// PIPELINED. This used to allow exactly one op in flight - ready went low at
+// acceptance and stayed low until the done pulse had been presented - so every
+// renderer read paid the full round trip: accept on a clk1x edge, ~11 clkMem of
+// SDRAM, then wait for the next IDX_DONE and the next IDX_ACCEPT. Around 16
+// clkMem cycles per op, of which the SDRAM only needed 8. nds_vram's rsrv port
+// has always been pipelined (AD_DEPTH = 4, answered in issue order); this side
+// was the whole restriction.
+//
+// Two outstanding is the useful maximum, and it is set by sdram.sv, not chosen:
+// ch1_rq is a single bit, so the channel holds one request awaiting grant plus
+// one in service. Beyond that a request would be dropped and the core would wait
+// forever for a word nobody asked for.
+//
+// No response queue is needed, and that is worth stating because it looks like
+// an omission. The controller's slot is 8 clkMem cycles (grant, WAIT, RW1, then
+// IDLE_5..IDLE), so two ch1 completions can never be closer than that, while a
+// held response is presented at the next IDX_DONE, at most CLKMEM_RATIO-1 cycles
+// away. vr_fin can therefore never still be occupied when the next response
+// lands. Anything that delays a grant - refresh, ch2 traffic - only widens the
+// gap.
+reg        vr_pend = 0;    // request presented to ch1, not yet granted
+reg  [1:0] vr_out  = 0;    // granted or presented, data not yet returned
+reg        vr_fin  = 0;
 reg        sd_vr_req = 0;
 reg [25:0] vr_adr;
 
-// ready must be a clk1x-observable level: low from acceptance until the done
-// pulse has been presented, so the core never issues into a busy channel
-assign vrsrv_ready_c = ~vr_busy & ~vr_fin;
+// A clk1x-observable level, as before. Low while a request is still awaiting
+// grant (vr_adr must hold until then - ch1 samples the address live), and low
+// once two ops are outstanding.
+assign vrsrv_ready_c = ~vr_pend & (vr_out < 2'd2);
 
 always @(posedge clk_mem) begin
 	sd_vr_req <= 0;
+
+	// grant clears the pending slot first, so that if it ever coincided with an
+	// acceptance the acceptance would win. It cannot today: ready is low while
+	// vr_pend is set, so no new request is taken until the grant is seen.
+	if (sd_ch1_accept) vr_pend <= 0;
 
 	if (vrsrv_req_c & vrsrv_ready_c & (clkMemIndex == IDX_ACCEPT[1:0])) begin
 		// halfword addr [26:1]; the line address makes it 8-byte aligned, which is
@@ -978,13 +1007,14 @@ always @(posedge clk_mem) begin
 		// rotated and dout[63:32] would not be the neighbouring word.
 		vr_adr    <= {8'd0, vrsrv_bank_c, vrsrv_addr_c, 2'b00};
 		sd_vr_req <= 1;
-		vr_busy   <= 1;
+		vr_pend   <= 1;
+		if (!sd_ch1_ready) vr_out <= vr_out + 2'd1;
 	end
+	else if (sd_ch1_ready) vr_out <= vr_out - 2'd1;
 
-	if (vr_busy & sd_ch1_ready) begin
+	if (sd_ch1_ready) begin
 		vrsrv_dout_r <= sd_ch1_dout;   // the whole aligned 8-byte line
 		vr_fin       <= 1;
-		vr_busy      <= 0;
 	end
 
 	vrsrv_done_r <= 0;
@@ -1021,6 +1051,7 @@ sdram #(
 	.ch1_req(sd_vr_req),
 	.ch1_rnw(1'b1),
 	.ch1_ready(sd_ch1_ready),
+	.ch1_accept(sd_ch1_accept),
 
 	.ch2_addr  (vs_owns ? vs_adr[26:1] : mr_adr[26:1]),
 	.ch2_din   (vs_owns ? vs_din       : mr_din),

@@ -164,7 +164,45 @@ All four configurations pass 12 checks.
 
 ---
 
-## 6. The standing question: is 4x worth it?
+## 6. Pipelining ch1: `ch1_accept`
+
+`ch1_addr` is sampled **live at grant** (unlike ch2, which latches its attributes
+at request time), and the channel exported no signal saying when that grant
+happened. A caller therefore had no way to know when the single `ch1_rq` slot had
+freed, and the only safe thing to do was hold everything until `ch1_ready` — i.e.
+pay the full SDRAM round trip on every read with nothing overlapped.
+
+`ch1_accept` pulses on the grant edge. That is the whole mechanism; the rest is
+NDS.sv.
+
+**Two outstanding is the maximum, and it is set by the controller, not chosen.**
+`ch1_rq` is a single bit, so the channel holds one request awaiting grant plus
+one in service. A third would be silently dropped and the renderer would wait
+forever for a word nobody asked for.
+
+**No response queue is needed**, which looks like an omission until you check the
+arithmetic: the ch1 slot is 8 clkMem cycles (grant, WAIT, RW1, `IDLE_5..IDLE`), so
+two completions can never be closer than that, while a held response is presented
+at the next `IDX_DONE`, at most `CLKMEM_RATIO-1` cycles away. `vr_fin` can never
+still be occupied when the next response lands. Anything that delays a grant —
+refresh, ch2 traffic — only widens the gap.
+
+The bench measures the resulting spacing directly:
+
+```
+-- ch1 pipelined: second request issued at ch1_accept, not at ready --
+  ok   pipelined read 1 of 2
+  ok   pipelined read 2 of 2
+  completions 79568 ps apart (8 clocks) - the channel's slot, not a full round trip
+```
+
+`tb_top_frame` gained `VRSRV_OUT` (max outstanding) and `VRSRV_GAP` (minimum
+clk1x cycles between accepts) to model this; `VRSRV_ONE` is kept so older
+measurements stay reproducible. Note `VRSRV_GAP=3` is **pessimistic** — the real
+slot is 2.67 clk1x at 3x and the model cannot express a fraction — so the bench
+understates the improvement rather than flattering it.
+
+## 7. The standing question: is 4x worth it?
 
 Worth restating with what this work established. SDRAM latency is fixed in
 **nanoseconds**. Clocking the controller faster mostly buys more cycles of the
