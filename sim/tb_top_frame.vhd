@@ -62,6 +62,16 @@ entity tb_top_frame is
       --   VRSRV_ONE : 1 = model hardware, ready low from acceptance until done
       VRSRV_LAT    : integer := 4;
       VRSRV_ONE    : integer := 0;
+      --   VRSRV_OUT : max ops outstanding (0 = unlimited). NDS.sv now allows 2,
+      --               which is what sdram.sv's ch1 can hold: one awaiting grant
+      --               plus one in service.
+      --   VRSRV_GAP : minimum clk1x cycles between accepts. The controller's ch1
+      --               slot is 8 clkMem cycles (grant, WAIT, RW1, IDLE_5..IDLE),
+      --               which at 3x is 2.67 clk1x - modelled as 3, so this bench
+      --               is slightly PESSIMISTIC about the real throughput rather
+      --               than flattering it.
+      VRSRV_OUT    : integer := 0;
+      VRSRV_GAP    : integer := 0;
       ISLAND     : integer := 1;         -- 0 = tie clk2x to clk1x, i.e. no ARM9 island
       -- clk2x half period in ps. 7500 = 66.67 MHz, the 2:1-with-coincident-edges
       -- relationship the hardware PLL currently produces because the island
@@ -311,8 +321,12 @@ architecture sim of tb_top_frame is
    end record;
    type t_vrsrvpipe_arr is array (0 to VRSRV_LAT - 1) of t_vrsrvpipe;
    signal vrsrvpipe : t_vrsrvpipe_arr := (others => ('0', (others => '0')));
-   -- VRSRV_ONE: hardware-shaped backpressure (one op in flight)
+   -- hardware-shaped backpressure. VRSRV_ONE is the old one-in-flight model,
+   -- kept so existing measurements stay reproducible; VRSRV_OUT/VRSRV_GAP model
+   -- the pipelined channel NDS.sv presents now.
    signal vrsrv_busy_m  : std_logic := '0';
+   signal vrsrv_out_m   : integer range 0 to 15 := 0;
+   signal vrsrv_gap_m   : integer range 0 to 15 := 0;
    signal vrsrv_ready_s : std_logic;
    -- protocol checker: a request this model did not take must still be on the
    -- wire, unchanged, at the next edge (valid/ready). A requester that pulses
@@ -1487,7 +1501,14 @@ begin
    -- it could not take - if the core stops holding it, the word is lost, which
    -- is exactly what silicon does, and the checker below turns that into a
    -- failure rather than a wedge 400,000 cycles later.
-   vrsrv_ready_s <= '1' when VRSRV_ONE = 0 else (not vrsrv_busy_m);
+   -- three models, in precedence order: explicit depth/gap, then the legacy
+   -- one-in-flight bit, then always-ready.
+   vrsrv_ready_s <= '1' when (VRSRV_OUT /= 0 or VRSRV_GAP /= 0) and
+                             (VRSRV_OUT = 0 or vrsrv_out_m < VRSRV_OUT) and
+                             (vrsrv_gap_m = 0)
+               else '0' when (VRSRV_OUT /= 0 or VRSRV_GAP /= 0)
+               else '1' when VRSRV_ONE = 0
+               else (not vrsrv_busy_m);
 
    prserv : process (clk1x)
       variable accept_v : boolean;
@@ -1509,8 +1530,8 @@ begin
             vrsrvpipe(k) <= vrsrvpipe(k - 1);
          end loop;
          vrsrvpipe(0).v <= '0';
-         accept_v := (vrsrv_req = '1') and
-                     (VRSRV_ONE = 0 or vrsrv_busy_m = '0');
+         accept_v := (vrsrv_req = '1') and (vrsrv_ready_s = '1');
+         if (vrsrv_gap_m > 0) then vrsrv_gap_m <= vrsrv_gap_m - 1; end if;
          if (accept_v) then
             vrsrvpipe(0).v <= '1';
             -- 64-bit line: both words of the aligned 8-byte block, which is what
@@ -1520,10 +1541,17 @@ begin
                               banks(to_integer(unsigned(vrsrv_bank)) * 32768 +
                                     to_integer(vrsrv_addr) * 2);
             if (VRSRV_ONE /= 0) then vrsrv_busy_m <= '1'; end if;
+            if (VRSRV_GAP > 1) then vrsrv_gap_m <= VRSRV_GAP - 1; end if;
          end if;
          vrsrv_done <= vrsrvpipe(VRSRV_LAT - 1).v;
          vrsrv_dout <= vrsrvpipe(VRSRV_LAT - 1).d;
          if (vrsrvpipe(VRSRV_LAT - 1).v = '1') then vrsrv_busy_m <= '0'; end if;
+         -- outstanding counter, handling accept and completion on the same edge
+         if (accept_v and vrsrvpipe(VRSRV_LAT - 1).v = '0') then
+            vrsrv_out_m <= vrsrv_out_m + 1;
+         elsif (not accept_v and vrsrvpipe(VRSRV_LAT - 1).v = '1') then
+            vrsrv_out_m <= vrsrv_out_m - 1;
+         end if;
 
          -- ---- valid/ready protocol checker (see the header above)
          assert vrsrv_held = '0' or

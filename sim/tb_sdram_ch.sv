@@ -60,6 +60,7 @@ wire        SDRAM_nCS, SDRAM_nWE, SDRAM_nRAS, SDRAM_nCAS, SDRAM_CKE, SDRAM_CLK;
 
 reg  [26:1] ch1_addr = 0;    wire [63:0] ch1_dout;   reg [15:0] ch1_din = 0;
 reg         ch1_req  = 0;    reg         ch1_rnw = 1; wire       ch1_ready;
+wire        ch1_accept;
 
 reg  [26:1] ch2_addr = 0;    wire [31:0] ch2_dout;   reg [31:0] ch2_din = 0;
 reg   [3:0] ch2_be   = 4'hF; reg         ch2_req = 0; reg        ch2_cancel = 0;
@@ -77,6 +78,7 @@ sdram #(.DQ_PIPE(`DQ_PIPE), .CAS_LATENCY(`CAS_LAT), .TRCD_WAIT(`TRCD_WAIT)) dut 
 	.refresh_req(1'b0),
 	.ch1_addr(ch1_addr), .ch1_dout(ch1_dout), .ch1_din(ch1_din),
 	.ch1_req(ch1_req), .ch1_rnw(ch1_rnw), .ch1_ready(ch1_ready),
+	.ch1_accept(ch1_accept),
 	.ch2_addr(ch2_addr), .ch2_dout(ch2_dout), .ch2_din(ch2_din), .ch2_be(ch2_be),
 	.ch2_req(ch2_req), .ch2_cancel(ch2_cancel), .ch2_rnw(ch2_rnw),
 	.ch2_ready(ch2_ready), .ch2_ready16(ch2_ready16),
@@ -106,6 +108,22 @@ always @(posedge clk) begin
 
 	if (ch3_ready) begin c3_sync <= ch3_dout; c3_got <= 1; end
 	r3_d <= ch3_ready;  if (r3_d) c3_late <= ch3_dout;
+end
+
+// ---- pipelined ch1 capture -------------------------------------------------
+// Two reads overlapped: the second is presented as soon as ch1_accept says the
+// channel has taken the first, rather than waiting for the first to complete.
+// Captured synchronously, like the real consumer, and kept in arrival order so
+// a swap would be caught rather than averaged away.
+reg [63:0] p_cap [0:1];
+reg  [1:0] p_n = 0;
+integer    p_t0 = 0, p_t1 = 0;
+reg        p_arm = 0;
+
+always @(posedge clk) if (p_arm && ch1_ready) begin
+	p_cap[p_n[0]] <= ch1_dout;
+	p_n           <= p_n + 2'd1;
+	if (p_n == 0) p_t0 = $time; else p_t1 = $time;
 end
 
 // ---- expected data ---------------------------------------------------------
@@ -160,6 +178,36 @@ task ch1_read(input [26:1] a);
 			errors = errors + 1;
 		end
 		repeat (3) @(negedge clk);   // let the late capture settle
+	end
+endtask
+
+// Present a, hold it until the channel grants (ch1 samples the address live at
+// grant), then immediately present b without waiting for a's data.
+task ch1_pipe2(input [26:1] a, input [26:1] b);
+	begin
+		@(negedge clk);
+		p_n = 0; p_arm = 1;
+		ch1_addr = a; ch1_rnw = 1; ch1_req = 1;
+		@(negedge clk);
+		ch1_req = 0;
+		to = 0;
+		while (!ch1_accept && to < 200) begin @(negedge clk); to = to + 1; end
+		if (!ch1_accept) begin
+			$display("  FAIL ch1_accept never pulsed for %h", a);
+			errors = errors + 1;
+		end
+		@(negedge clk);
+		ch1_addr = b; ch1_req = 1;
+		@(negedge clk);
+		ch1_req = 0;
+		to = 0;
+		while (p_n < 2 && to < 400) begin @(negedge clk); to = to + 1; end
+		if (p_n < 2) begin
+			$display("  FAIL pipelined pair returned %0d of 2 within 400 clocks", p_n);
+			errors = errors + 1;
+		end
+		p_arm = 0;
+		repeat (3) @(negedge clk);
 	end
 endtask
 
@@ -228,6 +276,16 @@ initial begin
 		expectv("ch1 sync capture (what NDS.sv:984 latches)", c1_sync, w1);
 		expectv("ch1 late capture (one cycle later)        ", c1_late, w1);
 	end
+
+	$display("");
+	$display("-- ch1 pipelined: second request issued at ch1_accept, not at ready --");
+	ch1_pipe2(26'h0200000, 26'h0300010);
+	expectv("pipelined read 1 of 2", p_cap[0],
+	        {expw(26'h0200000,3), expw(26'h0200000,2), expw(26'h0200000,1), expw(26'h0200000,0)});
+	expectv("pipelined read 2 of 2", p_cap[1],
+	        {expw(26'h0300010,3), expw(26'h0300010,2), expw(26'h0300010,1), expw(26'h0300010,0)});
+	$display("  completions %0d ps apart (%0d clocks) - the channel's slot, not a full round trip",
+	         p_t1 - p_t0, (p_t1 - p_t0) / `CLK_PS);
 
 	$display("");
 	$display("-- ch2 32-bit read --");
