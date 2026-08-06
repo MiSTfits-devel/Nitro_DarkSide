@@ -12,6 +12,26 @@
 #   scp tools/nitrodbg.sh root@mister:/media/fat/
 #   ssh root@mister /media/fat/nitrodbg.sh regs9
 #
+# *** peek9/dump9/where9 CAN DEADLOCK A RUNNING ARM9. HALT FIRST. ***
+#
+# nds_top.vhd:  mr9_done <= mem9_done and not ld_busy and not dbg_pk_sel;
+#
+# dbg_pk_sel is held for the whole peek, and while it is asserted the CPU's own
+# main-RAM completion pulse is MASKED OUT. If the ARM9 has an access in flight
+# when a peek starts, that access never completes and membus9 waits forever.
+# where9 is included in this warning: it peeks the opcode at the PC.
+#
+# The signature, from `probe`, is unmistakable and was hit for real 2026-08-06
+# while diagnosing a game hang - the debugger caused a SECOND, harder hang on
+# top of the one being investigated, and the two look nothing alike:
+#
+#   cache9   : BYPASS_WAIT  beat=7      <- waiting on a burst beat
+#   membus9  : W_MAIN  mr_done=0        <- waiting for main RAM
+#   mainram  : MR_IDLE  req9=0          <- ...which never saw a request
+#
+# SAFE:    regs9 / regs7 / irq / status / probe   (register read-back only)
+# UNSAFE while running: peek9, dump9, where9  -> halt9 first, then run9 after.
+#
 # Usage:
 #   nitrodbg.sh halt9 | run9 | halt7 | run7
 #   nitrodbg.sh step9 [cycles]        release for N clk1x cycles, then hold
