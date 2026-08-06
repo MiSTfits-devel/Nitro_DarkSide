@@ -47,6 +47,12 @@ Repo, docs, vendored primitives + ARM7TDMI, VRAM map decoder + passing unit test
 - 16ch mixer + capture; SPI touch; RTC; AUXSPI save with SD persistence.
 - Exit: sound sample plays bit-accurately (mixer unit tests + capture loopback);
   touch sample responds; save survives reset.
+- 2026-08-06: the mixer now **fits and ships on hardware** (`SOUND_ENABLE=1`,
+  `NDS_audio_20260806`, 41,024 ALMs / 98%, all slack positive). An A/B
+  equivalence bench against a verbatim pre-refactor copy exists and is
+  fault-injection verified (c06cdce). NOT yet exit-tested: bit-accuracy on
+  hardware is unconfirmed — nobody has listened to it against a reference.
+  Area is measured and the diet is planned; see FITTING.md "Sound area".
 
 ## M8 — First game
 - Card DMA patterns, remaining DMA triggers, IRQ edge cases, open-bus behaviors.
@@ -56,6 +62,13 @@ Repo, docs, vendored primitives + ARM7TDMI, VRAM map decoder + passing unit test
 ## M9 — Hardware bring-up & fitting war
 - NDS.sv + qsf profiles; timing closure at 100.5/67/33.5; the BRAM knife-fight.
 - Exit: RBF boots M8's game on a DE10-Nano at full speed.
+- 2026-08-06: **Kirby: Squeak Squad is playable on hardware.** Two timing-clean
+  images ship from one tree, selected by two generics + two QSF macros:
+  `NDS_audio_20260806` (41,024 ALMs, sound, no HDMI) and
+  `NDS_hdmi_noflicker_20260806` (38,176 ALMs, HDMI, no sound). They cannot be
+  combined — HDMI costs a measured ~3,600 ALMs. Not "at full speed": affine-heavy
+  scenes miss the line budget (docs/TICKET-obj-affine-slowness.md), and known
+  rendering defects remain open in that ticket.
 
 ## M10 — Compatibility sweep (2D library)
 - The long tail: per-game issues, DISPCAPCNT, main-mem display FIFO, GBA-slot stubs.

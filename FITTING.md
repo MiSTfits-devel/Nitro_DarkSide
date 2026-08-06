@@ -586,3 +586,83 @@ Independent, parallelizable lanes:
 - **Lane 3** (nds_cache9.vhd, unclaimed): conversion 4. Real design work.
 - **Lane 4** (NDS.sv = Agents A+C mixed hunks): fw_ram + fb evictions to
   DDR3. Must land before or with round 1 or M10K overflows.
+
+---
+
+# Sound area, measured (2026-08-06)
+
+This document closed with "what remains is a normal, per-module diet", naming
+sound as an unaudited lane. That audit is now done, and it produced a shipping
+image: `SOUND_ENABLE=1` builds, fits and closes timing.
+
+## How audio was made to fit
+
+Four attempts, from a 34,386 ALM (82%) baseline with sound off:
+
+| # | change | ALMs | outcome |
+|---|---|---:|---|
+| 1 | `SOUND_ENABLE=1` | 41,644 (99%) | `170012` — 4218 LABs vs 4191 |
+| 2 | + `ALM_REGISTER_PACKING_EFFORT HIGH`, `PHYSICAL_SYNTHESIS_COMBO_LOGIC_FOR_AREA ON` | 41,652 | **worse** — 4223 LABs |
+| 3 | + `DEBUG_ENABLE=0` | 41,241 (98%) | places, but `170143` routing congestion |
+| 4 | + `FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS` | **41,024 (98%)** | **fits, every slack positive, TNS 0** |
+
+Three results worth keeping:
+
+- **The two "area" fitter settings cost area here.** Do not retry them.
+- **The wall changes shape at ~98%.** Below it the failure is capacity — a LAB
+  count you can compute against. At 41,241 ALMs placement *succeeds* and the
+  router gives up instead (peak interconnect 79% at X11_Y35..X21_Y45). Freeing
+  a few hundred more ALMs is not obviously the fix for congestion; Quartus's own
+  advice — seed change or aggressive routability — is. Both seeds fit once the
+  option was on, so it was the option and not the seed.
+- **Per-entity ALM figures under-count.** `nds_sound` reports 6,402 ALMs
+  per-entity but cost ~7,258 in context. A fit predicted from entity totals was
+  optimistic by ~1.7%, which was the entire margin.
+
+## Where nds_sound's logic actually is
+
+Scoped ablation, synthesis-only (`quartus_map`, ~4 min/variant against ~45 for a
+full fit). Each variant deletes ONE construct; `base` is the control, without
+which the deltas mean nothing. All five synthesized with zero errors.
+
+| variant | ALUTs | saved | share |
+|---|---:|---:|---:|
+| **base** (control) | 10,060 | — | — |
+| `shift` — variable → fixed barrel shifts | 9,485 | 575 | 5.7% |
+| `table` — **`ADPCM_STEP` → constant** | 7,712 | **2,348** | **23.3%** |
+| `adpcm` — whole ADPCM decode → null | 5,604 | 4,456 | 44.3% |
+| `decode` — decode + position advance → null | 2,631 | 7,429 | 73.8% |
+
+Registers: base 4,909; `shift` 4,909 (unchanged); `table` 4,685; `adpcm` 4,157;
+`decode` 2,325.
+
+**The `ADPCM_STEP` table is the single biggest contained cut**, and this
+overturns an earlier analytical estimate that put it at "~480 ALMs, roughly 7%"
+by reasoning about an 89x15 table as a 7-input function per output bit. The
+measurement says ~23%. The estimate was wrong by about 3x, which is the whole
+argument for ablating rather than reasoning about area in this codebase.
+
+The barrel shift is not worth restructuring — 575 ALUTs and not one register.
+The table is over half the entire ADPCM datapath (2,348 of 4,456), so it can be
+cut without touching decode logic the equivalence bench would have to re-prove.
+
+## Audio + HDMI: the arithmetic
+
+```
+audio image today                41,024
++ HDMI (MEASURED, not ~2k)       ~3,600   -> ~44,600  vs 41,910 available
+- ADPCM_STEP to M10K             ~1,494   -> ~43,100  still over
+```
+
+They cannot both be on. The table cut alone is **not** enough; it needs roughly
+another 1,200 ALMs, which points at the state write-back muxing (the 2,973 ALUTs
+`decode` costs beyond `adpcm`) — and that is the part in genuine tension with
+exact equivalence, since time-multiplexing a shared engine changes *when* a
+channel's sample updates.
+
+Design note for the table cut, not yet attempted: a synchronous M10K read adds a
+cycle, which prefetching at index-update time avoids (indices change once per
+sample). The real obstacle is that all 16 channels read the table in the same
+cycle, and an M10K has two ports — so it is 8 blocks of the 82 free, or a shared
+table plus serialization that the equivalence gate (commit c06cdce) would have
+to bless.
