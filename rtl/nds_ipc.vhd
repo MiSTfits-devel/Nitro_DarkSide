@@ -36,6 +36,11 @@ entity nds_ipc is
       wired_done9     : out std_logic;
       irq9_sync       : out std_logic := '0';
       irq9_sendempty  : out std_logic := '0';
+
+      -- Debug tap (nds_debug op 0x0E). Both CPUs idling with IPC IRQs enabled
+      -- and neither IF pending is a missed-wakeup deadlock, and NOTHING else
+      -- can see it: peek cannot read IO, so IPCSYNC/IPCFIFOCNT are invisible.
+      dbg_ipc         : out std_logic_vector(31 downto 0) := (others => '0');
       irq9_recv       : out std_logic := '0'
    );
 end entity;
@@ -90,6 +95,15 @@ begin
    cnt9_rd(10) <= rirq9; cnt9_rd(9)  <= '1' when cnt79 = 16 else '0';
    cnt9_rd(8)  <= '1' when cnt79 = 0 else '0';
    cnt9_rd(7 downto 3) <= (others => '0');
+   -- [31:28] sync9_out  [27:24] sync7_out  [23] sync9_ien [22] sync7_ien
+   -- [21] en9 [20] en7 [19] err9 [18] err7 [17] rirq9 [16] rirq7
+   -- [15] sirq9 [14] sirq7  [12:8] cnt97 (7->9 depth)  [4:0] cnt79 (9->7 depth)
+   dbg_ipc <= sync9_out & sync7_out
+              & sync9_ien & sync7_ien & en9 & en7 & err9 & err7
+              & rirq9 & rirq7 & sirq9 & sirq7
+              & '0' & std_logic_vector(to_unsigned(cnt97, 5))
+              & "000" & std_logic_vector(to_unsigned(cnt79, 5));
+
    cnt9_rd(2)  <= sirq9; cnt9_rd(1)  <= '1' when cnt97 = 16 else '0';
    cnt9_rd(0)  <= '1' when cnt97 = 0 else '0';
 

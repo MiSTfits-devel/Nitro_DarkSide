@@ -369,6 +369,7 @@ architecture arch of nds_top is
    signal dbg_regval9, dbg_regval7 : std_logic_vector(31 downto 0);
    signal dbg_pk_ena, dbg_pk_act, dbg_pk_sel : std_logic;
    signal dbg_card_s : std_logic_vector(31 downto 0);
+   signal dbg_ipc_s  : std_logic_vector(31 downto 0);
 
    -- Everything the CPUs' resetCpu does not cover, but which a from-reset probe
    -- must still start clean. nds_mainram in particular latches req9/req7_pending
@@ -1207,6 +1208,7 @@ begin
       pc7      => pc7_s,
       probe    => dbg_probe,
       cardstat => dbg_card_s,
+      ipcstat  => dbg_ipc_s,
       irq9_ime => irq9_dbg_ime, irq9_ie => irq9_dbg_ie, irq9_if => irq9_dbg_if,
       irq7_ime => irq7_dbg_ime, irq7_ie => irq7_dbg_ie, irq7_if => irq7_dbg_if,
       pk_ena   => dbg_pk_ena,
@@ -1803,7 +1805,8 @@ begin
       bus7 => io_bus7, wired_out7 => ipc_wired_out7, wired_done7 => ipc_wired_done7,
       irq7_sync => ipc7_irq_sync, irq7_sendempty => ipc7_irq_sendempty, irq7_recv => ipc7_irq_recv,
       bus9 => io_bus9, wired_out9 => ipc_wired_out9, wired_done9 => ipc_wired_done9,
-      irq9_sync => ipc9_irq_sync, irq9_sendempty => ipc9_irq_sendempty, irq9_recv => ipc9_irq_recv
+      irq9_sync => ipc9_irq_sync, irq9_sendempty => ipc9_irq_sendempty, irq9_recv => ipc9_irq_recv,
+      dbg_ipc => dbg_ipc_s
    );
 
    isyscnt : entity work.nds_syscnt
