@@ -1695,7 +1695,7 @@ begin
       -- how far over the 2,130 budget the line that caused it has run, which is
       -- the difference between "one pathological line" and "everything is slow".
       variable linecyc : natural := 0;
-      variable linebg, lineobj, linevr : natural := 0;
+      variable linebg, lineobj, linevr, lineobjq : natural := 0;
       variable linestart : natural := 0;
       variable nlines, nstarts : positive := 1;
       variable frames : natural := 0;
@@ -1735,6 +1735,7 @@ begin
          if (a_busy = '1') then
             if (prev_abusy = '0') then
                linecyc := 1; linebg := 0; lineobj := 0; linevr := 0;
+               lineobjq := 0;
                linestart := a_line;
             else
                linecyc := linecyc + 1;
@@ -1742,6 +1743,12 @@ begin
             if (a_bgbusy = '1')  then linebg  := linebg + 1;  end if;
             if (a_objbusy = '1') then lineobj := lineobj + 1; end if;
             if (a_rbusy = '1')   then linevr  := linevr + 1;  end if;
+            -- The OBJ channel holds req until its done pulse, so this is exactly
+            -- the time the OBJ drawer spent STALLED on a VRAM round trip. Against
+            -- `obj` it splits the drawer's cost into round-trip stall and its own
+            -- work, which is what bounds the accept-protocol rework: only the
+            -- stall part can be pipelined away.
+            if (a_obj = '1')     then lineobjq := lineobjq + 1; end if;
          end if;
          -- PER-LINE cost profile for the top of one steady-state frame. The
          -- averages say a line costs ~1300 of 2130 and yet the same three lines
@@ -1753,6 +1760,7 @@ begin
                    " busy=" & integer'image(linecyc) &
                    " bg=" & integer'image(linebg) &
                    " obj=" & integer'image(lineobj) &
+                   " obj-vramstall=" & integer'image(lineobjq) &
                    " rvram=" & integer'image(linevr) &
                    " (budget 2130)" severity note;
          end if;
