@@ -292,7 +292,7 @@ parameter CONF_STR = {
 	"F2,BINROM,Load ARM9 BIOS;",
 	"-;",
 	"O[9],Boot,Direct (HLE),Firmware;",
-	"O[10],GPU pace,1-of-3 (all lines),1-of-1 (real speed);",
+	"O[10],GPU pace,1-of-1 (real speed),1-of-3 (all lines);",
 	"-;",
 	"P1,Video & Audio;",
 	"P1-;",
@@ -1251,7 +1251,13 @@ nds_port_wrap nds
 	// HANDOFF). Expect it to reach the firmware's video init and then wedge.
 	.direct_boot(1'b1),
 	.fw_boot(status[9]),
-	.gpu_full_pace(status[10]),
+	// INVERTED ON PURPOSE - do not "fix" it to match the bit name. A status bit
+	// is 0 on a core that has never been configured, so the DEFAULT is whichever
+	// label is listed first in CONF_STR. Real speed is now the default, which
+	// means bit 0 has to select it and the menu order had to flip to match.
+	// The drawer earns it: the OBJ rework took the 1-of-1 lines from 3302 to
+	// 1750 cycles against a 2130 budget, so full pace no longer drops lines.
+	.gpu_full_pace(~status[10]),
 
 	.KeyA(joy[4]),
 	.KeyB(joy[5]),
