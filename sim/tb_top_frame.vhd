@@ -1685,6 +1685,15 @@ begin
       -- is not aliasable - its type is declared inside gpu2d's architecture.
       alias a_bgbusy  is << signal .tb_top_frame.idut.igpu2d_a.dbg_bg_busy : std_logic >>;
       alias a_objbusy is << signal .tb_top_frame.idut.igpu2d_a.dbg_obj_busy : std_logic >>;
+      -- ...and engine B's. Every per-line number in this bench was engine A
+      -- only, so "the renderer fits the budget" was a claim about the TOP
+      -- screen alone - the bottom screen has its own gpu2d instance, its own
+      -- drawers and its own 2130-cycle budget, and nothing here ever looked at
+      -- it. Both engines share `drawline`/`linecounter` (nds_top.vhd:2065
+      -- derives dbg_line_drop_b from the same drawline), so the engine-A line
+      -- number and trigger are reused rather than duplicated.
+      alias b_bgbusy  is << signal .tb_top_frame.idut.igpu2d_b.dbg_bg_busy : std_logic >>;
+      alias b_objbusy is << signal .tb_top_frame.idut.igpu2d_b.dbg_obj_busy : std_logic >>;
       -- OBJ pixel writes, counted FREE-RUNNING and reported per frame, not per
       -- line. A per-line version gated on line_busy was tried and read zero on
       -- the very lines where OBJ burns 3,036 cycles - because the OBJ drawer
@@ -1708,6 +1717,11 @@ begin
       variable linecyc : natural := 0;
       variable linebg, lineobj, linevr, lineobjq : natural := 0;
       variable linestart : natural := 0;
+      -- the same set for engine B
+      variable linecyc_b : natural := 0;
+      variable linebg_b, lineobj_b, lineobjq_b : natural := 0;
+      variable linestart_b : natural := 0;
+      variable drops_b_r : natural := 0;
       variable nlines, nstarts : positive := 1;
       variable frames : natural := 0;
    begin
@@ -1776,6 +1790,35 @@ begin
                    " obj-vramstall=" & integer'image(lineobjq) &
                    " rvram=" & integer'image(linevr) &
                    " (budget 2130)" severity note;
+         end if;
+         -- engine B, same shape as engine A above
+         if (b_busy = '1') then
+            if (prev_bbusy = '0') then
+               linecyc_b := 1; linebg_b := 0; lineobj_b := 0; lineobjq_b := 0;
+               linestart_b := a_line;
+            else
+               linecyc_b := linecyc_b + 1;
+            end if;
+            if (b_bgbusy = '1')  then linebg_b  := linebg_b + 1;  end if;
+            if (b_objbusy = '1') then lineobj_b := lineobj_b + 1; end if;
+            if (b_obj = '1')     then lineobjq_b := lineobjq_b + 1; end if;
+         end if;
+         if (b_busy = '0' and prev_bbusy = '1' and frames = LINEPROF_FRAME and
+             linestart_b < 16) then
+            report "LINEPROF-B line " & integer'image(linestart_b) &
+                   " busy=" & integer'image(linecyc_b) &
+                   " bg=" & integer'image(linebg_b) &
+                   " obj=" & integer'image(lineobj_b) &
+                   " obj-vramstall=" & integer'image(lineobjq_b) &
+                   " (budget 2130)" severity note;
+         end if;
+         if (a_draw = '1' and b_busy = '1') then
+            drops_b_r := drops_b_r + 1;
+            if (drops_b_r <= 12) then
+               report "DROP engine B: line " & integer'image(a_line) &
+                      " (frame " & integer'image(frames) & ")" &
+                      "  cur-line busy so far=" & integer'image(linecyc_b) severity note;
+            end if;
          end if;
          if (a_busy = '1' and prev_abusy = '0') then starts_a := starts_a + 1; end if;
          if (b_busy = '1' and prev_bbusy = '0') then starts_b := starts_b + 1; end if;

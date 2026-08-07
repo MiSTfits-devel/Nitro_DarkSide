@@ -457,6 +457,30 @@ obj(o, 0, 100, 40, 0, 2, 0x19D, prio=1, palno=11, hicolor=1,
 aff(o, 8, 0x030, 0x010, -0x010 & 0xFFFF, 0x030)
 cases.append((c, o))
 
+# --- affine vs normal, same pixel count ---------------------------------
+# The pixel walk costs one cycle per pixel for a normal sprite but TWO for a
+# rot/scal one, because the affine address needs its own cycle to sum the
+# partial terms (NEXTADDR -> AFF_SUM -> NEXTADDR). These two cases are the
+# same eight 64-wide sprites on the same line, differing only in the affine
+# bit, so busy_cyc between them IS the affine penalty - measured rather than
+# read off the state machine. Scaled effects (a star trail, a pickup burst)
+# are exactly the content that pays it.
+
+# 30: eight 64x64 normal sprites on one line - 512 walked pixels
+c = cfg(one_dim=1); o = new_oam()
+for k in range(8):
+    obj(o, k, k * 24, 40, 0, 3, 0x60, prio=0, palno=(k % 8))
+cases.append((c, o))
+
+# 31: the same eight as rot/scal at 1:1 - identical pixels, double the walk
+c = cfg(one_dim=1); o = new_oam()
+for k in range(8):
+    obj(o, k, k * 24, 40, 0, 3, 0x60, prio=0, palno=(k % 8),
+        affine=1, affsel=k)
+for k in range(8):
+    aff(o, k, 0x100, 0, 0, 0x100)
+cases.append((c, o))
+
 # ---------------------------------------------------------------- emit
 
 def whex(f, v):

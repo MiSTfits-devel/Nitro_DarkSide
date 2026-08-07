@@ -212,11 +212,15 @@ architecture arch of nds_drawer_obj is
    signal OAMfetch_x_size        : integer range 4 to 8;
    signal OAMfetch_addrbase      : integer range 0 to 262143;
 
+   -- AFF_SUM is gone: the affine address sum now runs as a stage BESIDE the
+   -- walk (see the aff_pend block) rather than as a state the walk alternates
+   -- into. It used to cost rot/scal sprites a second cycle per pixel -
+   -- measured at +63% on a line of eight 64x64 sprites (646 -> 1054 cycles for
+   -- the same 227 pixels, tb_gpu_obj cases 30/31).
    type t_PIXELGen is
    (
       WAITOAM,
-      NEXTADDR,
-      AFF_SUM
+      NEXTADDR
    );
    signal PIXELGen : t_PIXELGen := WAITOAM;
 
@@ -321,6 +325,22 @@ architecture arch of nds_drawer_obj is
    signal wq_tail  : integer range 0 to WQ_DEPTH-1 := 0;
    signal wq_cnt   : integer range 0 to WQ_DEPTH := 0;
    signal inflight : integer range 0 to WQ_DEPTH := 0;   -- asked for, not back
+
+   -- AFFINE ADDRESS PIPELINE
+   -- The rot/scal address is a sum of six partial terms, too slow to fold into
+   -- the cycle that computes them - which is why it had its own state. But the
+   -- sum for pixel N and the partial-term compute for pixel N+1 are on
+   -- INDEPENDENT data, so they belong in the same cycle on different pixels,
+   -- not in consecutive cycles on the same one. The critical path is
+   -- max(sum, compute), not sum + compute, so this is a pipeline stage rather
+   -- than a longer combinational path.
+   --
+   -- aff_pend means "the partial registers hold a pixel whose sum has not been
+   -- queued yet". The walk may not overwrite them while it is set, so it also
+   -- provides the backpressure when the queue is full.
+   signal aff_pend   : std_logic := '0';
+   signal aff_target : integer range 0 to 255 := 0;
+   signal aff_second : std_logic := '0';
 
    signal unaccepted : std_logic := '0';   -- request presented, not yet taken
    signal walk_seen  : std_logic := '0';   -- a word for this sprite is queued
@@ -754,6 +774,7 @@ begin
       variable v_wtail : integer range 0 to WQ_DEPTH-1;
       variable v_infl  : integer range 0 to WQ_DEPTH;
       variable v_una   : std_logic;
+      variable v_affpend : std_logic;
       variable v_addr  : unsigned(17 downto 0);
       variable v_reuse : boolean;
       variable ent     : t_pq_entry;
@@ -776,6 +797,7 @@ begin
          v_wtail := wq_tail;
          v_infl  := inflight;
          v_una   := unaccepted;
+         v_affpend := aff_pend;
 
          if (VRAM_Drawer_accept = '1') then
             v_una := '0';
@@ -796,6 +818,60 @@ begin
             v_hw      := 0;
          elsif (pixeltime < maxpixeltime) then
             pixeltime <= pixeltime + 1;
+         end if;
+
+         -- ------------------------------------------------------------------
+         -- AFFINE SUM: queues the pixel whose partial terms were computed last
+         -- cycle. Runs BEFORE the walk below on purpose - the walk may then
+         -- refill the partial registers in this same cycle, which is what
+         -- makes a rot/scal pixel cost one cycle instead of two.
+         --
+         -- Reading the partial registers here is safe against the walk's
+         -- writes: both are in this one clocked process, so the walk's
+         -- assignments land at the next edge and this sees the previous
+         -- pixel's values.
+         -- ------------------------------------------------------------------
+         if (v_affpend = '1') then
+            if (is_bitmap = '1') then
+               v_affaddr := (pixeladdr_base
+                              + to_integer(pixeladdr_x_aff0)
+                              + to_integer(pixeladdr_x_aff4)) mod 262144;
+            elsif (one_dim_mapping = '1') then
+               v_affaddr := (pixeladdr_base
+                              + to_integer(pixeladdr_x_aff0) + to_integer(pixeladdr_x_aff1)
+                              + to_integer(pixeladdr_x_aff4) + to_integer(pixeladdr_x_aff5)) mod 262144;
+            else
+               v_affaddr := (pixeladdr_base
+                              + to_integer(pixeladdr_x_aff2) + to_integer(pixeladdr_x_aff3)
+                              + to_integer(pixeladdr_x_aff4) + to_integer(pixeladdr_x_aff5)) mod 262144;
+            end if;
+            -- Word reuse, same rule as the non-affine path: one fetched word
+            -- serves every address sharing bits 17..2, because the lane is
+            -- bits 1..0. Rotation just makes consecutive pixels land in
+            -- different words, and then this falls back to fetching exactly
+            -- as before - never wrong, only less effective.
+            v_addr  := to_unsigned(v_affaddr, 18);
+            v_reuse := (walk_seen = '1') and
+                       (v_addr(17 downto 2) = last_addr(17 downto 2));
+
+            if (v_pcnt < PQ_DEPTH and
+                (v_reuse or (v_wcnt + v_infl < WQ_DEPTH and v_una = '0'))) then
+               ent := ('0', v_addr(1 downto 0), aff_target, aff_second,
+                       not walk_seen, cur_set);
+               if (not v_reuse) then
+                  ent.newword     := '1';
+                  req_word        <= v_addr(17 downto 2);
+                  VRAM_Drawer_req <= '1';
+                  v_una           := '1';
+                  v_infl          := v_infl + 1;
+                  last_addr       <= v_addr;
+                  walk_seen       <= '1';
+               end if;
+               v_pq(v_ptail) := ent;
+               v_ptail := (v_ptail + 1) mod PQ_DEPTH;
+               v_pcnt  := v_pcnt + 1;
+               v_affpend := '0';
+            end if;
          end if;
 
          case (PIXELGen) is
@@ -834,6 +910,20 @@ begin
                      yyy := realY / 256;
                      if (xxx mod 2 = 1) then v_second := '1'; else v_second := '0'; end if;
 
+                     -- ONLY when the sum stage is free. While it still holds a
+                     -- pixel - queue full, or flushing at the end of a sprite -
+                     -- this state keeps running, and writing here would replace
+                     -- the very partial terms it has not summed yet. That
+                     -- corrupts the pending pixel, and only for ROTATED
+                     -- sprites: with pb/pc = 0 realY is constant along the
+                     -- line, so the overwrite is a no-op and pure-scale cases
+                     -- pass while rotated ones come out wrong.
+                     --
+                     -- The in-bounds `if` above cannot stand in for this: it is
+                     -- translate_off, i.e. simulation-only, so it guards
+                     -- nothing in hardware.
+                     if (v_affpend = '0') then
+
                      if (is_bitmap = '1') then
                         -- bitmap: base + yyy*rowstride + xxx*2
                         pixeladdr_x_aff0 <= to_unsigned(yyy * sizemult, 18);
@@ -856,6 +946,8 @@ begin
                            pixeladdr_x_aff5 <= to_unsigned(((xxx / 8) * 64), 18);
                         end if;
                      end if;
+
+                     end if;   -- v_affpend = '0'
 
                   -- synthesis translate_off
                   end if;
@@ -896,10 +988,17 @@ begin
                -- the cost is the sprite's field width, not how much of it
                -- landed on the screen. Charged where x advances, so a walk
                -- stalled for queue room is not charged twice.
-               if (time_up = '1') then
+               -- A pending affine sum must be queued before the sprite ends -
+               -- leaving NEXTADDR would let the next sprite's walk overwrite
+               -- the partial registers it is still holding, dropping its last
+               -- pixel. The sum block above clears it, so this is at most a
+               -- one-cycle wait per sprite.
+               if (time_up = '1' and v_affpend = '0') then
                   PIXELGen <= WAITOAM;
-               elsif (x >= fieldX) then
+               elsif (x >= fieldX and v_affpend = '0') then
                   PIXELGen <= WAITOAM;
+               elsif (time_up = '1' or x >= fieldX) then
+                  null;                       -- flushing the last affine pixel
                elsif (skip_var = '1') then
                   -- nothing to fetch or draw; last_addr keeps the last queued
                   -- word so the reuse compare stays truthful
@@ -909,12 +1008,20 @@ begin
                   if (v_hw <= 2046) then v_hw := v_hw + 1; end if;
                   PIXELGen <= NEXTADDR;
                elsif (Pixel_data0(OAM_AFFINE) = '1') then
-                  -- the summed address is one cycle away; AFF_SUM queues it
-                  realX <= realX + dx;
-                  realY <= realY + dy;
-                  x     <= x + 1;
-                  if (v_hw <= 2045) then v_hw := v_hw + 2; end if;
-                  PIXELGen <= AFF_SUM;
+                  -- Hand this pixel's partial terms (already assigned above)
+                  -- to the sum stage and keep walking. Only when the stage is
+                  -- free: while it still holds a pixel, advancing would
+                  -- overwrite the registers it has not summed yet.
+                  if (v_affpend = '0') then
+                     aff_target <= x + posX;
+                     aff_second <= v_second;
+                     v_affpend  := '1';
+                     realX <= realX + dx;
+                     realY <= realY + dy;
+                     x     <= x + 1;
+                     if (v_hw <= 2045) then v_hw := v_hw + 2; end if;
+                  end if;
+                  PIXELGen <= NEXTADDR;
                else
                   v_addr  := to_unsigned(pixeladdr_calc mod 262144, 18);
                   v_reuse := (walk_seen = '1') and
@@ -946,48 +1053,6 @@ begin
                      if (v_hw <= 2046) then v_hw := v_hw + 1; end if;
                   end if;
                   -- no room: hold x, realX/realY and the state, and retry
-                  PIXELGen <= NEXTADDR;
-               end if;
-
-            when AFF_SUM =>
-               if (is_bitmap = '1') then
-                  v_affaddr := (pixeladdr_base
-                                 + to_integer(pixeladdr_x_aff0)
-                                 + to_integer(pixeladdr_x_aff4)) mod 262144;
-               elsif (one_dim_mapping = '1') then
-                  v_affaddr := (pixeladdr_base
-                                 + to_integer(pixeladdr_x_aff0) + to_integer(pixeladdr_x_aff1)
-                                 + to_integer(pixeladdr_x_aff4) + to_integer(pixeladdr_x_aff5)) mod 262144;
-               else
-                  v_affaddr := (pixeladdr_base
-                                 + to_integer(pixeladdr_x_aff2) + to_integer(pixeladdr_x_aff3)
-                                 + to_integer(pixeladdr_x_aff4) + to_integer(pixeladdr_x_aff5)) mod 262144;
-               end if;
-               -- Word reuse, same rule as the non-affine path: one fetched word
-               -- serves every address sharing bits 17..2, because the lane is
-               -- bits 1..0. Rotation just makes consecutive pixels land in
-               -- different words, and then this falls back to fetching exactly
-               -- as before - never wrong, only less effective.
-               v_addr  := to_unsigned(v_affaddr, 18);
-               v_reuse := (walk_seen = '1') and
-                          (v_addr(17 downto 2) = last_addr(17 downto 2));
-
-               if (v_pcnt < PQ_DEPTH and
-                   (v_reuse or (v_wcnt + v_infl < WQ_DEPTH and v_una = '0'))) then
-                  ent := ('0', v_addr(1 downto 0), target, second_pix,
-                          not walk_seen, cur_set);
-                  if (not v_reuse) then
-                     ent.newword     := '1';
-                     req_word        <= v_addr(17 downto 2);
-                     VRAM_Drawer_req <= '1';
-                     v_una           := '1';
-                     v_infl          := v_infl + 1;
-                     last_addr       <= v_addr;
-                     walk_seen       <= '1';
-                  end if;
-                  v_pq(v_ptail) := ent;
-                  v_ptail := (v_ptail + 1) mod PQ_DEPTH;
-                  v_pcnt  := v_pcnt + 1;
                   PIXELGen <= NEXTADDR;
                end if;
 
@@ -1118,6 +1183,7 @@ begin
          wq_cnt     <= v_wcnt;
          inflight   <= v_infl;
          unaccepted <= v_una;
+         aff_pend   <= v_affpend;
 
       end if;
    end process;
@@ -1359,7 +1425,7 @@ begin
             tot := tot + 1;
          end if;
 
-         if (PIXELGen = NEXTADDR or PIXELGen = AFF_SUM) then
+         if (PIXELGen = NEXTADDR) then
             c_walk := c_walk + 1;
          elsif (PIXELGen = WAITOAM) then
             if (pq_cnt /= 0) then
