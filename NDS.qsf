@@ -155,6 +155,41 @@ set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ALSA=1"
 #    at a mean of 74% of budget), and shaving 20% off every line does not bring
 #    an outlier at 2x budget back inside it. Overclocking buys headroom to spend
 #    later; it is not the fix for dropped lines.
+#
+#    (Note 4's "dropped lines" are now understood and are NOT structural: the OBJ
+#    drawer costs ~3,036 cycles against 2,130 on lines that carry sprites, 15x its
+#    own baseline, because it is the one drawer of four without the accept-based
+#    pipelined VRAM protocol. See nds_drawer_obj.vhd:684. No memory clock fixes
+#    that, which is exactly why 4x moved the mean and not the drops.)
+#
+# 5. FIXED 2026-08-07, one of the two families. Staging nds_vram's A..D
+#    line-cache hit removes the ENTIRE vr_pend/vr_out -> rdr_*_dout family:
+#
+#      audio  clk_sys -1.166 -> +0.996   clk_mem -0.756 -> -0.515   (98% ALM)
+#      debug  clk_sys +0.052 -> +0.471   clk_mem -0.733 -> -0.432   (91% ALM)
+#
+#    What is left in BOTH is only sdram.sv: ch1_rq / state.* -> SDRAM_A[7:8].
+#
+# 6. THAT ONE IS NOT WORTH FIXING YET, and the reasons are measured, not assumed:
+#
+#    - It is not seed noise. Seeds 0 and 3 give -0.515 and -0.778, a 0.26 ns
+#      spread, both negative; seed 3 also pulls in SDRAM_A[11] from sd_vs_req and
+#      mr_sdram_ena. It is the channel-arbitration mux, from several channels.
+#    - The SDRAM_A registers are ALREADY packed into the I/O cells ("Fast Output
+#      Register assignment", pin AC23, column I/O), so the delay is the priority
+#      mux plus the route out to the I/O column.
+#    - DO NOT "fix" it by unpacking them from the IOE. There are no
+#      set_output_delay constraints on the SDRAM pins, so flop->pin is untimed:
+#      that would turn the number green while making the real pin timing worse.
+#      Same class of mistake as the ch1_ready off-by-one.
+#    - Both legitimate fixes - pre-arbitrating the row address, or pipelining the
+#      whole command/address/DQ-capture bus by one clock - cost ONE clkMem cycle
+#      per transaction. The ch1 slot goes 8 -> 9, so 4x's renderer-VRAM throughput
+#      gain over 3x falls from 33% to 19%.
+#
+#    Spending a third of the only benefit, on an overclock measured in note 4 to
+#    save zero dropped lines, to close 0.5 ns. Revisit if the 3D work needs the
+#    memory bandwidth; not before.
 # set_global_assignment -name VERILOG_MACRO "NDS_CLKMEM_4X=1"
 
 # HPS lightweight-bridge debug window at physical 0xFF200000
