@@ -438,6 +438,29 @@ architecture arch of nds_vram is
    signal rsp_valid : std_logic := '0';
    signal rsp_data  : std_logic_vector(63 downto 0) := (others => '0');
 
+   -- A..D line-cache HIT staged one cycle, for exactly the same reason rsp_* is,
+   -- and it is the second half of the same mistake. The hit branch of the issue
+   -- stage used to OR its word into v_rq(...).acc and decrement ad_owed in the
+   -- cycle it was decided - and that decision is gated on `rsrv_ready`, which on
+   -- hardware is driven from clk_mem (NDS.sv's `~vr_pend & (vr_out < 2)`). So
+   -- rsrv_ready reached the retire compare and the rdr_*_dout mux
+   -- COMBINATIONALLY, across the domain, on a path whose setup budget is ONE
+   -- clkMem period rather than a clk_sys one.
+   --
+   -- That is affordable at 3x (9.945 ns; measured +0.721) and it is not at 4x
+   -- (7.459 ns): vr_pend/vr_out -> nds_vram|rdr_*_dout was 48 of the 50 worst
+   -- paths in the design at -1.166 ns. Staging moves the whole
+   -- accumulate-and-retire chain inside clk_sys with a full period, and the only
+   -- cost is that a request finished BY a cache hit retires one cycle later.
+   --
+   -- Note what is deliberately NOT done: `rsrv_ready` is not registered. That is
+   -- the stale-ready wedge the port comment warns about - the issue stage must
+   -- still see the live level, because a request is transferred exactly once and
+   -- both ends have to agree at the same edge about which edge that was.
+   signal adhit_valid : std_logic := '0';
+   signal adhit_slot  : integer range 0 to RQ_DEPTH-1 := 0;
+   signal adhit_word  : std_logic_vector(31 downto 0) := (others => '0');
+
    -- false: no cache, every word costs a memory access (the 64-bit channel still
    -- carries the line, only its low word is used). It was false for one build:
    -- the cache landed at -4.50 ns clk_sys slack where the same tree closed at
@@ -779,6 +802,7 @@ begin
             rsrv_req  <= '0';
             adline    <= (others => ADLINE_INIT);
             rsp_valid <= '0';
+            adhit_valid <= '0';
 
          else
 
@@ -843,6 +867,20 @@ begin
                v_adcnt := v_adcnt - 1;
             end if;
 
+            -- ---- A..D line-cache hit decided LAST cycle (see adhit_*). Applied
+            -- here, after the memory completion above and before the retire
+            -- below, so a hit still retires its request with no extra latency
+            -- beyond the one staging cycle. Composing with the block above is
+            -- safe even when both target the same slot: these are sequential
+            -- variable assignments, so the second reads what the first wrote.
+            -- Nothing can queue up behind it - the issue stage produces at most
+            -- one hit per cycle and this consumes one per cycle.
+            if (adhit_valid = '1') then
+               v_rq(adhit_slot).acc     := v_rq(adhit_slot).acc or adhit_word;
+               v_rq(adhit_slot).ad_owed := v_rq(adhit_slot).ad_owed - 1;
+            end if;
+            adhit_valid <= '0';
+
             -- ---- A..D issue: present the next op when the request wire is
             -- free - either nothing is on it, or what was on it is taken by
             -- THIS edge (rsrv_ready high). Bookkeeping happens at presentation
@@ -872,8 +910,15 @@ begin
                      else
                         v_word := v_adl(v_chan).data(31 downto 0);
                      end if;
-                     v_rq(ad_scan).acc     := v_rq(ad_scan).acc or v_word;
-                     v_rq(ad_scan).ad_owed := v_rq(ad_scan).ad_owed - 1;
+                     -- staged, NOT applied here: this branch is gated on
+                     -- rsrv_ready and .acc/.ad_owed feed the retire compare and
+                     -- the rdr_*_dout mux (see adhit_*). ad_todo is still
+                     -- cleared now, because the scanner must not re-pick this
+                     -- bank next cycle; ad_todo reaches pad_pick, not the
+                     -- dout registers.
+                     adhit_valid <= '1';
+                     adhit_slot  <= ad_scan;
+                     adhit_word  <= v_word;
                      v_rq(ad_scan).ad_todo(v_bank) := '0';
                      -- the wire was free when we got here, so it must be released:
                      -- leaving it asserted would re-present the request that was
