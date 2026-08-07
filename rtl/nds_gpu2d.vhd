@@ -94,6 +94,7 @@ entity nds_gpu2d is
       srv_obj_addr      : out integer range 0 to 65535;
       srv_obj_data      : in  std_logic_vector(31 downto 0);
       srv_obj_done      : in  std_logic;
+      srv_obj_accept    : in  std_logic := '1';
       srv_bgep_req      : out std_logic := '0';
       srv_bgep_addr     : out integer range 0 to 8191;
       srv_bgep_data     : in  std_logic_vector(31 downto 0);
@@ -770,7 +771,8 @@ begin
       VRAM_Drawer_req      => srv_obj_req,
       VRAM_Drawer_addr     => srv_obj_addr,
       VRAM_Drawer_data     => srv_obj_data,
-      VRAM_Drawer_done     => srv_obj_done
+      VRAM_Drawer_done     => srv_obj_done,
+      VRAM_Drawer_accept   => srv_obj_accept
    );
 
    -- ================= palette / OAM =================

@@ -82,6 +82,22 @@ architecture sim of tb_gpu_obj is
    signal o_vram_addr   : integer range 0 to 65535;
    signal o_vram_req    : std_logic;
    signal o_vram_done   : std_logic := '0';
+   signal o_vram_accept : std_logic;
+
+   -- Pipelined line-server model, see p_vram
+   constant VQ_DEPTH : integer := 8;
+   type t_vq_ent is record
+      data : std_logic_vector(31 downto 0);
+      lat  : integer range 0 to 15;
+   end record;
+   type t_vq is array (0 to VQ_DEPTH-1) of t_vq_ent;
+   signal vq       : t_vq := (others => ((others => '0'), 0));
+   signal vq_head  : integer range 0 to VQ_DEPTH-1 := 0;
+   signal vq_tail  : integer range 0 to VQ_DEPTH-1 := 0;
+   signal vq_cnt   : integer range 0 to VQ_DEPTH := 0;
+   signal vpend    : std_logic := '0';
+   signal acc_gate : std_logic := '1';
+   signal vram_take : std_logic;
    signal o_pal_data, o_extpal_data, o_vram_data : std_logic_vector(31 downto 0);
 
 
@@ -144,7 +160,8 @@ begin
       VRAM_Drawer_req      => o_vram_req,
       VRAM_Drawer_addr     => o_vram_addr,
       VRAM_Drawer_data     => o_vram_data,
-      VRAM_Drawer_done     => o_vram_done
+      VRAM_Drawer_done     => o_vram_done,
+      VRAM_Drawer_accept   => o_vram_accept
    );
 
    -- OAM: plain registered read, data one cycle after address
@@ -165,16 +182,72 @@ begin
       end if;
    end process;
 
-   p_vram : process
+   -- Pipelined line-server model: latch the request pulse (nds_vram's rpend),
+   -- accept at most one per cycle, hold several in flight, and retire IN ISSUE
+   -- ORDER after a random latency.
+   --
+   -- The model this replaces waited for one req, slept, then answered - so a
+   -- second request issued while it slept was silently DROPPED, and the answer
+   -- was read from `vram(o_vram_addr)` at answer time, i.e. from whatever
+   -- address the client had moved on to. Against a one-request-at-a-time
+   -- client both mistakes were invisible. Against a pipelined one the drawer
+   -- deadlocked with vram_reqs=0 and every pixel transparent, which reads like
+   -- a drawer bug and is not one. Same lesson as VRSRV_ONE in the frame
+   -- benches: a permissive memory model hides exactly the bugs it should find.
+   vram_take <= '1' when ((o_vram_req = '1' or vpend = '1')
+                          and vq_cnt < VQ_DEPTH and acc_gate = '1') else '0';
+   o_vram_accept <= vram_take;
+
+   p_vram : process (clk)
       variable seed : unsigned(31 downto 0) := to_unsigned(44444, 32);
+      variable v_vq : t_vq;
+      variable v_c  : integer range 0 to VQ_DEPTH;
+      variable v_h  : integer range 0 to VQ_DEPTH-1;
+      variable v_t  : integer range 0 to VQ_DEPTH-1;
    begin
-      wait until rising_edge(clk) and o_vram_req = '1';
-      seed := seed xor shift_left(seed, 13); seed := seed xor shift_right(seed, 17); seed := seed xor shift_left(seed, 5);
-      for k in 0 to to_integer(seed(2 downto 0)) loop wait until rising_edge(clk); end loop;
-      o_vram_data <= vram(o_vram_addr);
-      o_vram_done <= '1';
-      wait until rising_edge(clk);
-      o_vram_done <= '0';
+      if rising_edge(clk) then
+         o_vram_done <= '0';
+
+         v_vq := vq;
+         v_c  := vq_cnt;
+         v_h  := vq_head;
+         v_t  := vq_tail;
+
+         seed := seed xor shift_left(seed, 13);
+         seed := seed xor shift_right(seed, 17);
+         seed := seed xor shift_left(seed, 5);
+         acc_gate <= seed(9) or seed(10);   -- occasionally refuse, to exercise
+                                            -- the client's unaccepted path
+
+         for k in 0 to VQ_DEPTH-1 loop
+            if (v_vq(k).lat > 0) then v_vq(k).lat := v_vq(k).lat - 1; end if;
+         end loop;
+
+         -- retire the oldest only: in-order, at most one per cycle
+         if (v_c > 0 and v_vq(v_h).lat = 0) then
+            o_vram_data <= v_vq(v_h).data;
+            o_vram_done <= '1';
+            v_h := (v_h + 1) mod VQ_DEPTH;
+            v_c := v_c - 1;
+         end if;
+
+         -- take the request, capturing the address THIS cycle
+         if (o_vram_req = '1' and vpend = '0') then
+            vpend <= '1';
+         end if;
+         if (vram_take = '1') then
+            vpend          <= '0';
+            v_vq(v_t).data := vram(o_vram_addr);
+            v_vq(v_t).lat  := 1 + to_integer(seed(2 downto 0));
+            v_t := (v_t + 1) mod VQ_DEPTH;
+            v_c := v_c + 1;
+         end if;
+
+         vq      <= v_vq;
+         vq_cnt  <= v_c;
+         vq_head <= v_h;
+         vq_tail <= v_t;
+      end if;
    end process;
 
    -- VRAM request counter. Correctness is what the golden model checks; this is

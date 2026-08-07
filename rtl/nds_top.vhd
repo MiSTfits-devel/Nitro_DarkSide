@@ -651,6 +651,7 @@ architecture arch of nds_top is
    -- the line server takes a request; the BG channels use it so a drawer may
    -- keep several fetches in flight (see nds_vram's pipeline comment).
    signal r_bg_accept, rb_bg_accept : std_logic;
+   signal r_obj_accept, rb_obj_accept : std_logic;
    signal r_bg_req, r_bg_done       : std_logic;
    signal r_bg_addr                 : unsigned(18 downto 2);
    signal r_bg_dout                 : std_logic_vector(31 downto 0);
@@ -1872,6 +1873,7 @@ begin
       rdr_bg_accept => r_bg_accept,
       rdr_obj_req => r_obj_req, rdr_obj_addr => r_obj_addr,
       rdr_obj_dout => r_obj_dout, rdr_obj_done => r_obj_done,
+      rdr_obj_accept => r_obj_accept,
       rdr_bgep_req => r_bgep_req, rdr_bgep_addr => r_bgep_addr,
       rdr_bgep_dout => r_bgep_dout, rdr_bgep_done => r_bgep_done,
       rdr_objep_req => r_objep_req, rdr_objep_addr => r_objep_addr,
@@ -1881,6 +1883,7 @@ begin
       rdr_bgb_accept => rb_bg_accept,
       rdr_objb_req => rb_obj_req, rdr_objb_addr => rb_obj_addr,
       rdr_objb_dout => rb_obj_dout, rdr_objb_done => rb_obj_done,
+      rdr_objb_accept => rb_obj_accept,
       rdr_bgepb_req => rb_bgep_req, rdr_bgepb_addr => rb_bgep_addr,
       rdr_bgepb_dout => rb_bgep_dout, rdr_bgepb_done => rb_bgep_done,
       rdr_objepb_req => rb_objep_req, rdr_objepb_addr => rb_objep_addr,
@@ -1972,6 +1975,7 @@ begin
       srv_bg_accept => r_bg_accept,
       srv_obj_req => r_obj_req, srv_obj_addr => g_obj_addr,
       srv_obj_data => r_obj_dout, srv_obj_done => r_obj_done,
+      srv_obj_accept => r_obj_accept,
       srv_bgep_req => r_bgep_req, srv_bgep_addr => g_bgep_addr,
       srv_bgep_data => r_bgep_dout, srv_bgep_done => r_bgep_done,
       srv_objep_req => r_objep_req, srv_objep_addr => g_objep_addr,
@@ -2026,6 +2030,7 @@ begin
       srv_bg_accept => rb_bg_accept,
       srv_obj_req => rb_obj_req, srv_obj_addr => gb_obj_addr,
       srv_obj_data => rb_obj_dout, srv_obj_done => rb_obj_done,
+      srv_obj_accept => rb_obj_accept,
       srv_bgep_req => rb_bgep_req, srv_bgep_addr => gb_bgep_addr,
       srv_bgep_data => rb_bgep_dout, srv_bgep_done => rb_bgep_done,
       srv_objep_req => rb_objep_req, srv_objep_addr => gb_objep_addr,

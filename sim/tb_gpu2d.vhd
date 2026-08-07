@@ -88,8 +88,12 @@ architecture sim of tb_gpu2d is
    signal srv_bg_addr   : integer range 0 to 131071;
    signal srv_bg_data   : std_logic_vector(31 downto 0);
    signal srv_obj_req, srv_obj_done : std_logic := '0';
+   signal srv_obj_accept            : std_logic := '0';
    signal srv_obj_addr  : integer range 0 to 65535;
    signal srv_obj_data  : std_logic_vector(31 downto 0);
+   constant OBJSRV_LAT : integer := 3;
+   type t_objpipe_arr is array (0 to OBJSRV_LAT - 1) of t_bgpipe;
+   signal objpipe : t_objpipe_arr := (others => ('0', (others => '0')));
    signal srv_bgep_req, srv_bgep_done : std_logic := '0';
    signal srv_bgep_addr : integer range 0 to 8191;
    signal srv_bgep_data : std_logic_vector(31 downto 0);
@@ -147,6 +151,7 @@ begin
       srv_obj_addr    => srv_obj_addr,
       srv_obj_data    => srv_obj_data,
       srv_obj_done    => srv_obj_done,
+      srv_obj_accept  => srv_obj_accept,
       srv_bgep_req    => srv_bgep_req,
       srv_bgep_addr   => srv_bgep_addr,
       srv_bgep_data   => srv_bgep_data,
@@ -184,16 +189,27 @@ begin
       end if;
    end process;
 
-   p_srv_obj : process
-      variable seed : unsigned(31 downto 0) := to_unsigned(7654301, 32);
+   -- OBJ, same shape as p_srv_bg above and for the same reason: the drawer
+   -- now keeps several requests in flight, and the one-at-a-time process this
+   -- replaces would have silently dropped every request that arrived while it
+   -- was sleeping - and answered from whatever address the drawer had moved
+   -- on to by the time it woke.
+   srv_obj_accept <= srv_obj_req;
+
+   p_srv_obj : process (clk)
    begin
-      wait until rising_edge(clk) and srv_obj_req = '1';
-      seed := seed xor shift_left(seed, 13); seed := seed xor shift_right(seed, 17); seed := seed xor shift_left(seed, 5);
-      for k in 0 to to_integer(seed(0 downto 0)) loop wait until rising_edge(clk); end loop;
-      srv_obj_data <= objvram(srv_obj_addr);
-      srv_obj_done <= '1';
-      wait until rising_edge(clk);
-      srv_obj_done <= '0';
+      if rising_edge(clk) then
+         for k in OBJSRV_LAT - 1 downto 1 loop
+            objpipe(k) <= objpipe(k - 1);
+         end loop;
+         objpipe(0).v <= '0';
+         if (srv_obj_req = '1') then
+            objpipe(0).v <= '1';
+            objpipe(0).d <= objvram(srv_obj_addr);
+         end if;
+         srv_obj_done <= objpipe(OBJSRV_LAT - 1).v;
+         srv_obj_data <= objpipe(OBJSRV_LAT - 1).d;
+      end if;
    end process;
 
    p_srv_bgep : process
