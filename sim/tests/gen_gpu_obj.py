@@ -412,6 +412,51 @@ obj(o, 0, 10, 56, 0, 2, 1, prio=0, palno=1, mosaic=1)
 obj(o, 1, 74, 56, 0, 2, 1, prio=0, palno=2, mosaic=1)
 cases.append((c, o))
 
+# --- magnified rot/scal -------------------------------------------------
+# pa/pd are the INVERSE scale, so small values magnify: 0x100 is 1:1 and
+# 0x020 is 8x. Every case above stays at 0x080 (2x) or coarser, which
+# leaves the drawer's word-reuse path almost untested - reuse only fires
+# when consecutive screen pixels land in the same VRAM word, and that is
+# exactly what heavy magnification does for run after run.
+#
+# This is the regime a scaling star-burst / pickup effect runs in, and it
+# is where a reuse bug shows up as a sprite drawn in ONE FLAT COLOUR
+# instead of a chunky version of its graphic.
+
+# NB tile 0x60, NOT 0x40: tiles 0x40..0x4F are zeroed above for the merge
+# tests, so a sprite pointed at them draws nothing at all. Case 7 above is
+# pointed at 0x40 and reports pixels=0 - it exercises the affine ADDRESS
+# walk but never a single opaque pixel, which is not what its name implies.
+
+# 26: affine 4bpp tile, 8x magnification (4 source columns over 32 px)
+c = cfg(one_dim=1); o = new_oam()
+obj(o, 0, 40, 48, 0, 2, 0x60, prio=0, palno=4, affine=1, affsel=2)
+aff(o, 2, 0x020, 0, 0, 0x020)
+cases.append((c, o))
+
+# 27: affine 4bpp tile, 32x magnification + double size - the extreme end,
+#     where a whole field can sit inside a single source word. y=16 with a
+#     64x64 field spans 16..79, so the y=64 render line lands at ty=48.
+c = cfg(one_dim=1); o = new_oam()
+obj(o, 0, 30, 16, 0, 2, 0x60, prio=0, palno=4, affine=1, dbl=1, affsel=4)
+aff(o, 4, 0x008, 0, 0, 0x008)
+cases.append((c, o))
+
+# 28: affine BITMAP, 8x magnification - the direct-colour path, two pixels
+#     per word rather than eight, so it reuses on a different boundary
+c = cfg(bitmap_1d=1); o = new_oam()
+obj(o, 0, 60, 48, 0, 2, 40, prio=2, palno=10, mode=3, affine=1, affsel=6)
+aff(o, 6, 0x020, 0, 0, 0x020)
+cases.append((c, o))
+
+# 29: affine 8bpp + ext palette, magnified AND rotated, so the address
+#     walks diagonally through VRAM while still revisiting words
+c = cfg(one_dim=1, tile_boundary=1, obj_extpal=1); o = new_oam()
+obj(o, 0, 100, 40, 0, 2, 0x19D, prio=1, palno=11, hicolor=1,
+    affine=1, dbl=1, affsel=8)
+aff(o, 8, 0x030, 0x010, -0x010 & 0xFFFF, 0x030)
+cases.append((c, o))
+
 # ---------------------------------------------------------------- emit
 
 def whex(f, v):
