@@ -4,9 +4,11 @@
 -- cadence (address latched while valid='0', data + valid='1' next cycle).
 -- Cases come from sim/tests/gpu_obj_vectors.hex (gen_gpu_obj.py golden
 -- model): 8 header words + 256 OAM words + 256 expected color words +
--- 256 expected settings words per case. The drawer has no busy output;
--- each line is bounded by the pixeltime budget, so we wait a fixed 2600
--- cycles after drawline before comparing.
+-- 256 expected settings words per case. Each line is bounded by the pixeltime
+-- budget, so we wait a fixed 2600 cycles after drawline before comparing.
+-- `busy` used to be left open here and the header claimed the drawer had no such
+-- port; it has had one at nds_drawer_obj.vhd:44 all along, and without it this
+-- bench could not report what a line COSTS - only whether it was correct.
 -- Run: sim/run_gpu_obj.sh  (regenerate vectors first)
 
 library IEEE;
@@ -85,6 +87,9 @@ architecture sim of tb_gpu_obj is
 
    -- pixel outputs
    signal pixel_we_color    : std_logic;
+   signal busy              : std_logic;
+   signal cyc_case          : integer := 0;
+   signal px_case           : integer := 0;
    signal pixeldata_color   : std_logic_vector(15 downto 0);
    signal pixel_we_settings : std_logic;
    signal pixeldata_settings : std_logic_vector(7 downto 0);
@@ -113,7 +118,7 @@ begin
    (
       clk                  => clk,
       drawline             => drawline,
-      busy                 => open,
+      busy                 => busy,
       ypos                 => ypos,
       ypos_mosaic          => ypos_mosaic,
       one_dim_mapping      => one_dim_mapping,
@@ -188,6 +193,23 @@ begin
       end if;
    end process;
 
+   -- Cost model for the line, which is what sizes any rework of this drawer.
+   -- vram_reqs alone cannot: measured in the full system, only 244 of the OBJ
+   -- drawer's 3,036 cycles on a sprite-bearing line are VRAM round-trip stall, so
+   -- 92% of the cost is this FSM walking per pixel. cyc/px is the number to move.
+   p_cost : process (clk)
+   begin
+      if rising_edge(clk) then
+         if (clear_line = '1') then
+            cyc_case <= 0;
+            px_case  <= 0;
+         else
+            if (busy = '1') then cyc_case <= cyc_case + 1; end if;
+            if (pixel_we_color = '1') then px_case <= px_case + 1; end if;
+         end if;
+      end if;
+   end process;
+
    -- pixel collect
    p_collect : process (clk)
    begin
@@ -253,7 +275,8 @@ begin
          wait until rising_edge(clk);
          drawline <= '0';
 
-         -- no busy port; the line is bounded by the pixeltime budget (2130)
+         -- bounded by the pixeltime budget (2130); busy is now wired for the
+         -- cost report, but the wait stays fixed so case timing is unchanged
          for k in 1 to 2600 loop wait until rising_edge(clk); end loop;
 
          for x in 0 to 255 loop
@@ -277,7 +300,11 @@ begin
             end if;
          end loop;
          report "case " & integer'image(c) & " done  vram_reqs=" &
-                integer'image(vram_reqs_case) severity note;
+                integer'image(vram_reqs_case) &
+                "  busy_cyc=" & integer'image(cyc_case) &
+                " pixels=" & integer'image(px_case) &
+                "  cyc/px=" & integer'image(cyc_case * 100 /
+                   (px_case + 1)) & "/100  (budget 2130)" severity note;
       end loop;
 
       if (nfail = 0) then

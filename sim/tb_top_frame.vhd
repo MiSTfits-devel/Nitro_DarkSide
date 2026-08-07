@@ -1685,7 +1685,18 @@ begin
       -- is not aliasable - its type is declared inside gpu2d's architecture.
       alias a_bgbusy  is << signal .tb_top_frame.idut.igpu2d_a.dbg_bg_busy : std_logic >>;
       alias a_objbusy is << signal .tb_top_frame.idut.igpu2d_a.dbg_obj_busy : std_logic >>;
+      -- OBJ pixel writes, counted FREE-RUNNING and reported per frame, not per
+      -- line. A per-line version gated on line_busy was tried and read zero on
+      -- the very lines where OBJ burns 3,036 cycles - because the OBJ drawer
+      -- pre-renders the NEXT line and runs partly while linestate is LIDLE, i.e.
+      -- outside that window. It looked exactly like "the drawer draws nothing",
+      -- which is why the frame totals are here instead: they are unambiguous.
+      -- Attributing OBJ work to a line needs the drawer's own line boundary
+      -- (linecounter_obj), not the BG line FSM's.
+      alias a_objpx is << signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.iobj.pixel_we_color : std_logic >>;
+      alias a_objpxs is << signal .tb_top_frame.idut.igpu2d_a.gslow.igpu.iobj.pixel_we_settings : std_logic >>;
       variable ops, cyc, blocked, blk_a, blk_b : natural := 0;
+      variable objpx_all, objpxs_all : natural := 0;
       variable busy_a, busy_b, lines : natural := 0;
       variable starts_a, starts_b : natural := 0;
       variable dones_a, drops_a   : natural := 0;
@@ -1707,6 +1718,8 @@ begin
          wait until rising_edge(clk1x);
          cyc := cyc + 1;
          if (a_rdisp = '1') then ops := ops + 1; end if;
+         if (a_objpx = '1')  then objpx_all  := objpx_all + 1;  end if;
+         if (a_objpxs = '1') then objpxs_all := objpxs_all + 1; end if;
          if (a_bg = '1' or a_obj = '1' or a_bgep = '1' or a_objep = '1') then
             blk_a := blk_a + 1;
          end if;
@@ -1811,6 +1824,8 @@ begin
                    " (budget 2130, " &
                    integer'image(busy_a / (nstarts * 256)) &
                    " cyc/dot)" &
+                   "  OBJ px_color=" & integer'image(objpx_all) &
+                   " px_settings=" & integer'image(objpxs_all) &
                    "  bg/render=" & integer'image(bgcyc / nstarts) &
                    " obj/render=" & integer'image(objcyc / nstarts) severity note;
             ops := 0;
@@ -1825,6 +1840,7 @@ begin
             starts_b := 0;
             dones_a := 0;
             drops_a := 0;
+            objpx_all := 0; objpxs_all := 0;
             bgcyc := 0;
             objcyc := 0;
          end if;
