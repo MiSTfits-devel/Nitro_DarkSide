@@ -143,6 +143,7 @@ entity nds_gpu2d_fast is
       srv_obj_addr      : out integer range 0 to 65535;
       srv_obj_data      : in  std_logic_vector(31 downto 0);
       srv_obj_done      : in  std_logic;
+      srv_obj_accept    : in  std_logic := '1';
       srv_bgep_req      : out std_logic := '0';
       srv_bgep_addr     : out integer range 0 to 8191;
       srv_bgep_data     : in  std_logic_vector(31 downto 0);
@@ -228,6 +229,7 @@ begin
          srv_bg_accept => srv_bg_accept,
          srv_obj_req => srv_obj_req, srv_obj_addr => srv_obj_addr,
          srv_obj_data => srv_obj_data, srv_obj_done => srv_obj_done,
+         srv_obj_accept => srv_obj_accept,
          srv_bgep_req => srv_bgep_req, srv_bgep_addr => srv_bgep_addr,
          srv_bgep_data => srv_bgep_data, srv_bgep_done => srv_bgep_done,
          srv_objep_req => srv_objep_req, srv_objep_addr => srv_objep_addr,
@@ -247,8 +249,8 @@ begin
       signal d_draw, d_obj, d_lt, d_hb, d_vb, d_ru : std_logic := '0';
       signal d_palwe, d_oamwe                      : std_logic := '0';
       signal d_bgd, d_objd, d_bgepd, d_objepd      : std_logic := '0';
-      signal d_bga                                 : std_logic := '0';
-      signal i_bg_accept                           : std_logic;
+      signal d_bga, d_obja                         : std_logic := '0';
+      signal i_bg_accept, i_obj_accept             : std_logic;
       -- rule 3: clk1x-aligned outbound request levels
       signal o_bg_req, o_obj_req, o_bgep_req, o_objep_req : std_logic := '0';
       signal o_bg_addr    : integer range 0 to 131071 := 0;
@@ -282,6 +284,7 @@ begin
             d_bgepd  <= srv_bgep_done;
             d_objepd <= srv_objep_done;
             d_bga    <= srv_bg_accept;
+            d_obja   <= srv_obj_accept;
          end if;
       end process;
 
@@ -298,6 +301,7 @@ begin
       i_bgep_done  <= srv_bgep_done   and not d_bgepd;
       i_objep_done <= srv_objep_done  and not d_objepd;
       i_bg_accept  <= srv_bg_accept   and not d_bga;
+      i_obj_accept <= srv_obj_accept  and not d_obja;
 
       -- gb_bus: payload is a stable level, ena must be one cycle (see rule 2 -
       -- eProcReg_gba's write path is combinational on ena)
@@ -353,7 +357,8 @@ begin
                -- accept and may hold several in flight, so done is no longer
                -- the signal that it is ready for the next one
                if (srv_bg_accept  = '1') then o_bg_req    <= '0'; end if;
-               if (srv_obj_done   = '1') then o_obj_req   <= '0'; end if;
+               -- OBJ releases on accept too now that its drawer pipelines
+               if (srv_obj_accept = '1') then o_obj_req   <= '0'; end if;
                if (srv_bgep_done  = '1') then o_bgep_req  <= '0'; end if;
                if (srv_objep_done = '1') then o_objep_req <= '0'; end if;
 
@@ -487,6 +492,7 @@ begin
          srv_bg_accept => i_bg_accept,
          srv_obj_req => i_obj_req, srv_obj_addr => i_obj_addr,
          srv_obj_data => srv_obj_data, srv_obj_done => i_obj_done,
+         srv_obj_accept => i_obj_accept,
          srv_bgep_req => i_bgep_req, srv_bgep_addr => i_bgep_addr,
          srv_bgep_data => srv_bgep_data, srv_bgep_done => i_bgep_done,
          srv_objep_req => i_objep_req, srv_objep_addr => i_objep_addr,

@@ -22,8 +22,11 @@
 --   * settings plane widened to 8 bits:
 --     [1:0] priority, [2] semi-transparent (mode 01), [3] bitmap sprite,
 --     [7:4] bitmap alpha (attr2 palette field)
---   * per-line budget kept but set to the full NDS line for now (melonDS
---     does not model the OBJ time limit; revisit for hardware accuracy)
+--   * the hardware per-line OBJ time budget IS enforced (HW_TIME_LIMIT):
+--     1210 cycles with the H-Blank interval free, 954 without, charged as
+--     1 cycle per field pixel for a normal sprite and 10 + 2 per pixel for
+--     a rot/scal one. melonDS does not model this, so the golden models do
+--     not either - see the generic's comment for why that is still safe.
 --
 -- OAM layout, affine pipeline and the priority merge into the double
 -- line buffer are unchanged from the donor. H-mosaic follows NDS hardware
@@ -36,6 +39,28 @@ use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
 
 entity nds_drawer_obj is
+   generic
+   (
+      -- Hardware OBJ per-line time budget, per GBATEK. Hardware gives OBJ
+      -- rendering 1210 cycles per line when DISPCNT.23 (H-Blank interval
+      -- free) is set and 954 when it is not, and charges:
+      --
+      --    normal sprite   : 1 cycle per pixel of the sprite's field width
+      --    rot/scal sprite : 10 cycles of setup + 2 cycles per field pixel
+      --
+      -- A line that asks for more than that loses its LAST sprites - OAM
+      -- order is priority order, so running out of budget drops the lowest
+      -- priority ones, which is what this walk does too.
+      --
+      -- This is counted in HARDWARE cycles, not ours. Charging our own clock
+      -- against 1210 would be wrong by whatever the drawer's cycles-per-pixel
+      -- happens to be, and would drop sprites hardware keeps.
+      --
+      -- Set to '0' to render every sprite regardless. melonDS does not model
+      -- the limit, so the generated golden models expect '0' behaviour on any
+      -- scene that would exceed the budget.
+      HW_TIME_LIMIT : std_logic := '1'
+   );
    port
    (
       clk                  : in  std_logic;
@@ -71,12 +96,16 @@ entity nds_drawer_obj is
       EXTPAL_Drawer_addr   : out integer range 0 to 2047;      -- 8 KB OBJ ext-pal slot
       EXTPAL_Drawer_data   : in  std_logic_vector(31 downto 0);
 
-      -- one request in flight; req one-cycle pulse, addr held until the
-      -- done pulse (data valid that cycle)
+      -- SEVERAL requests may be in flight: present req with addr, the arbiter
+      -- pulses accept when it takes it, and done pulses once per answer IN
+      -- ISSUE ORDER (nds_gpu2d's arbiter and nds_vram's server both retire in
+      -- order, which is what lets the word queue below be a plain FIFO).
+      -- accept defaults to '1' so a bench that does not model it still works.
       VRAM_Drawer_req      : out std_logic := '0';
       VRAM_Drawer_addr     : out integer range 0 to 65535;     -- 256 KB OBJ space
       VRAM_Drawer_data     : in  std_logic_vector(31 downto 0);
-      VRAM_Drawer_done     : in  std_logic
+      VRAM_Drawer_done     : in  std_logic;
+      VRAM_Drawer_accept   : in  std_logic := '1'
    );
 end entity;
 
@@ -138,6 +167,22 @@ architecture arch of nds_drawer_obj is
 
    signal OAM_currentobj : integer range 0 to 127;
 
+   -- The sprite whose OAM address is ON THE BUS. OAM reads are registered, so
+   -- the data arriving this cycle belongs to whatever address went out last
+   -- cycle - i.e. OAM_currentobj always trails OAM_scanptr by one.
+   --
+   -- Keeping the two apart is what lets a skipped sprite cost ONE cycle. The
+   -- walk used to be READFIRST (present address) -> WAITFIRST (consume it) ->
+   -- READFIRST, so every one of the 128 entries cost two cycles whether or not
+   -- it drew anything: a dead-constant 255 cycles per line, measured, on a
+   -- 2130-cycle budget. Presenting sprite N+1's address while N's data is
+   -- being consumed halves that.
+   --
+   -- Only the first-word scan pipelines. READSECOND and the affine reads still
+   -- address off OAM_currentobj, because those are reads for the sprite being
+   -- processed, not the one being scanned ahead.
+   signal OAM_scanptr    : integer range 0 to 127 := 0;
+
    signal OAM_data0 : std_logic_vector(15 downto 0) := (others => '0');
    signal OAM_data1 : std_logic_vector(15 downto 0) := (others => '0');
    signal OAM_data2 : std_logic_vector(15 downto 0) := (others => '0');
@@ -171,8 +216,7 @@ architecture arch of nds_drawer_obj is
    (
       WAITOAM,
       NEXTADDR,
-      AFF_SUM,
-      PIXELWAIT
+      AFF_SUM
    );
    signal PIXELGen : t_PIXELGen := WAITOAM;
 
@@ -201,9 +245,103 @@ architecture arch of nds_drawer_obj is
    signal realY             : integer range -8388608 to 8388607;
    signal target            : integer range 0 to 255;
    signal second_pix        : std_logic := '0';
-   signal firstpix          : std_logic;
-   signal issue_pixel       : std_logic;
-   signal pixeladdr_x       : unsigned(17 downto 0) := (others => '0');
+
+   -- ==========================================================================
+   -- DECOUPLED PIXEL QUEUE
+   -- ==========================================================================
+   -- v1 walked NEXTADDR -> (reuse | fetch -> PIXELWAIT) -> NEXTADDR one pixel
+   -- at a time and STOPPED DEAD in PIXELWAIT on every fetch, so a fetched pixel
+   -- cost 1 + the whole VRAM round trip. Measured 3,036 cycles on a
+   -- sprite-bearing line against a 2,130 budget - the drops the owner can see.
+   --
+   -- The address stream is predictable, so the walk now runs AHEAD of the
+   -- pixels. Each walked pixel is pushed onto a queue carrying everything the
+   -- pixel pipeline needs (byte lane, screen x, half-byte select, first-of-
+   -- sprite), tagged either "reuses the word before it" or "consumes the next
+   -- word to come back". Fetches are issued as the walk passes them, several
+   -- outstanding at once, and a drain stage pops one pixel per cycle - stalling
+   -- only when the head pixel's word has not landed yet.
+   --
+   -- Two consequences worth naming:
+   --   * the reuse compare is now on the WORD (bits 17..2), not the halfword
+   --     v1 used. One fetched word serves every address sharing those bits -
+   --     v1's own AFF_SUM comment says so - which halves the fetches for
+   --     4bpp tile sprites.
+   --   * it is guarded on walk_seen ("a word for THIS sprite is queued")
+   --     rather than v1's firstpix. firstpix was cleared by the first
+   --     NEXTADDR whether or not that pixel drew anything, so a sprite whose
+   --     first pixels were all skipped compared against the PREVIOUS sprite's
+   --     address. That was a live bug on the non-affine path; AFF_SUM already
+   --     guarded against it and said why.
+   constant PQ_DEPTH : integer := 8;   -- pixels queued between walk and pixels
+   constant WQ_DEPTH : integer := 4;   -- VRAM words tracked in flight
+
+   -- Everything the pixel pipeline needs to know about the SPRITE a queued
+   -- pixel came from. These used to be read live off Pixel_data* at drain
+   -- time, which is why a sprite's settings had to stay current until its last
+   -- pixel had drained - the `pq_cnt = 0` term in settings_go. That term cost
+   -- a bubble the size of the VRAM round trip once per sprite: measured 390 to
+   -- 655 cycles per line on a 128-sprite line, 20-34% of the drawer's time,
+   -- with the walk sitting idle for all of it.
+   --
+   -- Carrying them WITH the pixel is the same fix already applied to the
+   -- fetched word (see drain_word): the next sprite can start walking while
+   -- the previous one's pixels are still draining, because those pixels no
+   -- longer depend on any live register.
+   type t_pq_set is record
+      prio    : std_logic_vector(1 downto 0);
+      mode    : std_logic_vector(1 downto 0);
+      hicolor : std_logic;
+      affine  : std_logic;
+      hflip   : std_logic;
+      palette : std_logic_vector(3 downto 0);
+      mosaic  : std_logic;
+      bitmap  : std_logic;
+   end record;
+   constant PQ_SET_INIT : t_pq_set := ("00", "00", '0', '0', '0', "0000", '0', '0');
+
+   type t_pq_entry is record
+      newword : std_logic;                 -- consumes the next word to arrive
+      lane    : unsigned(1 downto 0);      -- byte lane within that word
+      target  : integer range 0 to 255;    -- screen x
+      second  : std_logic;                 -- odd source pixel (4bpp nibble)
+      first   : std_logic;                 -- sprite's first emitted pixel
+      set     : t_pq_set;                  -- the sprite this pixel belongs to
+   end record;
+   constant PQ_INIT : t_pq_entry := ('0', "00", 0, '0', '0', PQ_SET_INIT);
+   type t_pq is array (0 to PQ_DEPTH-1) of t_pq_entry;
+   signal pq       : t_pq := (others => PQ_INIT);
+   signal pq_head  : integer range 0 to PQ_DEPTH-1 := 0;
+   signal pq_tail  : integer range 0 to PQ_DEPTH-1 := 0;
+   signal pq_cnt   : integer range 0 to PQ_DEPTH := 0;
+
+   type t_wq is array (0 to WQ_DEPTH-1) of std_logic_vector(31 downto 0);
+   signal wq       : t_wq := (others => (others => '0'));
+   signal wq_head  : integer range 0 to WQ_DEPTH-1 := 0;
+   signal wq_tail  : integer range 0 to WQ_DEPTH-1 := 0;
+   signal wq_cnt   : integer range 0 to WQ_DEPTH := 0;
+   signal inflight : integer range 0 to WQ_DEPTH := 0;   -- asked for, not back
+
+   signal unaccepted : std_logic := '0';   -- request presented, not yet taken
+   signal walk_seen  : std_logic := '0';   -- a word for this sprite is queued
+   signal last_addr  : unsigned(17 downto 0) := (others => '0');
+   signal req_word   : unsigned(15 downto 0) := (others => '0');
+
+   -- drain -> pixel pipeline, all valid the cycle after issue_pixel
+   signal issue_pixel  : std_logic := '0';
+   signal issue_lane   : unsigned(1 downto 0) := "00";
+   signal issue_target : integer range 0 to 255 := 0;
+   signal issue_second : std_logic := '0';
+   -- the drained pixel's sprite settings, published with it
+   signal issue_set    : t_pq_set := PQ_SET_INIT;
+   -- the settings of the sprite currently being WALKED, i.e. what gets stamped
+   -- into each entry as it is queued
+   signal cur_set      : t_pq_set;
+   -- the word this pixel reads. It must travel WITH the pixel: a single
+   -- "last word fetched" register works only while the FSM stalls per fetch,
+   -- and back-to-back drains would overwrite it before the pipeline read it.
+   signal drain_word   : std_logic_vector(31 downto 0) := (others => '0');
+   signal word_eval    : std_logic_vector(31 downto 0) := (others => '0');
 
    signal pixeladdr_x_aff0  : unsigned(17 downto 0);
    signal pixeladdr_x_aff1  : unsigned(17 downto 0);
@@ -241,18 +379,10 @@ architecture arch of nds_drawer_obj is
 
    signal second_pix_eval   : std_logic;
 
-   signal VRAM_data_next    : std_logic_vector(31 downto 0) := (others => '0');
-
    signal readaddr_mux_eval : unsigned(1 downto 0);
 
-   signal prio_issue        : std_logic_vector(1 downto 0);
-   signal mode_issue        : std_logic_vector(1 downto 0);
-   signal hicolor_issue     : std_logic;
-   signal affine_issue      : std_logic;
-   signal hflip_issue       : std_logic;
-   signal palette_issue     : std_logic_vector(3 downto 0);
-   signal mosaic_issue      : std_logic;
-   signal bitmap_issue      : std_logic;
+   -- (the per-sprite *_issue registers that used to sit here are gone: those
+   -- values now ride in the pixel queue as t_pq_set, see issue_set)
 
    signal prio_eval         : std_logic_vector(1 downto 0);
    signal mode_eval         : std_logic_vector(1 downto 0);
@@ -287,7 +417,6 @@ architecture arch of nds_drawer_obj is
    end function;
    constant MOSTAB0 : t_mostab := init_mostab;
 
-   signal spr_seen          : std_logic := '0';
    signal mos_prevx         : integer range 0 to 256 := 256;  -- last opaque x (256 = none)
    signal issue_first       : std_logic := '0';
    signal sprfirst_eval     : std_logic := '0';
@@ -297,18 +426,63 @@ architecture arch of nds_drawer_obj is
    signal PALETTE_addrlow   : std_logic;
    signal EXTPAL_addrlow    : std_logic;
 
-   -- generous while the line-server latency story settles (melonDS does
-   -- not model the OBJ time budget; tighten during hardware bring-up)
+   -- Runaway guard, in OUR clock cycles. This is not the hardware budget -
+   -- it only exists so a pathological line cannot render forever; the real
+   -- limit is hwtime below.
    signal pixeltime         : integer range 0 to 8191;
    signal maxpixeltime      : integer range 0 to 8191;
 
+   -- The hardware OBJ budget, in HARDWARE cycles (see the generic).
+   signal hwtime            : integer range 0 to 2047 := 0;
+   signal maxhwtime         : integer range 0 to 2047 := 1210;
+   signal hw_over           : std_logic;
+   signal time_up           : std_logic;
+   signal settings_go       : std_logic;
+
 begin
 
-   busy <= '1' when (OAMFetch /= IDLE or PIXELGen /= WAITOAM
+   hw_over <= '1' when (HW_TIME_LIMIT = '1' and hwtime >= maxhwtime) else '0';
+   time_up <= '1' when (pixeltime >= maxpixeltime or hw_over = '1') else '0';
+
+   -- The OAM walk hands a sprite to the pixel walk. BOTH sides must agree on
+   -- the cycle it happens, so it is one condition, used twice.
+   --
+   -- v1 let the OAM side leave DONE on `PIXELGen = WAITOAM` alone, which was
+   -- safe only because the pixel side took the sprite unconditionally in that
+   -- same cycle. It no longer does - it also waits for the pixel queue to
+   -- drain - so the two could disagree, and the OAM side would step to the
+   -- next sprite while the pixel side was still waiting: the sprite in between
+   -- was silently dropped. That showed up as every MULTI-sprite test case
+   -- losing its later sprites.
+   -- No pq_cnt term: a queued pixel carries its own sprite's settings (see
+   -- t_pq_set), so the next sprite may start walking while the previous one is
+   -- still draining. Waiting for the queue to empty here was costing 390-655
+   -- cycles per line - 20-34% of the drawer's own time - with the walk idle
+   -- throughout. The pixel pipeline stays correct across the boundary because
+   -- every sprite's first pixel is tagged `first`, which the mosaic block in
+   -- the merge stage already uses to restart, so no gap between sprites is
+   -- required.
+   settings_go <= '1' when (OAMFetch = DONE and PIXELGen = WAITOAM)
+                  else '0';
+
+   -- the settings stamped into each queue entry as the walk pushes it
+   cur_set <= (prio    => Pixel_data2(OAM_PRIO_HI downto OAM_PRIO_LO),
+               mode    => Pixel_data0(OAM_MODE_HI downto OAM_MODE_LO),
+               hicolor => Pixel_data0(OAM_HICOLOR),
+               affine  => Pixel_data0(OAM_AFFINE),
+               hflip   => Pixel_data1(OAM_HFLIP),
+               palette => Pixel_data2(OAM_PALETTE_HI downto OAM_PALETTE_LO),
+               mosaic  => Pixel_data0(OAM_MOSAIC),
+               bitmap  => is_bitmap);
+
+   -- pq_cnt matters here: the walk reaches WAITOAM while queued pixels are
+   -- still draining, and a line that reports itself done early would let the
+   -- orchestrator retrigger on top of pixels still in flight
+   busy <= '1' when (OAMFetch /= IDLE or PIXELGen /= WAITOAM or pq_cnt /= 0
                      or enable_eval = '1' or enable_wait = '1' or enable_merge = '1'
                      or issue_pixel = '1') else '0';
 
-   VRAM_Drawer_addr    <= to_integer(pixeladdr_x(17 downto 2));
+   VRAM_Drawer_addr    <= to_integer(req_word);
    PALETTE_Drawer_addr <= to_integer(unsigned(PALETTE_byteaddr(8 downto 2)));
    EXTPAL_Drawer_addr  <= to_integer(unsigned(EXTPAL_byteaddr(12 downto 2)));
 
@@ -317,7 +491,7 @@ begin
                          (to_integer(unsigned(OAM_data1(OAM_AFF_HI downto OAM_AFF_LO))) * 8) + 3 when (OAMFetch = READAFFINE1) else
                          (to_integer(unsigned(OAM_data1(OAM_AFF_HI downto OAM_AFF_LO))) * 8) + 5 when (OAMFetch = READAFFINE2) else
                          (to_integer(unsigned(OAM_data1(OAM_AFF_HI downto OAM_AFF_LO))) * 8) + 7 when (OAMFetch = READAFFINE3) else
-                         OAM_currentobj * 2; -- READFIRST or IDLE
+                         OAM_scanptr * 2; -- READFIRST, WAITFIRST (scanning) or IDLE
 
    OAM_sizeX <=  8 when (OAMRAM_Drawer_data(OAM_OBJSHAPE_HI downto OAM_OBJSHAPE_LO) = "00" and OAMRAM_Drawer_data(16 + OAM_OBJSIZE_HI downto 16 + OAM_OBJSIZE_LO) = "00") else -- square size 0
                 16 when (OAMRAM_Drawer_data(OAM_OBJSHAPE_HI downto OAM_OBJSHAPE_LO) = "00" and OAMRAM_Drawer_data(16 + OAM_OBJSIZE_HI downto 16 + OAM_OBJSIZE_LO) = "01") else -- square size 1
@@ -362,24 +536,47 @@ begin
    begin
       if rising_edge(clk) then
 
+         -- hblankfree costs OBJ the H-Blank interval, so it gets LESS time,
+         -- not more. Same direction as the runaway guard beside it, which is
+         -- the donor's 954/1210 pair scaled up.
+         --
+         -- POLARITY IS UNVERIFIED for the NDS. GBATEK names the GBA's
+         -- DISPCNT.5 "H-Blank Interval Free" (set = the CPU gets H-Blank, so
+         -- OBJ loses it = 954) but the NDS's DISPCNT.23 "H-Blank OBJ
+         -- Processing" (set = enable), which reads the other way round.
+         -- melonDS models neither. Taking the donor's direction because this
+         -- register carries the GBA's name here; if a game that sets
+         -- DISPCNT.23 comes up short a few sprites, flip this first.
          if (hblankfree = '1') then
             maxpixeltime <= 6400;
+            maxhwtime    <= 954;
          else
             maxpixeltime <= 8191;
+            maxhwtime    <= 1210;
          end if;
 
          case (OAMFetch) is
 
             when IDLE =>
                OAM_currentobj     <= 0;
+               OAM_scanptr        <= 0;
                if (drawline = '1') then
                   OAMFetch           <= WAITFIRST;
+                  -- sprite 0's address went out during IDLE, so the scan is
+                  -- already one ahead when WAITFIRST consumes it
+                  OAM_scanptr        <= 1;
                   output_ok          <= '1';
                   overdraw           <= '0';
                end if;
 
             when READFIRST =>
+               -- re-priming after a sprite that actually drew: this cycle puts
+               -- OAM_currentobj's address out (scanptr was set to it), and the
+               -- scan runs one ahead again from here
                OAMFetch           <= WAITFIRST;
+               if (OAM_scanptr < 127) then
+                  OAM_scanptr     <= OAM_scanptr + 1;
+               end if;
 
             when WAITFIRST =>
                OAM_data0 <= OAMRAM_Drawer_data(15 downto 0);
@@ -426,8 +623,16 @@ begin
                   if (OAM_currentobj = 127) then
                      OAMFetch      <= IDLE;
                   else
-                     OAMFetch       <= READFIRST;
-                     OAM_currentobj <= OAM_currentobj + 1;
+                     -- STAY here: the next sprite's address is already on the
+                     -- bus, so its data lands next cycle and a skipped entry
+                     -- costs one cycle instead of two. currentobj follows the
+                     -- scan pointer, which is exactly the sprite that data
+                     -- will belong to.
+                     OAMFetch       <= WAITFIRST;
+                     OAM_currentobj <= OAM_scanptr;
+                     if (OAM_scanptr < 127) then
+                        OAM_scanptr <= OAM_scanptr + 1;
+                     end if;
                   end if;
                else
                   OAMFetch    <= READSECOND;
@@ -445,8 +650,11 @@ begin
                   if (OAM_currentobj = 127) then
                      OAMFetch      <= IDLE;
                   else
+                     -- the scan-ahead was thrown away by the second-word read,
+                     -- so re-prime it through READFIRST
                      OAMFetch       <= READFIRST;
                      OAM_currentobj <= OAM_currentobj + 1;
+                     OAM_scanptr    <= OAM_currentobj + 1;
                   end if;
                elsif (OAM_data0(OAM_AFFINE) = '1') then
                   OAMFetch           <= READAFFINE0;
@@ -485,18 +693,21 @@ begin
             when WAITAFFINE3 => OAMFetch <= DONE;        OAM_data_aff3 <= OAMRAM_Drawer_data(31 downto 16);
 
             when DONE =>
-               if (PIXELGen = WAITOAM or consumeSettings = '1') then
+               if (settings_go = '1' or consumeSettings = '1') then
                   if (OAM_currentobj = 127) then
                      OAMFetch      <= IDLE;
                   else
                      OAMFetch           <= READFIRST;
                      OAM_currentobj     <= OAM_currentobj + 1;
+                     -- READFIRST re-presents this sprite's address; the scan
+                     -- runs ahead again from there
+                     OAM_scanptr        <= OAM_currentobj + 1;
                   end if;
                end if;
 
          end case;
 
-         if (pixeltime >= maxpixeltime and OAMFetch /= IDLE) then
+         if (time_up = '1' and OAMFetch /= IDLE) then
             OAMFetch <= IDLE;
             overdraw <= '1';
          end if;
@@ -527,9 +738,26 @@ begin
       variable yyy               : integer range 0 to 63;
       variable pixeladdr_calc    : integer;
       variable skip_var          : std_logic;
+      variable v_hw              : integer range 0 to 2047;
       -- AFF_SUM needs the summed address as a value before it can decide whether
-      -- to fetch it, so it can no longer assign straight into pixeladdr_x
+      -- to fetch it, so it can no longer assign straight into an address signal
       variable v_affaddr         : integer range 0 to 262143;
+      -- queue state, taken into variables so a word can arrive and be consumed
+      -- in the same cycle (the text drawer's v_tq pattern)
+      variable v_pq    : t_pq;
+      variable v_pcnt  : integer range 0 to PQ_DEPTH;
+      variable v_phead : integer range 0 to PQ_DEPTH-1;
+      variable v_ptail : integer range 0 to PQ_DEPTH-1;
+      variable v_wq    : t_wq;
+      variable v_wcnt  : integer range 0 to WQ_DEPTH;
+      variable v_whead : integer range 0 to WQ_DEPTH-1;
+      variable v_wtail : integer range 0 to WQ_DEPTH-1;
+      variable v_infl  : integer range 0 to WQ_DEPTH;
+      variable v_una   : std_logic;
+      variable v_addr  : unsigned(17 downto 0);
+      variable v_reuse : boolean;
+      variable ent     : t_pq_entry;
+      variable v_second : std_logic;
    begin
       if rising_edge(clk) then
 
@@ -538,8 +766,34 @@ begin
          VRAM_Drawer_req   <= '0';
          applyNextSettings := '0';
 
+         v_pq    := pq;
+         v_pcnt  := pq_cnt;
+         v_phead := pq_head;
+         v_ptail := pq_tail;
+         v_wq    := wq;
+         v_wcnt  := wq_cnt;
+         v_whead := wq_head;
+         v_wtail := wq_tail;
+         v_infl  := inflight;
+         v_una   := unaccepted;
+
+         if (VRAM_Drawer_accept = '1') then
+            v_una := '0';
+         end if;
+
+         -- a fetched word lands, in issue order
+         if (VRAM_Drawer_done = '1') then
+            v_wq(v_wtail) := VRAM_Drawer_data;
+            v_wtail := (v_wtail + 1) mod WQ_DEPTH;
+            v_wcnt  := v_wcnt + 1;
+            v_infl  := v_infl - 1;
+         end if;
+
+         v_hw := hwtime;
+
          if (drawline = '1') then
             pixeltime <= 0;
+            v_hw      := 0;
          elsif (pixeltime < maxpixeltime) then
             pixeltime <= pixeltime + 1;
          end if;
@@ -547,14 +801,18 @@ begin
          case (PIXELGen) is
 
             when WAITOAM =>
-               if (OAMFetch = DONE) then
+               -- The next sprite's settings may only be latched once the queue
+               -- has drained: the pixel pipeline captures the LIVE Pixel_data*
+               -- one cycle after each drain, so a sprite has to stay current
+               -- until its last queued pixel has been issued.
+               if (settings_go = '1') then
                   PIXELGen          <= NEXTADDR;
                   applyNextSettings := '1';
                end if;
 
             when NEXTADDR =>
-               firstpix  <= '0';
                skip_var  := '0';
+               v_second  := '0';
                if ((x + posX) < 256 and (x + posX) >= 0) then
                   target    <= x + posX;
                else
@@ -574,7 +832,7 @@ begin
 
                      xxx := realX / 256;
                      yyy := realY / 256;
-                     if (xxx mod 2 = 1) then second_pix <= '1'; else second_pix <= '0'; end if;
+                     if (xxx mod 2 = 1) then v_second := '1'; else v_second := '0'; end if;
 
                      if (is_bitmap = '1') then
                         -- bitmap: base + yyy*rowstride + xxx*2
@@ -604,7 +862,7 @@ begin
                   -- synthesis translate_on
                else
 
-                  if (x mod 2 = 1) then second_pix <= '1'; else second_pix <= '0'; end if;
+                  if (x mod 2 = 1) then v_second := '1'; else v_second := '0'; end if;
 
                   if (is_bitmap = '1') then
                      -- bitmap row base is in pixeladdr; hflip mirrors x
@@ -631,35 +889,64 @@ begin
 
                end if;
 
-               realX <= realX + dx;
-               realY <= realY + dy;
+               second_pix <= v_second;
 
-               if (pixeltime >= maxpixeltime) then
+               -- hardware charges one cycle per field pixel walked, two for a
+               -- rot/scal sprite. Skipped (off-screen) pixels are charged too:
+               -- the cost is the sprite's field width, not how much of it
+               -- landed on the screen. Charged where x advances, so a walk
+               -- stalled for queue room is not charged twice.
+               if (time_up = '1') then
                   PIXELGen <= WAITOAM;
                elsif (x >= fieldX) then
                   PIXELGen <= WAITOAM;
+               elsif (skip_var = '1') then
+                  -- nothing to fetch or draw; last_addr keeps the last queued
+                  -- word so the reuse compare stays truthful
+                  realX <= realX + dx;
+                  realY <= realY + dy;
+                  x     <= x + 1;
+                  if (v_hw <= 2046) then v_hw := v_hw + 1; end if;
+                  PIXELGen <= NEXTADDR;
+               elsif (Pixel_data0(OAM_AFFINE) = '1') then
+                  -- the summed address is one cycle away; AFF_SUM queues it
+                  realX <= realX + dx;
+                  realY <= realY + dy;
+                  x     <= x + 1;
+                  if (v_hw <= 2045) then v_hw := v_hw + 2; end if;
+                  PIXELGen <= AFF_SUM;
                else
-                  x <= x + 1;
-                  if (skip_var = '1') then
-                     -- nothing to fetch or draw; pixeladdr_x keeps the last
-                     -- fetched word so the reuse compare stays truthful
-                     PIXELGen <= NEXTADDR;
-                  elsif (Pixel_data0(OAM_AFFINE) = '1') then
-                     PIXELGen <= AFF_SUM;
-                  elsif (pixeladdr_calc / 2 = pixeladdr_x(pixeladdr_x'left downto 1) and firstpix = '0') then
-                     -- same halfword as the last access: reuse the fetched
-                     -- word, but update the address - its low bits select
-                     -- the byte lane in the pixel pipeline
-                     pixeladdr_x <= to_unsigned(pixeladdr_calc mod 262144, 18);
-                     issue_pixel <= '1';
-                     issue_first <= not spr_seen;
-                     spr_seen    <= '1';
-                     PIXELGen    <= NEXTADDR;
-                  else
-                     pixeladdr_x     <= to_unsigned(pixeladdr_calc mod 262144, 18);
-                     VRAM_Drawer_req <= '1';
-                     PIXELGen        <= PIXELWAIT;
+                  v_addr  := to_unsigned(pixeladdr_calc mod 262144, 18);
+                  v_reuse := (walk_seen = '1') and
+                             (v_addr(17 downto 2) = last_addr(17 downto 2));
+
+                  -- room to queue the pixel, and - if it needs a word of its
+                  -- own - a free slot to land it in and a channel ready to
+                  -- take the request
+                  if (v_pcnt < PQ_DEPTH and
+                      (v_reuse or (v_wcnt + v_infl < WQ_DEPTH and v_una = '0'))) then
+                     ent := ('0', v_addr(1 downto 0), x + posX, v_second,
+                             not walk_seen, cur_set);
+                     if (not v_reuse) then
+                        ent.newword     := '1';
+                        req_word        <= v_addr(17 downto 2);
+                        VRAM_Drawer_req <= '1';
+                        v_una           := '1';
+                        v_infl          := v_infl + 1;
+                        last_addr       <= v_addr;
+                        walk_seen       <= '1';
+                     end if;
+                     v_pq(v_ptail) := ent;
+                     v_ptail := (v_ptail + 1) mod PQ_DEPTH;
+                     v_pcnt  := v_pcnt + 1;
+
+                     realX <= realX + dx;
+                     realY <= realY + dy;
+                     x     <= x + 1;
+                     if (v_hw <= 2046) then v_hw := v_hw + 1; end if;
                   end if;
+                  -- no room: hold x, realX/realY and the state, and retry
+                  PIXELGen <= NEXTADDR;
                end if;
 
             when AFF_SUM =>
@@ -676,55 +963,70 @@ begin
                                  + to_integer(pixeladdr_x_aff2) + to_integer(pixeladdr_x_aff3)
                                  + to_integer(pixeladdr_x_aff4) + to_integer(pixeladdr_x_aff5)) mod 262144;
                end if;
-               pixeladdr_x <= to_unsigned(v_affaddr, 18);
+               -- Word reuse, same rule as the non-affine path: one fetched word
+               -- serves every address sharing bits 17..2, because the lane is
+               -- bits 1..0. Rotation just makes consecutive pixels land in
+               -- different words, and then this falls back to fetching exactly
+               -- as before - never wrong, only less effective.
+               v_addr  := to_unsigned(v_affaddr, 18);
+               v_reuse := (walk_seen = '1') and
+                          (v_addr(17 downto 2) = last_addr(17 downto 2));
 
-               -- Word reuse. Until now this state fetched unconditionally, so an
-               -- affine sprite cost ONE VRAM ROUND TRIP PER PIXEL while the
-               -- non-affine path (NEXTADDR below) reused its fetched word - 4
-               -- pixels per fetch at 4bpp. That asymmetry, on top of this drawer
-               -- never getting the accept-based pipelined protocol, is what makes
-               -- rotated/scaled sprites miss the line budget.
-               --
-               -- The granularity is the WORD, not the halfword the non-affine
-               -- compare uses: VRAM_Drawer_addr is pixeladdr_x(17 downto 2) and
-               -- readaddr_mux_eval is pixeladdr_x(1 downto 0), so one fetched
-               -- word serves every address sharing bits 17..2. Rotation just
-               -- makes consecutive pixels land in different words, and then this
-               -- falls back to fetching exactly as before - never wrong, only
-               -- less effective.
-               --
-               -- Guarded on spr_seen, NOT firstpix: firstpix is already cleared
-               -- by the time this state runs, and more importantly spr_seen is
-               -- the only flag that means "a fetch for THIS sprite has landed in
-               -- VRAM_data_next". A sprite whose first pixels are all skipped
-               -- (routine for affine, the corners fall outside the source) would
-               -- otherwise compare against the PREVIOUS sprite's address.
-               if (spr_seen = '1' and
-                   v_affaddr / 4 = pixeladdr_x(pixeladdr_x'left downto 2)) then
-                  issue_pixel <= '1';
-                  issue_first <= not spr_seen;
-                  PIXELGen    <= NEXTADDR;
-               else
-                  VRAM_Drawer_req <= '1';
-                  PIXELGen        <= PIXELWAIT;
-               end if;
-
-            when PIXELWAIT =>
-               if (VRAM_Drawer_done = '1') then
-                  issue_pixel <= '1';
-                  issue_first <= not spr_seen;
-                  spr_seen    <= '1';
-                  PIXELGen    <= NEXTADDR;
+               if (v_pcnt < PQ_DEPTH and
+                   (v_reuse or (v_wcnt + v_infl < WQ_DEPTH and v_una = '0'))) then
+                  ent := ('0', v_addr(1 downto 0), target, second_pix,
+                          not walk_seen, cur_set);
+                  if (not v_reuse) then
+                     ent.newword     := '1';
+                     req_word        <= v_addr(17 downto 2);
+                     VRAM_Drawer_req <= '1';
+                     v_una           := '1';
+                     v_infl          := v_infl + 1;
+                     last_addr       <= v_addr;
+                     walk_seen       <= '1';
+                  end if;
+                  v_pq(v_ptail) := ent;
+                  v_ptail := (v_ptail + 1) mod PQ_DEPTH;
+                  v_pcnt  := v_pcnt + 1;
+                  PIXELGen <= NEXTADDR;
                end if;
 
          end case;
 
+         -- ------------------------------------------------------------------
+         -- DRAIN: one queued pixel per cycle into the pixel pipeline. A pixel
+         -- tagged newword waits for its word; a reuse pixel goes immediately,
+         -- because drain_word still holds the word it shares.
+         -- ------------------------------------------------------------------
+         if (v_pcnt > 0) then
+            ent := v_pq(v_phead);
+            if (ent.newword = '0' or v_wcnt > 0) then
+               if (ent.newword = '1') then
+                  drain_word <= v_wq(v_whead);
+                  v_whead := (v_whead + 1) mod WQ_DEPTH;
+                  v_wcnt  := v_wcnt - 1;
+               end if;
+               issue_pixel  <= '1';
+               issue_first  <= ent.first;
+               issue_lane   <= ent.lane;
+               issue_target <= ent.target;
+               issue_second <= ent.second;
+               issue_set    <= ent.set;
+               v_phead := (v_phead + 1) mod PQ_DEPTH;
+               v_pcnt  := v_pcnt - 1;
+            end if;
+         end if;
+
          if (applyNextSettings = '1') then
             consumeSettings <= '1';
 
+            -- rot/scal setup: 10 hardware cycles before the first pixel
+            if (OAM_data0(OAM_AFFINE) = '1' and v_hw <= 2037) then
+               v_hw := v_hw + 10;
+            end if;
+
             x          <= 0;
-            firstpix   <= '1';
-            spr_seen   <= '0';
+            walk_seen  <= '0';
 
             Pixel_data0     <= OAM_data0;
             Pixel_data1     <= OAM_data1;
@@ -804,6 +1106,19 @@ begin
             end if;
          end if;
 
+         hwtime <= v_hw;
+
+         pq         <= v_pq;
+         pq_head    <= v_phead;
+         pq_tail    <= v_ptail;
+         pq_cnt     <= v_pcnt;
+         wq         <= v_wq;
+         wq_head    <= v_whead;
+         wq_tail    <= v_wtail;
+         wq_cnt     <= v_wcnt;
+         inflight   <= v_infl;
+         unaccepted <= v_una;
+
       end if;
    end process;
 
@@ -820,31 +1135,28 @@ begin
             pixelarray <= (others => ('1', "11", '0', '0'));
          end if;
 
-         -- must save those here, as pixeldata will be overwritten in next cycle
-         prio_issue        <= Pixel_data2(OAM_PRIO_HI downto OAM_PRIO_LO);
-         mode_issue        <= Pixel_data0(OAM_MODE_HI downto OAM_MODE_LO);
-         hicolor_issue     <= Pixel_data0(OAM_HICOLOR);
-         affine_issue      <= Pixel_data0(OAM_AFFINE);
-         hflip_issue       <= Pixel_data1(OAM_HFLIP);
-         palette_issue     <= Pixel_data2(OAM_PALETTE_HI downto OAM_PALETTE_LO);
-         mosaic_issue      <= Pixel_data0(OAM_MOSAIC);
-         bitmap_issue      <= is_bitmap;
-
-         -- first cycle - wait for vram to deliver data
+         -- first cycle - take everything the drain published with the pixel.
+         -- The WORD travels here too: it can no longer be read out of a single
+         -- "last fetched" register, because the drain may publish the next
+         -- pixel's word before this one has been consumed.
          enable_eval       <= issue_pixel;
          sprfirst_eval     <= issue_first;
-         readaddr_mux_eval <= pixeladdr_x(1 downto 0);
-         target_eval       <= target;
-         second_pix_eval   <= second_pix;
+         readaddr_mux_eval <= issue_lane;
+         target_eval       <= issue_target;
+         second_pix_eval   <= issue_second;
+         word_eval         <= drain_word;
 
-         prio_eval       <= prio_issue;
-         mode_eval       <= mode_issue;
-         hicolor_eval    <= hicolor_issue;
-         affine_eval     <= affine_issue;
-         hflip_eval      <= hflip_issue;
-         palette_eval    <= palette_issue;
-         mosaic_eval     <= mosaic_issue;
-         bitmap_eval     <= bitmap_issue;
+         -- ...including which sprite it came from. Reading these off the live
+         -- Pixel_data* registers was what forced the drain to finish before
+         -- the next sprite could be latched.
+         prio_eval       <= issue_set.prio;
+         mode_eval       <= issue_set.mode;
+         hicolor_eval    <= issue_set.hicolor;
+         affine_eval     <= issue_set.affine;
+         hflip_eval      <= issue_set.hflip;
+         palette_eval    <= issue_set.palette;
+         mosaic_eval     <= issue_set.mosaic;
+         bitmap_eval     <= issue_set.bitmap;
 
          -- second cycle - eval vram
          target_wait   <= target_eval;
@@ -859,13 +1171,7 @@ begin
          if (mode_eval = "01") then Pixel_wait.alpha  <= '1'; else Pixel_wait.alpha  <= '0'; end if;
          if (mode_eval = "10") then Pixel_wait.objwnd <= '1'; else Pixel_wait.objwnd <= '0'; end if;
 
-         if (VRAM_Drawer_done = '1') then
-            VRAM_data_next <= VRAM_Drawer_data;
-         end if;
-
-         -- reads always come from the done-registered word: fresh fetches
-         -- were captured on their done pulse, reused pixels keep it
-         VRAM_Drawer_dataMuxed := VRAM_data_next;
+         VRAM_Drawer_dataMuxed := word_eval;
 
          case (readaddr_mux_eval(1 downto 0)) is
             when "00" => colorbyte := VRAM_Drawer_dataMuxed(7  downto 0);
@@ -1000,5 +1306,79 @@ begin
 
       end if;
    end process;
+
+   -- synthesis translate_off
+   -- ==========================================================================
+   -- PER-LINE PHASE BREAKDOWN (simulation only)
+   -- ==========================================================================
+   -- The frame profile reports one number, "obj=2000 of a 2130 budget", which
+   -- says the drawer is over but not WHERE. This splits the drawer's own busy
+   -- time into the four things it can be doing, so the next optimisation is
+   -- aimed by measurement rather than by inspection of the state machine.
+   --
+   --   fetch     - the OAM state machine is reading OAM (overlaps walk)
+   --   walk      - the pixel walk is producing addresses (the useful work)
+   --   drainwait - walk finished, waiting for the queue to empty before the
+   --               next sprite's settings may be applied (settings_go's
+   --               pq_cnt = 0 term). This is the per-sprite bubble.
+   --   oamwait   - walk idle with an empty queue, waiting for OAM to deliver
+   --               the next sprite
+   --
+   -- fetch overlaps walk by design, so the four do not sum to total.
+   p_objprof : process (clk)
+      variable c_fetch : integer := 0;
+      variable c_walk  : integer := 0;
+      variable c_drain : integer := 0;
+      variable c_oam   : integer := 0;
+      variable n_spr   : integer := 0;
+      variable n_aff   : integer := 0;
+      variable tot     : integer := 0;
+      variable y_line  : integer := 0;
+      variable started : boolean := false;
+   begin
+      if rising_edge(clk) then
+
+         if (drawline = '1') then
+            if (started and y_line < 8) then
+               report "OBJPROF y=" & integer'image(y_line) &
+                      " total=" & integer'image(tot) &
+                      " fetch=" & integer'image(c_fetch) &
+                      " walk=" & integer'image(c_walk) &
+                      " drainwait=" & integer'image(c_drain) &
+                      " oamwait=" & integer'image(c_oam) &
+                      " sprites=" & integer'image(n_spr) &
+                      " affine=" & integer'image(n_aff);
+            end if;
+            c_fetch := 0; c_walk := 0; c_drain := 0; c_oam := 0;
+            n_spr   := 0; n_aff  := 0; tot     := 0;
+            y_line  := ypos;
+            started := true;
+         end if;
+
+         if (OAMFetch /= IDLE or PIXELGen /= WAITOAM or pq_cnt /= 0) then
+            tot := tot + 1;
+         end if;
+
+         if (PIXELGen = NEXTADDR or PIXELGen = AFF_SUM) then
+            c_walk := c_walk + 1;
+         elsif (PIXELGen = WAITOAM) then
+            if (pq_cnt /= 0) then
+               c_drain := c_drain + 1;
+            elsif (OAMFetch /= IDLE and OAMFetch /= DONE) then
+               c_oam := c_oam + 1;
+            end if;
+         end if;
+
+         -- one cycle each, so these count sprites, not cycles
+         if (OAMFetch = READSECOND)  then n_spr := n_spr + 1; end if;
+         if (OAMFetch = READAFFINE0) then n_aff := n_aff + 1; end if;
+
+         if (OAMFetch /= IDLE and OAMFetch /= DONE) then
+            c_fetch := c_fetch + 1;
+         end if;
+
+      end if;
+   end process;
+   -- synthesis translate_on
 
 end architecture;
