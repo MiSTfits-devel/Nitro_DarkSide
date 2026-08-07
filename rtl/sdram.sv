@@ -197,6 +197,15 @@ always @(posedge clk) begin
 	reg       ch1_rq, ch2_rq, ch3_rq;
 	reg [1:0] ch;
 
+	// pre-arbitration (see the block below the rq latches)
+	reg [12:0] pre_a, pre_cas;
+	reg  [1:0] pre_ba;
+	reg [31:0] pre_data;
+	reg  [3:0] pre_be;
+	reg        pre_rfsh = 0, pre_ch1 = 0, pre_ch2 = 0, pre_ch3 = 0;
+	reg        pre_chip, pre_wr;
+	reg        n_ch1, n_ch2, n_ch3;
+
 	// ch2 request contract fix (2P guest mux): a request owns its attributes.
 	// The original code sampled ch2_addr/din/be/rnw LIVE at grant time and let
 	// a latched rq survive ch2_cancel - safe with the single 1P client whose
@@ -215,6 +224,75 @@ always @(posedge clk) begin
 	ch1_rq <= ch1_rq | ch1_req;
 	ch2_rq <= (ch2_rq & ~ch2_cancel) | ch2_req; // cancel kills a pending rq; same-edge relaunch re-arms
 	ch3_rq <= ch3_rq | ch3_req;
+
+	// ---- pre-arbitration -------------------------------------------------
+	// STATE_IDLE used to run the whole channel priority mux INTO the SDRAM_A
+	// register: `ch1_rq / state.* -> SDRAM_A[7:8]`, one clkMem period, ending
+	// in an I/O-column flop. At 134 MHz that was the last family missing
+	// timing (-0.432 audio, -0.515 debug), and it is why NDS_CLKMEM_4X could
+	// not close.
+	//
+	// The mux does not have to be in that cone. Its inputs are the request
+	// LATCHES, so the decision can be made one cycle early, in PARALLEL with
+	// those latches' own update rather than in series with it, and IDLE then
+	// only moves an already-chosen word. That is free, not a pipeline stage:
+	// pre_* holds exactly what the old mux would have produced in the cycle
+	// IDLE consumes it.
+	//
+	// It is evaluated from `rq | req` - the next value of each latch IGNORING
+	// the grant clears. The stale value that leaves behind is only ever seen
+	// while we are NOT in IDLE (a grant goes IDLE -> WAIT -> [WAIT2] -> RW1,
+	// so the earliest return to IDLE is several cycles later, by which time
+	// the clear has propagated), and IDLE is the only state that reads it.
+	//
+	// One behavioural change, and only for ch2: it used to grant on
+	// `ch2_rq | ch2_req`, i.e. in the very cycle the request arrived, taking
+	// the LIVE ch2_addr. That same-cycle grant is now one cycle later. ch1 and
+	// ch3 are bit-identical in timing - their request bits were already
+	// registered - so the renderer channel's 8-cycle slot is unchanged, and
+	// 4x keeps its full throughput gain over 3x.
+	// the next value of each request latch, ignoring the grant clears
+	n_ch1 = ch1_rq | ch1_req;
+	n_ch2 = (ch2_rq & ~ch2_cancel) | ch2_req;
+	n_ch3 = ch3_rq | ch3_req;
+
+	pre_rfsh <= refresh_req | refresh_due;
+	pre_ch1  <= ~(refresh_req | refresh_due) & n_ch1;
+	pre_ch2  <= ~(refresh_req | refresh_due) & ~n_ch1 & n_ch2;
+	pre_ch3  <= ~(refresh_req | refresh_due) & ~n_ch1 & ~n_ch2 & n_ch3;
+
+	if (n_ch1) begin
+		{pre_cas[12:9], pre_ba, pre_a, pre_cas[8:0]} <= {2'b00, 1'b1, ch1_addr[25:1]};
+		pre_chip <= ch1_addr[26];
+		pre_data <= ch1_din;
+		pre_be   <= 4'b1111;
+		pre_wr   <= ~ch1_rnw;
+	end
+	else if (n_ch2) begin
+		// a request owns its attributes: live only for the same-edge pulse,
+		// otherwise what was latched when it was made
+		if (ch2_req) begin
+			{pre_cas[12:9], pre_ba, pre_a, pre_cas[8:0]} <= {2'b00, ch2_rnw, ch2_addr[25:1]};
+			pre_chip <= ch2_addr[26];
+			pre_data <= ch2_din;
+			pre_be   <= ch2_be;
+			pre_wr   <= ~ch2_rnw;
+		end
+		else begin
+			{pre_cas[12:9], pre_ba, pre_a, pre_cas[8:0]} <= {2'b00, ch2_rnw_r, ch2_addr_r[25:1]};
+			pre_chip <= ch2_addr_r[26];
+			pre_data <= ch2_din_r;
+			pre_be   <= ch2_be_r;
+			pre_wr   <= ~ch2_rnw_r;
+		end
+	end
+	else begin
+		{pre_cas[12:9], pre_ba, pre_a, pre_cas[8:0]} <= {2'b00, ch3_rnw, ch3_addr[23:1], 2'b00};
+		pre_chip <= ch3_addr[24];
+		pre_data <= {8'hFF, ch3_din[15:8], 8'hFF, ch3_din[7:0]};
+		pre_be   <= 4'b1111;
+		pre_wr   <= ~ch3_rnw;
+	end
 
 	if (ch2_req) begin
 		ch2_addr_r <= ch2_addr;
@@ -313,63 +391,46 @@ always @(posedge clk) begin
 			chip     <= 1;
 		end
 
+		// Everything the grant needs was chosen a cycle ago (see the
+		// pre-arbitration block), so this state only MOVES it. SDRAM_A's data
+		// input is now a single register, not the channel priority mux, which
+		// is what takes the mux out of its cone.
 		STATE_IDLE: begin
-			if (refresh_req || refresh_due) begin
+			if (pre_rfsh) begin
 				state         <= STATE_RFSH;
 				command       <= CMD_AUTO_REFRESH;
 				refresh_count <= 0;
 				refresh_due   <= 0;
 				chip          <= 0;
 			end
-			else if(ch1_rq) begin
-				{cas_addr[12:9],SDRAM_BA,SDRAM_A,cas_addr[8:0]} <= {2'b00, 1'b1, ch1_addr[25:1]};
-				chip       <= ch1_addr[26];
-				saved_data <= ch1_din;
-				saved_be   <= 4'b1111;
-				saved_wr   <= ~ch1_rnw;
-				ch         <= 0;
-				ch1_rq     <= 0;
-				ch1_accept <= 1;   // address has been captured; caller may present the next
+			else if (pre_ch1 | pre_ch2 | pre_ch3) begin
+				SDRAM_A    <= pre_a;
+				SDRAM_BA   <= pre_ba;
+				cas_addr   <= pre_cas;
+				chip       <= pre_chip;
+				saved_data <= pre_data;
+				saved_be   <= pre_be;
+				saved_wr   <= pre_wr;
 				command    <= CMD_ACTIVE;
 				state      <= STATE_WAIT;
-			end
-			else if(ch2_rq | ch2_req) begin
-				// live attributes only for a same-edge request; a queued rq
-				// runs with what was latched at its request pulse. NB the
-				// cancel is deliberately NOT in this condition: extern's
-				// cancel term carries a wide comparator and would land in
-				// the SDRAM_A load cone; a stale rq granted at the cancel
-				// edge is silenced by ch2_kill below instead (dead slot)
-				if (ch2_req) begin
-					{cas_addr[12:9],SDRAM_BA,SDRAM_A,cas_addr[8:0]} <= {2'b00, ch2_rnw, ch2_addr[25:1]};
-					chip       <= ch2_addr[26];
-					saved_data <= ch2_din;
-					saved_be   <= ch2_be;
-					saved_wr   <= ~ch2_rnw;
+
+				if (pre_ch1) begin
+					ch         <= 0;
+					ch1_rq     <= 0;
+					ch1_accept <= 1;   // address captured; caller may present the next
+				end
+				else if (pre_ch2) begin
+					ch       <= 1;
+					ch2_rq   <= 0;
+					// a cancel arriving on THIS edge still wins: its
+					// `ch2_kill <= 1` is the last assignment in the block, so
+					// a stale rq granted here is a dead slot, not a stray done
+					ch2_kill <= 0;
 				end
 				else begin
-					{cas_addr[12:9],SDRAM_BA,SDRAM_A,cas_addr[8:0]} <= {2'b00, ch2_rnw_r, ch2_addr_r[25:1]};
-					chip       <= ch2_addr_r[26];
-					saved_data <= ch2_din_r;
-					saved_be   <= ch2_be_r;
-					saved_wr   <= ~ch2_rnw_r;
+					ch      <= 2;
+					ch3_rq  <= 0;
 				end
-				ch         <= 1;
-				ch2_rq     <= 0;
-				ch2_kill   <= 0;
-				command    <= CMD_ACTIVE;
-				state      <= STATE_WAIT;
-			end
-			else if(ch3_rq) begin
-				{cas_addr[12:9],SDRAM_BA,SDRAM_A,cas_addr[8:0]} <= {2'b00, ch3_rnw, ch3_addr[23:1], 2'b00};
-				chip       <= ch3_addr[24];
-				saved_data <= {8'hFF, ch3_din[15:8], 8'hFF, ch3_din[7:0]};
-				saved_be   <= 4'b1111;
-				saved_wr   <= ~ch3_rnw;
-				ch         <= 2;
-				ch3_rq     <= 0;
-				command    <= CMD_ACTIVE;
-				state      <= STATE_WAIT;
 			end
 		end
 
