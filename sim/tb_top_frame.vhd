@@ -44,6 +44,11 @@ entity tb_top_frame is
       HEARTBEAT_MS : integer := 0;
       -- 1 = count renderer VRAM arbiter ops per frame (p_vramops)
       VRAMOPS      : integer := 0;
+      -- >0 with VRAMOPS: dump the per-line cost of the first 16 engine-A lines of
+      -- that frame. The per-frame average cannot explain why the SAME three lines
+      -- drop every frame while the mean sits at 62% of budget - only the
+      -- distribution can, and this is it. Pick a steady-state frame, not 0 or 1.
+      LINEPROF_FRAME : integer := -1;
       -- 1 = run both 2D engines on clkMem (3x). See rtl/nds_gpu2d_fast.vhd.
       GPUFAST      : integer := 0;
       -- 0 = compile nds_sound out (nds_top SOUND_ENABLE). Sim-side A/B for the
@@ -1665,6 +1670,13 @@ begin
       alias a_busy  is << signal .tb_top_frame.idut.line_busy     : std_logic >>;
       alias b_busy  is << signal .tb_top_frame.idut.line_busy_b   : std_logic >>;
       alias a_draw  is << signal .tb_top_frame.idut.drawline      : std_logic >>;
+      alias a_line  is << signal .tb_top_frame.idut.linecounter   : integer range 0 to 191 >>;
+      -- the two things that could be stealing the renderer's VRAM/bus at the top
+      -- of a frame, so a drop report says WHICH rather than leaving it to a guess:
+      -- the ext-palette shadow refill (per frame, from vblank_trigger, 10,240 VRAM
+      -- ops) and the ARM9 DMA the game fires from its vblank IRQ.
+      alias a_epf   is << signal .tb_top_frame.idut.epfill_busy   : std_logic >>;
+      alias a_dmab  is << signal .tb_top_frame.idut.dma_bus_on    : std_logic >>;
       -- Engine A's drawer busies. nds_gpu2d's linestate goes
       -- LIDLE -> LDRAW -> LMERGE -> LFLUSH; LMERGE is a fixed 256 cycles (one
       -- pixel per cycle, already optimal) and LFLUSH is 8, so anything above
@@ -1679,6 +1691,12 @@ begin
       variable dones_a, drops_a   : natural := 0;
       variable bgcyc, objcyc : natural := 0;
       variable prev_abusy, prev_bbusy : std_logic := '0';
+      -- cycles the IN-PROGRESS engine-A line has burned so far. At a drop this is
+      -- how far over the 2,130 budget the line that caused it has run, which is
+      -- the difference between "one pathological line" and "everything is slow".
+      variable linecyc : natural := 0;
+      variable linebg, lineobj, linevr : natural := 0;
+      variable linestart : natural := 0;
       variable nlines, nstarts : positive := 1;
       variable frames : natural := 0;
    begin
@@ -1714,6 +1732,30 @@ begin
          -- of lines dropped that error is a factor of 3.
          if (a_bgbusy = '1')  then bgcyc  := bgcyc + 1;  end if;
          if (a_objbusy = '1') then objcyc := objcyc + 1; end if;
+         if (a_busy = '1') then
+            if (prev_abusy = '0') then
+               linecyc := 1; linebg := 0; lineobj := 0; linevr := 0;
+               linestart := a_line;
+            else
+               linecyc := linecyc + 1;
+            end if;
+            if (a_bgbusy = '1')  then linebg  := linebg + 1;  end if;
+            if (a_objbusy = '1') then lineobj := lineobj + 1; end if;
+            if (a_rbusy = '1')   then linevr  := linevr + 1;  end if;
+         end if;
+         -- PER-LINE cost profile for the top of one steady-state frame. The
+         -- averages say a line costs ~1300 of 2130 and yet the same three lines
+         -- drop every frame, so the average is the wrong statistic entirely -
+         -- this is the distribution that explains it.
+         if (a_busy = '0' and prev_abusy = '1' and frames = LINEPROF_FRAME and
+             linestart < 16) then
+            report "LINEPROF line " & integer'image(linestart) &
+                   " busy=" & integer'image(linecyc) &
+                   " bg=" & integer'image(linebg) &
+                   " obj=" & integer'image(lineobj) &
+                   " rvram=" & integer'image(linevr) &
+                   " (budget 2130)" severity note;
+         end if;
          if (a_busy = '1' and prev_abusy = '0') then starts_a := starts_a + 1; end if;
          if (b_busy = '1' and prev_bbusy = '0') then starts_b := starts_b + 1; end if;
          -- renders STARTED is a rising-edge count, so a renderer that never goes
@@ -1722,7 +1764,20 @@ begin
          -- say what really happened: line renders COMPLETED (falling edges) and
          -- drawlines DROPPED because the previous line was still busy.
          if (a_busy = '0' and prev_abusy = '1') then dones_a := dones_a + 1; end if;
-         if (a_draw = '1' and a_busy = '1')     then drops_a := drops_a + 1; end if;
+         if (a_draw = '1' and a_busy = '1')     then
+            drops_a := drops_a + 1;
+            -- WHICH lines drop, not just how many. A count alone cannot tell a
+            -- cold-start transient at the top of the frame from an overloaded
+            -- scene, and those want completely different fixes. Capped so a
+            -- badly overloaded run does not bury the report.
+            if (drops_a <= 12) then
+               report "DROP engine A: line " & integer'image(a_line) &
+                      " (frame " & integer'image(frames) & ")" &
+                      "  epfill=" & to_string(a_epf) &
+                      " dma_bus=" & to_string(a_dmab) &
+                      "  cur-line busy so far=" & integer'image(linecyc) severity note;
+            end if;
+         end if;
          prev_abusy := a_busy;
          prev_bbusy := b_busy;
          if (vblank_out = '1' and cyc > 1000) then
