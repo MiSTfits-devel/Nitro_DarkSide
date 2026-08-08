@@ -46,12 +46,16 @@ module ddram
 	input         ch2_rnw,
 	output        ch2_ready,
 
-	// data is packed 64bit -> 16bit
-	input  [25:1] ch3_addr,
-	output [15:0] ch3_dout,
-	input  [15:0] ch3_din,
+	// Was a donor 16-bit channel with a [25:1] address, tied off since import.
+	// Reshaped to ch4's form (64-bit R/W + byte enables, full [27:1] address)
+	// for the HPS audio ring: the ring lives at byte 0x0FFD0000, which the old
+	// 25-bit address could not reach at all (it topped out at 64 MB).
+	input  [27:1] ch3_addr,
+	output [63:0] ch3_dout,
+	input  [63:0] ch3_din,
 	input         ch3_req,
 	input         ch3_rnw,
+	input  [7:0]  ch3_be,
 	output        ch3_ready,
 
 	// save state
@@ -99,7 +103,7 @@ assign DDRAM_WE       = ram_write;
 
 assign ch1_dout  = ram_address[2] ? {ram_q[1][31:0], ram_q[1][63:32]} : ram_q[1];
 assign ch2_dout  = ram_address[2] ? ram_q[2][63:32] : ram_q[2][31:0];
-assign ch3_dout  = {ram_q[3][39:32], ram_q[3][7:0]};
+assign ch3_dout  = ram_q[3];
 assign ch4_dout  = ram_q[4];
 assign ch1_ready = ready[1];
 assign ch2_ready = ready[2];
@@ -206,15 +210,19 @@ always @(posedge DDRAM_CLK) begin
 					end
 				end
 			   else if(p3) begin
+					// Same shape as ch4 below. The old arm cleared cached[2] on a
+					// write - a copy-paste from the ch2 block that invalidated the
+					// CARD ROM beat cache, not ch3's (ch3 has none; `cached` is
+					// [2:1]). It never fired because ch3 was tied off; it is gone
+					// rather than carried into a channel that now sees real traffic.
 					ch_rq[3]         <= 0;
 					ch               <= 3;
-					ram_address      <= {ch3_addr, 2'b00};
-					ram_data         <= {24'd0, ch3_din[15:8], 24'd0, ch3_din[7:0]};
-					ram_be           <= 8'hFF;
+					ram_address      <= ch3_addr;
+					ram_data         <= ch3_din;
+					ram_be           <= ch3_be;
 					ram_burst        <= 1;
 					if(~ch3_rnw) begin
 						ram_write     <= 1;
-						cached[2]     <= 0;
 						ready[3]      <= 1;
 					end
 					else begin

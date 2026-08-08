@@ -66,6 +66,18 @@ set_global_assignment -name PLACEMENT_EFFORT_MULTIPLIER 1.0
 # This is Quartus's own first suggestion for 188026, and it only costs fit time.
 set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
 set_global_assignment -name SEED 0
+# NOHDMI removes ascal + pll_hdmi + hdmi_osd + shadowmask. MEASURED 2026-08-08:
+# turning HDMI back on costs ~3,500-4,000 ALMs, +51 LABs and +51 M10K (HDMI
+# builds sit at 517/553 RAM blocks vs 466). The M10K half is as binding as the
+# logic - see build/artifacts-aff-hdmi against build/artifacts-objdec.
+#
+# When HDMI does go back on, do it with a FIXED-RESOLUTION SPG rather than
+# ascal: skmp (polly2) puts a fixed-res video-out path at ~400 ALMs and points
+# at polly2's SPG.sv. That displaces ascal's 2,178 but NOT hdmi_osd (486) or
+# shadowmask (137), so budget ~2,200, not 400 - and note that is essentially
+# the ~2,000 already assumed, so it does NOT buy SOUND_ENABLE=1 + HDMI
+# together. Unverified against MiSTer's sys_top interface; scope-ablate before
+# believing the number. This image is analog-only (VGA/YC), IO-board required.
 set_global_assignment -name VERILOG_MACRO "MISTER_DEBUG_NOHDMI=1"
 set_global_assignment -name VERILOG_MACRO "MISTER_FB=0"
 
@@ -75,7 +87,9 @@ set_global_assignment -name VERILOG_MACRO "MISTER_DOWNSCALE_NN=1"
 # disable adaptive scanline filtering
 set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ADAPTIVE=1"
 
-# Disable YC / Composite output to save some resources
+# Disable YC / Composite output to save some resources.
+# MEASURED 2026-08-08: yc_out is 235 ALMs + 2 DSPs in every build to date.
+# Still untried - free if composite/S-video is not a target.
 # set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_YC=1"
 
 # Disable ALSA audio output to save some resources
@@ -203,6 +217,18 @@ set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ALSA=1"
 # `nitrodbg.sh lwtest` before relying on it, and see the header of
 # rtl/hps_lw_bridge.sv. Costs area, so leave it off for a release image.
 # set_global_assignment -name VERILOG_MACRO "NDS_LW_DEBUG=1"
+
+# HPS audio ring at DDR3 0x0FFD0000 (HPS 0x3FFD0000): the FPGA end of the sound
+# pipe the SPU is moving onto the ARM. See rtl/nds_audio_ddr3.sv and
+# docs/HPS_AUDIO.md.
+#
+# ON by default, unlike the two switches above, because it is not a debug aid -
+# it is where audio comes from once nds_sound is gone, and today's shipping
+# default (SOUND_ENABLE=0) has no audio at all. It is inert until the magic word
+# appears in DDR3, so turning it on cannot change how an existing image behaves;
+# the only cost is area, and it is left switchable so that area stays A/B-able
+# against the rest of the fitting war.
+set_global_assignment -name VERILOG_MACRO "NDS_HPS_AUDIO=1"
 
 # Drops ascal + pll_hdmi so the design fits, and removes the HDMI clock domain.
 # No HDMI out; direct_video carries analog.

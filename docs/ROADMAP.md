@@ -53,6 +53,13 @@ Repo, docs, vendored primitives + ARM7TDMI, VRAM map decoder + passing unit test
   fault-injection verified (c06cdce). NOT yet exit-tested: bit-accuracy on
   hardware is unconfirmed — nobody has listened to it against a reference.
   Area is measured and the diet is planned; see FITTING.md "Sound area".
+- 2026-08-08: **the SPU is moving to the HPS ARM** — a diet cannot close the
+  ~3,600 ALM gap to HDMI, and only a full farm-out can (docs/HPS_AUDIO.md).
+  The transport half is built and sim-verified: a DDR3 ring at `0x0FFD0000`,
+  `rtl/nds_audio_ddr3.sv` draining it into `AUDIO_L/R`, on ch3. Exit test for
+  this step is a tone out of the DE10-Nano with no daemon running at all
+  (`tools/audio-tone.sh on`). The SPU state itself has not moved yet, and
+  `nds_sound` stays as the reference the daemon gets judged against.
 
 ## M8 — First game
 - Card DMA patterns, remaining DMA triggers, IRQ edge cases, open-bus behaviors.

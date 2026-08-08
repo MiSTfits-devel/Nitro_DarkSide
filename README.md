@@ -46,4 +46,4 @@ core. The optimization headroom won there is the budget we spend here.
 
 ## License
 
-GPL-2.0, inherited from the GBA_MiSTer core this derives from. See `COPYING`/`LICENSE`.
+zlib baby fuck it

@@ -144,8 +144,8 @@ ddram u_ddram
 	.ch2_addr(ch2_addr), .ch2_din(32'd0), .ch2_req(ch2_req),
 	.ch2_rnw(1'b1), .ch2_dout(ch2_dout), .ch2_ready(ch2_ready),
 
-	.ch3_addr(25'd0), .ch3_din(16'd0), .ch3_req(1'b0), .ch3_rnw(1'b1),
-	.ch3_dout(), .ch3_ready(),
+	.ch3_addr(27'd0), .ch3_din(64'd0), .ch3_req(1'b0), .ch3_rnw(1'b1),
+	.ch3_be(8'd0), .ch3_dout(), .ch3_ready(),
 
 	.ch4_addr(27'd0), .ch4_din(64'd0), .ch4_req(1'b0), .ch4_rnw(1'b1),
 	.ch4_be(8'd0), .ch4_dout(), .ch4_ready(),
