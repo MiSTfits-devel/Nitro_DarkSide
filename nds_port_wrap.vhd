@@ -198,6 +198,16 @@ begin
    --   hdmi  : SOUND_ENABLE=>0, DEBUG_ENABLE=>1, NOHDMI commented out, SEED 3
    --           -> 38,176 ALMs (91%), all slack positive. NO AUDIO.
    -- They do not combine; see the HDMI note in NDS.qsf for the arithmetic.
+   --
+   -- 2026-08-08: which is why the SPU is being moved to the HPS - only a full
+   -- farm-out frees enough (~4-5k ALMs) to have HDMI and sound at once, and the
+   -- decode-only split that keeps this module's timers and fetch does not
+   -- (docs/HPS_AUDIO.md). The transport half of that is built and on by default
+   -- (NDS_HPS_AUDIO in NDS.qsf), so SOUND_ENABLE=0 no longer means "there is no
+   -- audio" - it means the fabric SPU is gone and audio comes from the ring.
+   -- Nothing above this line has moved yet: this generic still switches the
+   -- whole of nds_sound, and it stays the reference the daemon is judged
+   -- against until 1-4 in that document are proved.
    generic map ( GPU_FAST => 0, SOUND_ENABLE => 0, DEBUG_ENABLE => 1 )
    port map
    (

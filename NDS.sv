@@ -754,6 +754,53 @@ always @(posedge clk_sys) begin
 	endcase
 end
 
+/////////////////////////  HPS AUDIO RING  //////////////////////////////
+
+// The FPGA end of the HPS sound pipe (rtl/nds_audio_ddr3.sv; protocol in
+// docs/HPS_AUDIO.md). The ARM fills a DDR3 ring, this drains it at 32.729 kHz
+// and drives AUDIO_L/R. It stays silent until something writes the magic word
+// at HPS 0x3FFD0000, so a build carrying it behaves exactly like one without it
+// on a machine that has never run the daemon.
+//
+// [0x0FFD0000, 0x0FFE0000) is clear of every other DDR3 client: above the
+// framebuffer (0x0FE00000 + 512 KB) and the firmware image (0x0FF00000 +
+// 256 KB), below the debug mailbox (0x0FFF0000), and far above the 128 MB card
+// ceiling. It rides ch3, which was a tied-off donor channel until this.
+localparam [27:1] AUD_HW_BASE = 27'h7FE8000;   // byte address 0x0FFD0000 >> 1
+
+wire [27:1] au3_addr;
+wire [63:0] au3_din;
+wire        au3_req, au3_rnw;
+wire  [7:0] au3_be;
+wire [63:0] au3_dout;
+wire        au3_ready;
+wire [15:0] hps_audio_l, hps_audio_r;
+wire [15:0] hps_audio_ur;
+wire        hps_audio_on;
+
+`ifdef NDS_HPS_AUDIO
+nds_audio_ddr3 #(.AUD_HW_BASE(AUD_HW_BASE)) u_audio
+(
+	.clk_sys(clk_sys),
+	.reset(reset),
+	.sample_l(hps_audio_l), .sample_r(hps_audio_r), .sample_stb(),
+	.underruns(hps_audio_ur), .enabled(hps_audio_on),
+	.au3_addr(au3_addr), .au3_din(au3_din), .au3_req(au3_req),
+	.au3_rnw(au3_rnw), .au3_be(au3_be),
+	.au3_dout(au3_dout), .au3_ready(au3_ready)
+);
+`else
+assign au3_addr     = 27'd0;
+assign au3_din      = 64'd0;
+assign au3_req      = 1'b0;
+assign au3_rnw      = 1'b1;
+assign au3_be       = 8'd0;
+assign hps_audio_l  = 16'd0;
+assign hps_audio_r  = 16'd0;
+assign hps_audio_ur = 16'd0;
+assign hps_audio_on = 1'b0;
+`endif
+
 // DDR3 framebuffer window (machinery in the VIDEO section below): 32bpp
 // {14'b0, BGR666}, line = 1 KB, screen s at +s*0x40000; [0x0FE00000,
 // 0x0FF00000) sits below the firmware image, above the card ceiling.
@@ -778,12 +825,13 @@ ddram ddram
 	.ch2_dout(cd_dout),
 	.ch2_ready(cd_ready),
 
-	.ch3_addr(25'd0),
-	.ch3_din(16'd0),
-	.ch3_req(1'b0),
-	.ch3_rnw(1'b1),
-	.ch3_dout(),
-	.ch3_ready(),
+	.ch3_addr(au3_addr),
+	.ch3_din(au3_din),
+	.ch3_req(au3_req),
+	.ch3_rnw(au3_rnw),
+	.ch3_be(au3_be),
+	.ch3_dout(au3_dout),
+	.ch3_ready(au3_ready),
 
 	// ch4: nds_debug mailbox (uncached channel, see DEBUG MAILBOX above)
 	.ch4_addr(mb_addr),
@@ -1357,8 +1405,14 @@ nds_port_wrap nds
 	.dbg_hwstat(dbg_hwstat)
 );
 
-assign AUDIO_L = NDS_AUDIO_L;
-assign AUDIO_R = NDS_AUDIO_R;
+// The HPS ring wins whenever the daemon is actually running. Otherwise whatever
+// the fabric SPU produces still comes out - zero when SOUND_ENABLE=0 - so a
+// build carrying both degrades to FPGA audio rather than to silence, and a
+// daemon that dies takes the core back to the old behaviour instead of muting
+// it. hps_audio_on only moves at daemon start/stop, so the mux is not in any
+// per-sample path.
+assign AUDIO_L = hps_audio_on ? hps_audio_l : NDS_AUDIO_L;
+assign AUDIO_R = hps_audio_on ? hps_audio_r : NDS_AUDIO_R;
 
 ////////////////////////////  VIDEO  ////////////////////////////////////
 

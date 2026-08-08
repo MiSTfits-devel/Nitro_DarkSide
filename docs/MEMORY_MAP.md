@@ -184,7 +184,7 @@ six-channel round robin arbitrates, and each client gets a small pager FSM in `N
 | Firmware NVRAM | `ch1`, 64-bit read / 16-bit write lanes | `0x0FF00000`, 256 KB | `nds_spi` serves `fw[addr & 0x3FFFF]` (`nds_spi.vhd:241`). NB `nds_port_wrap.vhd:62` calls it 128 KB — that comment is wrong, the port carries 16 bits of *word* address |
 | Debug mailbox | `ch4`, 64-bit R/W + BE | cmd `0x0FFF0000`, rsp `0x0FFF0008` | **the only uncached channel**, which is exactly why the mailbox uses it: every poll must see the HPS's newest write |
 | Savestates/rewind | — | — | **not built.** The donor savestate buses are plumbed through `nds_cpu9`, `gba_cpu` and both timers but every `ss_wired_out` is left `open`; they are used at boot to preset the PCs, not to save state. NDS state ≈ 5 MB/slot when it happens |
-| `ch3` | — | — | tied off |
+| HPS audio ring | `ch3`, 64-bit R/W + BE | `0x0FFD0000`, 64 KB | control beats at `+0`/`+8`, 8192-frame ring at `+0x100`. `rtl/nds_audio_ddr3.sv` drains it at 32.729 kHz into `AUDIO_L/R`; the ARM fills it. Protocol in `docs/HPS_AUDIO.md`. ch3 was a tied-off 16-bit donor channel with a `[25:1]` address (64 MB of reach, so it could not name this region) and is now ch4's shape |
 
 ## Clocking
 
