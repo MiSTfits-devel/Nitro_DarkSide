@@ -44,6 +44,3 @@ core. The optimization headroom won there is the budget we spend here.
 - `../NitroSDK`, `../NitroSystem` — public reconstructions of the official SDKs; used as
   hardware ground truth (register maps, memory maps, boot protocol) alongside GBATEK.
 
-## License
-
-zlib baby fuck it
