@@ -55,8 +55,11 @@ architecture sim of tb_gpu_obj is
    constant vram    : t_words(0 to 65535) := load_hex(VRAMFILE, 65536);
    constant pal     : t_words(0 to 127)   := load_hex(PALFILE, 128);
    constant extpal  : t_words(0 to 2047)  := load_hex(EXTPALFILE, 2048);
-   -- 1 count word + up to 32 cases x 776 words
-   constant vectors : t_words(0 to 24832) := load_hex(VECFILE, 24833);
+   -- 1 count word + up to MAXCASES x 776 (8 header + 256 OAM + 256 colour +
+   -- 256 settings). load_hex zero-fills a short file, so this only has to be
+   -- an upper bound - raise it when gen_gpu_obj.py grows past it.
+   constant MAXCASES : integer := 64;
+   constant vectors  : t_words(0 to MAXCASES * 776) := load_hex(VECFILE, MAXCASES * 776 + 1);
 
    -- config
    signal ypos, ypos_mosaic : integer range 0 to 191 := 0;
@@ -70,11 +73,18 @@ architecture sim of tb_gpu_obj is
 
    signal drawline : std_logic := '0';
 
-   -- OAM: 128 sprites x 8 bytes = 256 words, registered read
+   -- OAM: 128 sprites x 8 bytes = 256 words. The drawer reads it by SPRITE
+   -- (whole 8-byte entry per read) and reads rot/scal groups from a separate
+   -- port; nds_gpu2d builds both out of write-through shadows of the same
+   -- 256-word array, so the bench models them as two views of `oam` with the
+   -- same one-cycle registered read the real RAMs have.
    type t_oam is array (0 to 255) of std_logic_vector(31 downto 0);
    signal oam      : t_oam := (others => (others => '0'));
-   signal oam_addr : integer range 0 to 255;
-   signal oam_data : std_logic_vector(31 downto 0) := (others => '0');
+   signal oam_addr : integer range 0 to 127;
+   signal oam_data : std_logic_vector(63 downto 0) := (others => '0');
+
+   signal oamaff_addr : integer range 0 to 31;
+   signal oamaff_data : std_logic_vector(63 downto 0) := (others => '0');
 
    -- drawer memory ports
    signal o_pal_addr    : integer range 0 to 127;
@@ -153,6 +163,8 @@ begin
       pixel_objwnd         => pixel_objwnd,
       OAMRAM_Drawer_addr   => oam_addr,
       OAMRAM_Drawer_data   => oam_data,
+      OAMAFF_Drawer_addr   => oamaff_addr,
+      OAMAFF_Drawer_data   => oamaff_data,
       PALETTE_Drawer_addr  => o_pal_addr,
       PALETTE_Drawer_data  => o_pal_data,
       EXTPAL_Drawer_addr   => o_extpal_addr,
@@ -164,11 +176,18 @@ begin
       VRAM_Drawer_accept   => o_vram_accept
    );
 
-   -- OAM: plain registered read, data one cycle after address
+   -- OAM: plain registered reads, data one cycle after address. The entry read
+   -- is the two words of the sprite; the affine read is the attr3 field of the
+   -- four entries of the group (words 8G+1/3/5/7, upper halfword each).
    p_oam : process (clk)
    begin
       if rising_edge(clk) then
-         oam_data <= oam(oam_addr);
+         oam_data <= oam(oam_addr * 2 + 1) & oam(oam_addr * 2);
+
+         oamaff_data <= oam(oamaff_addr * 8 + 7)(31 downto 16)
+                      & oam(oamaff_addr * 8 + 5)(31 downto 16)
+                      & oam(oamaff_addr * 8 + 3)(31 downto 16)
+                      & oam(oamaff_addr * 8 + 1)(31 downto 16);
       end if;
    end process;
 

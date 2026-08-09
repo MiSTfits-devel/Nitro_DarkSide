@@ -275,8 +275,10 @@ architecture arch of nds_gpu2d is
    signal obj_pal_data    : std_logic_vector(31 downto 0);
    signal obj_ep_addr     : integer range 0 to 2047;
    signal obj_ep_data     : std_logic_vector(31 downto 0);
-   signal obj_oam_addr    : integer range 0 to 255;
-   signal obj_oam_data    : std_logic_vector(31 downto 0);
+   signal obj_oam_addr    : integer range 0 to 127;   -- sprite index
+   signal obj_oam_data    : std_logic_vector(63 downto 0);
+   signal obj_oamaff_addr : integer range 0 to 31;    -- rot/scal group
+   signal obj_oamaff_data : std_logic_vector(63 downto 0);
    signal obj_we_color    : std_logic;
    signal obj_color       : std_logic_vector(15 downto 0);
    signal obj_we_settings : std_logic;
@@ -764,6 +766,8 @@ begin
       pixel_objwnd         => obj_objwnd,
       OAMRAM_Drawer_addr   => obj_oam_addr,
       OAMRAM_Drawer_data   => obj_oam_data,
+      OAMAFF_Drawer_addr   => obj_oamaff_addr,
+      OAMAFF_Drawer_data   => obj_oamaff_data,
       PALETTE_Drawer_addr  => obj_pal_addr,
       PALETTE_Drawer_data  => obj_pal_data,
       EXTPAL_Drawer_addr   => obj_ep_addr,
@@ -881,28 +885,102 @@ begin
       );
    end generate;
 
-   ioam : entity MEM.SyncRamDualByteEnable
-   generic map ( is_simu => is_simu, is_cyclone5 => '1',
-                 BYTE_WIDTH => 8, ADDR_WIDTH => 8, BYTES => 4 )
-   port map
-   (
-      clk       => clk,
-      ce_a      => '1',
-      addr_a    => oam_addr_i,
-      datain_a0 => oam_din_i( 7 downto  0),
-      datain_a1 => oam_din_i(15 downto  8),
-      datain_a2 => oam_din_i(23 downto 16),
-      datain_a3 => oam_din_i(31 downto 24),
-      dataout_a => open,
-      we_a      => oam_we_i,
-      be_a      => oam_be_i,
-      ce_b      => '1',
-      addr_b    => obj_oam_addr,
-      datain_b0 => x"00", datain_b1 => x"00", datain_b2 => x"00", datain_b3 => x"00",
-      dataout_b => obj_oam_data,
-      we_b      => '0',
-      be_b      => "0000"
-   );
+   -- OAM, seen by SPRITE rather than by word. The drawer used to read a sprite
+   -- as two 32-bit words back to back and each rot/scal group as four more -
+   -- 12 serial cycles for an affine sprite. See nds_drawer_obj's t_OAMFetch
+   -- comment for what that was really worth once measured; most of it was
+   -- already hidden behind the previous sprite's pixel walk.
+   --
+   -- Nothing about that had to be serial: OAM is 1 KB, the CPU is its only
+   -- writer, and port A here already sees every write. So the layouts the
+   -- drawer actually wants are maintained as write-through shadows off that
+   -- same write, in the same cycle. No tags, no fill pass, no miss path, and
+   -- no coherency question - a shadow tracks OAM exactly as the read port
+   -- does, including mid-line writes.
+   --
+   -- Two identical copies written in lockstep, read at the even and odd word
+   -- of the same entry, give the 64-bit sprite read out of the ordinary
+   -- 32-bit primitive - no width-mode gymnastics, and the CPU never reads OAM
+   -- back through here (dataout_a was already open), so replication is free
+   -- of correctness questions too.
+   goam : for i in 0 to 1 generate
+      ioam : entity MEM.SyncRamDualByteEnable
+      generic map ( is_simu => is_simu, is_cyclone5 => '1',
+                    BYTE_WIDTH => 8, ADDR_WIDTH => 8, BYTES => 4 )
+      port map
+      (
+         clk       => clk,
+         ce_a      => '1',
+         addr_a    => oam_addr_i,
+         datain_a0 => oam_din_i( 7 downto  0),
+         datain_a1 => oam_din_i(15 downto  8),
+         datain_a2 => oam_din_i(23 downto 16),
+         datain_a3 => oam_din_i(31 downto 24),
+         dataout_a => open,
+         we_a      => oam_we_i,
+         be_a      => oam_be_i,
+         ce_b      => '1',
+         addr_b    => obj_oam_addr * 2 + i,
+         datain_b0 => x"00", datain_b1 => x"00", datain_b2 => x"00", datain_b3 => x"00",
+         dataout_b => obj_oam_data(32*i + 31 downto 32*i),
+         we_b      => '0',
+         be_b      => "0000"
+      );
+   end generate;
+
+   -- Rot/scal parameter shadow. Group G's four params are the attr3 fields of
+   -- entries 4G+0..3, i.e. the upper halfword of word addresses 8G+1, 8G+3,
+   -- 8G+5 and 8G+7 - so a write's own address says which group it belongs to
+   -- and which of the four it is. Two 32x32 RAMs hold {PB,PA} and {PD,PC}, so
+   -- one read of each returns the whole group. attr3 is the upper halfword of
+   -- the incoming word, so its two byte enables are oam_be_i(3 downto 2) and
+   -- nothing else: aff_be ROUTES that pair to whichever halfword of the
+   -- shadow this address selects, rather than making up enables of its own.
+   -- A byte the write did not enable therefore cannot land here either, so the
+   -- shadow cannot diverge from the copy above under any write the rest of the
+   -- core can issue (OAM ignores 8-bit writes on hardware, but this port
+   -- carries byte enables and the two must agree regardless).
+   --
+   -- 32x32 is small enough that Quartus may place these in MLABs rather than
+   -- M10Ks, and MLABs are carved out of LABs - the resource this design is
+   -- short of. At this size that is at most 4 LABs, so it is left to the
+   -- fitter; if the LAB number moves, this is the first thing to pin.
+   gaff : for i in 0 to 1 generate
+      signal aff_we   : std_logic;
+      signal aff_half : std_logic;   -- '1' = upper halfword of this RAM
+      signal aff_be   : std_logic_vector(3 downto 0);
+   begin
+      -- attr3 words are the odd ones; (addr/2) mod 4 is which param, so bit 1
+      -- of it picks the RAM and bit 0 the halfword inside it
+      aff_we   <= oam_we_i when (oam_addr_i mod 2 = 1 and ((oam_addr_i / 4) mod 2) = i) else '0';
+      aff_half <= '1'      when ((oam_addr_i / 2) mod 2) = 1 else '0';
+      aff_be   <= (oam_be_i(3 downto 2) & "00") when aff_half = '1' else ("00" & oam_be_i(3 downto 2));
+
+      iaff : entity MEM.SyncRamDualByteEnable
+      generic map ( is_simu => is_simu, is_cyclone5 => '1',
+                    BYTE_WIDTH => 8, ADDR_WIDTH => 5, BYTES => 4 )
+      port map
+      (
+         clk       => clk,
+         ce_a      => '1',
+         addr_a    => oam_addr_i / 8,
+         -- attr3 is the upper halfword of the word being written, offered to
+         -- both halves; aff_be decides which one is taken
+         datain_a0 => oam_din_i(23 downto 16),
+         datain_a1 => oam_din_i(31 downto 24),
+         datain_a2 => oam_din_i(23 downto 16),
+         datain_a3 => oam_din_i(31 downto 24),
+         dataout_a => open,
+         we_a      => aff_we,
+         be_a      => aff_be,
+         ce_b      => '1',
+         addr_b    => obj_oamaff_addr,
+         datain_b0 => x"00", datain_b1 => x"00", datain_b2 => x"00", datain_b3 => x"00",
+         dataout_b => obj_oamaff_data(32*i + 31 downto 32*i),
+         we_b      => '0',
+         be_b      => "0000"
+      );
+   end generate;
 
    -- backdrop = palette entry 0, snooped on CPU writes (bit 15 stays '0')
    process (clk)
