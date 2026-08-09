@@ -208,7 +208,7 @@ begin
    -- Nothing above this line has moved yet: this generic still switches the
    -- whole of nds_sound, and it stays the reference the daemon is judged
    -- against until 1-4 in that document are proved.
-   generic map ( GPU_FAST => 0, SOUND_ENABLE => 0, DEBUG_ENABLE => 1 )
+   generic map ( GPU_FAST => 0, SOUND_ENABLE => 1, DEBUG_ENABLE => 0 )
    port map
    (
       clk1x            => clk1x,

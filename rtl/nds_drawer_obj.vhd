@@ -208,6 +208,35 @@ architecture arch of nds_drawer_obj is
    -- so ~21 of the 22 cycles is the deeper queue and the fetch rework's own
    -- share of THESE cases is the affine premium, 3 cycles down to 1. Both
    -- depths pass all 37 cases, so PQ_DEPTH is a throughput knob only.
+   --
+   -- DO NOT READ "521 vs 544" AS "PQ_DEPTH IS WORTH 4%". It is worth far more
+   -- than that, and this bench cannot see it: one drawer, no second engine, no
+   -- CPU, and a VRAM model that answers immediately. Run-ahead only pays when
+   -- something else is holding the bus. Measured 2026-08-09 on tb_top_frame,
+   -- which has both engines, both CPUs and VRSRV_ONE=1 (one op in flight, the
+   -- hardware behaviour) - nds_2dk, DIRECT=1 GPUCEDIV=1, frame 4, engine A:
+   --
+   --                        PQ_DEPTH=8   =12    =16
+   --   OBJ line total (y=1)     2930      2140   1722
+   --   stall, all pqfull        1822      1005    582
+   --   wordwait                 2065      1277    832
+   --   cyc/render A             1943      1954   1931
+   --   lines DROPPED              24        24     16
+   --
+   -- 12 IS NOT A COMPROMISE, IT IS THE WORST OPTION. It halves the stall and
+   -- takes 27% off the OBJ line, and drops exactly as many scanlines as 8 -
+   -- the drop threshold is somewhere between 12 and 16, and nothing below it
+   -- reaches the screen. It costs ~12 LABs more than 8 for a picture that is
+   -- identical. If 16 will not fit, go to 8, not 12. (Measured, after
+   -- predicting the opposite from the stall numbers - do not re-derive this
+   -- from cycles, the only metric that matters here is the drop count.)
+   --
+   -- Eight scanlines per frame, i.e. visible on a screen, not a profiler
+   -- curiosity. wqfull and unacc are flat zero at both depths, so it is purely
+   -- room to run ahead. The area temptation is real - the queue is 26 bits x
+   -- PQ_DEPTH per engine plus its read mux, x2 engines - and it was nearly
+   -- traded away for the SOUND_ENABLE=1 fit on the strength of the 4% figure
+   -- above. It is not the knob to cut; find the ALMs elsewhere.
    signal OAMFetch : t_OAMFetch := IDLE;
 
    signal output_ok : std_logic := '0';

@@ -177,6 +177,22 @@ always @(posedge clk, posedge reset) begin
 end
 
 wire [15:0] acl, acr;
+`ifdef NDS_NO_AUDIO_FILTER
+// NDS_MiSTfits LOCAL CHANGE to a vendored sys/ file - see NDS.qsf.
+// IIR_filter measures ~430 ALMs (~43 LABs) in this design, and the
+// SOUND_ENABLE=1 image is LAB-bound: five fitter seeds landed between 1 and 24
+// LABs over the 4,191 the device has. Dropping the user-selectable audio
+// low-pass is what buys full PQ_DEPTH=16 in the renderer, which is worth 8
+// scanlines a frame - a trade the owner called on 2026-08-09.
+//
+// The bypass keeps the EXACT sign conversion the filter was fed
+// (`~is_signed ^ x[15]` - cores may emit signed or offset-binary), so the
+// DC_blocker downstream sees the same format it always did, just unfiltered.
+// `cx`/`cx0..cy2` become unused inputs and `flt_ce`/`a_en1`/`dly1` become dead
+// logic; that is deliberate, and the extra savings are free.
+assign acl = {~is_signed ^ cl[15], cl[14:0]};
+assign acr = {~is_signed ^ cr[15], cr[14:0]};
+`else
 IIR_filter #(.use_params(0)) IIR_filter
 (
 	.clk(clk),
@@ -198,6 +214,7 @@ IIR_filter #(.use_params(0)) IIR_filter
 	.output_l(acl),
 	.output_r(acr)
 );
+`endif
 
 wire [15:0] adl;
 DC_blocker dcb_l
