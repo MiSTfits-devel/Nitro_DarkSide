@@ -87,8 +87,20 @@ entity nds_drawer_obj is
       pixel_x              : out integer range 0 to 255;
       pixel_objwnd         : out std_logic := '0';
 
-      OAMRAM_Drawer_addr   : buffer integer range 0 to 255;
-      OAMRAM_Drawer_data   : in  std_logic_vector(31 downto 0);
+      -- OAM is addressed by SPRITE, not by word: one read returns the whole
+      -- 8-byte entry (attr0/1/2 in 47..0; attr3 is the affine-param slot and
+      -- belongs to a group, not to this sprite, so it is not used here).
+      -- The two halves are two identical RAMs written in lockstep on the CPU
+      -- side - see nds_gpu2d - which is what buys the width without a copy or
+      -- a fill pass.
+      OAMRAM_Drawer_addr   : buffer integer range 0 to 127;
+      OAMRAM_Drawer_data   : in  std_logic_vector(63 downto 0);
+
+      -- The 32 rot/scal parameter groups, write-through shadows of the attr3
+      -- fields, all four params of a group readable in one cycle:
+      -- 15..0 = PA (dx), 31..16 = PB, 47..32 = PC (dy), 63..48 = PD.
+      OAMAFF_Drawer_addr   : out integer range 0 to 31;
+      OAMAFF_Drawer_data   : in  std_logic_vector(63 downto 0);
 
       PALETTE_Drawer_addr  : out integer range 0 to 127;
       PALETTE_Drawer_data  : in  std_logic_vector(31 downto 0);
@@ -146,20 +158,56 @@ architecture arch of nds_drawer_obj is
    type t_OAMFetch is
    (
       IDLE,
-      READFIRST,
       WAITFIRST,
-      READSECOND,
-      WAITSECOND,
-      READAFFINE0,
-      WAITAFFINE0,
-      READAFFINE1,
-      WAITAFFINE1,
-      READAFFINE2,
-      WAITAFFINE2,
-      READAFFINE3,
-      WAITAFFINE3,
+      WAITAFF,
       DONE
    );
+   -- v2 walked READFIRST -> WAITFIRST -> READSECOND -> WAITSECOND and then,
+   -- for a rot/scal sprite, four more READ/WAIT pairs to collect the affine
+   -- params one 16-bit field at a time: 12 cycles for an affine sprite, 4 for
+   -- a plain one. OAM is 1 KB and only the CPU writes it, so none of that had
+   -- to be serial - both layouts are now write-through shadows maintained on
+   -- the write side (nds_gpu2d), and the whole entry, or a whole group of
+   -- affine params, arrives in one read. WAITAFF is the single remaining
+   -- cycle, and only rot/scal sprites pay it: the shadow address comes from
+   -- attr1, which is not known until the entry itself lands.
+   --
+   -- READFIRST is gone with them. It existed only to re-present the sprite
+   -- address that READSECOND had clobbered; nothing clobbers it now, so the
+   -- scan-ahead address stands untouched all the way through DONE and the
+   -- next entry is already on the data bus when DONE hands off.
+   --
+   -- SIZE THIS HONESTLY. The obvious arithmetic - 128 affine sprites times 10
+   -- saved cycles against a 2,130-cycle line - is wrong, and tb_gpu_obj says
+   -- so. Sprite N+1's fetch runs CONCURRENTLY with sprite N's pixel walk (the
+   -- walk starts the cycle DONE hands off, and the fetch FSM re-enters
+   -- WAITFIRST in that same cycle), so the fetch only ever costs what it
+   -- exceeds the previous sprite's walk by. Even 16-wide sprites walk longer
+   -- than the old 12-cycle fetch, so it was nearly always fully hidden.
+   -- Measured, cases 32/33 - 24 dense 16x16 sprites, identical but for the
+   -- affine bit, busy_cyc from tb_gpu_obj:
+   --                       normal      rot/scal
+   --      before             542          554
+   --      after              520          521
+   -- i.e. the affine premium over 24 sprites went from 12 cycles to 1. What
+   -- is actually recovered is a per-LINE constant - the first drawn sprite
+   -- has no previous walk to hide behind - worth ~3 cycles on a plain line
+   -- and ~13 if the first drawn sprite is rot/scal (cases 6/7/8/14/26-29,
+   -- all -10). Over the 34 cases that existed when this was compared, every
+   -- one got faster or stayed level and none regressed; 34-36 are the screen
+   -- clip's own cases and postdate that sweep. The larger prize is
+   -- structural: 13 states became 4, and the LAB count is what this design
+   -- is short of.
+   --
+   -- The `after` row is the whole change measured together, NOT this state
+   -- machine on its own. A/B'd against the only other knob that moves these
+   -- two cases (they sit at x 0..108, so the screen clip never fires on
+   -- them), holding everything else:
+   --      PQ_DEPTH = 8    541   544      <- what an earlier draft recorded
+   --      PQ_DEPTH = 16   520   521
+   -- so ~21 of the 22 cycles is the deeper queue and the fetch rework's own
+   -- share of THESE cases is the affine premium, 3 cycles down to 1. Both
+   -- depths pass all 37 cases, so PQ_DEPTH is a throughput knob only.
    signal OAMFetch : t_OAMFetch := IDLE;
 
    signal output_ok : std_logic := '0';
@@ -186,6 +234,8 @@ architecture arch of nds_drawer_obj is
    signal OAM_data0 : std_logic_vector(15 downto 0) := (others => '0');
    signal OAM_data1 : std_logic_vector(15 downto 0) := (others => '0');
    signal OAM_data2 : std_logic_vector(15 downto 0) := (others => '0');
+
+   signal OAM_attr2 : std_logic_vector(15 downto 0);
 
    signal OAM_data_aff0 : std_logic_vector(15 downto 0) := (others => '0');
    signal OAM_data_aff1 : std_logic_vector(15 downto 0) := (others => '0');
@@ -233,7 +283,9 @@ architecture arch of nds_drawer_obj is
    signal posx              : integer range -512 to 511;
    signal sizeX             : integer range 8 to 64;
    signal sizeY             : integer range 8 to 64;
-   signal fieldX            : integer range 8 to 128;
+   -- the CLIPPED end of the walk, not the sprite's field width: an off-screen
+   -- sprite clips to first = last, so this reaches 0
+   signal fieldX            : integer range 0 to 128;
    signal pixeladdr_base    : integer range 0 to 262143;
    signal pixeladdr         : integer range -262144 to 262143;
    signal is_bitmap         : std_logic := '0';
@@ -277,7 +329,23 @@ architecture arch of nds_drawer_obj is
    --     first pixels were all skipped compared against the PREVIOUS sprite's
    --     address. That was a live bug on the non-affine path; AFF_SUM already
    --     guarded against it and said why.
-   constant PQ_DEPTH : integer := 8;   -- pixels queued between walk and pixels
+
+   -- PQ_DEPTH is the walk's RUN-AHEAD, and run-ahead is how VRAM latency gets
+   -- hidden: the drain stalls the moment it catches up to a pixel whose word
+   -- has not come back. At 8 the drain was starved for a large part of every
+   -- sprite-bearing line, and that back-pressure showed up at the walk as a
+   -- full pixel queue - measured on the frame bench, per line:
+   --     stall=49 (affsum=0 pqfull=48 wqfull=0 unacc=0) wordwait=89
+   -- pqfull was the entire stall, wqfull and unacc were flat zero, so the
+   -- walk was never short of request slots. It was short of ROOM TO RUN.
+   --
+   -- 16 recovers 43% of the stall (frame-bench totals, stall 2056 -> 1177,
+   -- drawer time 17485 -> 16629). 32 is worth another 2% and is not taken.
+   -- WQ_DEPTH is deliberately NOT raised with it: measured at 4/5/6 the
+   -- numbers are identical, so the extra in-flight slots buy nothing, and
+   -- the gpu2d arbiter only tracks 8 ops across ALL FOUR drawers - OBJ
+   -- taking more of them would come straight out of the BGs.
+   constant PQ_DEPTH : integer := 16;  -- pixels queued between walk and pixels
    constant WQ_DEPTH : integer := 4;   -- VRAM words tracked in flight
 
    -- Everything the pixel pipeline needs to know about the SPRITE a queued
@@ -455,7 +523,18 @@ architecture arch of nds_drawer_obj is
    -- The hardware OBJ budget, in HARDWARE cycles (see the generic).
    signal hwtime            : integer range 0 to 2047 := 0;
    signal maxhwtime         : integer range 0 to 2047 := 1210;
+   -- field pixels clipped off the RIGHT edge, charged to the budget when the
+   -- walk ends rather than at setup - see the screen-clip block
+   signal hw_tail           : integer range 0 to 256 := 0;
    signal hw_over           : std_logic;
+
+   -- Why the walk did not advance this cycle, for the profiler below. Driven
+   -- unconditionally but read only from a translate_off process, so synthesis
+   -- prunes it - no pragma around the walk itself, which is where this file
+   -- already carries one risky translate_off too many.
+   --   0 advanced   1 affine sum stage busy   2 pixel queue full
+   --   3 word queue full   4 request not yet accepted
+   signal dbg_stall_why     : integer range 0 to 4 := 0;
    signal time_up           : std_logic;
    signal settings_go       : std_logic;
 
@@ -506,12 +585,16 @@ begin
    PALETTE_Drawer_addr <= to_integer(unsigned(PALETTE_byteaddr(8 downto 2)));
    EXTPAL_Drawer_addr  <= to_integer(unsigned(EXTPAL_byteaddr(12 downto 2)));
 
-   OAMRAM_Drawer_addr <= (OAM_currentobj * 2) + 1                                                when (OAMFetch = READSECOND) else
-                         (to_integer(unsigned(OAM_data1(OAM_AFF_HI downto OAM_AFF_LO))) * 8) + 1 when (OAMFetch = READAFFINE0) else
-                         (to_integer(unsigned(OAM_data1(OAM_AFF_HI downto OAM_AFF_LO))) * 8) + 3 when (OAMFetch = READAFFINE1) else
-                         (to_integer(unsigned(OAM_data1(OAM_AFF_HI downto OAM_AFF_LO))) * 8) + 5 when (OAMFetch = READAFFINE2) else
-                         (to_integer(unsigned(OAM_data1(OAM_AFF_HI downto OAM_AFF_LO))) * 8) + 7 when (OAMFetch = READAFFINE3) else
-                         OAM_scanptr * 2; -- READFIRST, WAITFIRST (scanning) or IDLE
+   -- One address, always: the sprite the scan is running ahead to. Nothing
+   -- else reads this port any more.
+   OAMRAM_Drawer_addr <= OAM_scanptr;
+
+   -- The affine group of whatever entry is ON THE DATA BUS this cycle, taken
+   -- live rather than from OAM_data1 - the shadow read is registered, so
+   -- presenting it a cycle earlier is what makes WAITAFF a single cycle
+   -- instead of two. During WAITAFF and DONE this follows the scan-ahead
+   -- entry instead, which is harmless: WAITAFF has already latched.
+   OAMAFF_Drawer_addr <= to_integer(unsigned(OAMRAM_Drawer_data(16 + OAM_AFF_HI downto 16 + OAM_AFF_LO)));
 
    OAM_sizeX <=  8 when (OAMRAM_Drawer_data(OAM_OBJSHAPE_HI downto OAM_OBJSHAPE_LO) = "00" and OAMRAM_Drawer_data(16 + OAM_OBJSIZE_HI downto 16 + OAM_OBJSIZE_LO) = "00") else -- square size 0
                 16 when (OAMRAM_Drawer_data(OAM_OBJSHAPE_HI downto OAM_OBJSHAPE_LO) = "00" and OAMRAM_Drawer_data(16 + OAM_OBJSIZE_HI downto 16 + OAM_OBJSIZE_LO) = "01") else -- square size 1
@@ -551,6 +634,11 @@ begin
 
    OAM_isbitmap <= '1' when (OAMRAM_Drawer_data(OAM_MODE_HI downto OAM_MODE_LO) = "11") else '0';
 
+   -- attr0/attr1 keep their old bit positions in the widened read, so every
+   -- expression using them is untouched; only attr2 moved, and it gets a name
+   -- rather than a +32 on each of its constants.
+   OAM_attr2 <= OAMRAM_Drawer_data(47 downto 32);
+
    -- OAM Fetch
    process (clk)
    begin
@@ -589,19 +677,12 @@ begin
                   overdraw           <= '0';
                end if;
 
-            when READFIRST =>
-               -- re-priming after a sprite that actually drew: this cycle puts
-               -- OAM_currentobj's address out (scanptr was set to it), and the
-               -- scan runs one ahead again from here
-               OAMFetch           <= WAITFIRST;
-               if (OAM_scanptr < 127) then
-                  OAM_scanptr     <= OAM_scanptr + 1;
-               end if;
-
             when WAITFIRST =>
+               -- the whole entry lands at once: no second read, so attr2 and
+               -- everything derived from it are available here too
                OAM_data0 <= OAMRAM_Drawer_data(15 downto 0);
                OAM_data1 <= OAMRAM_Drawer_data(31 downto 16);
-               OAMFetch  <= READSECOND;
+               OAM_data2 <= OAMRAM_Drawer_data(47 downto 32);
 
                OAMfetch_sizeX    <= OAM_sizeX;
                OAMfetch_sizeY    <= OAM_sizeY;
@@ -634,12 +715,39 @@ begin
                   OAMfetch_x_size        <= 8;
                end if;
 
-               -- skip: off-line, disabled, prohibited shape, bitmap sprites
-               -- with alpha=0 or the reserved 1D+wide combination
+               -- char/bitmap base address (byte, in the 256 KB OBJ space).
+               -- Was computed in WAITSECOND off the second read; attr2 is here
+               -- now, so it is computed here.
+               if (OAMRAM_Drawer_data(OAM_MODE_HI downto OAM_MODE_LO) = "11") then
+                  if (bitmap_1d = '1') then
+                     if (bitmap_1d_boundary = '1') then
+                        OAMfetch_addrbase <= 256 * to_integer(unsigned(OAM_attr2(OAM_TILE_HI downto OAM_TILE_LO)));
+                     else
+                        OAMfetch_addrbase <= 128 * to_integer(unsigned(OAM_attr2(OAM_TILE_HI downto OAM_TILE_LO)));
+                     end if;
+                  elsif (bitmap_2d_wide = '1') then
+                     OAMfetch_addrbase <= 16 * to_integer(unsigned(OAM_attr2(OAM_TILE_LO + 4 downto OAM_TILE_LO)))
+                                        + 128 * (to_integer(unsigned(OAM_attr2(OAM_TILE_HI downto OAM_TILE_LO + 5))) * 32);
+                  else
+                     OAMfetch_addrbase <= 16 * to_integer(unsigned(OAM_attr2(OAM_TILE_LO + 3 downto OAM_TILE_LO)))
+                                        + 128 * (to_integer(unsigned(OAM_attr2(OAM_TILE_HI downto OAM_TILE_LO + 4))) * 16);
+                  end if;
+               elsif (one_dim_mapping = '1') then
+                  OAMfetch_addrbase <= (32 * (2 ** to_integer(tile_boundary))) * to_integer(unsigned(OAM_attr2(OAM_TILE_HI downto OAM_TILE_LO)));
+               else
+                  OAMfetch_addrbase <= 32 * to_integer(unsigned(OAM_attr2(OAM_TILE_HI downto OAM_TILE_LO)));
+               end if;
+
+               -- skip: off-line, disabled, prohibited shape, the reserved
+               -- 1D+wide combination, or a bitmap sprite with alpha=0. The
+               -- alpha test lived in WAITSECOND and cost such a sprite four
+               -- cycles; it is an attr2 field, so it now costs one like every
+               -- other skip.
                if (OAM_posyMos < 0 or OAM_posyMos >= OAM_sizeY2
                    or OAMRAM_Drawer_data(OAM_OFF_HI downto OAM_OFF_LO) = "10"
                    or OAMRAM_Drawer_data(OAM_OBJSHAPE_HI downto OAM_OBJSHAPE_LO) = "11"
-                   or (OAM_isbitmap = '1' and bitmap_1d = '1' and bitmap_2d_wide = '1')) then
+                   or (OAM_isbitmap = '1' and bitmap_1d = '1' and bitmap_2d_wide = '1')
+                   or (OAM_isbitmap = '1' and OAM_attr2(OAM_PALETTE_HI downto OAM_PALETTE_LO) = "0000")) then
                   if (OAM_currentobj = 127) then
                      OAMFetch      <= IDLE;
                   else
@@ -655,73 +763,36 @@ begin
                      end if;
                   end if;
                else
-                  OAMFetch    <= READSECOND;
                   OAMfetch_ty <= OAM_posyMos;
-               end if;
-
-            when READSECOND =>
-               OAMFetch <= WAITSECOND;
-
-            when WAITSECOND =>
-               OAM_data2 <= OAMRAM_Drawer_data(15 downto 0);
-               if (OAM_data0(OAM_MODE_HI downto OAM_MODE_LO) = "11"
-                   and OAMRAM_Drawer_data(OAM_PALETTE_HI downto OAM_PALETTE_LO) = "0000") then
-                  -- bitmap sprite with alpha=0: invisible
-                  if (OAM_currentobj = 127) then
-                     OAMFetch      <= IDLE;
+                  if (OAMRAM_Drawer_data(OAM_AFFINE) = '1') then
+                     -- OAMAFF_Drawer_addr is already presenting this entry's
+                     -- group (it is driven off the live bus), so the params
+                     -- land next cycle
+                     OAMFetch <= WAITAFF;
                   else
-                     -- the scan-ahead was thrown away by the second-word read,
-                     -- so re-prime it through READFIRST
-                     OAMFetch       <= READFIRST;
-                     OAM_currentobj <= OAM_currentobj + 1;
-                     OAM_scanptr    <= OAM_currentobj + 1;
+                     OAMFetch <= DONE;
                   end if;
-               elsif (OAM_data0(OAM_AFFINE) = '1') then
-                  OAMFetch           <= READAFFINE0;
-               else
-                  OAMFetch           <= DONE;
                end if;
 
-               -- char/bitmap base address (byte, in the 256 KB OBJ space)
-               if (OAM_data0(OAM_MODE_HI downto OAM_MODE_LO) = "11") then
-                  if (bitmap_1d = '1') then
-                     if (bitmap_1d_boundary = '1') then
-                        OAMfetch_addrbase <= 256 * to_integer(unsigned(OAMRAM_Drawer_data(OAM_TILE_HI downto OAM_TILE_LO)));
-                     else
-                        OAMfetch_addrbase <= 128 * to_integer(unsigned(OAMRAM_Drawer_data(OAM_TILE_HI downto OAM_TILE_LO)));
-                     end if;
-                  elsif (bitmap_2d_wide = '1') then
-                     OAMfetch_addrbase <= 16 * to_integer(unsigned(OAMRAM_Drawer_data(OAM_TILE_LO + 4 downto OAM_TILE_LO)))
-                                        + 128 * (to_integer(unsigned(OAMRAM_Drawer_data(OAM_TILE_HI downto OAM_TILE_LO + 5))) * 32);
-                  else
-                     OAMfetch_addrbase <= 16 * to_integer(unsigned(OAMRAM_Drawer_data(OAM_TILE_LO + 3 downto OAM_TILE_LO)))
-                                        + 128 * (to_integer(unsigned(OAMRAM_Drawer_data(OAM_TILE_HI downto OAM_TILE_LO + 4))) * 16);
-                  end if;
-               elsif (one_dim_mapping = '1') then
-                  OAMfetch_addrbase <= (32 * (2 ** to_integer(tile_boundary))) * to_integer(unsigned(OAMRAM_Drawer_data(OAM_TILE_HI downto OAM_TILE_LO)));
-               else
-                  OAMfetch_addrbase <= 32 * to_integer(unsigned(OAMRAM_Drawer_data(OAM_TILE_HI downto OAM_TILE_LO)));
-               end if;
-
-            when READAFFINE0 => OAMFetch <= WAITAFFINE0;
-            when WAITAFFINE0 => OAMFetch <= READAFFINE1; OAM_data_aff0 <= OAMRAM_Drawer_data(31 downto 16);
-            when READAFFINE1 => OAMFetch <= WAITAFFINE1;
-            when WAITAFFINE1 => OAMFetch <= READAFFINE2; OAM_data_aff1 <= OAMRAM_Drawer_data(31 downto 16);
-            when READAFFINE2 => OAMFetch <= WAITAFFINE2;
-            when WAITAFFINE2 => OAMFetch <= READAFFINE3; OAM_data_aff2 <= OAMRAM_Drawer_data(31 downto 16);
-            when READAFFINE3 => OAMFetch <= WAITAFFINE3;
-            when WAITAFFINE3 => OAMFetch <= DONE;        OAM_data_aff3 <= OAMRAM_Drawer_data(31 downto 16);
+            when WAITAFF =>
+               OAM_data_aff0 <= OAMAFF_Drawer_data(15 downto  0);   -- PA / dx
+               OAM_data_aff1 <= OAMAFF_Drawer_data(31 downto 16);   -- PB
+               OAM_data_aff2 <= OAMAFF_Drawer_data(47 downto 32);   -- PC / dy
+               OAM_data_aff3 <= OAMAFF_Drawer_data(63 downto 48);   -- PD
+               OAMFetch      <= DONE;
 
             when DONE =>
                if (settings_go = '1' or consumeSettings = '1') then
                   if (OAM_currentobj = 127) then
                      OAMFetch      <= IDLE;
                   else
-                     OAMFetch           <= READFIRST;
-                     OAM_currentobj     <= OAM_currentobj + 1;
-                     -- READFIRST re-presents this sprite's address; the scan
-                     -- runs ahead again from there
-                     OAM_scanptr        <= OAM_currentobj + 1;
+                     -- the scan-ahead address stood untouched through this
+                     -- sprite, so the next entry is already on the data bus
+                     OAMFetch       <= WAITFIRST;
+                     OAM_currentobj <= OAM_scanptr;
+                     if (OAM_scanptr < 127) then
+                        OAM_scanptr <= OAM_scanptr + 1;
+                     end if;
                   end if;
                end if;
 
@@ -779,6 +850,11 @@ begin
       variable v_reuse : boolean;
       variable ent     : t_pq_entry;
       variable v_second : std_logic;
+      -- screen clip, all resolved at sprite setup
+      variable v_posx   : integer range -512 to 511;
+      variable v_xfirst : integer range 0 to 128;   -- first on-screen x
+      variable v_xlast  : integer range 0 to 128;   -- one past the last
+      variable v_skipn  : integer range 0 to 256;   -- field pixels elided
    begin
       if rising_edge(clk) then
 
@@ -984,10 +1060,12 @@ begin
                second_pix <= v_second;
 
                -- hardware charges one cycle per field pixel walked, two for a
-               -- rot/scal sprite. Skipped (off-screen) pixels are charged too:
-               -- the cost is the sprite's field width, not how much of it
-               -- landed on the screen. Charged where x advances, so a walk
-               -- stalled for queue room is not charged twice.
+               -- rot/scal sprite. Charged where x advances, so a walk stalled
+               -- for queue room is not charged twice. The field pixels the
+               -- screen clip removed from the walk entirely are charged at
+               -- setup (leading) and here on exit (trailing), so the budget
+               -- still sees the sprite's whole field width - the cost to
+               -- hardware is the field width, not what landed on screen.
                -- A pending affine sum must be queued before the sprite ends -
                -- leaving NEXTADDR would let the next sprite's walk overwrite
                -- the partial registers it is still holding, dropping its last
@@ -996,9 +1074,19 @@ begin
                if (time_up = '1' and v_affpend = '0') then
                   PIXELGen <= WAITOAM;
                elsif (x >= fieldX and v_affpend = '0') then
+                  -- the sprite ran to its clipped end: settle the field pixels
+                  -- past the right edge that the clip elided, so the hardware
+                  -- budget still sees the full field width and sees it at the
+                  -- point hardware would have charged it
+                  if (v_hw + hw_tail > 2047) then
+                     v_hw := 2047;
+                  else
+                     v_hw := v_hw + hw_tail;
+                  end if;
                   PIXELGen <= WAITOAM;
                elsif (time_up = '1' or x >= fieldX) then
                   null;                       -- flushing the last affine pixel
+                  dbg_stall_why <= 1;
                elsif (skip_var = '1') then
                   -- nothing to fetch or draw; last_addr keeps the last queued
                   -- word so the reuse compare stays truthful
@@ -1020,6 +1108,8 @@ begin
                      realY <= realY + dy;
                      x     <= x + 1;
                      if (v_hw <= 2045) then v_hw := v_hw + 2; end if;
+                  else
+                     dbg_stall_why <= 1;
                   end if;
                   PIXELGen <= NEXTADDR;
                else
@@ -1051,6 +1141,14 @@ begin
                      realY <= realY + dy;
                      x     <= x + 1;
                      if (v_hw <= 2046) then v_hw := v_hw + 1; end if;
+                  else
+                     if (v_pcnt >= PQ_DEPTH) then
+                        dbg_stall_why <= 2;
+                     elsif (v_una = '1') then
+                        dbg_stall_why <= 4;
+                     else
+                        dbg_stall_why <= 3;
+                     end if;
                   end if;
                   -- no room: hold x, realX/realY and the state, and retry
                   PIXELGen <= NEXTADDR;
@@ -1090,7 +1188,6 @@ begin
                v_hw := v_hw + 10;
             end if;
 
-            x          <= 0;
             walk_seen  <= '0';
 
             Pixel_data0     <= OAM_data0;
@@ -1108,14 +1205,86 @@ begin
             end if;
 
             if (unsigned(OAM_data1(OAM_X_HI downto OAM_X_LO)) > 16#100#) then
-               posx <= to_integer(unsigned(OAM_data1(OAM_X_HI downto OAM_X_LO))) - 16#200#;
+               v_posx := to_integer(unsigned(OAM_data1(OAM_X_HI downto OAM_X_LO))) - 16#200#;
             else
-               posx <= to_integer(unsigned(OAM_data1(OAM_X_HI downto OAM_X_LO)));
+               v_posx := to_integer(unsigned(OAM_data1(OAM_X_HI downto OAM_X_LO)));
+            end if;
+            posx <= v_posx;
+
+            -- ---------------------------------------------------------------
+            -- SCREEN CLIP
+            -- ---------------------------------------------------------------
+            -- The walk used to start at x=0 and run the sprite's whole field
+            -- width, testing each pixel against the 0..255 screen and burning
+            -- a cycle on every one that fell outside. On the frame bench's
+            -- busiest line that was the single largest thing the drawer did:
+            --   walk=422  px=79  edge=286  oob=19  stall=38
+            -- 68% of the walk spent stepping over pixels that were never going
+            -- to be drawn, against 19% doing the work.
+            --
+            -- Both ends are closed-form - the first and last on-screen x are
+            -- pure arithmetic on posx - so they are computed once here and the
+            -- walk simply starts and stops there. A sprite entirely off either
+            -- side collapses to first = last and exits on its first cycle.
+            --
+            -- This is a clip on OUR cycles only. Hardware charges a sprite its
+            -- whole field width whether or not it lands on screen, so the
+            -- elided pixels are still charged to hwtime below, in one go -
+            -- otherwise HW_TIME_LIMIT would start keeping sprites the console
+            -- drops, and the golden models do not model truncation, so that
+            -- divergence would be silent.
+            -- clamp BEFORE the assignment, not after: posx reaches -255, so
+            -- -posx does not fit v_xfirst's range on its own
+            if (v_posx < 0) then
+               if (-v_posx > OAMfetch_fieldX) then
+                  v_xfirst := OAMfetch_fieldX;      -- entirely off the left
+               else
+                  v_xfirst := -v_posx;
+               end if;
+            else
+               v_xfirst := 0;
             end if;
 
+            if (v_posx + OAMfetch_fieldX > 256) then
+               if (v_posx >= 256) then
+                  v_xlast := v_xfirst;              -- entirely off the right
+               else
+                  v_xlast := 256 - v_posx;
+               end if;
+            else
+               v_xlast := OAMfetch_fieldX;
+            end if;
+            if (v_xlast < v_xfirst) then
+               v_xlast := v_xfirst;
+            end if;
+
+            x      <= v_xfirst;
             sizeX  <= OAMfetch_sizeX;
             sizeY  <= OAMfetch_sizeY;
-            fieldX <= OAMfetch_fieldX;
+            fieldX <= v_xlast;
+
+            -- The field pixels the walk will never visit still cost hardware,
+            -- so they are charged to the budget - but WHEN matters, not just
+            -- how much. Hardware charges the leading run before it draws
+            -- anything and the trailing run after, so charging both up front
+            -- would trip HW_TIME_LIMIT early and drop sprites the console
+            -- finishes. The leading run is charged here; the trailing run is
+            -- held and charged when the walk ends.
+            v_skipn := v_xfirst;
+            if (OAM_data0(OAM_AFFINE) = '1') then
+               v_skipn := v_skipn * 2;              -- rot/scal costs 2 each
+            end if;
+            if (v_hw + v_skipn > 2047) then
+               v_hw := 2047;
+            else
+               v_hw := v_hw + v_skipn;
+            end if;
+
+            if (OAM_data0(OAM_AFFINE) = '1') then
+               hw_tail <= (OAMfetch_fieldX - v_xlast) * 2;
+            else
+               hw_tail <= OAMfetch_fieldX - v_xlast;
+            end if;
 
             sizemult      <= OAMfetch_sizemult;
             x_flip_offset <= OAMfetch_x_flip_offset;
@@ -1144,9 +1313,15 @@ begin
             pixeladdr_pre_6 := ((OAMfetch_ty mod 8) * OAMfetch_x_size);
             pixeladdr_pre_7 := ((OAMfetch_ty / 8) * 1024);
 
-            -- affine
-            realX <= (pixeladdr_pre_a0 - pixeladdr_pre_a1 - pixeladdr_pre_a2 + pixeladdr_pre_a3);
-            realY <= (pixeladdr_pre_a4 - pixeladdr_pre_a5 - pixeladdr_pre_a6 + pixeladdr_pre_a7);
+            -- affine. The non-affine walk recomputes its address from x every
+            -- pixel, so the clip costs it nothing; realX/realY are the one
+            -- piece of walk state that ACCUMULATES, so starting at v_xfirst
+            -- means stepping them there too. v_xfirst is 0..128, so these are
+            -- two small multiplies beside the four this block already does.
+            realX <= (pixeladdr_pre_a0 - pixeladdr_pre_a1 - pixeladdr_pre_a2 + pixeladdr_pre_a3)
+                     + v_xfirst * to_integer(signed(OAM_data_aff0));
+            realY <= (pixeladdr_pre_a4 - pixeladdr_pre_a5 - pixeladdr_pre_a6 + pixeladdr_pre_a7)
+                     + v_xfirst * to_integer(signed(OAM_data_aff2));
 
             -- non affine
             if (OAM_data0(OAM_MODE_HI downto OAM_MODE_LO) = "11") then
@@ -1391,6 +1566,28 @@ begin
    --               the next sprite
    --
    -- fetch overlaps walk by design, so the four do not sum to total.
+   --
+   -- The walk is then split again, because "walk" being the biggest number
+   -- does not say whether the walk is DOING anything. Every walk cycle is one
+   -- of three things, and only the first is work:
+   --
+   --   px      - a pixel was queued (advanced x AND pushed onto the queue)
+   --   edge    - advanced but queued nothing because x+posX left the 0..255
+   --             screen. This is what motivated the screen clip and it should
+   --             now read ZERO on every line: the clip means the walk never
+   --             visits an off-screen x at all. Left in place as the clip's
+   --             tripwire - if it comes back non-zero, the clip is wrong.
+   --   oob     - advanced but queued nothing because a rot/scal pixel mapped
+   --             outside its source sprite. Not closed-form under rotation.
+   --
+   -- Both are charged a full cycle per pixel because a sprite's cost is its
+   -- FIELD width, not what landed on screen.
+   --   stall   - did not advance at all: no queue room, or the affine sum
+   --             stage still holding the previous pixel.
+   --
+   -- Derived from existing signals rather than new ones so the walk itself
+   -- stays untouched: advances are x changing, and every queued pixel is
+   -- drained exactly once, so issue_pixel counts them.
    p_objprof : process (clk)
       variable c_fetch : integer := 0;
       variable c_walk  : integer := 0;
@@ -1401,6 +1598,19 @@ begin
       variable tot     : integer := 0;
       variable y_line  : integer := 0;
       variable started : boolean := false;
+      variable prev_fetch : t_OAMFetch := IDLE;
+      variable c_adv   : integer := 0;   -- walk cycles that advanced x
+      variable c_iss   : integer := 0;   -- pixels actually queued
+      variable c_edge  : integer := 0;   -- of the advances, off-screen ones
+      variable c_lead  : integer := 0;   -- of those, off the LEFT edge
+      variable c_saff  : integer := 0;   -- stalls: affine sum stage busy
+      variable c_spq   : integer := 0;   -- stalls: pixel queue full
+      variable c_swq   : integer := 0;   -- stalls: word queue full
+      variable c_sacc  : integer := 0;   -- stalls: request not accepted
+      -- the drain's own stall: a pixel is queued, it needs a fetched word,
+      -- and no word has landed. This is what backs the queue up into pqfull.
+      variable c_wordwait : integer := 0;
+      variable prev_x  : integer := 0;
    begin
       if rising_edge(clk) then
 
@@ -1413,10 +1623,24 @@ begin
                       " drainwait=" & integer'image(c_drain) &
                       " oamwait=" & integer'image(c_oam) &
                       " sprites=" & integer'image(n_spr) &
-                      " affine=" & integer'image(n_aff);
+                      " affine=" & integer'image(n_aff) &
+                      " | px=" & integer'image(c_iss) &
+                      " edge=" & integer'image(c_edge) &
+                      " (lead=" & integer'image(c_lead) &
+                      " trail=" & integer'image(c_edge - c_lead) & ")" &
+                      " oob=" & integer'image(c_adv - c_iss - c_edge) &
+                      " stall=" & integer'image(c_walk - c_adv) &
+                      " (affsum=" & integer'image(c_saff) &
+                      " pqfull=" & integer'image(c_spq) &
+                      " wqfull=" & integer'image(c_swq) &
+                      " unacc=" & integer'image(c_sacc) & ")" &
+                      " wordwait=" & integer'image(c_wordwait);
             end if;
             c_fetch := 0; c_walk := 0; c_drain := 0; c_oam := 0;
             n_spr   := 0; n_aff  := 0; tot     := 0;
+            c_adv   := 0; c_iss  := 0; c_edge := 0; c_lead := 0;
+            c_saff  := 0; c_spq  := 0; c_swq  := 0; c_sacc := 0;
+            c_wordwait := 0;
             y_line  := ypos;
             started := true;
          end if;
@@ -1427,6 +1651,27 @@ begin
 
          if (PIXELGen = NEXTADDR) then
             c_walk := c_walk + 1;
+            -- x+1, not x/=prev_x: the per-sprite reset to 0 also changes x,
+            -- and it happens in WAITOAM, so it would read as an advance
+            if (x /= prev_x + 1) then
+               -- a stall: dbg_stall_why was set by the walk in this same cycle
+               case (dbg_stall_why) is
+                  when 1      => c_saff := c_saff + 1;
+                  when 2      => c_spq  := c_spq  + 1;
+                  when 3      => c_swq  := c_swq  + 1;
+                  when 4      => c_sacc := c_sacc + 1;
+                  when others => null;
+               end case;
+            end if;
+            if (x = prev_x + 1) then
+               c_adv := c_adv + 1;
+               -- same test the walk itself makes, one cycle later, so it
+               -- classifies the advance that just happened
+               if ((prev_x + posx) < 0 or (prev_x + posx) > 255) then
+                  c_edge := c_edge + 1;
+                  if ((prev_x + posx) < 0) then c_lead := c_lead + 1; end if;
+               end if;
+            end if;
          elsif (PIXELGen = WAITOAM) then
             if (pq_cnt /= 0) then
                c_drain := c_drain + 1;
@@ -1435,9 +1680,20 @@ begin
             end if;
          end if;
 
-         -- one cycle each, so these count sprites, not cycles
-         if (OAMFetch = READSECOND)  then n_spr := n_spr + 1; end if;
-         if (OAMFetch = READAFFINE0) then n_aff := n_aff + 1; end if;
+         -- WAITAFF is one cycle per rot/scal sprite, so it counts them
+         -- directly; a drawn sprite is one that leaves WAITFIRST for either of
+         -- the two accept states rather than staying to scan the next entry.
+         if (OAMFetch = WAITAFF) then n_aff := n_aff + 1; end if;
+         if (prev_fetch = WAITFIRST and (OAMFetch = WAITAFF or OAMFetch = DONE)) then
+            n_spr := n_spr + 1;
+         end if;
+         prev_fetch := OAMFetch;
+
+         if (issue_pixel = '1') then c_iss := c_iss + 1; end if;
+         if (pq_cnt /= 0 and pq(pq_head).newword = '1' and wq_cnt = 0) then
+            c_wordwait := c_wordwait + 1;
+         end if;
+         prev_x := x;
 
          if (OAMFetch /= IDLE and OAMFetch /= DONE) then
             c_fetch := c_fetch + 1;
