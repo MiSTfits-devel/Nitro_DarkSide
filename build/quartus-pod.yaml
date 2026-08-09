@@ -22,6 +22,11 @@ spec:
     args:
       - |
         set -u
+        # /work is a REUSED PVC (see the volume below), so the last build's
+        # tree is still here. Clear it: a stale source file that files.qip no
+        # longer lists, or a db/ from a different tree, is exactly the kind of
+        # contamination that makes one build disagree with the next.
+        rm -rf /work/src /work/exitcode
         mkdir -p /work/src
         echo "waiting for source (build/remote-build.sh streams it in)..."
         while [ ! -f /work/src/.ready ]; do sleep 2; done
@@ -69,4 +74,36 @@ spec:
       mountPath: /work
   volumes:
   - name: work
-    emptyDir: {}
+    persistentVolumeClaim:
+      claimName: nds-quartus-work
+---
+# /work was an emptyDir, which lives under /var/lib/kubelet - i.e. on the
+# node's 49.9 GB /var filesystem, the SAME one holding every container image.
+# A Quartus fit writes the streamed tree plus db/, incremental_db/ and
+# output_files/ there, several GB, on top of this image's own ~6 GB. On
+# 2026-08-08 that combination evicted the build twice, and the second time
+# took the node down to 0.4 GB free with the user's Matrix/cytube/minecraft
+# pods on it.
+#
+# slacker has far bigger disks, they are just not where ephemeral storage
+# goes - `standard` is /var/mnt/local-path-standard, a separate 899 GB
+# device (dm-4) with ~625 GB free. Putting /work there takes the fitter's
+# scratch off the pressured disk completely. The image pull still lands on
+# /var; that part needs either headroom there or containerd moved.
+#
+# Deliberately a NAMED claim, not a generic ephemeral volume: both
+# StorageClasses are ReclaimPolicy=Retain, so a per-pod ephemeral PVC would
+# leave its directory behind on every single build and silently fill the big
+# disk instead. One claim, reused, wiped at pod startup. It is RWO, so two
+# concurrent builds cannot both mount it - which is fine, the node has no
+# room to run two Quartus fits anyway.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nds-quartus-work
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 60Gi

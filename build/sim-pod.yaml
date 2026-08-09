@@ -42,3 +42,28 @@ spec:
         memory: 2Gi
       limits:
         memory: 12Gi
+    volumeMounts:
+    - name: work
+      mountPath: /work
+  volumes:
+  # /work had no volume at all, so it was the container's writable layer -
+  # which containerd keeps under /var/lib/containerd on the node's 49.9 GB
+  # /var, the same filesystem as every image. sim/tests alone streams in
+  # ~200 MB of hex (kirby_full.hex is 151 MB by itself) and nvc work dirs
+  # add more, all of it landing on the disk that evicts pods when it fills.
+  # An ephemeral claim on `standard` (separate 899 GB device) keeps it clear.
+  #
+  # Ephemeral rather than the named claim the Quartus pod uses, because sims
+  # DO run several at once under different POD= names and would deadlock on
+  # a single RWO claim. The cost is that Retain leaves the directory behind
+  # per run - small for sims, but see build/quartus-pod.yaml, and prune
+  # /var/mnt/local-path-standard occasionally.
+  - name: work
+    ephemeral:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          storageClassName: standard
+          resources:
+            requests:
+              storage: 20Gi
