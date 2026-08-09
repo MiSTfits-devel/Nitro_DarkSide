@@ -90,10 +90,20 @@ set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ADAPTIVE=1"
 # Disable YC / Composite output to save some resources.
 # MEASURED 2026-08-08: yc_out is 235 ALMs + 2 DSPs in every build to date.
 # Still untried - free if composite/S-video is not a target.
-# set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_YC=1"
+set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_YC=1"
 
 # Disable ALSA audio output to save some resources
 set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ALSA=1"
+
+# Bypass MiSTer's IIR audio low-pass (a LOCAL patch to sys/audio_out.v, guarded
+# so the vendored file still builds unmodified when this is off).
+# MEASURED: IIR_filter is ~430 ALMs (~43 LABs). This image is LAB-bound, not
+# ALM-bound - with SOUND_ENABLE=1 + PQ_DEPTH=16 the fitter needed 4,192..4,215
+# LABs against 4,191 across five seeds (0,1,2,3,5), i.e. it missed by as little
+# as ONE. This is what pays for keeping PQ_DEPTH=16, which is worth 8 fewer
+# dropped scanlines per frame (see the table in rtl/nds_drawer_obj.vhd).
+# Cost: no audio filtering. Turn it off again the moment nds_sound shrinks.
+set_global_assignment -name VERILOG_MACRO "NDS_NO_AUDIO_FILTER=1"
 
 # clkMem 4x = 134.055928 MHz instead of 3x = 100.541946 MHz. This ONE macro
 # moves both the PLL (rtl/pll/pll_0002.v) and every clk1x-crossing phase index
@@ -228,7 +238,10 @@ set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ALSA=1"
 # appears in DDR3, so turning it on cannot change how an existing image behaves;
 # the only cost is area, and it is left switchable so that area stays A/B-able
 # against the rest of the fitting war.
-set_global_assignment -name VERILOG_MACRO "NDS_HPS_AUDIO=1"
+# OFF for a SOUND_ENABLE=1 image: with the fabric SPU present the ring has no
+# producer and no consumer, and it measures 197.9 ALMs (nds_audio_ddr3:u_audio,
+# artifacts-perf entity table) that this configuration cannot spare.
+# set_global_assignment -name VERILOG_MACRO "NDS_HPS_AUDIO=1"
 
 # Drops ascal + pll_hdmi so the design fits, and removes the HDMI clock domain.
 # No HDMI out; direct_video carries analog.
