@@ -305,7 +305,12 @@ parameter CONF_STR = {
 	"P4,Credits;",
 	"P4-;",
 	"P4-,Sarah Aronson;",
-	"P4-,(Heni, Luigi & Co);",
+	// No comma in the label: CONF_STR uses ';' between entries and ',' between
+	// fields, so "(Heni, Luigi & Co)" parsed as two fields and the OSD rendered
+	// only the first - it showed "(Heni" and dropped the rest. There is no
+	// escape for it. Kept one char SHORTER than the original on purpose: this
+	// image fits at 4,191/4,191 LABs, so the string constant may not grow.
+	"P4-,(Heni/Luigi & Co);",
 	"P4-,ko-fi.com/heni;",
 
 	"- ;",
