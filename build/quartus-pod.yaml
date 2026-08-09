@@ -75,7 +75,7 @@ spec:
   volumes:
   - name: work
     persistentVolumeClaim:
-      claimName: nds-quartus-work
+      claimName: nds-quartus-build-work
 ---
 # /work was an emptyDir, which lives under /var/lib/kubelet - i.e. on the
 # node's 49.9 GB /var filesystem, the SAME one holding every container image.
@@ -94,13 +94,25 @@ spec:
 # Deliberately a NAMED claim, not a generic ephemeral volume: both
 # StorageClasses are ReclaimPolicy=Retain, so a per-pod ephemeral PVC would
 # leave its directory behind on every single build and silently fill the big
-# disk instead. One claim, reused, wiped at pod startup. It is RWO, so two
-# concurrent builds cannot both mount it - which is fine, the node has no
-# room to run two Quartus fits anyway.
+# disk instead. One claim per pod NAME, reused, wiped at pod startup.
+#
+# The name must CONTAIN the pod name, because remote-build.sh selects a pod
+# with `sed s/nds-quartus-build/$POD/g` over this whole file. It used to be
+# `nds-quartus-work`, which that sed did not touch, so every POD= override
+# silently mounted the SAME RWO claim - the second build would sit Pending on
+# a multi-attach error, or, worse, wipe the first one's tree at startup.
+# Same bug and same fix as build/sim-pod.yaml (94029c5).
+#
+# The old note here said two concurrent fits were impossible anyway because
+# "the node has no room". Measured 2026-08-09 and that is wrong: this pod
+# REQUESTS 1 CPU / 8Gi (it only bursts to 12/24Gi), and slacker allocates
+# 14.5 CPU / 98Gi at 35% / 19% used. Two fits schedule fine and contend only
+# on the compressible limit - each takes ~35 min instead of ~25, which is a
+# good trade when you are A/B-ing two configurations against a fitting wall.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: nds-quartus-work
+  name: nds-quartus-build-work
 spec:
   accessModes: ["ReadWriteOnce"]
   storageClassName: standard
