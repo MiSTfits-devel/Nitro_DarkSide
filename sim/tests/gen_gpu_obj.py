@@ -34,6 +34,14 @@ EXTPAL = bytearray(rnd.getrandbits(8) for _ in range(0x2000))
 
 # fully-transparent 4bpp/8bpp tiles for merge tests (tiles 0x40..0x4F at
 # char base 0): 4bpp tile n lives at n*32
+#
+# NOTE those sixteen tiles are CONTIGUOUS - bytes 0x800..0x9FF - which is
+# exactly the footprint of one 32x32 4bpp 1D sprite, or of the second tile
+# row of a 2D one based near it. A case that points at tileno 0x40 for
+# anything other than deliberate transparency renders completely blank and
+# still PASSES, because the golden model agrees it is blank. Cases 7 and 24
+# were both silently doing that. Check `opaque=` per case (or `pixels=` in
+# the bench output) before believing a case name.
 for t in range(0x40, 0x50):
     VRAM[t*32 : t*32 + 32] = bytes(32)
 # scattered zero bytes so transparency paths get hit everywhere
@@ -284,8 +292,11 @@ aff(o, 0, 0x100, 0, 0, 0x100)
 cases.append((c, o))
 
 # 7: affine rotated + double-size 32x32
+#    tileno 0x60, NOT 0x40: at 0x40 this case drew nothing at all (see the
+#    transparent-tile note above) and checked no opaque pixel for its whole
+#    life, despite being the only rotated double-size case
 c = cfg(one_dim=1); o = new_oam()
-obj(o, 0, 30, 30, 0, 2, 64, prio=1, palno=4, affine=1, dbl=1, affsel=3)
+obj(o, 0, 30, 30, 0, 2, 0x60, prio=1, palno=4, affine=1, dbl=1, affsel=3)
 aff(o, 3, 0x0B5, -0x0B5 & 0xFFFF, 0x0B5, 0x0B5)     # ~45 deg
 cases.append((c, o))
 
@@ -316,11 +327,15 @@ obj(o, 0, 90, 50, 1, 3, 0x2A7, prio=1, palno=9, mode=3)
 cases.append((c, o))
 
 # 13: bitmap hflip + vflip (1D)
+#     y=56, not 48: these are 16 tall and the bench draws line 64, so at 48
+#     every one of them was one line PAST its last (ty = 16, field 16) and
+#     the case skipped all four sprites - it has never drawn a pixel, and so
+#     has never checked a flipped bitmap
 c = cfg(bitmap_1d=1); o = new_oam()
-obj(o, 0,  20, 48, 0, 1, 20, prio=0, palno=7, mode=3, hflip=1)
-obj(o, 1,  80, 48, 0, 1, 20, prio=0, palno=7, mode=3, vflip=1)
-obj(o, 2, 140, 48, 0, 1, 20, prio=0, palno=7, mode=3, hflip=1, vflip=1)
-obj(o, 3, 200, 48, 0, 1, 20, prio=0, palno=7, mode=3)
+obj(o, 0,  20, 56, 0, 1, 20, prio=0, palno=7, mode=3, hflip=1)
+obj(o, 1,  80, 56, 0, 1, 20, prio=0, palno=7, mode=3, vflip=1)
+obj(o, 2, 140, 56, 0, 1, 20, prio=0, palno=7, mode=3, hflip=1, vflip=1)
+obj(o, 3, 200, 56, 0, 1, 20, prio=0, palno=7, mode=3)
 cases.append((c, o))
 
 # 14: affine bitmap, rotated, double-size (1D)
@@ -397,10 +412,14 @@ cases.append((c, o))
 # 24: H mosaic, screen-aligned grid (melonDS rule): sprites at x NOT
 # aligned to the grid (40 % 3 = 1, 91 % 3 = 1), plus a non-mosaic control.
 # The sprite-relative counting the donor used renders these differently.
+#
+# tileno 90, not 33: at 33 the 2D row for ty=8 lands at 0x820, inside the
+# transparent block, so this - the ONLY mosaic case in the bench - drew
+# nothing and could not have caught a mosaic regression.
 c = cfg(mosaic_h=2); o = new_oam()
-obj(o, 0, 40, 56, 0, 1, 33, prio=0, palno=1, mosaic=1)
-obj(o, 1, 91, 56, 0, 1, 33, prio=1, palno=3, mosaic=1, hflip=1)
-obj(o, 2, 180, 56, 0, 1, 33, prio=0, palno=2)
+obj(o, 0, 40, 56, 0, 1, 90, prio=0, palno=1, mosaic=1)
+obj(o, 1, 91, 56, 0, 1, 90, prio=1, palno=3, mosaic=1, hflip=1)
+obj(o, 2, 180, 56, 0, 1, 90, prio=0, palno=2)
 cases.append((c, o))
 
 # 25: H mosaic across transparency holes (4bpp tiles with zero nibbles)
@@ -479,6 +498,89 @@ for k in range(8):
         affine=1, affsel=k)
 for k in range(8):
     aff(o, k, 0x100, 0, 0, 0x100)
+cases.append((c, o))
+
+# --- dense small sprites, affine vs normal ------------------------------
+# Cases 30/31 are eight 64-wide sprites, so each sprite's OAM fetch hides
+# completely behind the PREVIOUS sprite's 64-pixel walk and the fetch cost
+# never shows. The regime that actually hurts is the opposite one - a crowd
+# of small sprites, where the walk is short enough that the fetch is exposed
+# on every one of them. That is what a stampede or a burst of pickups looks
+# like in OAM, and it is the case these two measure.
+
+# 24 of them, not more: a rot/scal sprite is charged 10 + 2/pixel against
+# the 1210-cycle hardware OBJ budget, so 24 16-wide ones come to 1008 and
+# fit. Past ~28 the drawer starts truncating the line exactly as hardware
+# would, and the golden model does not emulate the budget - the run fails on
+# sprites the model still expects to see.
+
+# 32: 24 normal 16x16 sprites on one line
+c = cfg(one_dim=1); o = new_oam()
+for k in range(24):
+    obj(o, k, (k * 4) % 256, 56, 0, 1, 5, prio=0, palno=(k % 8))
+cases.append((c, o))
+
+# 33: the same 24 as rot/scal at 1:1 - identical pixels, and every one of
+#     them needs its group's parameters
+c = cfg(one_dim=1); o = new_oam()
+for k in range(24):
+    obj(o, k, (k * 4) % 256, 56, 0, 1, 5, prio=0, palno=(k % 8),
+        affine=1, affsel=(k % 32))
+for g in range(32):
+    aff(o, g, 0x100, 0, 0, 0x100)
+cases.append((c, o))
+
+# --- the screen clip ----------------------------------------------------
+# The drawer no longer walks a sprite's whole field and drops the pixels
+# that miss the screen; it computes the first and last on-screen x up front
+# and walks only that span. Before these three cases NOTHING in this bench
+# put a sprite over either edge - every existing case sits comfortably
+# inside 0..255 - so the entire clip was exercised only by the full-frame
+# bench, and its arithmetic not at all by a golden comparison.
+#
+# The golden model needs no changes to grade them: it already steps rx/ry
+# across every field pixel and drops the ones whose target leaves 0..255,
+# which is precisely the behaviour the clip has to reproduce by arithmetic.
+
+# 34: normal sprites, every clip regime, against an unclipped control on the
+#     same tile - 1 and 0 differ only in where they sit
+c = cfg(one_dim=1); o = new_oam()
+obj(o, 0, (-20) & 0x1FF, 48, 0, 2, 0x60, prio=0, palno=2)   # hangs off left
+obj(o, 1,          40,   48, 0, 2, 0x60, prio=0, palno=2)   # control
+obj(o, 2,         240,   48, 0, 2, 0x60, prio=0, palno=4)   # hangs off right
+obj(o, 3, (-40) & 0x1FF, 48, 0, 2, 0x60, prio=0, palno=5)   # wholly off left
+obj(o, 4,         256,   48, 0, 2, 0x60, prio=0, palno=6)   # wholly off right
+obj(o, 5, (-60) & 0x1FF, 20, 0, 3, 0x0AB, prio=1, palno=9)  # 4 px of a 64
+obj(o, 6,         252,   60, 0, 0, 5,    prio=0, palno=3)   # 4 px of an 8
+obj(o, 7, (-12) & 0x1FF, 48, 0, 2, 33,   prio=2, palno=1, hflip=1)
+cases.append((c, o))
+
+# 35: the same regimes with ROTATION, which is what actually tests the clip's
+#     arithmetic. realX/realY are the only walk state that accumulates, so a
+#     clipped sprite has to start them at first_x * pa/pc rather than at the
+#     field origin. Pure scale hides that (with pb = pc = 0 realY is constant
+#     along the line, so a wrong seed is a no-op) - the same asymmetry that
+#     cost a debug round on the affine pipeline. Hence pb, pc != 0 here.
+c = cfg(one_dim=1); o = new_oam()
+obj(o, 0, (-18) & 0x1FF, 48, 0, 2, 0x60, prio=0, palno=2, affine=1, affsel=0)
+obj(o, 1,          60,   48, 0, 2, 0x60, prio=0, palno=2, affine=1, affsel=0)
+obj(o, 2,         244,   48, 0, 2, 0x60, prio=0, palno=4, affine=1, affsel=0)
+obj(o, 3, (-40) & 0x1FF, 48, 0, 2, 0x60, prio=0, palno=5, affine=1, affsel=0)
+obj(o, 4,         256,   48, 0, 2, 0x60, prio=0, palno=6, affine=1, affsel=0)
+aff(o, 0, 0x0B5, -0x0B5 & 0xFFFF, 0x0B5, 0x0B5)     # ~45 deg
+cases.append((c, o))
+
+# 36: clipped, rotated AND magnified double-size - the deepest leading run
+#     the clip can produce (a 64-wide field entered 30 px in) on the regime
+#     where word reuse fires constantly
+c = cfg(one_dim=1); o = new_oam()
+obj(o, 0, (-30) & 0x1FF, 16, 0, 2, 0x60, prio=0, palno=2,
+    affine=1, dbl=1, affsel=9)
+obj(o, 1,          90,   16, 0, 2, 0x60, prio=1, palno=2,
+    affine=1, dbl=1, affsel=9)
+obj(o, 2,         220,   16, 0, 2, 0x60, prio=0, palno=4,
+    affine=1, dbl=1, affsel=9)
+aff(o, 9, 0x030, 0x010, -0x010 & 0xFFFF, 0x030)
 cases.append((c, o))
 
 # ---------------------------------------------------------------- emit
