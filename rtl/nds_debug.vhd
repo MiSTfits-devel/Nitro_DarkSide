@@ -93,6 +93,14 @@ entity nds_debug is
       -- op 0x0E: IPC sync + FIFO depths, invisible to peek (IO space)
       ipcstat   : in  std_logic_vector(31 downto 0) := (others => '0');
 
+      -- op 0x0F: nds_perf's vblank snapshot, arg = 0..7 selects the counter.
+      -- perf_index is driven straight off cmd_arg rather than latched, so the
+      -- counter block's read mux settles while the command is still being
+      -- decoded and `answer` samples a stable word - the same trick op 0x0C
+      -- uses for the six interrupt registers, just muxed on the far side.
+      perfstat  : in  std_logic_vector(31 downto 0) := (others => '0');
+      perf_index : out std_logic_vector(2 downto 0) := (others => '0');
+
       -- interrupt controller state for both CPUs, returned by op 0x0C with
       -- arg = 0..5. PEEK cannot read these: it borrows the ARM9 main-RAM
       -- channel, so an 0x040001xx address aliases into RAM and returns garbage.
@@ -142,6 +150,10 @@ begin
    -- outranks unhalt, so an IRQ cannot resume a debugger-halted CPU.
    hold9 <= held9;
    hold7 <= held7;
+
+   -- combinational, so nds_perf's mux has settled by the time the op handler
+   -- samples perfstat into `answer`
+   perf_index <= cmd_arg(2 downto 0);
 
    process (clk)
       variable op : std_logic_vector(6 downto 0);
@@ -282,6 +294,10 @@ begin
 
                         when "0001110" =>            -- IPCSTAT (op 0x0E)
                            answer <= ipcstat;
+                           state  <= RESPOND;
+
+                        when "0001111" =>            -- PERFSTAT (op 0x0F)
+                           answer <= perfstat;
                            state  <= RESPOND;
 
                         when "0001100" =>            -- IRQSTAT, arg selects

@@ -370,6 +370,8 @@ architecture arch of nds_top is
    signal dbg_pk_ena, dbg_pk_act, dbg_pk_sel : std_logic;
    signal dbg_card_s : std_logic_vector(31 downto 0);
    signal dbg_ipc_s  : std_logic_vector(31 downto 0);
+   signal dbg_perf_s   : std_logic_vector(31 downto 0);
+   signal dbg_perf_idx : std_logic_vector(2 downto 0);
 
    -- Everything the CPUs' resetCpu does not cover, but which a from-reset probe
    -- must still start clean. nds_mainram in particular latches req9/req7_pending
@@ -1210,6 +1212,8 @@ begin
       probe    => dbg_probe,
       cardstat => dbg_card_s,
       ipcstat  => dbg_ipc_s,
+      perfstat => dbg_perf_s,
+      perf_index => dbg_perf_idx,
       irq9_ime => irq9_dbg_ime, irq9_ie => irq9_dbg_ie, irq9_if => irq9_dbg_if,
       irq7_ime => irq7_dbg_ime, irq7_ie => irq7_dbg_ie, irq7_if => irq7_dbg_if,
       pk_ena   => dbg_pk_ena,
@@ -1236,7 +1240,32 @@ begin
       dbg_regsel_s  <= (others => '0');
       dbg_pk_ena    <= '0';
       dbg_pk_addr_s <= (others => '0');
+      -- perf_index is an OUTPUT of nds_debug, so with the mailbox compiled out
+      -- it has no driver at all. nvc will not complain and Quartus will infer
+      -- something; drive it here for the same reason every signal above is
+      -- driven here.
+      dbg_perf_idx  <= (others => '0');
    end generate;
+
+   -- Renderer pace counters, read back through mailbox op 0x0F. Tied to
+   -- DEBUG_ENABLE because that is what compiles the mailbox in - counters with
+   -- no way to read them would be pure area. Both engines' line_busy come from
+   -- the two nds_gpu2d_fast instances below; a drawline landing on a busy
+   -- engine is the drop condition tb_gpu2d_timed counts.
+   iperf : entity work.nds_perf
+   generic map ( ENABLE => DEBUG_ENABLE )
+   port map
+   (
+      clk         => clk1x,
+      reset       => reset,
+      vblank      => gpu_vblank,
+      drawline    => drawline,
+      drawObj     => drawObj,
+      line_busy_a => line_busy,
+      line_busy_b => line_busy_b,
+      index       => dbg_perf_idx,
+      value       => dbg_perf_s
+   );
 
    process (clk1x)
    begin
