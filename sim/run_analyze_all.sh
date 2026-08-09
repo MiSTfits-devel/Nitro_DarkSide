@@ -52,6 +52,7 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_syscnt.vhd \
    rtl/nds_loader.vhd \
    rtl/nds_debug.vhd \
+   rtl/nds_perf.vhd \
    rtl/nds_card.vhd \
    rtl/nds_rtc.vhd \
    rtl/nds_sound.vhd \

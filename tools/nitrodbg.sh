@@ -29,7 +29,10 @@
 #   membus9  : W_MAIN  mr_done=0        <- waiting for main RAM
 #   mainram  : MR_IDLE  req9=0          <- ...which never saw a request
 #
-# SAFE:    regs9 / regs7 / irq / status / probe   (register read-back only)
+# SAFE:    regs9 / regs7 / irq / status / probe / perf  (register read-back only)
+#
+#   perf        renderer pace: fps, frame time, per-engine busy %, dropped lines
+#   perf <n>    same, sampled n times a second apart (0 = until Ctrl-C)
 # UNSAFE while running: peek9, dump9, where9  -> halt9 first, then run9 after.
 #
 # Usage:
@@ -193,6 +196,54 @@ do_lwtest() {
 	fi
 	echo "  bridge is UP. Use NITRODBG_LW=1 for the fast transport."
 	do_live
+}
+
+# Renderer pace, from nds_perf via op 0x0F. SAFE while the cores run: it is a
+# register read like irq/status, it never touches the ARM9 main-RAM channel,
+# and the counters are a vblank snapshot so a slow poll misses frames rather
+# than tearing one.
+#
+# `perf` samples once; `perf N` loops N times (0 = forever) about a second
+# apart, which is the mangohud-ish view. Each sample is 8 mailbox round trips
+# at ~122 us, so the sampling itself is ~1 ms - far below a frame, and it does
+# not perturb what it measures.
+CLK1X_HZ=33514000        # clk_sys; video is 2x and clkMem 4x this
+
+do_perf_once() {
+	_f=$(printf '%d' "0x$(cmd 0F 0)")     # frames, free-running
+	_fc=$(printf '%d' "0x$(cmd 0F 1)")    # clk1x cycles in the last frame
+	_ba=$(printf '%d' "0x$(cmd 0F 2)")    # renderer-busy cycles, engine A
+	_bb=$(printf '%d' "0x$(cmd 0F 3)")    # ... engine B
+	_da=$(printf '%d' "0x$(cmd 0F 4)")    # dropped lines last frame, A
+	_db=$(printf '%d' "0x$(cmd 0F 5)")    # ... B
+	_ta=$(printf '%d' "0x$(cmd 0F 6)")    # cumulative drops, A
+	_tb=$(printf '%d' "0x$(cmd 0F 7)")    # ... B
+
+	# frame time from the counter itself, not from wall clock: this is the
+	# core's own pace and is immune to how slowly the shell polls
+	_us=0; [ "$_fc" -gt 0 ] && _us=$(( _fc * 1000000 / CLK1X_HZ ))
+	_fps10=0; [ "$_us" -gt 0 ] && _fps10=$(( 10000000 / _us ))
+	_pa=0; [ "$_fc" -gt 0 ] && _pa=$(( _ba * 100 / _fc ))
+	_pb=0; [ "$_fc" -gt 0 ] && _pb=$(( _bb * 100 / _fc ))
+
+	printf 'frame %-8d  %2d.%d fps  %d.%03d ms   renderA %3d%%  renderB %3d%%   drops %d/%d  total %d/%d\n' \
+		"$_f" "$((_fps10 / 10))" "$((_fps10 % 10))" \
+		"$((_us / 1000))" "$((_us % 1000))" \
+		"$_pa" "$_pb" "$_da" "$_db" "$_ta" "$_tb"
+}
+
+do_perf() {
+	_n=${1:-1}
+	if [ "$_n" = "1" ]; then do_perf_once; return; fi
+	_i=0
+	# saturating counters read as a stuck maximum rather than a small wrapped
+	# number, so 255/65535 here mean "at least", not "exactly"
+	echo "frames | fps (core's own pace) | frame time | renderer busy | dropped lines this frame / cumulative"
+	while [ "$_n" = "0" ] || [ "$_i" -lt "$_n" ]; do
+		do_perf_once
+		_i=$((_i + 1))
+		[ "$_n" = "0" ] || [ "$_i" -lt "$_n" ] && sleep 1
+	done
 }
 
 do_live() {
@@ -433,6 +484,7 @@ case "$1" in
 	ipc)       do_ipc ;;
 	forcecart) do_forcecart ;;
 	irq)       do_irq ;;
+	perf)      do_perf "$2" ;;
 	where9)  do_where 9 ;;
 	where7)  do_where 7 ;;
 	lwtest)  do_lwtest ;;
