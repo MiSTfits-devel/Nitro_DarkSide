@@ -68,6 +68,15 @@ entity nds_cache9 is
       mem_wdata     : out std_logic_vector(31 downto 0) := (others => '0');
       mem_done      : in  std_logic;
       mem_rdata     : in  std_logic_vector(31 downto 0);
+      -- PAIR FILLS. The SDRAM controller runs BURST_LENGTH=4 and so moves 64
+      -- bits on every access; ch2 used to discard half (rtl/sdram.sv
+      -- ch2_dout_hi). Asking nds_mainram for the aligned pair makes a 32-byte
+      -- line four requests instead of eight, and each request saved is a whole
+      -- clk1x handshake plus a wait for clkMemIndex = 0 with mainram_allow -
+      -- which costs far more than the burst does. mem_addr is always even in
+      -- pair mode: a line is 32-byte aligned, so its four pairs are too.
+      mem_pair      : out std_logic := '0';
+      mem_rdata_hi  : in  std_logic_vector(31 downto 0) := (others => '0');
 
       -- maintenance (see nds_cpu9 cache_op encoding)
       op_ena        : in  std_logic;
@@ -113,6 +122,9 @@ architecture arch of nds_cache9 is
    signal id_we    : std_logic_vector(3 downto 0);
    signal dd_we    : std_logic_vector(3 downto 0);
    signal id_waddr : integer range 0 to 511;
+   -- was hardwired to mem_rdata at the BRAM; a pair fill has to steer the
+   -- second word through the same port on the following cycle
+   signal id_wdata : std_logic_vector(31 downto 0);
    signal dd_waddr : integer range 0 to 255;
    signal dd_wdata : std_logic_vector(31 downto 0);
    signal dd_wbe   : std_logic_vector(3 downto 0);
@@ -167,8 +179,9 @@ architecture arch of nds_cache9 is
       WB_PREP,       -- one cycle so the victim way's beat-0 read lands
       WB_BEAT,       -- write back one dirty line (victim or clean op)
       WB_WAIT,
-      FILL_BEAT,     -- fill one line from memory
-      FILL_WAIT,
+      FILL_BEAT,     -- fill one line from memory, an aligned PAIR per request
+      FILL_WAIT,     -- pair arrived: low word to the way BRAM
+      FILL_HI,       -- ...and its high word, the next cycle
       OP_FINISH
    );
    signal state : t_state := IDLE;
@@ -188,6 +201,7 @@ architecture arch of nds_cache9 is
          when FILL_BEAT    => return x"9";
          when FILL_WAIT    => return x"A";
          when OP_FINISH    => return x"B";
+         when FILL_HI      => return x"C";
       end case;
    end function;
 
@@ -202,6 +216,15 @@ architecture arch of nds_cache9 is
 
    -- fill/writeback bookkeeping
    signal beat        : unsigned(2 downto 0) := (others => '0');
+   -- CRITICAL WORD FIRST. beat no longer starts at 0 and runs to 7; it starts
+   -- at the PAIR holding the word the CPU asked for and wraps (6 -> 0 falls out
+   -- of the 3-bit width), so the requested word is in the very first memory
+   -- round trip instead of the 2.5th on average. That only pays because the
+   -- response is now sent the moment that word lands rather than at the end of
+   -- the line, which leaves up to three of the four round trips overlapping
+   -- real CPU work. Since beat wraps, it can no longer be the end-of-fill test
+   -- - fill_cnt counts the four pairs instead.
+   signal fill_cnt    : unsigned(1 downto 0) := (others => '0');
    signal fill_way    : integer range 0 to 3 := 0;
    signal wb_line     : integer range 0 to 255 := 0;   -- D line being written back
    signal wb_addrbase : std_logic_vector(21 downto 5) := (others => '0');
@@ -282,7 +305,14 @@ begin
    begin
       it_we <= (others => '0');
       dt_we <= (others => '0');
-      if (state = FILL_WAIT and mem_done = '1' and beat = 7) then
+      -- The LAST cycle of the fill, which pairing moved: beats now walk
+      -- 0,2,4,6 and the eighth word lands in the FILL_HI that follows beat 6,
+      -- so `beat = 7` never happens. Leaving this on the old condition writes
+      -- the line's data and never its tag - the line is then unfindable, every
+      -- later access misses, and a dirty write goes straight to memory. That
+      -- is a silent correctness bug, not a stall: sim/tests/arm9_cache.s test 1
+      -- catches it exactly (write-back looks like write-through).
+      if (state = FILL_HI and fill_cnt = 3) then
          if (r_code = '1') then
             it_we(fill_way) <= '1';
          else
@@ -315,6 +345,12 @@ begin
          dd_waddr <= to_integer(unsigned(r_addr(9 downto 5))) * 8 + to_integer(beat);
          dd_wdata <= mem_rdata;
          dd_wbe   <= "1111";
+      elsif (state = FILL_HI and r_code = '0') then
+         -- beat still holds the EVEN index here; it advances on the way out
+         dd_we(fill_way) <= '1';
+         dd_waddr <= to_integer(unsigned(r_addr(9 downto 5))) * 8 + to_integer(beat) + 1;
+         dd_wdata <= mem_rdata_hi;
+         dd_wbe   <= "1111";
       end if;
    end process;
 
@@ -322,8 +358,13 @@ begin
    begin
       id_we    <= (others => '0');
       id_waddr <= to_integer(unsigned(r_addr(10 downto 5))) * 8 + to_integer(beat);
+      id_wdata <= mem_rdata;
       if (state = FILL_WAIT and mem_done = '1' and r_code = '1') then
          id_we(fill_way) <= '1';
+      elsif (state = FILL_HI and r_code = '1') then
+         id_we(fill_way) <= '1';
+         id_waddr <= to_integer(unsigned(r_addr(10 downto 5))) * 8 + to_integer(beat) + 1;
+         id_wdata <= mem_rdata_hi;
       end if;
    end process;
 
@@ -407,10 +448,10 @@ begin
          be_a      => "0000",
          ce_b      => '1',
          addr_b    => id_waddr,
-         datain_b0 => mem_rdata( 7 downto  0),
-         datain_b1 => mem_rdata(15 downto  8),
-         datain_b2 => mem_rdata(23 downto 16),
-         datain_b3 => mem_rdata(31 downto 24),
+         datain_b0 => id_wdata( 7 downto  0),
+         datain_b1 => id_wdata(15 downto  8),
+         datain_b2 => id_wdata(23 downto 16),
+         datain_b3 => id_wdata(31 downto 24),
          dataout_b => open,
          we_b      => id_we(w),
          be_b      => "1111"
@@ -590,7 +631,8 @@ begin
                         state      <= IDLE;
                      else
                         fill_way <= to_integer(irr(iset));
-                        beat     <= (others => '0');
+                        beat     <= unsigned(r_addr(4 downto 3)) & '0';
+                        fill_cnt <= (others => '0');
                         state    <= FILL_BEAT;
                      end if;
                   else
@@ -635,7 +677,9 @@ begin
                            after_wb_fill <= '1';
                            state         <= WB_PREP;
                         else
-                           state <= FILL_BEAT;
+                           beat     <= unsigned(r_addr(4 downto 3)) & '0';
+                           fill_cnt <= (others => '0');
+                           state    <= FILL_BEAT;
                         end if;
                      end if;
                   end if;
@@ -705,6 +749,7 @@ begin
 
                when BYPASS_ISSUE =>
                   mem_ena   <= '1';
+                  mem_pair  <= '0';
                   mem_rnw   <= r_rnw;
                   mem_addr  <= r_addr(21 downto 2);
                   mem_be    <= r_be;
@@ -724,6 +769,13 @@ begin
 
                when WB_BEAT =>
                   mem_ena   <= '1';
+                  -- writes never pair (nds_mainram masks it anyway), and this
+                  -- must be HELD like mem_rnw/mem_addr rather than pulsed: the
+                  -- request crosses into clk1x through a toggle handshake, so
+                  -- nds_mainram samples the attributes some cycles later. A
+                  -- one-cycle mem_pair reads as low by then, which is what
+                  -- broke the first attempt at this.
+                  mem_pair  <= '0';
                   mem_rnw   <= '0';
                   mem_addr  <= wb_addrbase & std_logic_vector(beat);
                   mem_be    <= "1111";
@@ -740,8 +792,9 @@ begin
                      if (beat = 7) then
                         ddirty(wb_line) <= '0';
                         if (after_wb_fill = '1') then
-                           beat  <= (others => '0');
-                           state <= FILL_BEAT;
+                           beat     <= unsigned(r_addr(4 downto 3)) & '0';
+                           fill_cnt <= (others => '0');
+                           state    <= FILL_BEAT;
                         else
                            -- maintenance clean: optionally invalidate too
                            if (op_invalidate_after = '1') then
@@ -755,8 +808,11 @@ begin
                      end if;
                   end if;
 
+               -- beat is always EVEN here: the fill walks 0,2,4,6 and each
+               -- request brings back that word and the one above it.
                when FILL_BEAT =>
                   mem_ena  <= '1';
+                  mem_pair <= '1';
                   mem_rnw  <= '1';
                   mem_addr <= r_addr(21 downto 5) & std_logic_vector(beat);
                   mem_be   <= "1111";
@@ -764,29 +820,51 @@ begin
 
                when FILL_WAIT =>
                   if (mem_done = '1') then
-                     -- the beat lands in the way BRAM via port B (see the
-                     -- id_we/dd_we processes); only the bookkeeping is here
+                     -- the low word lands in the way BRAM via port B (see the
+                     -- id_we/dd_we processes); only the bookkeeping is here.
+                     -- Critical-word-first means this match, when it happens,
+                     -- happens on the FIRST pair - so the CPU is released after
+                     -- one round trip and the other three overlap its work.
+                     -- Safe because nothing is served from the line until the
+                     -- fill writes its tag: a request the CPU issues in the gap
+                     -- is caught by req_pending and replayed against a complete,
+                     -- valid line, so it cannot hit a half-filled one.
                      if (beat = to_integer(unsigned(r_addr(4 downto 2)))) then
-                        resp_hold <= mem_rdata;
+                        resp_rdata <= mem_rdata;
+                        resp_done  <= '1';
                      end if;
-                     if (beat = 7) then
-                        if (r_code = '1') then
-                           iset := to_integer(unsigned(r_addr(10 downto 5)));
-                           ivalid(fill_way*64 + iset) <= '1';
-                           irr(iset) <= irr(iset) + 1;
-                        else
-                           dset := to_integer(unsigned(r_addr(9 downto 5)));
-                           dvalid(fill_way*32 + dset) <= '1';
-                           ddirty(fill_way*32 + dset) <= '0';
-                           drr(dset) <= drr(dset) + 1;
-                        end if;
-                        resp_use_i <= '0';   -- fill returns via resp_hold
-                        resp_use_d <= '0';
-                        state <= HIT_RESP;
+                     -- one extra cycle to push the high word through the same
+                     -- single write port, rather than widening the way BRAMs
+                     state <= FILL_HI;
+                  end if;
+
+               when FILL_HI =>
+                  if (beat + 1 = unsigned(r_addr(4 downto 2))) then
+                     resp_rdata <= mem_rdata_hi;
+                     resp_done  <= '1';
+                  end if;
+                  if (fill_cnt = 3) then
+                     if (r_code = '1') then
+                        iset := to_integer(unsigned(r_addr(10 downto 5)));
+                        ivalid(fill_way*64 + iset) <= '1';
+                        irr(iset) <= irr(iset) + 1;
                      else
-                        beat  <= beat + 1;
-                        state <= FILL_BEAT;
+                        dset := to_integer(unsigned(r_addr(9 downto 5)));
+                        dvalid(fill_way*32 + dset) <= '1';
+                        ddirty(fill_way*32 + dset) <= '0';
+                        drr(dset) <= drr(dset) + 1;
                      end if;
+                     -- The response already went out with the critical word,
+                     -- so the line simply completes and the cache frees itself.
+                     -- IDLE replays whatever req_pending caught meanwhile; the
+                     -- tag and valid bit are set in this same cycle, so that
+                     -- replay hits the line rather than allocating it twice.
+                     state <= IDLE;
+                  else
+                     -- 3-bit beat wraps 6 -> 0, which is the wrap fetch
+                     beat     <= beat + 2;
+                     fill_cnt <= fill_cnt + 1;
+                     state    <= FILL_BEAT;
                   end if;
 
                when OP_FINISH =>

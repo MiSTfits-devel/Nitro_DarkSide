@@ -898,6 +898,10 @@ reg         vsrv_done_r,  vrsrv_done_r;
 
 wire        sd_ch2_ready;
 wire [31:0] sd_ch2_dout;
+// the other half of the same ch2 burst - see rtl/sdram.sv ch2_dout_hi. Only
+// main RAM consumes it; the vsrv side of this arbiter stays 32-bit.
+wire [31:0] sd_ch2_dout_hi;
+wire        sd_ch2_ready64;
 wire        sd_ch1_ready;
 wire [63:0] sd_ch1_dout;
 wire        sd_ch1_accept;
@@ -918,6 +922,9 @@ reg  [2:0] drain_cnt;
 
 wire vs_owns = (arb_state == A_WAIT);
 wire mr_done32 = sd_ch2_ready & ~vs_owns;
+// Gated by the SAME vs_owns as done32: while the arbiter has parked main RAM
+// and handed ch2 to vsrv, neither done belongs to us.
+wire mr_done64 = sd_ch2_ready64 & ~vs_owns;
 
 always @(posedge clk_mem) begin
 	vs_req_d  <= vsrv_req_c;
@@ -1114,6 +1121,8 @@ sdram #(
 	.ch2_rnw   (vs_owns ? vs_rnw       : mr_rnw),
 	.ch2_ready (sd_ch2_ready),
 	.ch2_ready16(),
+	.ch2_dout_hi(sd_ch2_dout_hi),
+	.ch2_ready64(sd_ch2_ready64),
 
 	.ch3_addr(24'd0),
 	.ch3_din(16'd0),
@@ -1362,6 +1371,8 @@ nds_port_wrap nds
 	.sdram_be(mr_be),
 	.sdram_Dout(sd_ch2_dout),
 	.sdram_done32(mr_done32),
+	.sdram_Dout_hi(sd_ch2_dout_hi),
+	.sdram_done64(mr_done64),
 
 	.vsrv_req(vsrv_req_c),
 	.vsrv_rnw(vsrv_rnw_c),

@@ -118,6 +118,12 @@ architecture sim of tb_arm9_island is
    signal mr9_addr : std_logic_vector(21 downto 2);
    signal mr9_be   : std_logic_vector(3 downto 0);
    signal mr9_writedata, mr9_readdata : std_logic_vector(31 downto 0);
+   -- pair fills: one request, the aligned 8-byte block back. Leaving these
+   -- unconnected does NOT fail loudly - mem9_pair defaults to '0', so mainram
+   -- happily serves 32 bits while the cache writes a zeroed high word into
+   -- every odd slot of every line. Wire them.
+   signal mr9_pair : std_logic;
+   signal mr9_readdata_hi : std_logic_vector(31 downto 0);
    signal mainram_active, mainram_busy : std_logic;
    signal model_allow : std_logic := '1';
    signal sdram_ena, sdram_rnw : std_logic := '0';
@@ -126,6 +132,8 @@ architecture sim of tb_arm9_island is
    signal sdram_be  : std_logic_vector(3 downto 0);
    signal sdram_Dout : std_logic_vector(31 downto 0) := (others => '0');
    signal sdram_done32 : std_logic := '0';
+   signal sdram_Dout_hi : std_logic_vector(31 downto 0) := (others => '0');
+   signal sdram_done64  : std_logic := '0';
 
    -- IO register bus
    signal io_bus : proc_bus_gb_type;
@@ -278,6 +286,7 @@ begin
       vram_din => vram_din, vram_dout => (others => '0'), vram_done => '0',
       mr_ena => mr9_ena, mr_rnw => mr9_rnw, mr_addr => mr9_addr, mr_be => mr9_be,
       mr_writedata => mr9_writedata, mr_done => mr9_done, mr_readdata => mr9_readdata,
+      mr_pair => mr9_pair, mr_readdata_hi => mr9_readdata_hi,
       io_ce_next => io_ce_next,
       io_bus => io_bus, io_wired_out => io_wired_out, io_wired_done => io_wired_done
    );
@@ -375,12 +384,14 @@ begin
       arm7_priority => '0',
       mem9_ena => mr9_ena, mem9_rnw => mr9_rnw, mem9_addr => mr9_addr, mem9_be => mr9_be,
       mem9_writedata => mr9_writedata, mem9_done => mr9_done, mem9_readdata => mr9_readdata,
+      mem9_pair => mr9_pair, mem9_readdata_hi => mr9_readdata_hi,
       mem7_ena => '0', mem7_rnw => '1', mem7_addr => (others => '0'), mem7_be => "0000",
       mem7_writedata => (others => '0'), mem7_done => open, mem7_readdata => open,
       mainram_allow => model_allow, mainram_active => mainram_active, mainram_busy => mainram_busy,
       mr_sdram_ena => sdram_ena, mr_sdram_rnw => sdram_rnw, mr_sdram_Adr => sdram_Adr,
       mr_sdram_Din => sdram_Din, mr_sdram_be => sdram_be,
-      sdram_Dout => sdram_Dout, sdram_done32 => sdram_done32
+      sdram_Dout => sdram_Dout, sdram_done32 => sdram_done32,
+      sdram_Dout_hi => sdram_Dout_hi, sdram_done64 => sdram_done64
    );
 
    -- ================= behavioral SDRAM controller (from tb_mainram) =================
@@ -416,7 +427,27 @@ begin
             sdram_done32 <= '1';
             wait until rising_edge(clkMem);
             sdram_done32 <= '0';
-            for k in 1 to 3 loop wait until rising_edge(clkMem); end loop;
+            -- The real controller runs BURST_LENGTH=4, so the upper 32 bits of
+            -- the aligned 8-byte block arrive two clocks after done32 and
+            -- done64 marks them (rtl/sdram.sv ch2_dout_hi / ch2_ready64). The
+            -- pairing is w with w xor 1 rather than w+1 because ACCESS_TYPE is
+            -- sequential: a burst from an odd word wraps inside its aligned
+            -- block, so the "high" half of an odd base is the EVEN word. Pair
+            -- mode is only ever issued on even addresses, but modelling the
+            -- wrap is what makes a violation of that show up here rather than
+            -- as silently transposed data on hardware.
+            wait until rising_edge(clkMem);
+            if (w mod 2) = 0 then
+               sdram_Dout_hi <= mem(w + 1);
+            else
+               sdram_Dout_hi <= mem(w - 1);
+            end if;
+            sdram_done64  <= '1';
+            wait until rising_edge(clkMem);
+            sdram_done64 <= '0';
+            -- the slot stays 10 clkMem cycles long, exactly as before pair
+            -- mode existed, so a non-pair read is cycle-identical to baseline
+            wait until rising_edge(clkMem);
          else
             for k in 1 to 3 loop wait until rising_edge(clkMem); end loop;
             for j in 0 to 3 loop
@@ -425,8 +456,10 @@ begin
                end if;
             end loop;
             sdram_done32 <= '1';
+            sdram_done64 <= '1';   -- a write returns no data; both dones fire
             wait until rising_edge(clkMem);
             sdram_done32 <= '0';
+            sdram_done64 <= '0';
             for k in 1 to 4 loop wait until rising_edge(clkMem); end loop;
          end if;
       elsif (refresh_cnt > 750) then
