@@ -541,11 +541,22 @@ never a registered edge, which would leave a cycle to slip through:
 
 ### Two traps worth remembering
 
-**The area wall is real and it is 2 LABs wide.** Stage 3 first fitted at 41,653
-ALMs / 4,203 LABs against 4,191 on the device. The core already sat at 41,388 /
-**4,189** — see `docs/TICKET-arm9-2to1-timing.md`. `WQ_DEPTH` and the
-invalidation granularity are both area decisions, not comfort ones. Anything
-added to this core has to pay for itself in registers.
+**The area wall is real, it is 2 LABs wide, and you cannot measure your way
+across it one edit at a time.** Stage 3 fitted at 4,203 LABs against 4,191. The
+core already sat at 4,189 (`docs/TICKET-arm9-2to1-timing.md`), so `WQ_DEPTH` and
+the invalidation granularity are area decisions, not comfort ones.
+
+But three fits went **4,203 → 4,197 → 4,216**, and the last two were changes that
+source-level reasoning said should *shrink* it. `NDS.qsf:101` explains why: this
+image is LAB-bound, and for a **fixed** design the fitter needed 4,192..4,215
+LABs across five seeds. Every number I measured sits inside that band, so none of
+those edits can be shown to have done anything at all.
+
+The lesson is not "trim harder". It is that below ~25 LABs of difference, a
+single fit tells you nothing about your change — either sweep seeds
+(`SEED_OVERRIDE=`) or find area in something with a *named, measured* cost, of
+which `NDS.qsf` lists several. Reverting the two unattributable "savings" and
+keeping the simpler code was the right call.
 
 **A read-after-write test that reads in write order proves nothing.** The first
 version of the `tb_vram_torture` posted phase passed with *both* ordering guards
