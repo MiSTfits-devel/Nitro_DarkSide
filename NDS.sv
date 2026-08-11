@@ -236,7 +236,28 @@ wire pll_locked;
 wire clk_mem;
 wire clk_sys;
 wire clk_video_67;   // 67.027964 MHz: VIDEO OUTPUT ONLY
+
+`ifndef NDS_FIXEDRES
 assign CLK_VIDEO = clk_video_67;
+`else
+// FIXED-RESOLUTION output runs the scanout on its OWN 27.000000 MHz PLL, not
+// on clk_video_67. MEASURED ON HARDWARE 2026-08-10: at 67.028 MHz the sink
+// never saw a signal at all - the monitor slept, while the MENU core's 15.7 kHz
+// on the same cable was measured and reported out-of-range. direct_video is
+// MiSTer's VGA-converter path and the HPS sets the ADV7513 up for that range;
+// 67 MHz is outside it. 27 MHz / 720x480p is a mandatory HDMI sink mode.
+wire clk_video_27;
+wire pll_video_locked;
+assign CLK_VIDEO = clk_video_27;
+
+pll_video pll_video_inst
+(
+	.refclk   (CLK_50M),
+	.rst      (1'b0),
+	.outclk_0 (clk_video_27),
+	.locked   (pll_video_locked)
+);
+`endif
 
 // The ARM9 island used to share clk_video_67, which is why it was stuck at
 // 67.028 MHz - a video number, never an ARM9 requirement. Giving it its own PLL
@@ -1446,6 +1467,7 @@ reg        pf_scr;
 reg  [7:0] pf_line;
 reg        pf_bank;
 wire [35:0] lb_q;
+wire  [7:0] lb_raddr;    // {bank, pair-word}; driven by the scanout below
 wire [27:1] fb5_addr, fb6_addr;
 wire [63:0] fb5_din, fb6_dout;
 wire        fb5_req, fb5_next, fb5_ready;
@@ -1482,7 +1504,7 @@ nds_fb_ddr3 #(.FB_HW_BASE(FB_HW_BASE), .FB_BURST(FB_BURST)) fb_ddr3
 	.pf_scr(pf_scr),
 	.pf_line(pf_line),
 	.pf_bank(pf_bank),
-	.lb_raddr({vcnt[0], hcnt[7:1]}),
+	.lb_raddr(lb_raddr),
 	.lb_q(lb_q),
 
 	.fb5_addr(fb5_addr), .fb5_din(fb5_din), .fb5_req(fb5_req),
@@ -1492,8 +1514,13 @@ nds_fb_ddr3 #(.FB_HW_BASE(FB_HW_BASE), .FB_BURST(FB_BURST)) fb_ddr3
 	.fb6_valid(fb6_valid), .fb6_ready(fb6_ready)
 );
 
-// scanout timing: 256x384 active in a 533x526 frame, pixel ce = CLK_VIDEO/4
-// = 16.757 MHz -> 59.77 Hz
+`ifndef NDS_FIXEDRES
+// ---------------------------------------------------------------------------
+// NATIVE scanout: 256x384 active in a 533x526 frame, pixel ce = CLK_VIDEO/4
+// = 16.757 MHz -> 59.77 Hz. Not a mode any display syncs to: this path needs
+// MiSTer's scaler (ascal) behind it, or an HDMI->analog adapter when
+// MISTER_DEBUG_NOHDMI forces direct_video. See NDS_FIXEDRES below.
+// ---------------------------------------------------------------------------
 localparam H_TOTAL  = 533;
 localparam H_ACTIVE = 256;
 localparam HS_BEG   = 320;
@@ -1503,13 +1530,15 @@ localparam V_ACTIVE = 384;
 localparam VS_BEG   = 408;
 localparam VS_END   = 412;
 
-reg  [9:0] hcnt = 0;
-reg  [9:0] vcnt = 0;
+reg  [10:0] hcnt = 0;
+reg  [9:0]  vcnt = 0;
 reg  [1:0] ce_cnt = 0;
 reg        ce_pix = 0;
 reg        hs, vs, hbl, vbl;
 reg  [7:0] r_out, g_out, b_out;
 reg        lbq_sel;
+
+assign lb_raddr = {vcnt[0], hcnt[7:1]};
 
 // vnext = the line about to start at the wrap; vpf = the one to prefetch
 // while vnext displays. Bank parity is vpf[0], so the prefetch target is
@@ -1553,15 +1582,152 @@ always @(posedge CLK_VIDEO) begin
 	end
 end
 
+`else
+// ---------------------------------------------------------------------------
+// FIXED-RESOLUTION scanout: CEA-861 720x480p, one pixel per 27.000000 MHz
+// clock from the dedicated video PLL. 858x525 total -> 31.469 kHz / 59.94 Hz,
+// which is the mode every HDMI sink is required to accept. The NDS's 256x384
+// sits 1:1 in the middle: 232 px of border each side, 48 lines top and bottom.
+//
+// WHY NOT 2x. Doubling needs 768 active lines, so 1024x768 or 1080p, and both
+// need a pixel clock far above what MiSTer's direct_video path carries - the
+// 67.028 MHz attempt produced no detectable signal at all on hardware
+// (2026-08-10). A guaranteed small picture beats an elegant absent one; if the
+// sink turns out to accept more later, only these constants and the PLL
+// frequency move.
+//
+// This costs no emulation accuracy: scanout is decoupled from emulation by the
+// DDR3 framebuffer, so only the display rate changes (59.94 Hz against the
+// core's 59.826 Hz - a slow-drifting tear, same as the native path had).
+//
+// The line period is 31.78us, comfortably clear of nds_fb_ddr3's ~10us
+// worst-case prefetch, and vertical is 1:1 so one source line is consumed per
+// display line, as in the native path.
+// ---------------------------------------------------------------------------
+localparam H_TOTAL  = 858;   // 720 active + 16 front + 62 sync + 60 back
+localparam H_ACTIVE = 720;
+localparam HS_BEG   = 736;
+localparam HS_END   = 798;
+localparam V_TOTAL  = 525;   // 480 active + 9 front + 6 sync + 30 back
+localparam V_ACTIVE = 480;
+localparam VS_BEG   = 489;
+localparam VS_END   = 495;
+localparam H_IMG0   = 10'd232;   // 256-wide image centred in 720
+localparam H_IMG1   = 10'd488;
+localparam V_IMG0   = 10'd48;    // 384-tall image centred in 480
+localparam V_IMG1   = 10'd432;
+
+reg  [9:0] hcnt = 0;
+reg  [9:0] vcnt = 0;
+reg        ce_pix = 0;
+reg        hs, vs, hbl, vbl;
+reg  [7:0] r_out, g_out, b_out;
+reg        lbq_sel;
+
+// one stage of skid: at one pixel per clock the line-buffer read no longer
+// settles inside a 4-clock ce window, so the address goes out for pixel N and
+// lb_q answers on the edge that emits it. Everything else is delayed to match.
+reg        hs_d, vs_d, hbl_d, vbl_d, img_d;
+
+// 1:1 mapping - source pixel is the offset into the image, source line likewise
+wire [9:0] hoff   = hcnt - H_IMG0;
+wire [9:0] voff   = vcnt - V_IMG0;
+wire       in_img = (hcnt >= H_IMG0) && (hcnt < H_IMG1) &&
+                    (vcnt >= V_IMG0) && (vcnt < V_IMG1);
+assign lb_raddr = {voff[0], hoff[7:1]};
+
+wire [9:0] vnext = (vcnt == V_TOTAL-1) ? 10'd0 : vcnt + 10'd1;
+// The source line to prefetch while vnext displays. vnext = V_IMG0-1 yields 0,
+// so the line before the image starts primes source line 0 - the image's first
+// line is already in the buffer when it is needed.
+wire [9:0] sy_pf = vnext + 10'd1 - V_IMG0;
+wire       pf_go = (vnext + 10'd1 >= V_IMG0) && (sy_pf < 10'd384);
+
+always @(posedge CLK_VIDEO) begin
+	ce_pix <= 1'b1;
+
+	// stage 1: latch what this clock's address will produce
+	lbq_sel <= hoff[0];
+	img_d   <= in_img;
+	hs_d    <= (hcnt >= HS_BEG && hcnt < HS_END);
+	vs_d    <= (vcnt >= VS_BEG && vcnt < VS_END);
+	hbl_d   <= ~(hcnt < H_ACTIVE);
+	vbl_d   <= ~(vcnt < V_ACTIVE);
+
+	// stage 2: lb_q now holds the pair addressed on the previous edge
+	hs  <= hs_d;
+	vs  <= vs_d;
+	hbl <= hbl_d;
+	vbl <= vbl_d;
+
+	// BGR666 -> RGB888 (B in [17:12]); pair half picked by source-x parity.
+	// Outside the image the frame is black border, not line-buffer garbage.
+	if (img_d)
+		{b_out, g_out, r_out} <= lbq_sel ?
+			{lb_q[35:30], lb_q[35:34], lb_q[29:24], lb_q[29:28], lb_q[23:18], lb_q[23:22]} :
+			{lb_q[17:12], lb_q[17:16], lb_q[11:6],  lb_q[11:10], lb_q[5:0],   lb_q[5:4]};
+	else
+		{b_out, g_out, r_out} <= 24'd0;
+
+	if (hcnt == H_TOTAL-1) begin
+		hcnt <= 0;
+		vcnt <= vnext;
+		// one source line per display line; sy_pf lands in bank sy_pf[0], the
+		// opposite bank to the one being displayed
+		if (pf_go) begin
+			pf_scr  <= (sy_pf >= 10'd192);
+			pf_line <= (sy_pf >= 10'd192) ? (sy_pf[7:0] - 8'd192) : sy_pf[7:0];
+			pf_bank <= sy_pf[0];
+			pf_tgl  <= ~pf_tgl;
+		end
+	end
+	else hcnt <= hcnt + 1'd1;
+end
+`endif
+
 assign VGA_F1 = 0;
 assign VGA_SL = sl[1:0];
 
 wire [2:0] scale = status[4:2];
 wire [2:0] sl = scale ? scale - 1'd1 : 3'd0;
 
+// GAMMA MUST BE OFF AT ONE PIXEL PER CLOCK. sys/video_mixer.sv states the
+// framework's contract in its own port comment: "CLK_VIDEO - should be
+// multiple by (ce_pix*4)". sys/gamma_corr.sv is where that bites: it latches
+// on `~old_ce & ce_pix`, a RISING EDGE of ce_pix, and then spends three spare
+// clk_vid cycles walking one 768-entry single-port RAM for R, G and B. Hold
+// ce_pix at 1 and that edge happens exactly once, at reset - after which
+// HSync_out, VSync_out, HBlank_out, VBlank_out and RGB_out are frozen
+// FOREVER. The whole video path downstream sees a still frame with no syncs.
+//
+// MEASURED ON HARDWARE 2026-08-10, and this was the entire reason two
+// fixed-resolution images produced no picture. Loading each core and counting
+// ADV7513 VSYNC interrupts (reg 0x96 bit 5, enabled via 0x94) over 60 samples:
+//
+//    core                        VSYNC interrupts
+//    NDS_cart_audio (native)     60/60      ce_pix = CLK_VIDEO/4
+//    NDS_fixedres   (67 MHz)      0/60      ce_pix = 1
+//    NDS_480pv2     (27 MHz)      0/60      ce_pix = 1
+//    menu.rbf                   105/120     (control)
+//
+// Not the PLL, not the mode, not the sink: no video ever left the FPGA. The
+// two fixed-res builds differ in clock and in PLL and fail identically, and
+// the one thing they share is the constant ce_pix.
+//
+// Bypassing gamma is the right fix rather than a workaround. NDS exposes no
+// gamma OSD item (gamma_bus only reaches hps_io), the framework's own
+// gamma_fast variant would need a 3x256 RAM to do at 1x what gamma_corr does
+// with spare cycles, and this design is LAB-bound. The native path keeps
+// gamma because it still runs ce_pix at CLK_VIDEO/4.
+`ifdef NDS_FIXEDRES
+localparam VM_GAMMA = 0;
+`else
+localparam VM_GAMMA = 1;
+`endif
+
 // Clash port of the NDS-active video_mixer branch. Gamma RAM stays in the
 // wrapper; NDS ties the non-portable scandoubler/HQ2x/freeze branches low.
-nds_clash_video_mixer #(.LINE_LENGTH(600), .GAMMA(1)) video_mixer
+nds_clash_video_mixer #(.LINE_LENGTH(600), .GAMMA(VM_GAMMA)) video_mixer
 (
 	.*,
 	.scandoubler(1'b0),

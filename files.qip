@@ -58,5 +58,13 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/nds_audio_ddr3.sv
 # cyclonev_hps_interface_hps2fpga_light_weight WYSIWYG, so it is Cyclone V only.
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/hps_lw_bridge.sv
 set_global_assignment -name VHDL_FILE nds_port_wrap.vhd
+# Video-output PLL: exactly 27.000000 MHz for CEA-861 720x480p. Separate from
+# the main PLL because 27 MHz is not an integer divisor of any VCO that also
+# yields the NDS master clock and its multiples - see rtl/pll_video/pll_video.v.
+set_global_assignment -name VERILOG_FILE rtl/pll_video/pll_video.v
+set_instance_assignment -name PLL_COMPENSATION_MODE DIRECT -to "*pll_video*|altera_pll:altera_pll_i*|*"
+set_instance_assignment -name PLL_CHANNEL_SPACING "0.0 KHz" -to "*pll_video*|altera_pll:altera_pll_i*|*"
+set_instance_assignment -name PLL_AUTO_RESET ON -to "*pll_video*|altera_pll:altera_pll_i*|*"
+set_instance_assignment -name PLL_BANDWIDTH_PRESET AUTO -to "*pll_video*|altera_pll:altera_pll_i*|*"
 set_global_assignment -name SYSTEMVERILOG_FILE NDS.sv
 set_global_assignment -name SDC_FILE NDS.sdc
