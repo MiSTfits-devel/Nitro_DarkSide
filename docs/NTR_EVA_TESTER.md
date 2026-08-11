@@ -253,3 +253,52 @@ Engine A logged **zero dropped lines** across all 100 frames.
 
 Note engine A logged **zero dropped lines** across all 75 frames; the 300 drops
 in that run were all engine B, which this cart never draws to.
+
+## 2026-08-11: the CPI gap is 1.9x, and the sim needed one fix to boot at all
+
+**The wedge, first.** `53bf403` gave `nds_mainram` a pair-read mode that retires
+on `sdram_done64`, not `done32`. `tb_arm9_island` was taught to drive that;
+`tb_top_frame` was not, and its `nds_top` port map simply omitted
+`sdram_Dout_hi`/`sdram_done64`, which default to `'0'`. So the ARM9's first cache
+line fill waited forever:
+
+    HB 19999775000000 fs  ARM9 pc=02000B30 n=35 (+35)  ARM7 pc=02380030 n=44 (+44)
+    HB 24999725000000 fs  ARM9 pc=02000B30 n=35 (+0)   ARM7 pc=02380030 n=44 (+0)
+
+Both CPUs, because the ARM7 shares that channel — it reads as a total wedge, not
+an ARM9 fault. Fixed in `4aaa7fe`. The lesson for anyone adding a port to
+`nds_top`: a defaulted `in` port turns a missing testbench connection into a
+silent deadlock instead of an elaboration error.
+
+**Boot preset still correct.** First retire is `02000808 E3A0C301`
+(`MOV r12,#0x04000000`) with `CPSR=000000D3`, `r13=03002F7C`, `r14=02000800` —
+the `--direct` column of the table above, unchanged.
+
+**No functional divergence from the 2026-08-11 work.** Blocks 0 and 1 of the
+from-boot trace are byte-identical to the melonDS reference, i.e. the first
+200,000 instructions match after the drawer merge, the `GPU_CE_DIV` removal, the
+ARM9 pair fills and the card prefetch queue.
+
+**The gap closed from 2.30x to 1.92x.** Steady state, three consecutive 10 ms
+heartbeats, `DIRECT=1 PRELOAD=1`:
+
+| | instr/frame | CPI @ 67.028 MHz | vs melonDS |
+|---|---|---|---|
+| melonDS      | ~267k | ~4.2 | 1.0 |
+| RTL, previous| ~116k | ~9.7 | 2.30x |
+| RTL, now     | ~139k | ~8.05 | **1.92x** |
+
++83,247 ARM9 instructions per 10 ms, dead flat across heartbeats, so 8.32 M/s
+against a 16.715 ms frame. The pair fills are the difference; nothing else in
+that set touches ARM9 throughput.
+
+Scaling the observed frame-86 display-on by 116/139 puts it near frame **72**
+now, and the `[07-01]` halt near frame **260**. Still an overnight job — the CPI
+gap remains the thing that makes this cart practical, and it is now the only
+thing left on it.
+
+**`ISLAND=1` is the default and this is measured at 2:1.** The sim has always run
+the ARM9 island at 66.67 MHz (`ISLAND_HALF_PS=7500`), so none of the numbers
+above move with `7452cc8`, which fixed the *FPGA* running `clk2x` at 1:1. That
+was a real factor of two on hardware and no part of it was ever visible here —
+which is exactly why it survived so long.
