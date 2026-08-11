@@ -75,7 +75,27 @@ use work.pnds_vram_map.all;
 entity nds_vram is
    generic
    (
-      is_simu : std_logic := '0'
+      is_simu : std_logic := '0';
+      -- Posted A..D writes: correct and measured, but 4,197..4,204 LABs across
+      -- four fitter seeds against the 4,191 this device has, on an image that
+      -- already fitted by 2. Held behind a generic so the RTL lives in the tree
+      -- and can be A/B'd for area the way every other tradeoff in NDS.qsf is,
+      -- rather than being carried on a branch or deleted.
+      --
+      -- false makes cpu9_welig/cpu9_wok constant '0', so nds_dma9 never presents
+      -- a posted write, nothing ever enters the queue, and synthesis removes the
+      -- whole thing: 7 cycles per 16-bit unit into VRAM D instead of 2, and
+      -- [04-02] fails as it did before.
+      --
+      -- It is an A/B MEASUREMENT knob, not a shipping fallback, and the
+      -- measurement it produced is the surprising part: false still needs 4,214
+      -- LABs where true needs 4,197..4,204. Deleting the entire queue does not
+      -- get this image back under 4,191, because the queue was never the
+      -- expensive half - the combinational single-cycle fast-lane request in
+      -- nds_dma9 is, and that one is unconditional because it is what makes an
+      -- access one cycle. If you are hunting the ~10-25 LABs, hunt there or
+      -- outside this module; do not spend another fit on WQ_DEPTH.
+      POSTED_WRITES : boolean := true
    );
    port
    (
@@ -804,8 +824,8 @@ begin
    -- welig: postable at all. wok: and there is room for it right now. The
    -- requester needs both, because they mean different things to it - no room is
    -- backpressure to wait out, not postable is a reason to take the slow path.
-   cpu9_welig  <= '1' when (cpu9_wpost = '1' and cpu9_rnw = '0' and wq_elig = '1' and
-                            clr_busy = '0') else '0';
+   cpu9_welig  <= '1' when (POSTED_WRITES and cpu9_wpost = '1' and cpu9_rnw = '0' and
+                            wq_elig = '1' and clr_busy = '0') else '0';
    cpu9_wok    <= '1' when (cpu9_welig = '1' and wq_count < WQ_DEPTH) else '0';
    wq_push_now  <= cpu9_ena and cpu9_wok;
    wq_bank_now  <= ad_next(dec9_hit, 0);
