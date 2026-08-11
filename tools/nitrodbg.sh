@@ -331,6 +331,7 @@ do_card() {
 	_st=$(((_n >> 29) & 7)); _busy=$(((_n >> 28) & 1)); _wr=$(((_n >> 27) & 1))
 	_o9=$(((_n >> 26) & 1)); _o7=$(((_n >> 25) & 1)); _ien=$(((_n >> 24) & 1))
 	_pop=$(((_n >> 23) & 1)); _len=$(((_n >> 16) & 127)); _pos=$((_n & 8191))
+	_pf=$(((_n >> 13) & 7))
 	case $_st in
 		0) _sn=IDLE ;;      1) _sn=CMDDELAY ;;  2) _sn=FETCH ;;
 		3) _sn=DATAREADY ;; 4) _sn=WORDDELAY ;; 5) _sn=FINISH ;;
@@ -339,9 +340,11 @@ do_card() {
 	echo "card 0x$_v"
 	echo "  state    : $_sn"
 	echo "  busy=$_busy word_ready=$_wr pop_req=$_pop  xferpos=$_pos xferlen(lo7)=$_len"
-	echo "  own9=$_o9 own7=$_o7  AUXSPICNT.14 xfer-irq-en=$_ien"
+	echo "  own9=$_o9 own7=$_o7  AUXSPICNT.14 xfer-irq-en=$_ien  prefetch=$_pf words"
 	echo "  DATAREADY + busy=1 that never advances = the card is waiting for a"
 	echo "  data-port pop that is not coming (CPU poll or DMA never drained it)."
+	echo "  FETCH + prefetch=0 that never advances = the other way round: the card"
+	echo "  is waiting on DDR3 for the image word (see the CARD PAGER in NDS.sv)."
 }
 
 do_probe() {

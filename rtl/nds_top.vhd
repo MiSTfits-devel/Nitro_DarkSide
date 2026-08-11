@@ -899,6 +899,12 @@ begin
    card_addr <= ld_card_addr when ld_busy = '1' else cardm_addr;
 
    icard : entity work.nds_card
+   generic map
+   (
+      -- 4x the cart bus. Not hardware-faithful and deliberately so: see the
+      -- Timing note in nds_card.vhd. Set to 0 to get NTR pacing back.
+      CARDSPEED_SHIFT => 2
+   )
    port map
    (
       clk => clk1x, ce => '1', reset => resetCpu,
