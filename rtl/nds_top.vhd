@@ -1981,7 +1981,11 @@ begin
 
    -- ================= VRAM + engine A render path =================
    ivram : entity work.nds_vram
-   generic map ( is_simu => is_simu )
+   -- POSTED_WRITES is what buys NITRO [04-02]'s 2-cycle DMA cadence, and it is
+   -- ~10 LABs this image does not currently have. See the generic's own comment
+   -- in nds_vram; set it false to get the fitting configuration back at the cost
+   -- of that test.
+   generic map ( is_simu => is_simu, POSTED_WRITES => true )
    port map
    (
       clk => clk1x, reset => reset_boot, vramcnt => vramcnt,
