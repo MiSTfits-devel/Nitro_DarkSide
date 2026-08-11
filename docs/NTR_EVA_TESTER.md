@@ -302,3 +302,123 @@ the ARM9 island at 66.67 MHz (`ISLAND_HALF_PS=7500`), so none of the numbers
 above move with `7452cc8`, which fixed the *FPGA* running `clk2x` at 1:1. That
 was a real factor of two on hardware and no part of it was ever visible here —
 which is exactly why it survived so long.
+
+## 2026-08-11 (later): why the cart stops at `[04-02] DMA PRIORITY`
+
+On hardware the cart now reaches `PROGRESS[011/058]` and halts there:
+
+    [04-02] DMA PRIORITY
+     NG!:0_1 STEP_1 109449216 AD: 00000001
+     NG!:1_2 STEP_1 109449216 AD: 00000001
+     NG!:2_3 STEP_1 109449216 AD: 00000001
+     CODE: 00000007        RESULT:FAIL  TOTAL:FAIL
+
+melonDS passes this test and goes on to `012`–`016`, so this is ours. All three
+adjacent channel pairs fail identically, and the numbers decode exactly — the
+format string is ` NG!:%d_%d STEP_1 %d AD: %08X` at `0x022089C4`, its third
+vararg is the walk pointer and its fourth is the saved IME, so `109449216` is
+`0x06861000` (index **0** of the high-priority buffer) and `AD: 00000001` is
+just IME. The failure is on the very first entry compared.
+
+### What the test actually does
+
+Disassembled from the dump at `0x0201A13C`. Per pair `(N, N+1)`, with
+`TimerStart(3, 0xFFFF, 0)` — which writes `TM3CNT_L = ~0xFFFF = 0` and
+`TM3CNT_H = 0xC0`, i.e. **prescaler /1, one tick per 33.513982 MHz bus cycle**:
+
+| | ch `N` | ch `N+1` |
+|-|--------|----------|
+| SAD | `0x0400010C` (`TM3CNT_L`), **fixed** | same |
+| DAD | `0x06861000`, increment | `0x06860000`, increment |
+| units | 8, 16-bit | 2048, 16-bit |
+| start | HBLANK | IMMEDIATE |
+
+Both channels therefore fill VRAM bank D with snapshots of a free-running
+counter. The checker then walks the 2048-entry buffer of the **low**-priority
+channel and requires it to be exactly `t, t+2, t+4, …` — a 16-bit DMA unit is
+one read plus one write, **two bus cycles**, on real silicon. Where that
+sequence breaks, the 8 missing counter values must be sitting in the
+high-priority channel's buffer, contiguous: proof that it preempted mid-transfer.
+
+So `[04-02]` is a **DMA throughput** measurement, not an ordering one. Our
+priority pick (`for i in 3 downto 0`, last-write-wins, `nds_dma9.vhd:275`) was
+already correct, and preemption is not required to pass: a core with the right
+cadence and no preemption walks the whole buffer in state 0 and prints
+`PRIORITY_n_n: OK`, because the gap check only runs if there is a gap.
+
+### Repro without the other 57 tests
+
+`sim/tests/dmaprio` is a standalone ROM that does exactly the above, and
+`check.py` applies the cart's own three-state checker to the dump:
+
+    sim/tests/dmaprio/build.sh
+    DUMP_STATE=1 PRELOAD=1 DIRECT=1 FRAMES=3 \
+       sim/run_top_frame.sh sim/tests/nds_dmaprio.hex
+    sim/tests/dmaprio/check.py
+
+Minutes instead of the ~4 hours the cart needs to reach test 011. It reproduced
+the board's failure exactly, down to the printed index.
+
+### Bug 1, fixed: ARM9 DMA reads of IO registers returned 0
+
+Both buffers came back **entirely zero** — VRAM bank D held 3 non-zero words,
+all of them CPU-written markers.
+
+`io_wired_done` is not a level on the ARM9. `nds_top` generates it as a
+one-island-cycle *completion event*, unconditionally, so that reads of unclaimed
+addresses retire too. `nds_membus9`'s read mux presented `io_wired_out` for
+exactly that one cycle and `x"00000000"` on every other. The CPU is inside the
+island and samples precisely then, so its reads were fine; `nds_dma9` is a clk1x
+unit driven by the stretched `cpu9_done_1x`, a registered toggle-edge that lands
+one to two clk1x cycles later — by which point `T_IO` read zero.
+
+Every ARM9 DMA read from an IO register returned 0, in both the 1:1 and 2:1
+island configurations. Only the DMA was affected: every other source (VRAM, main
+RAM, shared WRAM) answers from a register that stays valid, which is why
+ordinary memory-to-memory DMA always worked and this hid for so long. Fixed by
+holding the IO word past the completion pulse (`io_rd_hold`); the CPU's
+same-cycle path is untouched. The ARM7 is not affected — `io_wired_done7` is the
+OR of plain address decodes, a level, so it holds for as long as its DMA needs.
+
+### Bug 2, open: a 16-bit DMA unit costs 20 bus cycles, not 2
+
+With real data flowing, the buffers are perfectly uniform and exactly 10x too
+slow — one single distinct delta across all 2047 steps. Same source and same
+DMA, varying only the destination, measures where it goes:
+
+| DMA destination | cycles per 16-bit unit |
+|-----------------|------------------------|
+| palette (`T_PAL`, retires in `FINISH` — the fastest write in the core) | **11** |
+| VRAM E (BRAM inside `nds_vram`) | 16 |
+| VRAM D (off-chip over `vsrv`) | 20 |
+| real hardware | **2** |
+
+The destination memory is **not** the dominant term. Rebuilding the VRAM A..D
+write path — the obvious first guess, since A..D leave the chip — would take 20
+to 11 and still miss by 5.5x. The floor is the per-access cost: 11 = 3 cycles of
+`nds_dma9` FSM states (`RD`, `WR`, `NEXTUNIT`) plus ~4 cycles of wait per access,
+and that wait is mostly island CDC. Each access crosses clk1x -> clk2x for the
+request and clk2x -> clk1x for the done, and an IO read additionally round-trips
+the clk1x IO fabric through `cdc_io_cpl`.
+
+Hardware needs no overlap to hit 2: each access there is a single bus cycle.
+Matching it therefore needs single-cycle accesses, which means
+
+1. `nds_dma9` inside the island (or the per-access CDC removed), so a request and
+   its done cost no cycles of crossing;
+2. the FSM reduced to one state per access — no `NEXTUNIT`, request asserted in
+   the same cycle the previous access retires;
+3. VRAM A..D writes accepted in one cycle, i.e. posted and write-combined behind
+   the `vsrv` channel (palette and E already qualify).
+
+Items 1 and 2 alone are worth having regardless — DMA is on the hot path for
+every graphics upload, so 11 -> ~5 is a general win and low risk. Only item 3
+plus a genuinely single-cycle IO read closes it to 2, and that is the expensive,
+correctness-sensitive part.
+
+**Cost/benefit.** `[04-02]` is the *only* test in group 04 that measures cycles:
+`[04-04]`/`[04-05]`/`[04-06]` report ` DMA_%d: OK COUNT: %d`, i.e. they count
+DMA firings, and `[04-03]` checks address patterns. So this one test gates four
+that are probably close to passing already, and it cannot be reached any other
+way — the cart halts on first failure. Nothing short of the datapath work above
+moves `PROGRESS` off `011`.
