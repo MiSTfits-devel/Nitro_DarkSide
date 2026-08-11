@@ -45,7 +45,7 @@ def halfwords(off, n):
     return out
 
 
-mark = words[D0 + MARK_OFF:D0 + MARK_OFF + 8]
+mark = words[D0 + MARK_OFF:D0 + MARK_OFF + 12]
 print(f"markers: ran={mark[0]:08X} (want DEADBEEF)  done={mark[1]:08X} (want C0DE0001)")
 print(f"         TM3CNT_L at completion={mark[2]:08X}  poll iterations={mark[3]}")
 
@@ -54,6 +54,16 @@ vre = [mark[4] & 0xFFFF, mark[5] & 0xFFFF, mark[6] & 0xFFFF, mark[7] & 0xFFFF]
 print(f"\nVRAM E destination (BRAM, no off-chip trip): "
       f"{' '.join(f'{v:04X}' for v in vre)}")
 print(f"  per-unit cycles: {' '.join(str((vre[i+1]-vre[i]) & 0xFFFF) for i in range(3))}")
+
+# VRAM -> VRAM copy: bank E at 0x06880100 must equal bank D at 0x06860000. This
+# is the only case that exercises the DMA's VRAM READ path (everything else reads
+# IO) and the not-postable write fallback (bank E is BRAM, never queueable).
+# markers past 0x06862004 are written through r1 = 0x06862004, so [r1,#28] is
+# word 9 of the dump, not word 8 - the same +1 the VRAM E block above carries.
+v2v = [mark[8] & 0xFFFF, mark[9] & 0xFFFF, mark[10] & 0xFFFF, mark[11] & 0xFFFF]
+ok = v2v[0] == v2v[2] and v2v[1] == v2v[3]
+print(f"\nVRAM D -> VRAM E copy: dst {v2v[0]:04X} {v2v[1]:04X} "
+      f"vs src {v2v[2]:04X} {v2v[3]:04X}  -> {'OK' if ok else 'MISMATCH'}")
 
 try:
     pal = []
@@ -71,6 +81,19 @@ try:
     print(f"  per-unit cycles: {' '.join(str((ph[i+1]-ph[i]) & 0xFFFF) for i in range(7))}")
 except FileNotFoundError:
     print("\n(rtl_state_pal.hex not found - run with DUMP_STATE=1)")
+
+# Bank A, written by a posted-write burst while the renderer was fetching BG0
+# from that same bank. Same +2 cadence as the buffers below, so a posted write
+# lost to the read gate - or a merge that dropped a lane - breaks the sequence.
+bankA = []
+for i in range(1024):
+    w = words[i // 2]
+    bankA.append(w & 0xFFFF if i % 2 == 0 else (w >> 16) & 0xFFFF)
+dA = sorted(set((bankA[i + 1] - bankA[i]) & 0xFFFF for i in range(1023)))
+print(f"\nbank A (renderer reading it concurrently), first 8: "
+      f"{' '.join(f'{v:04X}' for v in bankA[:8])}")
+print(f"  distinct deltas over 1023 steps: {dA[:8]}{' ...' if len(dA) > 8 else ''}"
+      f"  -> {'OK' if dA == [2] else 'BROKEN'}")
 
 low = halfwords(LOW_OFF, 2048)
 high = halfwords(HIGH_OFF, 8)
