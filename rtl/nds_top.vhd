@@ -11,13 +11,15 @@
 -- Current scope/simplifications (see docs/ROADMAP.md):
 --   * both CPUs run at the full clk1x rate (ce='1'); the ARM9 2x / ARM7 1x
 --     pacing model is the M9 hardware milestone
---   * the GPU dot cadence is ce-paced at 1-of-GPU_CE_DIV so the render
---     fabric has GPU_CE_DIV clocks per dot — the planned MiSTer topology
---     (fabric 100.5 MHz, dots 33.5) with clk1x standing in for the fabric
---     clock. At 1 the v1 line server blows the line budget (~110 dropped
---     lines/frame on an affine scene); tb_gpu2d_timed proves 3 is enough.
---     Consequence: relative to the CPUs the frame is GPU_CE_DIV x longer
---     than hardware — fine for static scenes, revisited with M9 pacing.
+--   * the GPU renders one dot per clk1x, i.e. at the real frame rate. This
+--     used to be ce-paced at 1-of-GPU_CE_DIV (3 fabric clocks per dot), a
+--     scaffold from when the v1 line server could not make the 2,130-cycle
+--     line budget and dropped ~110 lines/frame on an affine scene. Successive
+--     drawer reworks removed the need for it: OBJ took 1-of-1 lines from 3302
+--     to 1750, and pipelining the affine and extended BG drawers took the
+--     worst BG case from 4641 to 1680. With nothing left that needs the slack,
+--     the divider, its runtime override and the OSD item that selected it are
+--     gone - a 3x-too-slow frame was never a mode anyone wanted to ship.
 --   * TCMs, ARM7-private WRAM: SyncRamDualByteEnable (M10K; the membus
 --     presents addresses combinationally in the accept cycle, the BRAM's
 --     internal address register replaces the old registered-address idiom)
@@ -51,7 +53,6 @@ entity nds_top is
    (
       is_simu                  : std_logic := '0';
       Softmap_NDS_MAINRAM_ADDR : integer   := 8388608; -- byte offset of the 4 MB window in SDRAM
-      GPU_CE_DIV               : integer   := 3;       -- render-fabric clocks per dot
       -- 1 = run both 2D engines on clkMem (3x clk1x) instead of clk1x, giving
       -- the renderer 6390 cycles per scanline instead of 2130. A rendered line
       -- measures 5829 cycles, so it only fits the former. See nds_gpu2d_fast.
@@ -125,9 +126,6 @@ entity nds_top is
       -- WRAM were each fixed by hand-reimplementing one thing the firmware does.
       -- Booting the firmware addresses the cause rather than the symptoms.
       fw_boot          : in  std_logic := '0';
-      -- '1' = dot cadence 1-of-1 (real frame rate); '0' = 1-of-GPU_CE_DIV
-      gpu_full_pace    : in  std_logic := '0';
-
       -- keys (active high) — X/Y/lid are NDS additions routed via ARM7 side
       KeyA             : in  std_logic;
       KeyB             : in  std_logic;
@@ -691,7 +689,6 @@ architecture arch of nds_top is
    signal gb_objep_addr : integer range 0 to 2047;
 
    -- timing -> gpu2d line control
-   signal gpu_ce          : std_logic := '0';
    signal linecounter     : integer range 0 to 191;
    signal linecounter_obj : integer range 0 to 191;
    signal drawline, drawObj, line_trigger, hblank_trigger, gpu_vblank, refpoint_update : std_logic;
@@ -1925,37 +1922,14 @@ begin
       dbg_rbusy => dbg_rbusy_s
    );
 
-   -- dot pace: 1 of GPU_CE_DIV clocks (see header)
-   -- gpu_full_pace = '1' runs the dot cadence at 1-of-1 instead of
-   -- 1-of-GPU_CE_DIV, i.e. real frame rate instead of GPU_CE_DIV x too slow.
-   -- Runtime-selectable rather than a generic so the two can be compared on
-   -- hardware from the OSD without a 25-minute rebuild each way. The trade is
-   -- real and visible: at 1-of-1 a line has 2,130 clk1x cycles and the renderer
-   -- needs ~3,996 even with GPU_FAST, so roughly half the scanlines are dropped
-   -- per frame; at 1-of-3 every line renders but frames are 3x long. Changing it
-   -- mid-frame just perturbs one frame's pacing, so it needs no reset.
-   p_gpu_ce : process (clk1x)
-      variable div : integer range 0 to GPU_CE_DIV - 1 := 0;
-   begin
-      if rising_edge(clk1x) then
-         if (gpu_full_pace = '1') then
-            div    := 0;
-            gpu_ce <= '1';
-         elsif (div = GPU_CE_DIV - 1) then
-            div    := 0;
-            gpu_ce <= '1';
-         else
-            div    := div + 1;
-            gpu_ce <= '0';
-         end if;
-      end if;
-   end process;
-
+   -- Dot pace is 1-of-1: one dot per clk1x, the real frame rate. The divider
+   -- that used to sit here (and the OSD item that switched it) is gone - see
+   -- the header. A line is 2,130 clk1x cycles and the renderer fits it.
    itiming : entity work.nds_gpu_timing
    port map
    (
       clk             => clk1x,
-      ce              => gpu_ce,
+      ce              => '1',
       reset           => resetCpu,
       gb_bus9         => io_bus9,
       wired_out9      => tim_wired_out9,
