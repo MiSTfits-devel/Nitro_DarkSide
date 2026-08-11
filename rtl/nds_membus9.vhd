@@ -235,6 +235,28 @@ architecture arch of nds_membus9 is
    signal cresp_done     : std_logic;
    signal cresp_rdata    : std_logic_vector(31 downto 0);
 
+   -- IO read data, held past the completion pulse.
+   --
+   -- io_wired_done is not a level here. nds_top generates it as a one-island-cycle
+   -- COMPLETION event, unconditionally, so that reads of UNCLAIMED addresses retire
+   -- too (see the "IO completion, clk1x -> island" block there). The read mux below
+   -- therefore presents io_wired_out for exactly that one cycle and falls through to
+   -- x"00000000" on every other cycle.
+   --
+   -- The CPU is inside the island and samples in precisely that cycle, so its reads
+   -- are correct. nds_dma9 is not: it is a clk1x unit driven by the stretched
+   -- cpu9_done_1x, which is a registered toggle-edge and so lands one to two clk1x
+   -- cycles LATER. By then T_IO read 0. Every ARM9 DMA read from an IO register
+   -- returned zero, in both the 1:1 and 2:1 island configurations.
+   --
+   -- Found via the NITRO Tester's [04-02] DMA PRIORITY test (progress 011/058),
+   -- which DMAs from TM3CNT_L and so filled both of its VRAM buffers with zeroes -
+   -- reproduced standalone by sim/tests/dmaprio. Only the DMA is affected; every
+   -- other source (VRAM, main RAM, shared WRAM) answers from a register that stays
+   -- valid, which is why ordinary memory-to-memory DMA always worked.
+   signal io_rd_hold     : std_logic_vector(31 downto 0) := (others => '0');
+   signal io_rd_eff      : std_logic_vector(31 downto 0);
+
 begin
 
    -- BIOS9 uses a synchronous hot-loadable RAM in hardware. Drive its read
@@ -696,9 +718,24 @@ begin
                 vram_dout     when target = T_VRAM   else
                 x"00000000"   when (target = T_PAL or target = T_OAM) else -- readback gap: BRAMs are write-only from the CPU
                 cresp_rdata   when target = T_MAIN   else
-                io_wired_out  when (target = T_IO and io_wired_done = '1') else
-                x"00000000"   when target = T_IO else -- unclaimed NDS9 IO reads 0 (not GBA open bus): calico probes SCFG 0x04004000 for NTR/TWL detection
+                -- unclaimed NDS9 IO reads 0 (not GBA open bus): calico probes SCFG
+                -- 0x04004000 for NTR/TWL detection. io_wired_out is a wired-OR tree
+                -- and is already 0 when nothing claims the address, so capturing it
+                -- in the completion cycle preserves that and also survives into the
+                -- cycle nds_dma9 retires the access - see io_rd_hold above.
+                io_rd_eff     when target = T_IO     else
                 cpu_lastread;
+
+   io_rd_eff <= io_wired_out when io_wired_done = '1' else io_rd_hold;
+
+   process (clk)
+   begin
+      if rising_edge(clk) then
+         if (io_wired_done = '1') then
+            io_rd_hold <= io_wired_out;
+         end if;
+      end if;
+   end process;
 
    process (all)
    begin
