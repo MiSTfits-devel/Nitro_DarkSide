@@ -161,6 +161,11 @@ architecture arch of nds_dma9 is
    -- one cycle per retired unit, for the census below
    signal unit_ret : std_logic := '0';
 
+   -- the fast lanes' shared request: whichever of src/dst this cycle is using
+   signal fast_adr : unsigned(27 downto 0);
+   signal fast_be  : std_logic_vector(3 downto 0);
+   signal fast_w32 : std_logic;
+
    -- register write/read decode
    signal regsel_ch  : integer range 0 to 3;
    signal regsel_reg : integer range 0 to 2;
@@ -248,15 +253,19 @@ begin
    -- channel register -> active mux -> nds_top's dma_bus_on mux -> the target's
    -- decode -> back here to be captured. That is the shape of a single-cycle bus
    -- and it is the thing to watch in the fit, not a functional risk.
-   io_fast_ena <= '1' when (state = RD and is_io(ch(active).cur_src)) or
-                           (state = WR and is_io(ch(active).cur_dst)) else '0';
+   -- One address mux, shared. Selecting cur_src/cur_dst separately for the IO
+   -- and VRAM lanes meant two 28-bit muxes downstream of the same 4:1 `active`
+   -- one, for an address that is the same in both cases - and in a core with two
+   -- LABs of headroom that is not a rounding error.
+   fast_adr <= ch(active).cur_src when state = RD else ch(active).cur_dst;
+   fast_be  <= be_of(fast_adr, ch(active).word32);
+   fast_w32 <= ch(active).word32;
+
+   io_fast_ena <= '1' when (state = RD or state = WR) and is_io(fast_adr) else '0';
    io_fast_rnw <= '1' when state = RD else '0';
-   io_fast_adr <= x"0" & std_logic_vector(ch(active).cur_src(23 downto 2)) & "00"
-                     when state = RD else
-                  x"0" & std_logic_vector(ch(active).cur_dst(23 downto 2)) & "00";
-   io_fast_be  <= be_of(ch(active).cur_src, ch(active).word32) when state = RD else
-                  be_of(ch(active).cur_dst, ch(active).word32);
-   io_fast_acc <= ACCESS_32BIT when ch(active).word32 = '1' else ACCESS_16BIT;
+   io_fast_adr <= x"0" & std_logic_vector(fast_adr(23 downto 2)) & "00";
+   io_fast_be  <= fast_be;
+   io_fast_acc <= ACCESS_32BIT when fast_w32 = '1' else ACCESS_16BIT;
    -- bEna picks the lane, so a halfword goes out replicated
    io_fast_dout <= rdval when ch(active).word32 = '1' else
                    rdval(15 downto 0) & rdval(15 downto 0);
@@ -266,15 +275,14 @@ begin
    -- only when nds_vram will actually take it: with room in the posted queue, or
    -- when the access cannot be posted at all and has to go the slow way. With
    -- neither, ena stays low and the FSM stalls in WR - that is the backpressure.
-   vram_fast_ena  <= '1' when (state = RD and is_vram(ch(active).cur_src)) or
-                              (state = WR and is_vram(ch(active).cur_dst) and
-                               (vram_fast_welig = '0' or vram_fast_wok = '1')) else '0';
+   vram_fast_ena  <= '1' when is_vram(fast_adr) and
+                              (state = RD or
+                               (state = WR and (vram_fast_welig = '0' or
+                                                vram_fast_wok = '1'))) else '0';
    vram_fast_rnw  <= '1' when state = RD else '0';
-   vram_fast_addr <= ch(active).cur_src(23 downto 2) when state = RD else
-                     ch(active).cur_dst(23 downto 2);
-   vram_fast_be   <= be_of(ch(active).cur_src, ch(active).word32) when state = RD else
-                     be_of(ch(active).cur_dst, ch(active).word32);
-   vram_fast_din  <= rdval when ch(active).word32 = '1' else
+   vram_fast_addr <= fast_adr(23 downto 2);
+   vram_fast_be   <= fast_be;
+   vram_fast_din  <= rdval when fast_w32 = '1' else
                      rdval(15 downto 0) & rdval(15 downto 0);
 
    -- ================= register decode =================

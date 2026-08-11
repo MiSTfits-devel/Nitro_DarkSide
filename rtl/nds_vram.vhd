@@ -350,6 +350,7 @@ architecture arch of nds_vram is
 
    -- combinational eligibility, so the requester can decide in the cycle it
    -- presents the access
+   signal ad_hit4     : unsigned(3 downto 0);
    signal wq_elig     : std_logic;
    signal wq_push_now : std_logic;
    signal wq_bank_now : integer range 0 to 4;
@@ -784,8 +785,13 @@ begin
    -- Exactly one A..D bank and no E..I bank: a multi-bank write would need two
    -- queue entries, and an E..I hit retires on the dispatch edge instead. Both
    -- fall back to the cpu9_done path, which is unchanged.
-   wq_elig <= '1' when (ad_next(dec9_hit, 0) /= 4 and
-                        ad_next(dec9_hit, ad_next(dec9_hit, 0) + 1) = 4 and
+   --
+   -- `h and (h-1)` clears the lowest set bit, so zero-after-that with h nonzero
+   -- means exactly one bit was set. This used to ask ad_next for a SECOND hit
+   -- starting from a variable index, which reads as innocent and synthesises to
+   -- something much wider - a priority scan whose start point is data.
+   ad_hit4 <= unsigned(dec9_hit(BANK_D downto BANK_A));
+   wq_elig <= '1' when (ad_hit4 /= 0 and (ad_hit4 and (ad_hit4 - 1)) = 0 and
                         (dec9_hit(BANK_E) or dec9_hit(BANK_F) or dec9_hit(BANK_G) or
                          dec9_hit(BANK_H) or dec9_hit(BANK_I)) = '0') else '0';
 
