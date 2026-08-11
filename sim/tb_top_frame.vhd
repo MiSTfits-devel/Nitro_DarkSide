@@ -30,9 +30,6 @@ entity tb_top_frame is
       DUMPFILE_B : string  := "top_frame_fb_b.txt";
       DUMP_START_FRAME : integer := 0;    -- skip expensive text dumps before this frame
       CARD_WORDS : integer := 1048576;   -- 4 MB staging window
-      GPUCEDIV   : integer := 3;         -- render clocks per dot (1 = full-rate video,
-                                         -- ~110 dropped lines/frame with line server v1:
-                                         -- pixels bad, but game pacing = real hardware)
       FRAMES     : integer := 3;
       TIMEOUT_MS : integer := 400;
       DIRECT     : integer := 0;         -- 1 = firmware direct-boot env (stock ROMs)
@@ -132,7 +129,7 @@ entity tb_top_frame is
       -- time cheaper per boot. See preload_main below.
       PRELOAD    : integer := 0;
       -- >0: fail with a full dump if ONE engine-A line render stays busy this
-      -- many clk1x cycles. A line is 2,130 cycles at GPUCEDIV=1, so a few
+      -- many clk1x cycles. A line is 2,130 cycles at the 1-of-1 dot pace, so a few
       -- thousand is over budget and tens of thousands is a wedge - and the two
       -- are indistinguishable in the frame output, which is what made the
       -- renderer's backpressure failure so hard to place. Reaches into the
@@ -518,7 +515,6 @@ begin
    (
       is_simu                  => '1',
       Softmap_NDS_MAINRAM_ADDR => MAINRAM_BASE,
-      GPU_CE_DIV               => GPUCEDIV,
       GPU_FAST                 => GPUFAST,
       SOUND_ENABLE             => SOUND,
       skip_copy                => itosl(PRELOAD)
@@ -1636,7 +1632,7 @@ begin
    -- reasoning this project has been burned by. So measure it:
    -- Counts rdispatch pulses (one per renderer VRAM op) per frame and per line.
    -- Multiply ops/line by the documented ~4 cycles/op and compare against the
-   -- 2,130 clk1x cycles a line has at GPUCEDIV=1: if that product is at or over
+   -- 2,130 clk1x cycles a line has at the 1-of-1 dot pace: if that product is at or over
    -- the budget, the serial arbiter IS the wall and no pixel-pipeline work will
    -- help. `rstate` is not aliasable from here - its type is declared inside the
    -- architecture body and is not visible externally - so occupancy is derived
@@ -1744,7 +1740,7 @@ begin
             blocked := blocked + 1;
          end if;
          -- Render time per line: the number this whole section now turns on.
-         -- A line has 2,130 clk1x cycles at GPUCEDIV=1 and 256 dots, so 8.3
+         -- A line has 2,130 clk1x cycles at the 1-of-1 dot pace and 256 dots, so 8.3
          -- cycles/dot. busy/line well over 2,130 with blocked% near zero means
          -- the drawer/merge chain itself is the cost, and busy/line divided by
          -- 256 is the per-pixel figure that says whether it is an FSM stepping

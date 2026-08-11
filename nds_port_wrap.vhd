@@ -6,7 +6,7 @@
 -- everything else 1:1 as std_logic/std_logic_vector.
 --
 -- No logic lives here. Generics keep their nds_top defaults (is_simu='0', main
--- RAM at SDRAM byte offset 8 MB, GPU_CE_DIV=3) except the three set explicitly
+-- RAM at SDRAM byte offset 8 MB) except the three set explicitly
 -- on the generic map below - GPU_FAST, SOUND_ENABLE and DEBUG_ENABLE - each
 -- with its reason written out there. SOUND_ENABLE and DEBUG_ENABLE are the two
 -- that select which of the two shipping images this tree builds.
@@ -28,9 +28,6 @@ entity nds_port_wrap is
       -- '1' = boot the real firmware from the retail BIOSes' reset vectors
       -- instead of HLE direct boot. See the header note on ARCHITECTURE.md.
       fw_boot          : in  std_logic;
-      -- '1' = dot cadence 1-of-1 (real frame rate, some scanlines dropped)
-      gpu_full_pace    : in  std_logic;
-
       -- keys (active high)
       KeyA             : in  std_logic;
       KeyB             : in  std_logic;
@@ -219,7 +216,6 @@ begin
       nds_on           => nds_on,
       direct_boot      => direct_boot,
       fw_boot          => fw_boot,
-      gpu_full_pace    => gpu_full_pace,
 
       KeyA             => KeyA,
       KeyB             => KeyB,
