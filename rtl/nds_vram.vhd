@@ -330,17 +330,19 @@ architecture arch of nds_vram is
    -- combining, the push and drain rates are both one word per 4 cycles, so the
    -- queue absorbs jitter, not a rate mismatch.
    --
-   -- Do not "save area" by dropping this to 2 without also widening cpu9_wok. A
-   -- pop and a push land on the same edge and wok is evaluated on the PRE-pop
-   -- count, so at depth 2 the steady state hits count=2 exactly when a push
-   -- arrives and stalls - which costs the 2-cycle cadence. It would need
-   -- `or (state = WQ_WAIT and srv_done = '1')`, and that puts srv_done on the
-   -- combinational path into nds_dma9's ena. Measure before believing it.
+   -- 3 is MEASURED, not chosen for comfort. 2 is the smallest that can work at
+   -- all - one entry draining while the next fills - and it does not hold: even
+   -- with cpu9_wok widened to count the pop landing on the same edge, dmaprio
+   -- comes back with deltas of [2, 4] rather than [2]. A handful of units in 2048
+   -- taking 4 cycles is enough to fail [04-02], which wants exactly 2 everywhere.
    --
-   -- 3 is also not free the way 4 is: `mod 3` synthesises to comparators where
-   -- `mod 4` is a dropped carry, which is why going 4 -> 3 bought only 25 ALMs.
-   -- sim/tests/dmaprio is the check either way - anything too shallow shows up
-   -- immediately as a per-unit cost above 2.
+   -- Beware the census average when checking this: 4,101 cycles over 2,048 units
+   -- prints as "2/unit" and hides the 4s completely. sim/tests/dmaprio/check.py
+   -- walks the per-step deltas, and that is the number that decides.
+   --
+   -- 3 is also not free the way 2 and 4 are - `mod 3` synthesises to comparators
+   -- where a power of two is a dropped carry, which is why 4 -> 3 bought only 25
+   -- ALMs of the ~130 its registers should have been worth.
    constant WQ_DEPTH : integer := 3;
 
    type t_wq_entry is record
@@ -360,7 +362,6 @@ architecture arch of nds_vram is
 
    -- combinational eligibility, so the requester can decide in the cycle it
    -- presents the access
-   signal ad_hit4     : unsigned(3 downto 0);
    signal wq_elig     : std_logic;
    signal wq_push_now : std_logic;
    signal wq_bank_now : integer range 0 to 4;
@@ -795,13 +796,8 @@ begin
    -- Exactly one A..D bank and no E..I bank: a multi-bank write would need two
    -- queue entries, and an E..I hit retires on the dispatch edge instead. Both
    -- fall back to the cpu9_done path, which is unchanged.
-   --
-   -- `h and (h-1)` clears the lowest set bit, so zero-after-that with h nonzero
-   -- means exactly one bit was set. This used to ask ad_next for a SECOND hit
-   -- starting from a variable index, which reads as innocent and synthesises to
-   -- something much wider - a priority scan whose start point is data.
-   ad_hit4 <= unsigned(dec9_hit(BANK_D downto BANK_A));
-   wq_elig <= '1' when (ad_hit4 /= 0 and (ad_hit4 and (ad_hit4 - 1)) = 0 and
+   wq_elig <= '1' when (ad_next(dec9_hit, 0) /= 4 and
+                        ad_next(dec9_hit, ad_next(dec9_hit, 0) + 1) = 4 and
                         (dec9_hit(BANK_E) or dec9_hit(BANK_F) or dec9_hit(BANK_G) or
                          dec9_hit(BANK_H) or dec9_hit(BANK_I)) = '0') else '0';
 
