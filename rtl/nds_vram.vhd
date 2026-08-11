@@ -324,7 +324,14 @@ architecture arch of nds_vram is
    -- channel, and the A..D line cache. Each is closed below, and the closures
    -- are levels rather than edges for the same reason the pre-existing srv_req
    -- invalidation is - a level cannot be missed.
-   constant WQ_DEPTH : integer := 4;
+   -- Depth is an AREA decision, not a comfort one: this core fits in 4,189 of
+   -- the device's 4,191 LABs, so every entry is 54 registers that have to come
+   -- from somewhere. Depth 4 fitted nowhere; 3 does, and the cadence is
+   -- unchanged because with combining the push and drain rates are both one word
+   -- per 4 cycles - the queue absorbs jitter, it does not have to absorb a rate
+   -- mismatch. sim/tests/dmaprio is the check: anything too shallow shows up
+   -- immediately as a per-unit cost above 2.
+   constant WQ_DEPTH : integer := 3;
 
    type t_wq_entry is record
       valid : std_logic;
@@ -964,9 +971,16 @@ begin
             -- being refetched until the write has drained. Both read
             -- wq_push_now combinationally, so there is no cycle in between for a
             -- fill to slip into.
+            -- Per-BANK, not per-line, and that is an area call: per-line would be
+            -- eight 14-bit comparators here on top of the five the issue gate
+            -- already needs, and this core has no room for them. Invalidating too
+            -- much is always safe - the cost is that a burst into the displayed
+            -- bank makes the renderer refetch its 64-bit lines for the length of
+            -- the burst. The GATE below stays per-line, because that one decides
+            -- whether the renderer stalls, and per-bank there cost a dropped line.
             if (wq_push_now = '1') then
                for i in 0 to 7 loop
-                  if (v_adl(i).bank = wq_bank_now and v_adl(i).line = wq_push_line) then
+                  if (v_adl(i).bank = wq_bank_now) then
                      v_adl(i).valid := '0';
                   end if;
                end loop;
