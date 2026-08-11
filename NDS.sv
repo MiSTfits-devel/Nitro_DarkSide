@@ -1312,7 +1312,26 @@ nds_port_wrap nds
 	// Kirby's handshake (both sides wait unboundedly). The cost is ARM9 clock, to
 	// be won back on CPI - the caches are not even enabled in anything measured so
 	// far.
-	.clk2x(clk_sys),
+	//
+	// 2026-08-11: THE COST WAS NEVER WON BACK, AND IT IS THE WHOLE GAME.
+	// A real ARM9 runs at 67.027964 MHz against a 33.513982 MHz bus. At 1:1 the
+	// emulated CPU gets HALF the cycles per emulated frame that it should, while
+	// nds_gpu_timing counts clk1x and so still produces a perfect 59.83 Hz. The
+	// symptom is unmistakable once named and was reported from the couch before
+	// it was found in the source: flawless 60 fps, game logic at half speed.
+	// sim/tb_arm9_island.vhd has always modelled the intended ratio - "ARM9 runs
+	// at 2x the system/bus clock ... the pacing nds_top will use (66 MHz core /
+	// 33 MHz bus)" - so every island bench has been validating 2:1 while the
+	// FPGA shipped 1:1. No amount of memory-path work can recover this; it is a
+	// factor of two on the clock itself.
+	//
+	// So: back to 2:1. The -2.809 ns that killed it before was measured on a
+	// much fuller design (pre-drawer-rewrite, pre-GPU_CE_DIV-removal, with ascal
+	// still in). The fixed-resolution profile now fits at 88% with zero
+	// negative-slack domains, which is a different fitting problem. If it still
+	// misses, the honest options are CPI work or a real pipeline in nds_cpu9 -
+	// NOT quietly leaving the CPU at half rate.
+	.clk2x(clk_video_67),
 	.clkMem(clk_mem),
 	.clkMemIndex(clkMemIndex),
 	.reset(reset | bios_load_reset),
