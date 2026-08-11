@@ -511,6 +511,14 @@ architecture arch of nds_top is
    -- ARM9 DMA bus mastering
    signal cpu9_bus_idle : std_logic;
    signal dma_on, dma_bus_on : std_logic;
+
+   -- nds_dma9's clk1x fast lane into the IO fabric (see the io_bus9 mux)
+   signal dma_io_ena  : std_logic;
+   signal dma_io_rnw  : std_logic;
+   signal dma_io_adr  : std_logic_vector(27 downto 0);
+   signal dma_io_acc  : std_logic_vector(1 downto 0);
+   signal dma_io_be   : std_logic_vector(3 downto 0);
+   signal dma_io_dout : std_logic_vector(31 downto 0);
    signal dmab_ena, dmab_rnw : std_logic;
    signal dmab_adr  : std_logic_vector(31 downto 0);
    signal dmab_acc  : std_logic_vector(1 downto 0);
@@ -1066,7 +1074,19 @@ begin
       end if;
    end process;
 
-   io_bus9 <= (Din  => io9_lat_1x.Din,  Adr  => io9_lat_1x.Adr,
+   -- ...and while the ARM9 DMA holds the bus it drives the fabric itself, from
+   -- clk1x, skipping this bridge entirely. That is worth 4 clk1x cycles on every
+   -- IO access (measured 5 -> 1) and it is safe without arbitration: dma_on pauses
+   -- the CPU and nds_dma9 does not raise dma_bus_on until cpu_bus_idle, which only
+   -- returns to '1' on gb_bus_done - so the island has no IO transaction in flight
+   -- for the whole window. io9_ena cannot pulse here either, since it is generated
+   -- from cdc_req_io toggles and the paused CPU makes none.
+   io_bus9 <= (Din  => dma_io_dout,      Adr  => dma_io_adr,
+               rnw  => dma_io_rnw,       ena  => dma_io_ena,
+               acc  => dma_io_acc,       bEna => dma_io_be,
+               rst  => i9_io_bus.rst)
+              when dma_bus_on = '1' else
+              (Din  => io9_lat_1x.Din,  Adr  => io9_lat_1x.Adr,
                rnw  => io9_lat_1x.rnw,  ena  => io9_ena,
                acc  => io9_lat_1x.acc,  bEna => io9_lat_1x.bEna,
                rst  => i9_io_bus.rst);
@@ -1470,6 +1490,15 @@ begin
       -- nds_dma9 is outside the island (clk1x), so it needs the stretched form of
       -- membus9's one-island-cycle done, not the raw signal.
       mb_done      => cpu9_done_1x,
+      -- clk1x fast lane: io_wired_out9 is the clk1x wired-OR the peripherals
+      -- already drive, so the DMA reads it in the cycle it presents the address
+      io_fast_ena  => dma_io_ena,
+      io_fast_rnw  => dma_io_rnw,
+      io_fast_adr  => dma_io_adr,
+      io_fast_acc  => dma_io_acc,
+      io_fast_be   => dma_io_be,
+      io_fast_dout => dma_io_dout,
+      io_fast_din  => io_wired_out9,
       irq_dma      => irq_dma9
    );
 
