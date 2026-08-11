@@ -305,6 +305,13 @@ architecture sim of tb_top_frame is
    signal sdram_be  : std_logic_vector(3 downto 0);
    signal sdram_Dout : std_logic_vector(31 downto 0) := (others => '0');
    signal sdram_done32 : std_logic := '0';
+   -- Pair fills. These MUST be driven: nds_mainram will not retire a pair read
+   -- on done32 alone, so leaving them at the nds_top port defaults ('0') wedges
+   -- the main-RAM channel on the ARM9's first cache line fill - and because the
+   -- ARM7 shares that channel, both CPUs stop. That is what it looked like:
+   -- 35 ARM9 instructions retired, then nothing, forever.
+   signal sdram_Dout_hi : std_logic_vector(31 downto 0) := (others => '0');
+   signal sdram_done64  : std_logic := '0';
 
    signal vsrv_req, vsrv_rnw, vsrv_done : std_logic := '0';
    signal vsrv_bank : std_logic_vector(1 downto 0);
@@ -537,6 +544,7 @@ begin
       sdram_ena => sdram_ena, sdram_rnw => sdram_rnw, sdram_Adr => sdram_Adr,
       sdram_Din => sdram_Din, sdram_be => sdram_be,
       sdram_Dout => sdram_Dout, sdram_done32 => sdram_done32,
+      sdram_Dout_hi => sdram_Dout_hi, sdram_done64 => sdram_done64,
       vsrv_req => vsrv_req, vsrv_rnw => vsrv_rnw, vsrv_bank => vsrv_bank, vsrv_addr => vsrv_addr,
       vsrv_be => vsrv_be, vsrv_din => vsrv_din, vsrv_dout => vsrv_dout, vsrv_done => vsrv_done,
       vrsrv_req => vrsrv_req, vrsrv_bank => vrsrv_bank, vrsrv_addr => vrsrv_addr,
@@ -1444,7 +1452,30 @@ begin
             sdram_done32 <= '1';
             wait until rising_edge(clkMem);
             sdram_done32 <= '0';
-            for k in 1 to 3 loop wait until rising_edge(clkMem); end loop;
+            -- The real controller runs BURST_LENGTH=4, so the upper 32 bits of
+            -- the aligned 8-byte block arrive two clocks after done32 and
+            -- done64 marks them (rtl/sdram.sv ch2_dout_hi / ch2_ready64). The
+            -- pairing is w with w xor 1 rather than w+1 because ACCESS_TYPE is
+            -- sequential: a burst from an odd word wraps inside its aligned
+            -- block, so the "high" half of an odd base is the EVEN word. Pair
+            -- mode is only ever issued on even addresses, but modelling the
+            -- wrap is what makes a violation of that show up here rather than
+            -- as silently transposed data on hardware.
+            -- Kept identical to sim/tb_arm9_island.vhd's model on purpose: two
+            -- behavioural SDRAMs that disagree about pair timing would make the
+            -- island bench and the system bench disagree about the CPU.
+            wait until rising_edge(clkMem);
+            if (w mod 2) = 0 then
+               sdram_Dout_hi <= mainram(w + 1);
+            else
+               sdram_Dout_hi <= mainram(w - 1);
+            end if;
+            sdram_done64 <= '1';
+            wait until rising_edge(clkMem);
+            sdram_done64 <= '0';
+            -- the slot stays 10 clkMem cycles long, exactly as before pair mode
+            -- existed, so a non-pair read is cycle-identical to baseline
+            wait until rising_edge(clkMem);
          else
             for k in 1 to 3 loop wait until rising_edge(clkMem); end loop;
             for j in 0 to 3 loop
@@ -1453,8 +1484,10 @@ begin
                end if;
             end loop;
             sdram_done32 <= '1';
+            sdram_done64 <= '1';   -- a write returns no data; both dones fire
             wait until rising_edge(clkMem);
             sdram_done32 <= '0';
+            sdram_done64 <= '0';
             for k in 1 to 4 loop wait until rising_edge(clkMem); end loop;
          end if;
       elsif (refresh_cnt > 750) then
