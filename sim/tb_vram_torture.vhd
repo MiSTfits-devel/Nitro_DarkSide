@@ -45,6 +45,8 @@ architecture sim of tb_vram_torture is
    signal cpu9_addr : unsigned(23 downto 2) := (others => '0');
    signal cpu9_be   : std_logic_vector(3 downto 0) := (others => '0');
    signal cpu9_din, cpu9_dout : std_logic_vector(31 downto 0) := (others => '0');
+   signal cpu9_wpost : std_logic := '0';
+   signal cpu9_welig, cpu9_wok : std_logic;
 
    signal cpu7_ena, cpu7_rnw, cpu7_done : std_logic := '0';
    signal cpu7_addr : unsigned(23 downto 2) := (others => '0');
@@ -96,6 +98,7 @@ begin
       clk => clk, reset => reset, vramcnt => vramcnt,
       cpu9_ena => cpu9_ena, cpu9_rnw => cpu9_rnw, cpu9_addr => cpu9_addr,
       cpu9_be => cpu9_be, cpu9_din => cpu9_din, cpu9_dout => cpu9_dout, cpu9_done => cpu9_done,
+      cpu9_wpost => cpu9_wpost, cpu9_welig => cpu9_welig, cpu9_wok => cpu9_wok,
       cpu7_ena => cpu7_ena, cpu7_rnw => cpu7_rnw, cpu7_addr => cpu7_addr,
       cpu7_be => cpu7_be, cpu7_din => cpu7_din, cpu7_dout => cpu7_dout, cpu7_done => cpu7_done,
       srv_req => srv_req, srv_rnw => srv_rnw, srv_bank => srv_bank, srv_addr => srv_addr,
@@ -346,6 +349,50 @@ begin
       constant LCDC_BASE  : t_ia := (16#800000#, 16#820000#, 16#840000#, 16#860000#,
                                      16#880000#, 16#890000#, 16#894000#, 16#898000#, 16#8A0000#);
       constant LCDC_WORDS : t_ia := (32768, 32768, 32768, 32768, 16384, 4096, 4096, 8192, 4096);
+      -- Posted A..D writes. cpu9wp drives the port exactly the way nds_dma9 does:
+      -- hold wpost, present the access, and treat wok as the acknowledgement -
+      -- no cpu9_done follows a posted write. Bank D at LCDC, so the reads below
+      -- come back over the same srv channel the queue drains onto.
+      constant POST_BASE : integer := 16#860000#;
+      -- comfortably more than nds_vram's WQ_DEPTH, so the queue is certainly full
+      constant POST_BURST : integer := 8;
+      variable postops : integer := 0;
+      variable stalls  : integer := 0;
+
+      procedure cpu9wp(byteaddr : integer; be_in : std_logic_vector(3 downto 0);
+                       data : std_logic_vector(31 downto 0)) is
+         variable guard : integer := 0;
+      begin
+         cpu9_addr  <= to_unsigned(byteaddr, 24)(23 downto 2);
+         cpu9_rnw   <= '0';
+         cpu9_be    <= be_in;
+         cpu9_din   <= data;
+         cpu9_wpost <= '1';
+         -- ena goes high only in a cycle where wok is already high. With ena high
+         -- and wok low the DUT would - correctly - latch the access as an ordinary
+         -- request, and the retry would then perform it twice. nds_dma9 gates its
+         -- ena on wok for exactly this reason, so the bench must too.
+         loop
+            wait until rising_edge(clk);
+            exit when cpu9_wok = '1';
+            stalls := stalls + 1;
+            guard  := guard + 1;
+            assert guard < 200 report "posted queue never drained" severity failure;
+         end loop;
+         assert cpu9_welig = '1'
+            report "posted write unexpectedly not eligible @" &
+                   to_hstring(to_unsigned(byteaddr, 24))
+            severity failure;
+         cpu9_ena <= '1';
+         wait until rising_edge(clk);
+         cpu9_ena   <= '0';
+         cpu9_wpost <= '0';
+         assert cpu9_done = '0'
+            report "posted write also pulsed cpu9_done: performed twice"
+            severity failure;
+         postops := postops + 1;
+      end procedure;
+
       constant NPROBE : integer := 32;
       type t_probe is array (0 to NBANK - 1, 0 to NPROBE - 1) of integer;
       variable probe   : t_probe := (others => (others => 0));
@@ -381,12 +428,87 @@ begin
          end if;
       end loop;
 
-      -- ================= reset-clear check (see header) =================
       -- map every bank in LCDC mode so the CPU port can reach all nine
       for b in 0 to NBANK - 1 loop
          vramcnt(b*8 + 7 downto b*8) <= x"80";
       end loop;
       wait until rising_edge(clk);
+
+      -- ================= posted A..D writes =================
+      -- The posted queue acknowledges a write before it reaches the store, which
+      -- buys nds_dma9 a 16-bit unit every two bus cycles and costs a
+      -- read-after-write window silicon does not have. This phase drives the
+      -- window on purpose. The srv server above answers with a random 1..8 cycle
+      -- latency, so the queue fills and backpressures on its own.
+
+      -- 1. halfword pairs sharing a word, presented back to back. Each pair must
+      --    be COMBINED into one srv write, and both halves must survive: a merge
+      --    that loses byte enables or overwrites the wrong lane shows up here.
+      for k in 0 to 63 loop
+         cpu9wp(POST_BASE + k*4,
+                "0011", x"0000" & std_logic_vector(to_unsigned(16#1000# + k, 16)));
+         cpu9wp(POST_BASE + k*4 + 2,
+                "1100", std_logic_vector(to_unsigned(16#2000# + k, 16)) & x"0000");
+      end loop;
+
+      -- Read back through the ordinary path, NEWEST FIRST. The order matters:
+      -- reading in write order only ever reads words that have already drained,
+      -- so it cannot see the read-after-write window at all. Descending puts the
+      -- reads on exactly the words still sitting in the queue.
+      for k in 63 downto 0 loop
+         cpu9r(POST_BASE + k*4);
+         assert cpu9_dout = std_logic_vector(to_unsigned(16#2000# + k, 16)) &
+                            std_logic_vector(to_unsigned(16#1000# + k, 16))
+            report "posted write lost or mis-merged: word " & integer'image(k) &
+                   " reads " & to_hstring(cpu9_dout)
+            severity failure;
+      end loop;
+
+      -- 2. the window with nothing at all in between: fill the queue, then read
+      --    the most recent entry first. One posted write is not enough to show a
+      --    violation - the drain starts on the next edge and is already in flight
+      --    by the time a read could be presented - so this fills WQ_DEPTH so that
+      --    entries are still queued behind the one on the wire.
+      for k in 0 to POST_BURST - 1 loop
+         cpu9wp(POST_BASE + 16#400# + k*4, "1111",
+                x"C0FFEE" & std_logic_vector(to_unsigned(k, 8)));
+      end loop;
+      for k in POST_BURST - 1 downto 0 loop
+         cpu9r(POST_BASE + 16#400# + k*4);
+         assert cpu9_dout = x"C0FFEE" & std_logic_vector(to_unsigned(k, 8))
+            report "read overtook a posted write: word " & integer'image(k) &
+                   " reads " & to_hstring(cpu9_dout)
+            severity failure;
+      end loop;
+
+      -- 3. a write that cannot be posted must say so and still land. Bank E is
+      --    BRAM, retired on the dispatch edge, so it is never queue-eligible.
+      cpu9_addr  <= to_unsigned(16#880000#, 24)(23 downto 2);
+      cpu9_rnw   <= '0';
+      cpu9_be    <= "1111";
+      cpu9_din   <= x"BEEF0001";
+      cpu9_wpost <= '1';
+      wait until rising_edge(clk);
+      assert cpu9_welig = '0' and cpu9_wok = '0'
+         report "an E..I write must not be postable" severity failure;
+      cpu9_ena <= '1';
+      wait until rising_edge(clk);
+      cpu9_ena <= '0';
+      wait until rising_edge(clk) and cpu9_done = '1' for 5 us;
+      assert cpu9_done = '1' report "non-postable fallback never completed" severity failure;
+      cpu9_wpost <= '0';
+      cpu9r(16#880000#);
+      assert cpu9_dout = x"BEEF0001"
+         report "non-postable fallback lost the write: " & to_hstring(cpu9_dout)
+         severity failure;
+
+      assert stalls > 0
+         report "posted queue never backpressured - the full-queue path is untested"
+         severity failure;
+      report "tb_vram_torture: posted writes OK  ops=" & integer'image(postops) &
+             " stall_cycles=" & integer'image(stalls) severity note;
+
+      -- ================= reset-clear check (see header) =================
 
       -- pick probe words per bank: always the first and last word (a clear that
       -- truncates a bank is the likely failure), the rest pseudo-random

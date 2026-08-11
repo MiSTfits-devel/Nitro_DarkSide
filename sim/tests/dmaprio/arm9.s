@@ -73,7 +73,18 @@ dmatest:
    mov  r0, #0x80              @ VRAMCNT_D = LCDC, so 0x06860000 is plain RAM
    strb r0, [r12, #0x243]
    strb r0, [r12, #0x244]      @ VRAMCNT_E = LCDC: 0x06880000, but BRAM-backed
-   ldr  r0, =0x00010000        @ DISPCNT: display mode 1, BG mode 0
+   @ Bank A as main BG with BG0 enabled, so the RENDERER is reading bank A over
+   @ its own rsrv channel while the DMA below posts writes into that same bank.
+   @ That collision is the whole point: a posted write is acknowledged before it
+   @ reaches the store, and nds_vram has to keep the renderer out of the window
+   @ (per-bank, so this must be the bank being displayed, not a spare one).
+   @ Without it the DMA writes bank D while the renderer reads bank A and the
+   @ hazard logic is never entered.
+   mov  r0, #0x81              @ VRAMCNT_A = enabled, MST=1 (main BG)
+   strb r0, [r12, #0x240]
+   mov  r0, #0                 @ BG0CNT: screen base 0, char base 0, 4bpp
+   strh r0, [r12, #0x008]
+   ldr  r0, =0x00010100        @ DISPCNT: display mode 1, BG mode 0, BG0 on
    str  r0, [r12]
    ldr  r11, =0x04000208       @ halfword offsets are only 8-bit: hold IME
    mov  r0, #0                 @ IME off, exactly as the cart's test does
@@ -140,6 +151,18 @@ dmatest:
    cmp  r7, r5
    blo  1b
 
+   @ ---- collide the posted queue with the renderer on the SAME bank ----
+   @ 1024 units into bank A, running across visible lines while BG0 is fetching
+   @ from bank A. Checked two ways in check.py: the data must land (+2 apart, so
+   @ a lost or mis-merged posted write shows up), and tb_top_frame must still
+   @ report 0 dropped lines - the per-bank read gate holds the renderer off, and
+   @ holding it off too long or wedging it would cost lines.
+   str  r3, [r12, #0x0C8]      @ DMA2SAD = TM3CNT_L, FIXED
+   ldr  r0, =0x06000000
+   str  r0, [r12, #0x0CC]      @ DMA2DAD = bank A, as main BG
+   ldr  r0, =0x81000400        @ 1024 units, 16-bit, immediate, src fixed, dst inc
+   str  r0, [r12, #0x0D0]
+
    @ ---- cost decomposition: same source and same DMA, cheaper destinations ----
    @ The 2048-unit transfer above measures (DMA FSM + IO read + VRAM A..D write),
    @ where A..D leave the chip over the vsrv channel. Repeat it into the two
@@ -160,6 +183,20 @@ dmatest:
    ldr  r0, =0x81000040
    str  r0, [r12, #0x0D0]
 
+   @ ---- VRAM -> VRAM, so the DMA's VRAM READ path gets exercised too ----
+   @ Everything above reads IO, which the fast lane answers combinationally. A
+   @ VRAM source instead goes through nds_vram's ordinary read handshake, and a
+   @ VRAM destination is the posted-write queue - so this copy crosses the two
+   @ halves of the fast lane against each other. Source is the counter buffer
+   @ channel 1 just filled in bank D; destination is bank E, which is BRAM and
+   @ never queue-eligible, so the not-postable fallback runs here as well.
+   ldr  r0, =0x06860000
+   str  r0, [r12, #0x0D4]      @ DMA3SAD
+   ldr  r0, =0x06880100
+   str  r0, [r12, #0x0D8]      @ DMA3DAD
+   ldr  r0, =0x80000010        @ 16 units, 16-bit, immediate, both incrementing
+   str  r0, [r12, #0x0DC]
+
    mov  r0, #0                 @ TimerStop(3)
    strh r0, [r3, #2]
 
@@ -178,6 +215,19 @@ dmatest:
    str  r0, [r1, #20]
    ldrh r0, [r2, #6]
    str  r0, [r1, #24]
+
+   @ and the VRAM->VRAM copy: bank E at 0x06880100 must now equal the first
+   @ words of bank D at 0x06860000
+   ldr  r2, =0x06880100
+   ldrh r0, [r2]
+   str  r0, [r1, #28]
+   ldrh r0, [r2, #2]
+   str  r0, [r1, #32]
+   ldr  r2, =0x06860000
+   ldrh r0, [r2]
+   str  r0, [r1, #36]
+   ldrh r0, [r2, #2]
+   str  r0, [r1, #40]
    bx   lr
 
    .ltorg

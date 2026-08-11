@@ -490,6 +490,11 @@ architecture arch of nds_top is
    signal dma_vr_addr : unsigned(23 downto 2);
    signal dma_vr_be   : std_logic_vector(3 downto 0);
    signal dma_vr_din  : std_logic_vector(31 downto 0);
+   -- posted-write handshake. wpost is only ever asked for by the DMA, so it is
+   -- gated on dma_bus_on: a CPU store to VRAM keeps its ordinary timing and none
+   -- of the posted window's coherency rules apply to it.
+   signal dma_vr_wpost : std_logic;
+   signal vr9_wpost, vr9_welig, vr9_wok : std_logic;
 
    signal pal_we, oam_we : std_logic;
    signal pal_addr, oam_addr : integer range 0 to 511;
@@ -1519,6 +1524,9 @@ begin
       vram_fast_din  => dma_vr_din,
       vram_fast_dout => vram9_dout,
       vram_fast_done => vram9_done,
+      vram_fast_wpost => dma_vr_wpost,
+      vram_fast_welig => vr9_welig,
+      vram_fast_wok   => vr9_wok,
       irq_dma      => irq_dma9
    );
 
@@ -1969,6 +1977,7 @@ begin
    vr9_addr <= dma_vr_addr when dma_bus_on = '1' else vram9_addr;
    vr9_be   <= dma_vr_be   when dma_bus_on = '1' else vram9_be;
    vr9_din  <= dma_vr_din  when dma_bus_on = '1' else vram9_din;
+   vr9_wpost <= dma_vr_wpost and dma_bus_on;
 
    -- ================= VRAM + engine A render path =================
    ivram : entity work.nds_vram
@@ -1978,6 +1987,7 @@ begin
       clk => clk1x, reset => reset_boot, vramcnt => vramcnt,
       cpu9_ena => vr9_ena, cpu9_rnw => vr9_rnw, cpu9_addr => vr9_addr,
       cpu9_be => vr9_be, cpu9_din => vr9_din, cpu9_dout => vram9_dout, cpu9_done => vram9_done,
+      cpu9_wpost => vr9_wpost, cpu9_welig => vr9_welig, cpu9_wok => vr9_wok,
       cpu7_ena => vram7_ena, cpu7_rnw => vram7_rnw, cpu7_addr => vram7_addr,
       cpu7_be => vram7_be, cpu7_din => vram7_din, cpu7_dout => vram7_dout, cpu7_done => vram7_done,
       srv_req => vsrv_req, srv_rnw => vsrv_rnw, srv_bank => vsrv_bank, srv_addr => vsrv_addr,

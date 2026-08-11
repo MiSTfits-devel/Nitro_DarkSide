@@ -101,6 +101,14 @@ entity nds_dma9 is
       vram_fast_din  : out std_logic_vector(31 downto 0) := (others => '0');
       vram_fast_dout : in  std_logic_vector(31 downto 0);
       vram_fast_done : in  std_logic;
+      -- posted writes: nds_vram takes the write in the cycle vram_fast_wok is
+      -- high and never pulses done for it, so a VRAM write costs one cycle
+      -- instead of a round trip through the off-chip banks. welig says the write
+      -- is postable at all (single bank, no E..I); wok adds "and there is room".
+      -- Both are combinational from the address this module is presenting.
+      vram_fast_wpost : out std_logic := '1';
+      vram_fast_welig : in  std_logic;
+      vram_fast_wok   : in  std_logic;
 
       irq_dma      : out std_logic_vector(3 downto 0) := (others => '0')
    );
@@ -143,8 +151,8 @@ architecture arch of nds_dma9 is
    -- RD_VRW / WR_VRW are the VRAM fast lane. Unlike IO, nds_vram takes several
    -- cycles and pulses done, so these do wait - just without the island in the
    -- middle.
-   type t_state is (IDLE, GRANT, LATCH, RD, RD_WAIT, RD_IOW, RD_VRW,
-                    WR, WR_WAIT, WR_IOW, WR_VRW, COMPLETE);
+   type t_state is (IDLE, GRANT, LATCH, RD, RD_WAIT, RD_VRW,
+                    WR, WR_WAIT, WR_VRW, COMPLETE);
    signal state  : t_state := IDLE;
    signal active : integer range 0 to 3 := 0;
 
@@ -212,8 +220,8 @@ begin
    begin
       if rising_edge(clk) then
          if (state /= IDLE)     then cy := cy + 1; end if;
-         if (state = RD_WAIT or state = RD_IOW or state = RD_VRW) then rw := rw + 1; end if;
-         if (state = WR_WAIT or state = WR_IOW or state = WR_VRW) then ww := ww + 1; end if;
+         if (state = RD_WAIT or state = RD_VRW) then rw := rw + 1; end if;
+         if (state = WR_WAIT or state = WR_VRW) then ww := ww + 1; end if;
          if (unit_ret = '1')    then un := un + 1; end if;
          if (state = COMPLETE and un > 0) then
             report "dma9 census ch" & integer'image(active) & ": " &
@@ -226,6 +234,48 @@ begin
       end if;
    end process;
    -- synthesis translate_on
+
+   -- ================= fast-lane request, combinational =================
+   -- These used to be registered, which cost a cycle per access: one to present
+   -- the address, another to capture the answer. Hardware spends ONE bus cycle
+   -- per access, so matching it leaves room for neither. Driving the request
+   -- straight out of `state` and the channel's live pointers makes the address
+   -- valid in the same cycle the FSM is in RD or WR, and both targets answer
+   -- within it - the IO fabric because its wired-OR is combinational from the
+   -- address, nds_vram because an eligible write is posted rather than performed.
+   --
+   -- The cost is that a fast-lane access is now one long combinational path:
+   -- channel register -> active mux -> nds_top's dma_bus_on mux -> the target's
+   -- decode -> back here to be captured. That is the shape of a single-cycle bus
+   -- and it is the thing to watch in the fit, not a functional risk.
+   io_fast_ena <= '1' when (state = RD and is_io(ch(active).cur_src)) or
+                           (state = WR and is_io(ch(active).cur_dst)) else '0';
+   io_fast_rnw <= '1' when state = RD else '0';
+   io_fast_adr <= x"0" & std_logic_vector(ch(active).cur_src(23 downto 2)) & "00"
+                     when state = RD else
+                  x"0" & std_logic_vector(ch(active).cur_dst(23 downto 2)) & "00";
+   io_fast_be  <= be_of(ch(active).cur_src, ch(active).word32) when state = RD else
+                  be_of(ch(active).cur_dst, ch(active).word32);
+   io_fast_acc <= ACCESS_32BIT when ch(active).word32 = '1' else ACCESS_16BIT;
+   -- bEna picks the lane, so a halfword goes out replicated
+   io_fast_dout <= rdval when ch(active).word32 = '1' else
+                   rdval(15 downto 0) & rdval(15 downto 0);
+
+   -- A VRAM read is presented for the single RD cycle (RD always advances to
+   -- RD_VRW) and answered by done, like any other read. A write is presented
+   -- only when nds_vram will actually take it: with room in the posted queue, or
+   -- when the access cannot be posted at all and has to go the slow way. With
+   -- neither, ena stays low and the FSM stalls in WR - that is the backpressure.
+   vram_fast_ena  <= '1' when (state = RD and is_vram(ch(active).cur_src)) or
+                              (state = WR and is_vram(ch(active).cur_dst) and
+                               (vram_fast_welig = '0' or vram_fast_wok = '1')) else '0';
+   vram_fast_rnw  <= '1' when state = RD else '0';
+   vram_fast_addr <= ch(active).cur_src(23 downto 2) when state = RD else
+                     ch(active).cur_dst(23 downto 2);
+   vram_fast_be   <= be_of(ch(active).cur_src, ch(active).word32) when state = RD else
+                     be_of(ch(active).cur_dst, ch(active).word32);
+   vram_fast_din  <= rdval when ch(active).word32 = '1' else
+                     rdval(15 downto 0) & rdval(15 downto 0);
 
    -- ================= register decode =================
    process (all)
@@ -304,8 +354,6 @@ begin
 
          irq_dma     <= (others => '0');
          mb_ena        <= '0';
-         io_fast_ena   <= '0';
-         vram_fast_ena <= '0';
          unit_ret      <= '0';
 
          if (reset = '1') then
@@ -438,24 +486,20 @@ begin
 
                when RD =>
                   if (is_io(ch(active).cur_src)) then
-                     io_fast_ena <= '1';
-                     io_fast_rnw <= '1';
-                     -- the IO fabric decodes with the region nibble stripped
-                     -- (nds_membus9 drives x"0" & adr(23:2) & "00", and this
-                     -- module's own ADR_BASE is x"00000B0", not x"40000B0")
-                     io_fast_adr <= x"0" & std_logic_vector(ch(active).cur_src(23 downto 2)) & "00";
-                     io_fast_be  <= be_of(ch(active).cur_src, ch(active).word32);
+                     -- the request is already on the wire (see the concurrent
+                     -- drivers above) and the wired-OR answered inside this
+                     -- cycle, so the read completes here. The rotation that
+                     -- nds_membus9 would have done is ours: the rest of the FSM
+                     -- wants the halfword in the low half.
                      if (ch(active).word32 = '1') then
-                        io_fast_acc <= ACCESS_32BIT;
+                        rdval <= io_fast_din;
+                     elsif (ch(active).cur_src(1) = '1') then
+                        rdval <= x"0000" & io_fast_din(31 downto 16);
                      else
-                        io_fast_acc <= ACCESS_16BIT;
+                        rdval <= x"0000" & io_fast_din(15 downto 0);
                      end if;
-                     state <= RD_IOW;
+                     state <= WR;
                   elsif (is_vram(ch(active).cur_src)) then
-                     vram_fast_ena  <= '1';
-                     vram_fast_rnw  <= '1';
-                     vram_fast_addr <= ch(active).cur_src(23 downto 2);
-                     vram_fast_be   <= be_of(ch(active).cur_src, ch(active).word32);
                      state <= RD_VRW;
                   else
                      mb_ena     <= '1';
@@ -478,24 +522,9 @@ begin
                      state <= WR;
                   end if;
 
-               when RD_IOW =>
-                  -- io_fast_ena is high across this cycle and the peripherals'
-                  -- wired_out is combinational from the address, so the word is
-                  -- valid now. Rotate it here, since the slow path's rotation
-                  -- lives in nds_membus9 and this one bypasses it: the rest of the
-                  -- FSM expects the halfword in the low half.
-                  if (ch(active).word32 = '1') then
-                     rdval <= io_fast_din;
-                  elsif (ch(active).cur_src(1) = '1') then
-                     rdval <= x"0000" & io_fast_din(31 downto 16);
-                  else
-                     rdval <= x"0000" & io_fast_din(15 downto 0);
-                  end if;
-                  state <= WR;
-
                when RD_VRW =>
                   if (vram_fast_done = '1') then
-                     -- same rotation as RD_IOW, for the same reason
+                     -- same rotation as the IO read above, for the same reason
                      if (ch(active).word32 = '1') then
                         rdval <= vram_fast_dout;
                      elsif (ch(active).cur_src(1) = '1') then
@@ -508,31 +537,21 @@ begin
 
                when WR =>
                   if (is_io(ch(active).cur_dst)) then
-                     io_fast_ena <= '1';
-                     io_fast_rnw <= '0';
-                     io_fast_adr <= x"0" & std_logic_vector(ch(active).cur_dst(23 downto 2)) & "00";
-                     io_fast_be  <= be_of(ch(active).cur_dst, ch(active).word32);
-                     if (ch(active).word32 = '1') then
-                        io_fast_acc  <= ACCESS_32BIT;
-                        io_fast_dout <= rdval;
-                     else
-                        io_fast_acc  <= ACCESS_16BIT;
-                        lane16       := rdval(15 downto 0);
-                        io_fast_dout <= lane16 & lane16;   -- bEna picks the lane
-                     end if;
-                     state <= WR_IOW;
+                     -- the peripheral latched it on this edge
+                     retire_unit;
                   elsif (is_vram(ch(active).cur_dst)) then
-                     vram_fast_ena  <= '1';
-                     vram_fast_rnw  <= '0';
-                     vram_fast_addr <= ch(active).cur_dst(23 downto 2);
-                     vram_fast_be   <= be_of(ch(active).cur_dst, ch(active).word32);
-                     if (ch(active).word32 = '1') then
-                        vram_fast_din <= rdval;
+                     if (vram_fast_welig = '1') then
+                        -- posted, or stalled here until the queue has room. Note
+                        -- ena is gated on wok too, so a stalled cycle presents
+                        -- nothing and cannot be taken twice.
+                        if (vram_fast_wok = '1') then
+                           retire_unit;
+                        end if;
                      else
-                        lane16        := rdval(15 downto 0);
-                        vram_fast_din <= lane16 & lane16;   -- be picks the lane
+                        -- not postable (spans two banks): ena was presented for
+                        -- this one cycle and nds_vram latched it the ordinary way
+                        state <= WR_VRW;
                      end if;
-                     state <= WR_VRW;
                   else
                      mb_ena <= '1';
                      mb_rnw <= '0';
@@ -554,10 +573,6 @@ begin
                   if (mb_done = '1') then
                      retire_unit;
                   end if;
-
-               when WR_IOW =>
-                  -- the peripheral latched the write on this cycle's edge
-                  retire_unit;
 
                when WR_VRW =>
                   if (vram_fast_done = '1') then

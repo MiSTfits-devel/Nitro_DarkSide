@@ -93,6 +93,21 @@ entity nds_vram is
       cpu9_din  : in  std_logic_vector(31 downto 0);
       cpu9_dout : out std_logic_vector(31 downto 0) := (others => '0');
       cpu9_done : out std_logic := '0';
+      -- Posted writes, opt-in. With cpu9_wpost held, a write that lands in
+      -- exactly one of banks A..D and nowhere else is taken into a short queue
+      -- and acknowledged by cpu9_wok in the SAME cycle cpu9_ena is presented -
+      -- no cpu9_done follows for it. The queue drains over srv_* in the
+      -- background and combines adjacent halfwords into whole words, which is
+      -- what makes it keep up: a 16-bit-per-2-cycles writer produces one word
+      -- every 4 cycles and srv_* sustains one every 3.
+      --
+      -- Only nds_dma9 asks for this. The requester must check cpu9_wok in the
+      -- cycle it presents the access and hold the access until it is high; a
+      -- write that is not eligible (multi-bank, or E..I) leaves cpu9_wok low and
+      -- goes down the ordinary cpu9_done path unchanged.
+      cpu9_wpost : in  std_logic := '0';
+      cpu9_welig : out std_logic;
+      cpu9_wok   : out std_logic;
 
       -- ARM7 CPU port (only banks C/D in MST=2 can ever hit)
       cpu7_ena  : in  std_logic;
@@ -260,6 +275,7 @@ architecture arch of nds_vram is
       BRAMREAD,   -- capture + OR the BRAM dataouts
       SRVSCAN,    -- multi-bank continuation only: re-arm srv_req for bank n+1
       SRVWAIT,    -- wait for server done
+      WQ_WAIT,    -- posted-write drain: wait for the server
       CLR_BRAM,   -- reset clear: sweep E..I (all five in parallel)
       CLR_SRV,    -- reset clear: issue one A..D word write
       CLR_SRVWAIT -- reset clear: wait for the server
@@ -291,6 +307,72 @@ architecture arch of nds_vram is
          end if;
       end loop;
       return n;
+   end function;
+
+   -- ==================== posted write queue (A..D) ====================
+   -- A..D leave the chip over srv_*, which takes several cycles per word. That
+   -- latency is unavoidable, but it does not have to be in the writer's way: a
+   -- write has no result to wait for. So eligible writes are queued and
+   -- acknowledged on the spot, and the queue drains behind them.
+   --
+   -- What this buys, and the whole reason it exists: it lets a DMA sustain one
+   -- 16-bit unit every two bus cycles, which is what real hardware does and what
+   -- the NITRO Tester's [04-02] measures. See docs/NTR_EVA_TESTER.md.
+   --
+   -- What it costs is a read-after-write window that silicon does not have, and
+   -- three readers can fall into it: the cpu9/cpu7 port, the renderer's rsrv
+   -- channel, and the A..D line cache. Each is closed below, and the closures
+   -- are levels rather than edges for the same reason the pre-existing srv_req
+   -- invalidation is - a level cannot be missed.
+   constant WQ_DEPTH : integer := 4;
+
+   type t_wq_entry is record
+      valid : std_logic;
+      bank  : integer range BANK_A to BANK_D;
+      addr  : unsigned(16 downto 2);
+      be    : std_logic_vector(3 downto 0);
+      din   : std_logic_vector(31 downto 0);
+   end record;
+   constant WQ_INIT : t_wq_entry := ('0', BANK_A, (others => '0'), (others => '0'), (others => '0'));
+   type t_wq is array (0 to WQ_DEPTH-1) of t_wq_entry;
+
+   signal wq       : t_wq := (others => WQ_INIT);
+   signal wq_head  : integer range 0 to WQ_DEPTH-1 := 0;
+   signal wq_tail  : integer range 0 to WQ_DEPTH-1 := 0;
+   signal wq_count : integer range 0 to WQ_DEPTH := 0;
+
+   -- combinational eligibility, so the requester can decide in the cycle it
+   -- presents the access
+   signal wq_elig     : std_logic;
+   signal wq_push_now : std_logic;
+   signal wq_bank_now : integer range 0 to 4;
+
+   -- the 64-bit renderer line the write being accepted on this edge lands in
+   signal wq_push_line : unsigned(16 downto 3);
+
+   -- Does a write that has not reached the store yet cover this 64-bit line?
+   -- Includes the one being accepted on this very edge, so a reader gated on
+   -- registered state cannot slip through the cycle in between.
+   --
+   -- This was per-BANK first, and that was far too coarse: a burst uploading into
+   -- the bank being displayed held the renderer off for the whole burst, and
+   -- tb_top_frame duly dropped a line. Real hardware interleaves DMA and render
+   -- accesses at word granularity, so blocking a whole bank is not the authentic
+   -- behaviour either. Per-line costs 5 comparators and makes the renderer wait
+   -- only when it genuinely wants the words being written.
+   function wq_touches(q : t_wq; pushv : std_logic; pbank : integer;
+                       pline : unsigned(16 downto 3);
+                       bank : integer; line : unsigned(16 downto 3)) return boolean is
+   begin
+      if (pushv = '1' and pbank = bank and pline = line) then
+         return true;
+      end if;
+      for k in 0 to WQ_DEPTH-1 loop
+         if (q(k).valid = '1' and q(k).bank = bank and q(k).addr(16 downto 3) = line) then
+            return true;
+         end if;
+      end loop;
+      return false;
    end function;
 
    -- reset clear pass: one counter for both phases (E..I sweep 0..16383,
@@ -691,8 +773,32 @@ begin
       rbram_ce(i) <= rdispatch and rchosen_hit(i);
    end generate;
 
-   -- arbitration: dispatch a latched request when the FSM is free
-   dispatch   <= '1' when (state = IDLE and (req9.valid = '1' or req7.valid = '1')) else '0';
+   -- ---- posted-write eligibility, all combinational from the live cpu9 inputs
+   -- Exactly one A..D bank and no E..I bank: a multi-bank write would need two
+   -- queue entries, and an E..I hit retires on the dispatch edge instead. Both
+   -- fall back to the cpu9_done path, which is unchanged.
+   wq_elig <= '1' when (ad_next(dec9_hit, 0) /= 4 and
+                        ad_next(dec9_hit, ad_next(dec9_hit, 0) + 1) = 4 and
+                        (dec9_hit(BANK_E) or dec9_hit(BANK_F) or dec9_hit(BANK_G) or
+                         dec9_hit(BANK_H) or dec9_hit(BANK_I)) = '0') else '0';
+
+   -- welig: postable at all. wok: and there is room for it right now. The
+   -- requester needs both, because they mean different things to it - no room is
+   -- backpressure to wait out, not postable is a reason to take the slow path.
+   cpu9_welig  <= '1' when (cpu9_wpost = '1' and cpu9_rnw = '0' and wq_elig = '1' and
+                            clr_busy = '0') else '0';
+   cpu9_wok    <= '1' when (cpu9_welig = '1' and wq_count < WQ_DEPTH) else '0';
+   wq_push_now  <= cpu9_ena and cpu9_wok;
+   wq_bank_now  <= ad_next(dec9_hit, 0);
+   wq_push_line <= dec9_offs(wq_bank_now)(16 downto 3);
+
+   -- arbitration: dispatch a latched request when the FSM is free. Holding
+   -- dispatch off while anything is queued is what keeps the cpu9/cpu7 port
+   -- ordered against the posted writes: a read cannot overtake a write that has
+   -- not reached the store, and neither can a later non-posted write. The queue
+   -- is only ever non-empty during a DMA burst, when both CPUs are paused.
+   dispatch   <= '1' when (state = IDLE and wq_count = 0 and
+                           (req9.valid = '1' or req7.valid = '1')) else '0';
    chosen_is9 <= '1' when (req9.valid = '1' and (req7.valid = '0' or prefer9 = '1')) else '0';
    chosen     <= req9 when chosen_is9 = '1' else req7;
 
@@ -850,6 +956,22 @@ begin
                end loop;
             end if;
 
+            -- ---- and the same closure for posted writes, which are acknowledged
+            -- long before srv_req rises for them. A pulse is enough here, unlike
+            -- the level above, precisely BECAUSE the issue gate below is
+            -- per-line: this drops any cached copy of the line being written on
+            -- the edge it is accepted, and the gate then keeps that line from
+            -- being refetched until the write has drained. Both read
+            -- wq_push_now combinationally, so there is no cycle in between for a
+            -- fill to slip into.
+            if (wq_push_now = '1') then
+               for i in 0 to 7 loop
+                  if (v_adl(i).bank = wq_bank_now and v_adl(i).line = wq_push_line) then
+                     v_adl(i).valid := '0';
+                  end if;
+               end loop;
+            end if;
+
             -- ---- S1: the BRAM stage. port-B q is valid the cycle after the
             -- address was presented, so this collects the request issued last
             -- cycle. It runs before the new issue below, which re-drives the
@@ -920,6 +1042,17 @@ begin
                   v_line := ad_addr(ad_scan, v_bank)(16 downto 3);
                   v_hi   := ad_addr(ad_scan, v_bank)(2);
 
+                  if (wq_touches(wq, wq_push_now, wq_bank_now, wq_push_line,
+                                 v_bank, v_line)) then
+                     -- a posted write covering this exact line has not reached the
+                     -- store yet. rsrv_* is a separate port into the same memory,
+                     -- so reading now would legitimately return pre-write data.
+                     -- Present nothing and pick this request up again once the
+                     -- queue drains - releasing the wire is the same thing the
+                     -- not-armed branch below does, and cannot wedge.
+                     rsrv_req <= '0';
+                  else
+
                   -- the channel's own cached line already holds this word: take it
                   -- now and issue nothing. This is the whole point of the 64-bit
                   -- line - the memory access for the neighbouring word already
@@ -954,6 +1087,8 @@ begin
                      v_adt   := (v_adt + 1) mod AD_DEPTH;
                      v_adcnt := v_adcnt + 1;
                   end if;
+
+                  end if;   -- wq_touches
                else
                   rsrv_req <= '0';
                end if;
@@ -1032,6 +1167,15 @@ begin
       variable v_acc  : std_logic_vector(31 downto 0);
       variable v_next : integer range 0 to 4;
 
+      -- posted-write queue, worked on as variables because a push and a pop can
+      -- land on the same edge
+      variable v_wq    : t_wq;
+      variable v_wh    : integer range 0 to WQ_DEPTH-1;
+      variable v_wt    : integer range 0 to WQ_DEPTH-1;
+      variable v_wcnt  : integer range 0 to WQ_DEPTH;
+      variable v_wprev : integer range 0 to WQ_DEPTH-1;
+      variable v_wbusy : boolean;
+
       -- Hand bank `nxt` of request `r` to the srv_* channel and wait on it.
       procedure issue_srv (r : t_req; nxt : integer) is
       begin
@@ -1066,8 +1210,16 @@ begin
          cpu9_done <= '0';
          cpu7_done <= '0';
 
-         -- request latching (ena is a single-cycle pulse)
-         if (cpu9_ena = '1') then
+         v_wq    := wq;
+         v_wh    := wq_head;
+         v_wt    := wq_tail;
+         v_wcnt  := wq_count;
+         v_wbusy := (state = WQ_WAIT);   -- the head is on the wire right now
+
+         -- request latching (ena is a single-cycle pulse). A posted write never
+         -- reaches req9: cpu9_wok already acknowledged it, and pushing it here
+         -- as well would perform it twice.
+         if (cpu9_ena = '1' and cpu9_wok = '0') then
             req9 <= ('1', cpu9_rnw, cpu9_be, cpu9_din, dec9_hit, dec9_offs);
             -- sim guard: no second op while one is in flight
             -- synthesis translate_off
@@ -1093,13 +1245,28 @@ begin
             req7.valid <= '0';
             srv_req    <= '0';
             prefer9    <= '1';
+            v_wq       := (others => WQ_INIT);
+            v_wh       := 0;
+            v_wt       := 0;
+            v_wcnt     := 0;
 
          else
 
             case state is
 
                when IDLE =>
-                  if (dispatch = '1') then
+                  -- draining outranks dispatch, and `dispatch` is gated on the
+                  -- queue being empty so the two can never both fire
+                  if (v_wcnt > 0) then
+                     srv_req  <= '1';
+                     srv_rnw  <= '0';
+                     srv_bank <= std_logic_vector(to_unsigned(v_wq(v_wh).bank, 2));
+                     srv_addr <= v_wq(v_wh).addr;
+                     srv_be   <= v_wq(v_wh).be;
+                     srv_din  <= v_wq(v_wh).din;
+                     state    <= WQ_WAIT;
+                     v_wbusy  := true;   -- blocks a merge into it on this edge
+                  elsif (dispatch = '1') then
                      cur     <= chosen;
                      cur_is9 <= chosen_is9;
                      acc     <= (others => '0');
@@ -1173,6 +1340,18 @@ begin
                      end if;
                   end if;
 
+               when WQ_WAIT =>
+                  -- a posted write has no result and nobody is waiting on it, so
+                  -- retiring it is just a pop
+                  if (srv_done = '1') then
+                     srv_req          <= '0';
+                     v_wq(v_wh).valid := '0';
+                     v_wh             := (v_wh + 1) mod WQ_DEPTH;
+                     v_wcnt           := v_wcnt - 1;
+                     v_wbusy          := false;
+                     state            <= IDLE;
+                  end if;
+
                -- ===================== reset clear pass =====================
                -- E..I first (one word per cycle into all five BRAMs), then the
                -- four SDRAM-backed banks over the srv_* write channel. No CPU
@@ -1216,7 +1395,43 @@ begin
 
             end case;
 
+            -- ---- posted write accept. Runs after the FSM so that v_wh/v_wcnt
+            -- and v_wbusy already reflect any pop or issue on this edge, which is
+            -- what makes the merge test below exact rather than conservative.
+            --
+            -- Merging is not an optimisation here, it is the reason the queue
+            -- keeps up: a writer producing a halfword every two cycles produces a
+            -- WORD every four, and srv_* sustains one every three. Without
+            -- merging it would want one every two and the queue would back up.
+            -- Adjacent halfwords of a 16-bit DMA burst land in the same word, so
+            -- the tail entry is nearly always the right one to fold into.
+            if (wq_push_now = '1') then
+               v_wprev := (v_wt + WQ_DEPTH - 1) mod WQ_DEPTH;
+               if (v_wcnt > 0 and v_wq(v_wprev).valid = '1' and
+                   v_wq(v_wprev).bank = wq_bank_now and
+                   v_wq(v_wprev).addr = dec9_offs(wq_bank_now)(16 downto 2) and
+                   not (v_wprev = v_wh and v_wbusy)) then
+                  for j in 0 to 3 loop
+                     if (cpu9_be(j) = '1') then
+                        v_wq(v_wprev).din(j*8 + 7 downto j*8) := cpu9_din(j*8 + 7 downto j*8);
+                     end if;
+                  end loop;
+                  v_wq(v_wprev).be := v_wq(v_wprev).be or cpu9_be;
+               else
+                  v_wq(v_wt) := ('1', wq_bank_now,
+                                 dec9_offs(wq_bank_now)(16 downto 2), cpu9_be, cpu9_din);
+                  v_wt   := (v_wt + 1) mod WQ_DEPTH;
+                  v_wcnt := v_wcnt + 1;
+               end if;
+            end if;
+
          end if;
+
+         wq       <= v_wq;
+         wq_head  <= v_wh;
+         wq_tail  <= v_wt;
+         wq_count <= v_wcnt;
+
       end if;
    end process;
 
