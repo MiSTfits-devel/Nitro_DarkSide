@@ -398,6 +398,13 @@ architecture arch of nds_gpu2d is
 
    signal ypos_mosaic_bg  : integer range 0 to 191;
    signal ypos_mosaic_obj : integer range 0 to 191;
+   -- mosaic y counters (see the mosaic y block) - these replace two general
+   -- dividers, so they must stay 4-bit counters and not grow an operator
+   signal mos_bgy     : integer range 0 to 15  := 0;
+   signal mos_bgy_max : integer range 0 to 15  := 0;
+   signal mos_bgbase  : integer range 0 to 191 := 0;
+   signal mos_objcnt  : integer range 0 to 15  := 0;
+   signal mos_objbase : integer range 0 to 191 := 0;
 
    signal merge_out666    : std_logic_vector(17 downto 0);
 
@@ -573,9 +580,94 @@ begin
       end if;
    end process;
 
-   -- mosaic y
-   ypos_mosaic_bg  <= linecounter     - (linecounter     mod (to_integer(unsigned(R_mos_bgv))  + 1));
-   ypos_mosaic_obj <= linecounter_obj - (linecounter_obj mod (to_integer(unsigned(R_mos_objv)) + 1));
+   -- ================= mosaic y =================
+   -- These two used to be `linecounter mod (size + 1)`. A variable divisor
+   -- makes Quartus build a general divider: lpm_divide:Mod0 and Mod1, a
+   -- MEASURED 37.7 + 35.6 ALMs per engine and 146 across both, for a row snap
+   -- that a 4-bit counter and a subtract do exactly.
+   --
+   -- The counter is also what the hardware does. melonDS: "Y mosaic uses
+   -- incrementing 4-bit counters" (GPU2D.cpp UpdateMosaicCounters), and the
+   -- two forms differ in two ways whenever MOSAIC is written mid-frame:
+   --
+   --   * BGMosaicYMax is re-latched from MOSAIC only when the counter WRAPS
+   --     (GPU2D_Soft.cpp, end of DrawScanline_BGOBJ), so a mid-frame write
+   --     takes effect at the next block boundary, not on the next line;
+   --   * the counter carries phase from the frame start, so it does not jump
+   --     when the size changes, where the divider re-snaps against absolute
+   --     linecounter.
+   --
+   -- So this is a divergence FIX as well as an area cut, and it is not a speed
+   -- change - it takes a divider out of a combinational path feeding the
+   -- drawers and puts a register there.
+   --
+   -- Phase, which has to stay identical to the divider for constant MOSAIC:
+   -- melonDS updates AFTER drawing a line and clears at VBlankEnd, so block 0
+   -- starts at line 0 and each block is size+1 lines. refpoint_update fires on
+   -- lines 1..191 only (nds_gpu_timing.vhd) and lands before drawline in the
+   -- same line, so line 0 sees the counter at 0 and line L sees it after L
+   -- advances - the same snap the divider gave. sim/run_mosaic_equiv.sh proves
+   -- that over every line x every size.
+   -- Tracked as the block BASE, not as an offset subtracted from linecounter.
+   -- refpoint_update for line L lands before drawline sets linecounter <= L, so
+   -- at this tick linecounter still holds L-1 and the line the tick belongs to
+   -- is linecounter + 1. Driving `linecounter - mos_bgy` instead is what
+   -- run_gpu2d caught: in the window between the two pulses the counter has
+   -- advanced and linecounter has not, and the line 0 -> 1 tick drove
+   -- ypos_mosaic_bg to -1. A base register is valid at every instant rather
+   -- than only when the drawers happen to sample it.
+   process (clk)
+   begin
+      if rising_edge(clk) then
+         if (reset = '1' or vblank_trigger = '1') then
+            mos_bgy     <= 0;
+            mos_bgy_max <= to_integer(unsigned(R_mos_bgv));
+            mos_bgbase  <= 0;
+         elsif (refpoint_update = '1') then
+            if (mos_bgy >= mos_bgy_max) then
+               mos_bgy     <= 0;
+               mos_bgy_max <= to_integer(unsigned(R_mos_bgv));
+               -- refpoint_update only fires on lines 1..191, so linecounter is
+               -- 0..190 here and the clamp never engages; it is a range guard,
+               -- not behaviour.
+               if (linecounter < 191) then
+                  mos_bgbase <= linecounter + 1;
+               else
+                  mos_bgbase <= 191;
+               end if;
+            else
+               mos_bgy <= mos_bgy + 1;
+            end if;
+         end if;
+      end if;
+   end process;
+
+   ypos_mosaic_bg <= mos_bgbase;
+
+   -- OBJ renders one line ahead, so linecounter_obj is already melonDS's
+   -- "line + 1" - the value UpdateMosaicCounters stores in OBJMosaicY on a
+   -- wrap - and the base is used directly as the sampled row rather than as an
+   -- offset. drawObj lands at the same point in the line as drawline, and the
+   -- base register updates on that edge, so it is stable for the line the
+   -- pulse starts. The counter is preloaded to the size at vblank so the first
+   -- pulse of the frame wraps and latches base = line 0.
+   process (clk)
+   begin
+      if rising_edge(clk) then
+         if (reset = '1' or vblank_trigger = '1') then
+            mos_objcnt <= to_integer(unsigned(R_mos_objv));
+         elsif (drawObj = '1') then
+            if (mos_objcnt >= to_integer(unsigned(R_mos_objv))) then
+               mos_objcnt  <= 0;
+               mos_objbase <= linecounter_obj;
+            else
+               mos_objcnt <= mos_objcnt + 1;
+            end if;
+         end if;
+      end if;
+   end process;
+
+   ypos_mosaic_obj <= mos_objbase;
 
    -- ================= affine internal refs =================
    process (clk)
