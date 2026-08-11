@@ -422,3 +422,66 @@ DMA firings, and `[04-03]` checks address patterns. So this one test gates four
 that are probably close to passing already, and it cannot be reached any other
 way — the cart halts on first failure. Nothing short of the datapath work above
 moves `PROGRESS` off `011`.
+
+### Closing the cadence: stage 1 done, measured
+
+`nds_dma9` now carries a `translate_off` census (`p_census`) that splits the
+per-unit cost into read wait, write wait and FSM states, printed once per
+completed transfer. That is what the stages below are steered by — the first
+guess (the VRAM A..D backing) was wrong, and only the census showed it.
+
+**Stage 1 (`9990b7e`): clk1x fast lane into the IO fabric, and NEXTUNIT removed.**
+The 5-cycle read wait was constant across every destination, so it was not the
+memory at all — it was the island bridge. `nds_dma9` is already a clk1x unit, so
+`nds_top` now hands it `io_bus9` directly for as long as `dma_bus_on` is held.
+No arbitration is needed: `dma_on` pauses the CPU, the grant waits for
+`cpu_bus_idle`, and that only returns to `'1'` on `gb_bus_done`, so the island has
+nothing in flight. `io_wired_out9` is the clk1x wired-OR the peripherals already
+drive, valid in the cycle the address is presented.
+
+| destination | rd_wait | wr_wait | fsm | total | was |
+|---|---|---|---|---|---|
+| palette | 1 | 3 | 2 | **6** | 11 |
+| VRAM E | 1 | 8 | 2 | **11** | 16 |
+| VRAM D | 1 | 12 | 2 | **15** | 20 |
+
+Two gotchas for anyone extending the fast lane: it bypasses `nds_membus9`, so it
+must redo the read rotation and the byte enables itself, and the IO fabric decodes
+with the **region nibble stripped** (`x"0" & adr(23:2) & "00"` — this module's own
+`ADR_BASE` is `x"00000B0"`). Driving the unstripped address matches no peripheral
+and reads 0, indistinguishable from the bug in `8a99e81`.
+
+**Stage 2, not done: VRAM fast lane + collapse `nds_vram`'s CPU FSM.** Of the 12
+cycles a VRAM D write costs, ~4 are `nds_membus9` plus the same island CDC, and ~8
+are `nds_vram`'s own FSM around a 3-cycle `vsrv` op — request latch, dispatch,
+`SRVSCAN`, `SRVWAIT`, a second `SRVSCAN` that finds nothing, then `FINISH`. The
+second scan and `FINISH` are pure overhead: spotting the last bank during
+`SRVWAIT` and asserting done from there saves ~2, and a clk1x mux on `nds_vram`'s
+`cpu9` port (same `dma_bus_on` argument as above) saves the ~4. Expect 15 -> ~8.
+Contained and low risk, but **not sufficient** — the 3-cycle `vsrv` round trip
+still sits in the middle of every unit.
+
+**Stage 3, not done and the risky one: posted, write-combining A..D writes.**
+This is what actually reaches 2. The arithmetic works out, which is the reason the
+whole project is worth doing:
+
+* `vsrv` sustains one 32-bit word every 3 cycles (the tb model; `NDS.sv` ch1 on
+  hardware is the open question and must be measured before relying on this).
+* Combining two 16-bit units into one word means the drain needs one word every
+  **4** cycles to hold 2 cycles/unit.
+* 3 < 4, so it fits with ~25% headroom.
+
+So: accept the write into a short queue and ack it in one cycle, combine adjacent
+halfwords into words, and drain over `vsrv` bypassing the per-op FSM. Note this
+does *not* extend to 32-bit DMA units into A..D — those would need a word every 2
+cycles and `vsrv` gives one every 3 — but no test in this cart measures that.
+
+**The hazard to design against.** Posting creates a read-after-write window that
+hardware does not have, because on silicon a VRAM write is a single cycle. The
+renderer reads A..D over the *separate* `rsrv`/`vrsrv` channel straight to the same
+backing store, so a queued write is invisible to it until it drains — and the
+existing `adline` invalidation only covers the line cache, not the store behind
+it. A correct design has to either drain before serving a renderer read of an
+affected address, or snoop the queue into that path. Getting this wrong produces
+per-game graphics corruption rather than an obvious failure, so it wants its own
+`tb_vram_torture` case before it goes anywhere near a build.
