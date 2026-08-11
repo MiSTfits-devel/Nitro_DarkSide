@@ -15,7 +15,10 @@ entity gba_timer_module is
       Reg_H_Prescaler        : regmap_type;
       Reg_H_Count_up         : regmap_type;
       Reg_H_Timer_IRQ_Enable : regmap_type;
-      Reg_H_Timer_Start_Stop : regmap_type
+      Reg_H_Timer_Start_Stop : regmap_type;
+      -- See the iSAVESTATE_TIMER comment below: '1' drops the savestate
+      -- register this core never writes, '0' builds it.
+      SS_PRESET_ONLY         : std_logic := '1'
    );
    port 
    (
@@ -81,7 +84,22 @@ begin
    SAVESTATE_TIMER_BACK(18 downto 2)  <= '0' & std_logic_vector(counter);        
    SAVESTATE_TIMER_BACK(29 downto 19) <= '0' & std_logic_vector(prescalecounter) when (index = 0) else (others => '0');
 
-   iSAVESTATE_TIMER : entity work.eProcReg_gba generic map (REG_SAVESTATE_TIMER, index) port map (clk, savestate_bus, ss_wired_out, ss_wired_done, SAVESTATE_TIMER_BACK, SAVESTATE_TIMER);
+   -- REG_SAVESTATE_TIMER covers addresses 62-65. nds_top's boot preset only
+   -- writes savestate addresses 0, 13, 14, 15, 24, 34 and 37 (preset_adr in
+   -- nds_top.vhd), and nds_top maps this unit's ss_wired_out/ss_wired_done to
+   -- `open`, so neither direction of this register is reachable: it holds its
+   -- startVal of 0 forever. Dropping it is bit-exact - the reset load below
+   -- lands timer_on = 0 and counter = 0 either way - and costs no speed, since
+   -- SAVESTATE_TIMER is only read in the reset branch. Four of these per timer
+   -- unit, two units.
+   gss_full : if SS_PRESET_ONLY = '0' generate
+      iSAVESTATE_TIMER : entity work.eProcReg_gba generic map (REG_SAVESTATE_TIMER, index) port map (clk, savestate_bus, ss_wired_out, ss_wired_done, SAVESTATE_TIMER_BACK, SAVESTATE_TIMER);
+   end generate;
+   gss_preset : if SS_PRESET_ONLY = '1' generate
+      SAVESTATE_TIMER <= (others => '0');
+      ss_wired_out    <= (others => '0');
+      ss_wired_done   <= '0';
+   end generate;
 
 
    iL_Counter_Reload   : entity work.eProcReg_gba generic map ( Reg_L                  ) port map  (clk, gb_bus, reg_wired_or(0), reg_wired_done(0), counter_readback   , L_Counter_Reload   , open, L_Counter_Reload_writeValue  , L_Counter_Reload_writeTo);  

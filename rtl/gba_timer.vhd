@@ -9,7 +9,10 @@ use work.pReg_savestates.all;
 entity gba_timer is
    generic
    (
-      is_simu : std_logic
+      is_simu : std_logic;
+      -- See the iSAVESTATE_TIMER comment below: '1' drops the savestate
+      -- registers this core never writes, '0' builds them.
+      SS_PRESET_ONLY : std_logic := '1'
    );
    port 
    (
@@ -57,7 +60,19 @@ architecture arch of gba_timer is
  
 begin 
 
-   iSAVESTATE_TIMER : entity work.eProcReg_gba generic map (REG_SAVESTATE_TIMER, 0) port map (clk, savestate_bus, open, open, 30x"0", SAVESTATE_TIMER);
+   -- REG_SAVESTATE_TIMER is at address 62 (size 4, so 62-65). nds_top's boot
+   -- preset only ever writes savestate addresses 0, 13, 14, 15, 24, 34 and 37
+   -- (preset_adr in nds_top.vhd) and never reads the bus back, so this
+   -- register can only ever hold its startVal of 0 - it exists purely so
+   -- Quartus can build 30 flops that never change. Tying it to 0 is bit-exact:
+   -- the reset load below already lands 0 in prescaleCounter either way.
+   -- Set SS_PRESET_ONLY = '0' to get the register back with savestates.
+   gss_full : if SS_PRESET_ONLY = '0' generate
+      iSAVESTATE_TIMER : entity work.eProcReg_gba generic map (REG_SAVESTATE_TIMER, 0) port map (clk, savestate_bus, open, open, 30x"0", SAVESTATE_TIMER);
+   end generate;
+   gss_preset : if SS_PRESET_ONLY = '1' generate
+      SAVESTATE_TIMER <= (others => '0');
+   end generate;
 
    process (reg_wired_or)
       variable wired_or : std_logic_vector(31 downto 0);

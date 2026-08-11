@@ -10,7 +10,12 @@ use work.pReg_savestates.all;
 entity gba_cpu is
    generic
    (
-      is_simu : std_logic
+      is_simu : std_logic;
+      -- '1' builds only the seven savestate registers nds_top's boot preset
+      -- actually writes and ties the rest to their startVal. See the
+      -- "savestates" block below for why that is bit-exact. '0' restores the
+      -- full bus, which is what a real savestate implementation would need.
+      SS_PRESET_ONLY : std_logic := '1'
    );
    port 
    (
@@ -472,6 +477,34 @@ begin
    cpu_halt   <= decode_halt;
    
    -- savestates
+   -- ---------------------------------------------------------------------
+   -- This core has no savestates. nds_top drives the savestate bus for
+   -- exactly one purpose - presetting the boot PC and the r13 banks before it
+   -- releases CPU reset (see preset_adr/preset_val in nds_top.vhd, and the
+   -- comment there on why presetting the PC alone is not enough) - and it
+   -- never reads the bus back: ss_wired_out and ss_wired_done are `open` at
+   -- every one of the four instantiations, and the debugger reads registers
+   -- through the separate dbg_regsel/dbg_regval port instead.
+   --
+   -- So the bus only ever carries writes to REG_SAVESTATE addresses
+   -- 0, 13, 14, 15, 24, 34 and 37. Every other register on it sits at its
+   -- declared startVal for the life of the design - but Quartus cannot prove
+   -- that, because proc_bus.Adr is a runtime value, so it builds all 47 of
+   -- them. That is a MEASURED 870 ALMs across cpu9/cpu7/itimer9/itimer7
+   -- (~3,000 flops) that can never change value, on a design that fits at
+   -- 100% with 21 ALMs to spare.
+   --
+   -- gss_preset therefore instantiates only the seven live registers and ties
+   -- the rest to their startVal. Bit-exact by construction, and it is NOT a
+   -- speed change - none of this is in a timing path, it is reset plumbing.
+   --
+   -- CPUMIXED's startVal is 0xCC0, NOT zero: bits 9:6 are cpu_mode = 3 =
+   -- supervisor, and bits 11:10 disable FIQ and IRQ. That is the reset mode
+   -- both CPUs come up in and the reason nds_top can treat the plain r13 at
+   -- address 14 as the supervisor stack. Tying this one off to zero instead
+   -- would boot the ARM9 in user mode with interrupts already enabled.
+   gss_full : if SS_PRESET_ONLY = '0' generate
+   begin
    gSAVESTATE_REGS : for i in 0 to 15 generate
    begin
       iSAVESTATE_REGS : entity work.eProcReg_gba generic map (REG_SAVESTATE_REGS, i) port map (clk, savestate_bus, save_wired_or(i), save_wired_done(i), std_logic_vector(regs(i)) , SAVESTATE_REGS(i));
@@ -522,7 +555,71 @@ begin
       ss_wired_out <= wired_or;
    end process;
    ss_wired_done <= '0' when (save_wired_done = 0) else '1';
-   
+   end generate;
+
+   gss_preset : if SS_PRESET_ONLY = '1' generate
+   begin
+      -- The seven registers nds_top's preset_adr actually writes. wired_out is
+      -- mapped `open` so the per-register read mux and the 47-deep OR tree
+      -- behind it go away too; nothing upstream reads either.
+      --
+      -- REG_SAVESTATE_REGS is a size-18 block based at 1, so rN is at 1+N:
+      -- addresses 13/14/15 are r12/r13/r14.
+      gkeep_regs : for i in 12 to 14 generate
+      begin
+         iSAVESTATE_REGS : entity work.eProcReg_gba generic map (REG_SAVESTATE_REGS, i) port map (clk, savestate_bus, open, open, std_logic_vector(regs(i)) , SAVESTATE_REGS(i));
+      end generate;
+
+      iSAVESTATE_PC        : entity work.eProcReg_gba generic map (REG_SAVESTATE_PC       ) port map (clk, savestate_bus, open, open, SAVESTATE_PC_out            , SAVESTATE_PC_in);
+
+      -- r13 banks: 24 = user/system, 34 = IRQ, 37 = supervisor
+      iSAVESTATE_REGS_0_13 : entity work.eProcReg_gba generic map (REG_SAVESTATE_REGS_0_13) port map (clk, savestate_bus, open, open, std_logic_vector(regs_0_13) , SAVESTATE_REGS_0_13);
+      iSAVESTATE_REGS_2_13 : entity work.eProcReg_gba generic map (REG_SAVESTATE_REGS_2_13) port map (clk, savestate_bus, open, open, std_logic_vector(regs_2_13) , SAVESTATE_REGS_2_13);
+      iSAVESTATE_REGS_3_13 : entity work.eProcReg_gba generic map (REG_SAVESTATE_REGS_3_13) port map (clk, savestate_bus, open, open, std_logic_vector(regs_3_13) , SAVESTATE_REGS_3_13);
+
+      -- Never written on this bus -> permanently startVal. All of these
+      -- declare startVal 0 in reg_savestates.vhd; CPUMIXED does not.
+      gzero_lo : for i in 0 to 11 generate
+      begin
+         SAVESTATE_REGS(i) <= (others => '0');
+      end generate;
+      SAVESTATE_REGS(15)  <= (others => '0');
+
+      SAVESTATE_REGS_0_8  <= (others => '0');
+      SAVESTATE_REGS_0_9  <= (others => '0');
+      SAVESTATE_REGS_0_10 <= (others => '0');
+      SAVESTATE_REGS_0_11 <= (others => '0');
+      SAVESTATE_REGS_0_12 <= (others => '0');
+      SAVESTATE_REGS_0_14 <= (others => '0');
+      SAVESTATE_REGS_1_8  <= (others => '0');
+      SAVESTATE_REGS_1_9  <= (others => '0');
+      SAVESTATE_REGS_1_10 <= (others => '0');
+      SAVESTATE_REGS_1_11 <= (others => '0');
+      SAVESTATE_REGS_1_12 <= (others => '0');
+      SAVESTATE_REGS_1_13 <= (others => '0');
+      SAVESTATE_REGS_1_14 <= (others => '0');
+      SAVESTATE_REGS_1_17 <= (others => '0');
+      SAVESTATE_REGS_2_14 <= (others => '0');
+      SAVESTATE_REGS_2_17 <= (others => '0');
+      SAVESTATE_REGS_3_14 <= (others => '0');
+      SAVESTATE_REGS_3_17 <= (others => '0');
+      SAVESTATE_REGS_4_13 <= (others => '0');
+      SAVESTATE_REGS_4_14 <= (others => '0');
+      SAVESTATE_REGS_4_17 <= (others => '0');
+      SAVESTATE_REGS_5_13 <= (others => '0');
+      SAVESTATE_REGS_5_14 <= (others => '0');
+      SAVESTATE_REGS_5_17 <= (others => '0');
+
+      -- 0xCC0: cpu_mode = 3 (supervisor), IRQ and FIQ disabled. See above -
+      -- this is the one startVal on the bus that is not zero, and the boot
+      -- flow depends on it.
+      SAVESTATE_mixed_in <= std_logic_vector(to_unsigned(16#CC0#, 12));
+
+      ss_wired_out  <= (others => '0');
+      ss_wired_done <= '0';
+   end generate;
+
+
    SAVESTATE_mixed_out(0) <= decode_halt;           
    SAVESTATE_mixed_out(1) <= Flag_Zero;     
    SAVESTATE_mixed_out(2) <= Flag_Carry;     

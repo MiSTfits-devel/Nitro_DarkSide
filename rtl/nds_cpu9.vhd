@@ -27,7 +27,10 @@ use work.pReg_savestates.all;
 entity nds_cpu9 is
    generic
    (
-      is_simu : std_logic
+      is_simu : std_logic;
+      -- See the "savestates" block below. '1' builds only the seven savestate
+      -- registers nds_top's boot preset writes; '0' restores the full bus.
+      SS_PRESET_ONLY : std_logic := '1'
    );
    port 
    (
@@ -674,6 +677,21 @@ begin
    end process;
    
    -- savestates
+   -- ---------------------------------------------------------------------
+   -- This core has no savestates - the bus exists only so nds_top can preset
+   -- the boot PC and the r13 banks before it releases CPU reset, and nothing
+   -- ever reads it back (ss_wired_out/ss_wired_done are `open` at all four
+   -- instantiations; the debugger uses dbg_regsel/dbg_regval instead). Only
+   -- addresses 0, 13, 14, 15, 24, 34 and 37 are ever written, so every other
+   -- register here sits at its startVal forever - but Quartus cannot prove it
+   -- because proc_bus.Adr is a runtime value, and builds all 47. That is a
+   -- MEASURED 870 ALMs across cpu9/cpu7/itimer9/itimer7 that can never
+   -- change, on a design fitting at 100%. Bit-exact to remove, and not a
+   -- timing change - this is reset plumbing. Full rationale, including why
+   -- CPUMIXED's startVal of 0xCC0 (supervisor, IRQ/FIQ disabled) must be
+   -- preserved rather than zeroed, is in the matching block in gba_cpu.vhd.
+   gss_full : if SS_PRESET_ONLY = '0' generate
+   begin
    gSAVESTATE_REGS : for i in 0 to 15 generate
    begin
       iSAVESTATE_REGS : entity work.eProcReg_gba generic map (REG_SAVESTATE_REGS, i) port map (clk, savestate_bus, save_wired_or(i), save_wired_done(i), std_logic_vector(regs(i)) , SAVESTATE_REGS(i));
@@ -724,7 +742,67 @@ begin
       ss_wired_out <= wired_or;
    end process;
    ss_wired_done <= '0' when (save_wired_done = 0) else '1';
-   
+   end generate;
+
+   gss_preset : if SS_PRESET_ONLY = '1' generate
+   begin
+      -- The seven registers nds_top's preset_adr actually writes. wired_out is
+      -- `open`, so each register's read mux and the 47-deep OR tree behind it
+      -- go away too. REG_SAVESTATE_REGS is a size-18 block based at 1, so rN
+      -- is at 1+N: addresses 13/14/15 are r12/r13/r14.
+      gkeep_regs : for i in 12 to 14 generate
+      begin
+         iSAVESTATE_REGS : entity work.eProcReg_gba generic map (REG_SAVESTATE_REGS, i) port map (clk, savestate_bus, open, open, std_logic_vector(regs(i)) , SAVESTATE_REGS(i));
+      end generate;
+
+      iSAVESTATE_PC        : entity work.eProcReg_gba generic map (REG_SAVESTATE_PC       ) port map (clk, savestate_bus, open, open, SAVESTATE_PC_out            , SAVESTATE_PC_in);
+
+      -- r13 banks: 24 = user/system, 34 = IRQ, 37 = supervisor
+      iSAVESTATE_REGS_0_13 : entity work.eProcReg_gba generic map (REG_SAVESTATE_REGS_0_13) port map (clk, savestate_bus, open, open, std_logic_vector(regs_0_13) , SAVESTATE_REGS_0_13);
+      iSAVESTATE_REGS_2_13 : entity work.eProcReg_gba generic map (REG_SAVESTATE_REGS_2_13) port map (clk, savestate_bus, open, open, std_logic_vector(regs_2_13) , SAVESTATE_REGS_2_13);
+      iSAVESTATE_REGS_3_13 : entity work.eProcReg_gba generic map (REG_SAVESTATE_REGS_3_13) port map (clk, savestate_bus, open, open, std_logic_vector(regs_3_13) , SAVESTATE_REGS_3_13);
+
+      -- Never written on this bus -> permanently startVal, which is 0 for all
+      -- of these in reg_savestates.vhd.
+      gzero_lo : for i in 0 to 11 generate
+      begin
+         SAVESTATE_REGS(i) <= (others => '0');
+      end generate;
+      SAVESTATE_REGS(15)  <= (others => '0');
+
+      SAVESTATE_REGS_0_8  <= (others => '0');
+      SAVESTATE_REGS_0_9  <= (others => '0');
+      SAVESTATE_REGS_0_10 <= (others => '0');
+      SAVESTATE_REGS_0_11 <= (others => '0');
+      SAVESTATE_REGS_0_12 <= (others => '0');
+      SAVESTATE_REGS_0_14 <= (others => '0');
+      SAVESTATE_REGS_1_8  <= (others => '0');
+      SAVESTATE_REGS_1_9  <= (others => '0');
+      SAVESTATE_REGS_1_10 <= (others => '0');
+      SAVESTATE_REGS_1_11 <= (others => '0');
+      SAVESTATE_REGS_1_12 <= (others => '0');
+      SAVESTATE_REGS_1_13 <= (others => '0');
+      SAVESTATE_REGS_1_14 <= (others => '0');
+      SAVESTATE_REGS_1_17 <= (others => '0');
+      SAVESTATE_REGS_2_14 <= (others => '0');
+      SAVESTATE_REGS_2_17 <= (others => '0');
+      SAVESTATE_REGS_3_14 <= (others => '0');
+      SAVESTATE_REGS_3_17 <= (others => '0');
+      SAVESTATE_REGS_4_13 <= (others => '0');
+      SAVESTATE_REGS_4_14 <= (others => '0');
+      SAVESTATE_REGS_4_17 <= (others => '0');
+      SAVESTATE_REGS_5_13 <= (others => '0');
+      SAVESTATE_REGS_5_14 <= (others => '0');
+      SAVESTATE_REGS_5_17 <= (others => '0');
+
+      -- 0xCC0: cpu_mode = 3 (supervisor), IRQ and FIQ disabled. The one
+      -- startVal on this bus that is not zero, and the boot flow needs it.
+      SAVESTATE_mixed_in <= std_logic_vector(to_unsigned(16#CC0#, 12));
+
+      ss_wired_out  <= (others => '0');
+      ss_wired_done <= '0';
+   end generate;
+
    SAVESTATE_mixed_out(0) <= decode_halt;           
    SAVESTATE_mixed_out(1) <= Flag_Zero;     
    SAVESTATE_mixed_out(2) <= Flag_Carry;     
