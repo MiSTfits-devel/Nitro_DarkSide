@@ -485,3 +485,93 @@ it. A correct design has to either drain before serving a renderer read of an
 affected address, or snoop the queue into that path. Getting this wrong produces
 per-game graphics corruption rather than an obvious failure, so it wants its own
 `tb_vram_torture` case before it goes anywhere near a build.
+
+## 2026-08-11 (later still): stages 2 and 3 done — the cadence is 2
+
+`[04-02]`'s own workload now measures exactly what hardware measures:
+
+    distinct low-priority deltas over all 2047 steps: [2]
+
+Cycles per 16-bit DMA unit, measured with `sim/tests/dmaprio` at each step:
+
+| destination | start | stage 1 | stage 2 | stage 3 | hardware |
+|---|---|---|---|---|---|
+| IO -> palette | 11 | 6 | 6 | 5 | |
+| IO -> VRAM E (BRAM) | 16 | 11 | 6 | 4 | |
+| IO -> VRAM D (off-chip) | 20 | 15 | **9** | **2** | 2 |
+| VRAM D -> VRAM E | — | — | — | 9 | |
+
+**Stage 2** was two independent things. `nds_vram`'s CPU FSM ran `SRVSCAN` twice
+per single-bank access — once to pick the bank, once afterwards purely to
+discover there was no next one — then `FINISH` to hand back the result. Picking
+is a combinational function of the hit mask, so it folds into the cycles that
+already know the answer. `SRVSCAN` survives only for multi-bank accesses, where
+it is not overhead: `srv_req` has to drop for a cycle between ops. And
+`nds_dma9` now addresses `nds_vram` directly while it holds the bus, the same
+lane it already had into the IO fabric. VRAM E ended up costing what the palette
+costs — the entire difference had been the island round trip.
+
+**Stage 3** is what reaches 2, and it needed both halves at once, because 2
+cycles is one read plus one write with no slack anywhere:
+
+* **Posted writes.** An eligible A..D write (single bank, no E..I) goes into a
+  3-entry queue and is acknowledged in the cycle it is presented. It keeps up
+  because it **write-combines**: a writer producing a halfword every 2 cycles
+  produces a *word* every 4, and the drain is one word per 4. Combining is
+  load-bearing, not an optimisation — without it the queue wants a word every 2
+  and backs up.
+* **Single-cycle requests.** The fast-lane request outputs were registered,
+  costing a cycle to present and another to capture. They are combinational from
+  `state` now, so `RD` and `WR` are one cycle each.
+
+Note 2 is a *ceiling as well as a floor*: pipelining read against write would
+give 1 cycle/unit and **fail** the test for being faster than hardware.
+
+### The read-after-write window, and who closes it
+
+Posting acknowledges a write before it reaches the store. Three readers can see
+pre-write data, and each closure is a level or a same-edge combinational pulse —
+never a registered edge, which would leave a cycle to slip through:
+
+| reader | closure |
+|---|---|
+| `cpu9`/`cpu7` port | `dispatch` held off while anything is queued, **and** the FSM drains before it dispatches. Either alone suffices; both are there. |
+| renderer `rsrv` channel | per-64-bit-**line** issue gate. Per-bank was the first cut and cost a dropped line — a burst into the displayed bank held the renderer off for the whole burst. |
+| A..D line cache | any cached line of the written **bank** invalidated on the accept edge. Per-bank here is an area call; it is safe because over-invalidating only costs refetches. |
+
+### Two traps worth remembering
+
+**The area wall is real and it is 2 LABs wide.** Stage 3 first fitted at 41,653
+ALMs / 4,203 LABs against 4,191 on the device. The core already sat at 41,388 /
+**4,189** — see `docs/TICKET-arm9-2to1-timing.md`. `WQ_DEPTH` and the
+invalidation granularity are both area decisions, not comfort ones. Anything
+added to this core has to pay for itself in registers.
+
+**A read-after-write test that reads in write order proves nothing.** The first
+version of the `tb_vram_torture` posted phase passed with *both* ordering guards
+removed, because reading ascending only ever reads words that have already
+drained. It has to read **newest first**, and the queue has to be full so
+entries are still sitting behind the one on the wire. Verified by mutation:
+breaking the byte-enable merge, or removing both guards, now fails it.
+
+### Coverage
+
+`tb_vram_torture` drives `cpu9_wpost` the way `nds_dma9` does — 136 posted ops,
+219 cycles of genuine queue-full backpressure, halfword pairs that must merge, a
+non-postable E..I write that must fall back and still land.
+
+`sim/tests/dmaprio` additionally DMAs 1024 units into bank A while BG0 fetches
+from bank A, which is the only thing that enters the renderer hazard path at
+all, and copies VRAM D -> VRAM E for the DMA's VRAM *read* path.
+
+`examples/vram_dma_2d` is a BlocksDS ROM for the half no testbench covers:
+whether the renderer *sees* the right pixels. It sweeps the 2D BG modes and in
+each one DMAs into bank A mid-frame, including one burst per visible line, then
+reports PASS/FAIL and measured cycles per unit on the sub screen. It runs
+unattended on purpose. It measures 2/unit for 16-bit and **3/unit for 32-bit** —
+a word cannot be combined, so the queue backpressures. Hardware does 32-bit
+units in 2; nothing in this cart measures them.
+
+**Still not done: preemption** of a running lower-priority channel by a higher
+one. Real hardware behaviour, not needed for `[04-02]`, and implementing it
+raises the bar — the handover must cost zero extra cycles.
