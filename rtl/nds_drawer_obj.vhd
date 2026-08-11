@@ -368,14 +368,45 @@ architecture arch of nds_drawer_obj is
    -- pqfull was the entire stall, wqfull and unacc were flat zero, so the
    -- walk was never short of request slots. It was short of ROOM TO RUN.
    --
-   -- 16 recovers 43% of the stall (frame-bench totals, stall 2056 -> 1177,
-   -- drawer time 17485 -> 16629). 32 is worth another 2% and is not taken.
+   -- 16 recovered 43% of the stall (frame-bench totals, stall 2056 -> 1177,
+   -- drawer time 17485 -> 16629). 32 was worth another 2% and was not taken.
    -- WQ_DEPTH is deliberately NOT raised with it: measured at 4/5/6 the
    -- numbers are identical, so the extra in-flight slots buy nothing, and
    -- the gpu2d arbiter only tracks 8 ops across ALL FOUR drawers - OBJ
    -- taking more of them would come straight out of the BGs.
-   constant PQ_DEPTH : integer := 16;  -- pixels queued between walk and pixels
-   constant WQ_DEPTH : integer := 4;   -- VRAM words tracked in flight
+   --
+   -- 2026-08-10: CUT BACK 16 -> 4, because the reason 16 paid has gone. That
+   -- measurement was taken while the affine and extended BG drawers were still
+   -- serial; they held the arbiter and starved this drawer, so run-ahead was
+   -- the only way to hide the wait. Pipelining them (v2, since merged into
+   -- nds_drawer_affext) halved BG VRAM traffic - engine-A frame bench,
+   -- renderer busy 2586 -> 1221 cycles/line on the affine case - and OBJ now
+   -- gets the request slots it used to queue for. Re-measured on the frame
+   -- bench at 16 / 8 / 4, WITH those drawers in:
+   --     cycles/line   1218 / 1218 / 1216      dropped lines   0 / 0 / 0
+   --     OBJ stall/line  ~33 / 64.6 / 147
+   -- The stall still grows as the queue shrinks, but it is ABSORBED - it no
+   -- longer moves the line, because the line is not bounded here any more.
+   -- Area is the binding constraint on this device and cycles/line are not, so
+   -- the trade runs the other way now: 16 -> 4 gives back 1,208 ALMs across the
+   -- two instances for a measured 2 cycles per line. That is what pays for the
+   -- two BG drawers' queues.
+   --
+   -- WQ_DEPTH 4 -> 2 for the same reason and at the same price: identical line
+   -- time (1215) and identical stall, because the walk was never short of
+   -- REQUEST slots - the original note above already said wqfull was flat zero
+   -- at 4/5/6, and that holds going down as well as up.
+   --
+   -- PQ_DEPTH 2 also measures nearly free (1218, +3 cycles) but takes stall
+   -- 147 -> 212. Held in reserve rather than taken: it is the next thing to
+   -- spend if the image needs a last few LABs, and the first thing to give
+   -- back if a scene ever bounds here again.
+   --
+   -- If a future scene DOES bound on this drawer again, the diagnostic is
+   -- OBJPROF's stall breakdown: pqfull rising while wqfull and unacc stay zero
+   -- is this constant, and nothing else, being too small.
+   constant PQ_DEPTH : integer := 4;   -- pixels queued between walk and pixels
+   constant WQ_DEPTH : integer := 2;   -- VRAM words tracked in flight
 
    -- Everything the pixel pipeline needs to know about the SPRITE a queued
    -- pixel came from. These used to be read live off Pixel_data* at drain

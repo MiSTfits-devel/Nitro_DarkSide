@@ -39,8 +39,7 @@ set_global_assignment -name VHDL_FILE rtl/nds_rtc.vhd
 set_global_assignment -name VHDL_FILE rtl/nds_sound.vhd
 set_global_assignment -name VHDL_FILE rtl/reg_nds_display.vhd
 set_global_assignment -name VHDL_FILE rtl/nds_drawer_text.vhd
-set_global_assignment -name VHDL_FILE rtl/nds_drawer_affine.vhd
-set_global_assignment -name VHDL_FILE rtl/nds_drawer_extended.vhd
+set_global_assignment -name VHDL_FILE rtl/nds_drawer_affext.vhd
 set_global_assignment -name VHDL_FILE rtl/nds_drawer_obj.vhd
 set_global_assignment -name VHDL_FILE rtl/nds_drawer_merge.vhd
 set_global_assignment -name VHDL_FILE rtl/nds_gpu2d.vhd

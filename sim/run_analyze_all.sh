@@ -58,8 +58,7 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_sound.vhd \
    rtl/reg_nds_display.vhd \
    rtl/nds_drawer_text.vhd \
-   rtl/nds_drawer_affine.vhd \
-   rtl/nds_drawer_extended.vhd \
+   rtl/nds_drawer_affext.vhd \
    rtl/nds_drawer_obj.vhd \
    sim/tb_vram_map.vhd \
    sim/tb_vram_torture.vhd \

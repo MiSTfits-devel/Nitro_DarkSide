@@ -18,7 +18,7 @@ library IEEE;
 use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
 
-entity nds_drawer_extended is
+entity nds_drawer_extended_ref is
    generic
    (
       DXYBITS      : integer := 16;
@@ -69,7 +69,7 @@ entity nds_drawer_extended is
    );
 end entity;
 
-architecture arch of nds_drawer_extended is
+architecture arch of nds_drawer_extended_ref is
 
    type tVRAMState is
    (

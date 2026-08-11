@@ -39,6 +39,9 @@ crowd are affine; a HUD full of static OAM is not.
 | `nds_drawer_text` | `req` / **`accept`** / `done` |
 | `nds_drawer_affine` | `req` / `done` |
 | `nds_drawer_extended` | `req` / `done` |
+<!-- Historical: those two entities have since been pipelined AND merged into
+     rtl/nds_drawer_affext.vhd, which speaks req/accept/done. -->
+
 | `nds_drawer_obj` | `req` / `done` |
 
 The BG arbiter in `nds_gpu2d.vhd` supports `OS_DEPTH` ops in flight, but a

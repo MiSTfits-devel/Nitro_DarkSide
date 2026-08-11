@@ -14,8 +14,7 @@ mkdir -p "$WORK"
 
 nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_drawer_text.vhd \
-   rtl/nds_drawer_affine.vhd \
-   rtl/nds_drawer_extended.vhd \
+   rtl/nds_drawer_affext.vhd \
    sim/tb_gpu_bg.vhd
 
 nvc -H 1g -L "$WORK" --work="$WORK/work" -e tb_gpu_bg -gTIMEOUT_MS="$TIMEOUT_MS"

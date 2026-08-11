@@ -103,9 +103,14 @@ NDS.sv (emu)                        — MiSTer glue, HPS, PLL, OSD, *and* everyt
         └── (no nds_math, no nds_gx_stub — see the subsystem map)
 ```
 
-Each 2D engine holds **ten** drawer instances, not five: `nds_drawer_text` ×4,
-`nds_drawer_affine` ×2, `nds_drawer_extended` ×2 (BG2/BG3 carry all three, selected by mode
-and muted otherwise), `nds_drawer_obj`, `nds_drawer_merge`. The BG VRAM arbiter inside
+Each 2D engine holds **eight** drawer instances, not five: `nds_drawer_text` ×4,
+`nds_drawer_affext` ×2, `nds_drawer_obj`, `nds_drawer_merge`. BG2/BG3 each carry a text
+drawer *and* a rot/scale drawer, selected by mode and muted otherwise. It used to be ten:
+affine and extended were separate entities and both were instantiated per BG, so two of
+the four always idled. Plain affine turns out to be a strict subset of extended variant 0
+— widen its 8-bit map entry to the 16-bit layout and every later stage is already
+identical — so they are now one entity with an `is_affine` input
+(`rtl/nds_drawer_affext.vhd`). The BG VRAM arbiter inside
 `nds_gpu2d` multiplexes **only the four BG layers**; OBJ, BG ext-palette and OBJ ext-palette
 are three further independent channels per engine, so eight renderer channels reach
 `nds_vram` (`nds_top.vhd:1719-1736`).
