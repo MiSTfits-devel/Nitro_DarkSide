@@ -189,6 +189,10 @@ entity nds_top is
       sdram_be         : out std_logic_vector(3 downto 0);
       sdram_Dout       : in  std_logic_vector(31 downto 0);
       sdram_done32     : in  std_logic;
+      -- upper half of the same ch2 burst + its later done, for nds_mainram's
+      -- ARM9 pair reads (rtl/sdram.sv ch2_dout_hi)
+      sdram_Dout_hi    : in  std_logic_vector(31 downto 0) := (others => '0');
+      sdram_done64     : in  std_logic := '0';
 
       -- VRAM banks A..D backing store (CPU r/w + renderer read channels;
       -- SDRAM guest clients in nds_wrap, behavioral models in sim)
@@ -486,6 +490,12 @@ architecture arch of nds_top is
    signal mr9_addr : std_logic_vector(21 downto 2);
    signal mr9_be   : std_logic_vector(3 downto 0);
    signal mr9_writedata, mr9_readdata : std_logic_vector(31 downto 0);
+   -- ARM9 cache line fills fetch an aligned 8-byte pair per request instead of
+   -- a word, halving the round trips through nds_mainram. mr9_readdata_hi
+   -- crosses the island/clk1x boundary exactly as mr9_readdata does - stable
+   -- for the whole transaction, qualified by the same mr9_done.
+   signal mr9_pair : std_logic;
+   signal mr9_readdata_hi : std_logic_vector(31 downto 0);
 
    signal io_bus9 : proc_bus_gb_type;
    signal io_wired_out9, irq_wired_out9, timer_wired_out9 : std_logic_vector(31 downto 0);
@@ -641,6 +651,8 @@ architecture arch of nds_top is
    signal mem9_addr : std_logic_vector(21 downto 2);
    signal mem9_be   : std_logic_vector(3 downto 0);
    signal mem9_writedata, mem9_readdata : std_logic_vector(31 downto 0);
+   signal mem9_pair_s : std_logic;
+   signal mem9_readdata_hi_s : std_logic_vector(31 downto 0);
    signal ld_to_main, ld_to_wram7 : std_logic;
 
    -- ================= GPU =================
@@ -934,8 +946,14 @@ begin
    mem9_be        <= "1111"                     when ld_busy = '1' else
                      "1111"                     when dbg_pk_sel = '1' else mr9_be;
    mem9_writedata <= ld_wr_data                 when ld_busy = '1' else mr9_writedata;
+   -- Pair mode belongs to the cache alone. The loader writes and the debugger's
+   -- peek both borrow this port, and neither wants two words back - forcing it
+   -- low here means a peek issued mid-fill cannot make nds_mainram wait on a
+   -- done64 that its 32-bit op will never produce.
+   mem9_pair_s    <= mr9_pair when (ld_busy = '0' and dbg_pk_sel = '0') else '0';
    mr9_done       <= mem9_done and not ld_busy and not dbg_pk_sel;
    mr9_readdata   <= mem9_readdata;
+   mr9_readdata_hi <= mem9_readdata_hi_s;
    dbg_pk_done_s  <= mem9_done and dbg_pk_sel;
 
    reset_boot <= reset or dbg_boot_rst;
@@ -1406,6 +1424,7 @@ begin
       oam_we => i9_oam_we, oam_addr => oam_addr, oam_din => oam_din, oam_be => oam_be,
       mr_ena => i9_mr_ena, mr_rnw => mr9_rnw, mr_addr => mr9_addr, mr_be => mr9_be,
       mr_writedata => mr9_writedata, mr_done => i9_mr_done, mr_readdata => mr9_readdata,
+      mr_pair => mr9_pair, mr_readdata_hi => mr9_readdata_hi,
       io_ce_next => '1',
       io_bus => i9_io_bus, io_wired_out => io_wired_out9, io_wired_done => i9_io_done,
       dbg_mb => dbg_mb9, dbg_cache => dbg_cache9
@@ -1879,6 +1898,8 @@ begin
       mr_sdram_ena => sdram_ena, mr_sdram_rnw => sdram_rnw, mr_sdram_Adr => sdram_Adr,
       mr_sdram_Din => sdram_Din, mr_sdram_be => sdram_be,
       sdram_Dout => sdram_Dout, sdram_done32 => sdram_done32,
+      sdram_Dout_hi => sdram_Dout_hi, sdram_done64 => sdram_done64,
+      mem9_pair => mem9_pair_s, mem9_readdata_hi => mem9_readdata_hi_s,
       dbg_mr => dbg_mr_s
    );
 

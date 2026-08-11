@@ -87,6 +87,10 @@ entity nds_port_wrap is
       sdram_be         : out std_logic_vector(3 downto 0);
       sdram_Dout       : in  std_logic_vector(31 downto 0);
       sdram_done32     : in  std_logic;
+      -- upper half of the same ch2 burst + its later done, for nds_mainram's
+      -- ARM9 pair reads (rtl/sdram.sv ch2_dout_hi)
+      sdram_Dout_hi    : in  std_logic_vector(31 downto 0) := (others => '0');
+      sdram_done64     : in  std_logic := '0';
 
       -- VRAM banks A..D backing store
       vsrv_req         : out std_logic;
@@ -269,6 +273,8 @@ begin
       sdram_be         => sdram_be,
       sdram_Dout       => sdram_Dout,
       sdram_done32     => sdram_done32,
+      sdram_Dout_hi    => sdram_Dout_hi,
+      sdram_done64     => sdram_done64,
 
       vsrv_req         => vsrv_req,
       vsrv_rnw         => vsrv_rnw,

@@ -85,6 +85,21 @@ module sdram
 	input             ch2_rnw,     // 1 - read, 0 - write
 	output reg        ch2_ready,
 	output reg        ch2_ready16,
+	// The high 32 bits of the SAME burst ch2_dout already returns. BURST_LENGTH
+	// is 4, so every ch2 read moves 64 bits over the bus and this channel used
+	// to discard half of them; ch1 has always kept all four words. Taking the
+	// other two costs nothing on the wire - the burst occupies the identical
+	// number of cycles - and lets a caller that wants an aligned 8-byte pair
+	// (an ARM9 cache line fill is four such pairs) halve its number of round
+	// trips through nds_mainram, which is where the real cost is.
+	//
+	// ch2_dout stays valid until the next burst, so a 64-bit consumer reads
+	// {ch2_dout_hi, ch2_dout} on ch2_ready64 and a 32-bit one is untouched.
+	// Only meaningful when the burst base is 8-byte aligned: ACCESS_TYPE is 0
+	// (sequential), so a burst from a misaligned base wraps inside its aligned
+	// block and the two halves come back swapped.
+	output reg [31:0] ch2_dout_hi,
+	output reg        ch2_ready64,
 
 	input      [24:1] ch3_addr,
 	output reg [15:0] ch3_dout,
@@ -305,6 +320,7 @@ always @(posedge clk) begin
 	ch1_accept  <= 0;
 	ch2_ready   <= 0;
 	ch2_ready16 <= 0;
+	ch2_ready64 <= 0;
 	ch3_ready   <= 0;
 
 	refresh_count <= refresh_count+1'b1;
@@ -335,6 +351,14 @@ always @(posedge clk) begin
 	if(data_ready_delay2[2]) ch2_dout[31:16] <= dqu2;
 	if(data_ready_delay2[2]) ch2_ready   <= 1;
 	if(data_ready_delay2[3]) ch2_ready16 <= 1;
+	// words 3 and 4 of the same burst - the half ch2 used to drop. Tapped at
+	// [1]/[0] exactly as ch1 is, and ready at [0] rather than [1] for the
+	// reason spelled out above ch1_ready: the last word lands ON the [0] edge,
+	// so a ready raised at [1] would be seen beside the PREVIOUS burst's high
+	// half. That was a real ch1 bug; do not "tighten" it here either.
+	if(data_ready_delay2[1]) ch2_dout_hi[15:00] <= dqu2;
+	if(data_ready_delay2[0]) ch2_dout_hi[31:16] <= dqu2;
+	if(data_ready_delay2[0]) ch2_ready64 <= 1;
 
 	if(data_ready_delay3[3]) ch3_dout[07:00] <= dqu3[7:0];
 	if(data_ready_delay3[1]) ch3_dout[15:08] <= dqu3[7:0];
@@ -485,6 +509,10 @@ always @(posedge clk) begin
 				dq_oe       <= 1;
 				ch2_ready   <= 1;
 				ch2_ready16 <= 1;
+				// a write returns no data; raise the 64-bit done too so a
+				// pair-mode caller retires writes on the same signal it
+				// retires reads on
+				ch2_ready64 <= 1;
 			end
 			else begin
 				state       <= STATE_IDLE_2;
@@ -510,6 +538,7 @@ always @(posedge clk) begin
 		data_ready_delay2 <= 'd0;
 		ch2_ready         <= 0;
 		ch2_ready16       <= 0;
+		ch2_ready64       <= 0;
 		// sticky kill for ops between grant and CAS, and for a stale rq
 		// granted this very edge (this assignment is last, so it wins over
 		// the grant's clear). A same-edge relaunch keeps its op alive.

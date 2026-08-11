@@ -65,6 +65,7 @@ wire        ch1_accept;
 reg  [26:1] ch2_addr = 0;    wire [31:0] ch2_dout;   reg [31:0] ch2_din = 0;
 reg   [3:0] ch2_be   = 4'hF; reg         ch2_req = 0; reg        ch2_cancel = 0;
 reg         ch2_rnw  = 1;    wire        ch2_ready, ch2_ready16;
+wire [31:0] ch2_dout_hi;     wire        ch2_ready64;
 
 reg  [24:1] ch3_addr = 0;    wire [15:0] ch3_dout;   reg [15:0] ch3_din = 0;
 reg         ch3_req  = 0;    reg         ch3_rnw = 1; wire       ch3_ready;
@@ -82,6 +83,7 @@ sdram #(.DQ_PIPE(`DQ_PIPE), .CAS_LATENCY(`CAS_LAT), .TRCD_WAIT(`TRCD_WAIT)) dut 
 	.ch2_addr(ch2_addr), .ch2_dout(ch2_dout), .ch2_din(ch2_din), .ch2_be(ch2_be),
 	.ch2_req(ch2_req), .ch2_cancel(ch2_cancel), .ch2_rnw(ch2_rnw),
 	.ch2_ready(ch2_ready), .ch2_ready16(ch2_ready16),
+	.ch2_dout_hi(ch2_dout_hi), .ch2_ready64(ch2_ready64),
 	.ch3_addr(ch3_addr), .ch3_dout(ch3_dout), .ch3_din(ch3_din),
 	.ch3_req(ch3_req), .ch3_rnw(ch3_rnw), .ch3_ready(ch3_ready)
 );
@@ -98,6 +100,7 @@ sdram_model #(.TRCD_CK(`TRCD_CK)) mem (
 reg [63:0] c1_sync, c1_late;  reg c1_got = 0;  reg r1_d = 0;
 reg [31:0] c2_sync, c2_late;  reg c2_got = 0;  reg r2_d = 0;
 reg [15:0] c3_sync, c3_late;  reg c3_got = 0;  reg r3_d = 0;
+reg [63:0] c2_sync64;         reg c2_got64 = 0;
 
 always @(posedge clk) begin
 	if (ch1_ready) begin c1_sync <= ch1_dout; c1_got <= 1; end
@@ -105,6 +108,12 @@ always @(posedge clk) begin
 
 	if (ch2_ready) begin c2_sync <= ch2_dout; c2_got <= 1; end
 	r2_d <= ch2_ready;  if (r2_d) c2_late <= ch2_dout;
+
+	// 64-bit tap: the whole burst, sampled the way a synchronous consumer
+	// would. Catching a ready that fires one clock early REQUIRES two reads
+	// from different addresses - a single read would pass while showing the
+	// previous burst's high half, which is exactly the bug ch1 once had.
+	if (ch2_ready64) begin c2_sync64 <= {ch2_dout_hi, ch2_dout}; c2_got64 <= 1; end
 
 	if (ch3_ready) begin c3_sync <= ch3_dout; c3_got <= 1; end
 	r3_d <= ch3_ready;  if (r3_d) c3_late <= ch3_dout;
@@ -227,6 +236,25 @@ task ch2_access(input [26:1] a, input rnw, input [31:0] d, input [3:0] be);
 	end
 endtask
 
+// Same request as ch2_access, but retired on ch2_ready64 - two clocks later
+// than ch2_ready, because the burst's last two words have not landed yet when
+// the 32-bit consumer is already done.
+task ch2_read64(input [26:1] a);
+	begin
+		@(negedge clk);
+		c2_got64 = 0; ch2_addr = a; ch2_rnw = 1; ch2_din = 0; ch2_be = 4'hF; ch2_req = 1;
+		@(negedge clk);
+		ch2_req = 0;
+		to = 0;
+		while (!c2_got64 && to < 200) begin @(negedge clk); to = to + 1; end
+		if (!c2_got64) begin
+			$display("  FAIL ch2 read64 %h: no ready64 within 200 clocks", a);
+			errors = errors + 1;
+		end
+		repeat (3) @(negedge clk);
+	end
+endtask
+
 task ch3_read(input [24:1] a);
 	begin
 		@(negedge clk);
@@ -292,6 +320,22 @@ initial begin
 	ch2_access(26'h0044448, 1, 0, 4'hF);
 	expectv("ch2 read sync capture", {32'd0, c2_sync},
 	        {32'd0, expw(26'h0044448,1), expw(26'h0044448,0)});
+
+	$display("");
+	$display("-- ch2 64-bit read: the half this channel used to discard --");
+	// Two reads from DIFFERENT aligned bases, back to back. The second is the
+	// one that matters: a ready64 raised a clock early would hand back the
+	// first read's high half here and pass a single-read test.
+	ch2_read64(26'h0055550);
+	expectv("ch2 read64 A", c2_sync64,
+	        {expw(26'h0055550,3), expw(26'h0055550,2), expw(26'h0055550,1), expw(26'h0055550,0)});
+	ch2_read64(26'h0066668);
+	expectv("ch2 read64 B (not A's high half)", c2_sync64,
+	        {expw(26'h0066668,3), expw(26'h0066668,2), expw(26'h0066668,1), expw(26'h0066668,0)});
+	// and the low half must still be bit-identical to what the 32-bit path
+	// returns for the same address - main RAM's existing callers depend on it
+	ch2_access(26'h0066668, 1, 0, 4'hF);
+	expectv("ch2 read64 low half == ch2 32-bit read", {32'd0, c2_sync64[31:0]}, {32'd0, c2_sync});
 
 	$display("");
 	$display("-- ch2 write then read back --");

@@ -132,6 +132,10 @@ entity nds_membus9 is
       mr_writedata   : out std_logic_vector(31 downto 0) := (others => '0');
       mr_done        : in  std_logic;
       mr_readdata    : in  std_logic_vector(31 downto 0);
+      -- cache line fills ask for an aligned 8-byte pair per request; the second
+      -- word arrives beside mr_readdata on the same mr_done
+      mr_pair        : out std_logic := '0';
+      mr_readdata_hi : in  std_logic_vector(31 downto 0) := (others => '0');
 
       -- IO register bus. The peripherals may live in a slower ce domain
       -- (33 MHz vs the 66 MHz ARM9): io_ce_next is the value their ce will
@@ -265,6 +269,8 @@ begin
       mem_wdata     => mr_writedata,
       mem_done      => mr_done,
       mem_rdata     => mr_readdata,
+      mem_pair      => mr_pair,
+      mem_rdata_hi  => mr_readdata_hi,
       op_ena        => cache_op_ena,
       op            => cache_op,
       op_addr       => cache_op_addr,
