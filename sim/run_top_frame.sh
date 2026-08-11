@@ -133,6 +133,7 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/nds_dma7.vhd \
    rtl/nds_bios7.vhd \
    rtl/nds_bios9.vhd \
+   rtl/nds_perf.vhd \
    rtl/nds_top.vhd \
    sim/tb_top_frame.vhd
 
