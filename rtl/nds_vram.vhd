@@ -326,10 +326,20 @@ architecture arch of nds_vram is
    -- invalidation is - a level cannot be missed.
    -- Depth is an AREA decision, not a comfort one: this core fits in 4,189 of
    -- the device's 4,191 LABs, so every entry is 54 registers that have to come
-   -- from somewhere. Depth 4 fitted nowhere; 3 does, and the cadence is
-   -- unchanged because with combining the push and drain rates are both one word
-   -- per 4 cycles - the queue absorbs jitter, it does not have to absorb a rate
-   -- mismatch. sim/tests/dmaprio is the check: anything too shallow shows up
+   -- from somewhere. Depth 4 was headroom rather than a requirement - with
+   -- combining, the push and drain rates are both one word per 4 cycles, so the
+   -- queue absorbs jitter, not a rate mismatch.
+   --
+   -- Do not "save area" by dropping this to 2 without also widening cpu9_wok. A
+   -- pop and a push land on the same edge and wok is evaluated on the PRE-pop
+   -- count, so at depth 2 the steady state hits count=2 exactly when a push
+   -- arrives and stalls - which costs the 2-cycle cadence. It would need
+   -- `or (state = WQ_WAIT and srv_done = '1')`, and that puts srv_done on the
+   -- combinational path into nds_dma9's ena. Measure before believing it.
+   --
+   -- 3 is also not free the way 4 is: `mod 3` synthesises to comparators where
+   -- `mod 4` is a dropped carry, which is why going 4 -> 3 bought only 25 ALMs.
+   -- sim/tests/dmaprio is the check either way - anything too shallow shows up
    -- immediately as a per-unit cost above 2.
    constant WQ_DEPTH : integer := 3;
 
