@@ -258,9 +258,8 @@ architecture arch of nds_vram is
       IDLE,
       BRAMWAIT,   -- E..I registered read settles
       BRAMREAD,   -- capture + OR the BRAM dataouts
-      SRVSCAN,    -- find next A..D hit (or finish)
+      SRVSCAN,    -- multi-bank continuation only: re-arm srv_req for bank n+1
       SRVWAIT,    -- wait for server done
-      FINISH,
       CLR_BRAM,   -- reset clear: sweep E..I (all five in parallel)
       CLR_SRV,    -- reset clear: issue one A..D word write
       CLR_SRVWAIT -- reset clear: wait for the server
@@ -271,6 +270,28 @@ architecture arch of nds_vram is
    signal acc      : std_logic_vector(31 downto 0) := (others => '0');
    signal srv_idx  : integer range 0 to 4 := 0;
    signal prefer9  : std_logic := '1';
+
+   -- Lowest A..D bank at or above `from_idx` that this request hits, or 4 for
+   -- none. This used to be a state of its own (SRVSCAN) evaluated once before
+   -- the first srv op and once more after the last one just to discover there
+   -- was no next bank, plus a FINISH state to hand the result back. It is a
+   -- pure function of the hit mask, so it folds into the cycles that already
+   -- know the answer: the dispatch edge and the srv_done edge. Nearly every
+   -- access hits exactly one bank, and that path drops 8 cycles to 5.
+   --
+   -- SRVSCAN survives for the multi-bank case only. There it is not overhead:
+   -- srv_req has to drop for a cycle between ops for the server to see a new
+   -- request, so the continuation needs an idle cycle regardless.
+   function ad_next (hit : std_logic_vector(8 downto 0); from_idx : integer) return integer is
+      variable n : integer range 0 to 4 := 4;
+   begin
+      for i in BANK_D downto BANK_A loop
+         if (i >= from_idx and hit(i) = '1') then
+            n := i;
+         end if;
+      end loop;
+      return n;
+   end function;
 
    -- reset clear pass: one counter for both phases (E..I sweep 0..16383,
    -- each A..D bank 0..32767)
@@ -1010,6 +1031,35 @@ begin
    process (clk)
       variable v_acc  : std_logic_vector(31 downto 0);
       variable v_next : integer range 0 to 4;
+
+      -- Hand bank `nxt` of request `r` to the srv_* channel and wait on it.
+      procedure issue_srv (r : t_req; nxt : integer) is
+      begin
+         srv_req  <= '1';
+         srv_rnw  <= r.rnw;
+         srv_bank <= std_logic_vector(to_unsigned(nxt, 2));
+         srv_addr <= r.offs(nxt)(16 downto 2);
+         srv_be   <= r.be;
+         srv_din  <= r.din;
+         srv_idx  <= nxt + 1;
+         state    <= SRVWAIT;
+      end procedure;
+
+      -- Drive the requester's result and pulse its done. `is9` is passed in
+      -- rather than read from cur_is9 because the dispatch cycle can retire an
+      -- access outright (an E..I write, or an unmapped one) and cur_is9 is only
+      -- being assigned on that same edge.
+      procedure retire (is9 : std_logic; d : std_logic_vector(31 downto 0)) is
+      begin
+         if (is9 = '1') then
+            cpu9_dout <= d;
+            cpu9_done <= '1';
+         else
+            cpu7_dout <= d;
+            cpu7_done <= '1';
+         end if;
+         state <= IDLE;
+      end procedure;
    begin
       if rising_edge(clk) then
 
@@ -1068,7 +1118,15 @@ begin
                           chosen.hit(BANK_H) or chosen.hit(BANK_I)) = '1') then
                         state <= BRAMWAIT;
                      else
-                        state <= SRVSCAN;
+                        v_next := ad_next(chosen.hit, 0);
+                        if (v_next = 4) then
+                           -- nothing off-chip to do: an E..I write already
+                           -- landed on this edge via bram_we, and an access
+                           -- that maps nowhere reads as 0
+                           retire(chosen_is9, (others => '0'));
+                        else
+                           issue_srv(chosen, v_next);
+                        end if;
                      end if;
                   end if;
 
@@ -1082,47 +1140,38 @@ begin
                         v_acc := v_acc or bram_dout(i);
                      end if;
                   end loop;
-                  acc   <= v_acc;
-                  state <= SRVSCAN;
+                  acc    <= v_acc;
+                  v_next := ad_next(cur.hit, 0);
+                  if (v_next = 4) then
+                     retire(cur_is9, v_acc);
+                  else
+                     issue_srv(cur, v_next);
+                  end if;
 
                when SRVSCAN =>
-                  v_next := 4;
-                  for i in BANK_D downto BANK_A loop
-                     if (i >= srv_idx and cur.hit(i) = '1') then
-                        v_next := i;
-                     end if;
-                  end loop;
+                  v_next := ad_next(cur.hit, srv_idx);
                   if (v_next = 4) then
-                     state <= FINISH;
+                     -- unreachable: SRVWAIT only comes here when it has already
+                     -- found a next bank. Retiring keeps the FSM total anyway.
+                     retire(cur_is9, acc);
                   else
-                     srv_req  <= '1';
-                     srv_rnw  <= cur.rnw;
-                     srv_bank <= std_logic_vector(to_unsigned(v_next, 2));
-                     srv_addr <= cur.offs(v_next)(16 downto 2);
-                     srv_be   <= cur.be;
-                     srv_din  <= cur.din;
-                     srv_idx  <= v_next + 1;
-                     state    <= SRVWAIT;
+                     issue_srv(cur, v_next);
                   end if;
 
                when SRVWAIT =>
                   if (srv_done = '1') then
-                     srv_req <= '0';
+                     v_acc := acc;
                      if (cur.rnw = '1') then
-                        acc <= acc or srv_dout;
+                        v_acc := v_acc or srv_dout;
+                        acc   <= v_acc;
                      end if;
-                     state <= SRVSCAN;
+                     srv_req <= '0';
+                     if (ad_next(cur.hit, srv_idx) = 4) then
+                        retire(cur_is9, v_acc);
+                     else
+                        state <= SRVSCAN;
+                     end if;
                   end if;
-
-               when FINISH =>
-                  if (cur_is9 = '1') then
-                     cpu9_dout <= acc;
-                     cpu9_done <= '1';
-                  else
-                     cpu7_dout <= acc;
-                     cpu7_done <= '1';
-                  end if;
-                  state <= IDLE;
 
                -- ===================== reset clear pass =====================
                -- E..I first (one word per cycle into all five BRAMs), then the
