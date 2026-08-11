@@ -204,35 +204,39 @@ architecture arch of nds_gpu2d is
    signal cfg_extslot : t_slot_arr;
    type t_var_arr is array (2 to 3) of unsigned(1 downto 0);
    signal cfg_variant : t_var_arr;
-   signal cfg_extbase : t_base_arr;   -- map/bitmap base for the extended drawer
+   signal cfg_extbase : t_base_arr;   -- map/bitmap base in extended mode
+   -- what the merged rot/scale drawer is actually rendering this line, and the
+   -- base that goes with it: plain affine reads the map base, extended reads
+   -- the map or bitmap base depending on its variant.
+   signal cfg_isaff   : std_logic_vector(2 to 3);
+   signal cfg_aebase  : t_base_arr;
 
    -- BG type per mode: 0=off, 1=text, 2=affine, 3=extended
    type t_bgtype_arr is array (0 to 3) of integer range 0 to 3;
    signal bgtype : t_bgtype_arr;
 
    -- ================= drawer wiring =================
+   -- BG2/BG3 have ONE rot/scale drawer each (nds_drawer_affext), covering both
+   -- affine and extended: bgtype picks one per BG per mode, so a second
+   -- instance would idle all frame for ~1.3-2.1k ALMs. Hence the _ae suffix
+   -- where there used to be an _aff and an _ext set.
    signal drawline_text : std_logic_vector(0 to 3);
-   signal drawline_aff  : std_logic_vector(2 to 3);
-   signal drawline_ext  : std_logic_vector(2 to 3);
+   signal drawline_ae   : std_logic_vector(2 to 3);
    -- drawline/drawObj after the drop gate (see the drawline routing section)
    signal drawline_acc  : std_logic;
    signal drawobj_acc   : std_logic;
 
    signal busy_text : std_logic_vector(0 to 3);
-   signal busy_aff  : std_logic_vector(2 to 3);
-   signal busy_ext  : std_logic_vector(2 to 3);
+   signal busy_ae   : std_logic_vector(2 to 3);
 
    type t_pix_arr  is array (0 to 3) of std_logic_vector(15 downto 0);
    type t_x_arr    is array (0 to 3) of integer range 0 to 255;
    signal pix_we_text : std_logic_vector(0 to 3);
    signal pix_text    : t_pix_arr;
    signal pixx_text   : t_x_arr;
-   signal pix_we_aff  : std_logic_vector(2 to 3);
-   signal pix_aff     : t_pix_arr;
-   signal pixx_aff    : t_x_arr;
-   signal pix_we_ext  : std_logic_vector(2 to 3);
-   signal pix_ext     : t_pix_arr;
-   signal pixx_ext    : t_x_arr;
+   signal pix_we_ae   : std_logic_vector(2 to 3);
+   signal pix_ae      : t_pix_arr;
+   signal pixx_ae     : t_x_arr;
 
    -- per-BG vram clients (muxed from the active drawer)
    type t_vaddr_arr is array (0 to 3) of integer range 0 to 131071;
@@ -248,14 +252,12 @@ architecture arch of nds_gpu2d is
    type t_vaddrt_arr is array (0 to 3) of integer range 0 to 131071;
    signal v_req_text : std_logic_vector(0 to 3);
    signal v_addr_text : t_vaddrt_arr;
-   signal v_req_aff  : std_logic_vector(2 to 3);
-   signal v_addr_aff : t_vaddrt_arr;
-   signal v_req_ext  : std_logic_vector(2 to 3);
-   signal v_addr_ext : t_vaddrt_arr;
+   signal v_req_ae   : std_logic_vector(2 to 3);
+   signal v_addr_ae  : t_vaddrt_arr;
 
    -- palette clients
    type t_paddr_arr is array (0 to 3) of integer range 0 to 127;
-   signal p_addr_text, p_addr_aff, p_addr_ext : t_paddr_arr;
+   signal p_addr_text, p_addr_ae : t_paddr_arr;
    signal bgp_addr  : t_paddr_arr;
    -- per-BG palette read data / valid. valid is now unconditional: with a
    -- private read port the answer always lands the cycle after the address,
@@ -265,7 +267,7 @@ architecture arch of nds_gpu2d is
    signal bgp_valid : std_logic_vector(0 to 3) := (others => '1');
 
    type t_epaddr_arr is array (0 to 3) of integer range 0 to 8191;
-   signal ep_addr_text, ep_addr_ext : t_epaddr_arr;
+   signal ep_addr_text, ep_addr_ae : t_epaddr_arr;
    signal bgep_addr  : t_epaddr_arr;
    signal bgep_data  : t_pdata_arr;                     -- per-BG, private port
    signal bgep_valid : std_logic_vector(0 to 3) := (others => '1');
@@ -553,6 +555,11 @@ begin
                         "01" when R_bgcnt(i).charbase(0) = '0' else
                         "10";
       cfg_extbase(i) <= cfg_mapbase(i) when R_bgcnt(i).hicolor = "0" else cfg_bmpbase(i);
+      -- the merged drawer latches these at drawline, and drawline only fires
+      -- for this BG when bgtype is 2 or 3, so bgtype is stable when they are
+      -- sampled - exactly as it was when each mode had its own instance.
+      cfg_isaff(i)   <= '1' when bgtype(i) = 2 else '0';
+      cfg_aebase(i)  <= cfg_mapbase(i) when bgtype(i) = 2 else cfg_extbase(i);
    end generate;
 
    refx_arr(2) <= ref2x_int;  refy_arr(2) <= ref2y_int;
@@ -719,12 +726,11 @@ begin
       drawline_text(i) <= drawline_acc when (bgtype(i) = 1) else '0';
    end generate;
    gen_dl_a : for i in 2 to 3 generate
-      drawline_aff(i) <= drawline_acc when (bgtype(i) = 2) else '0';
-      drawline_ext(i) <= drawline_acc when (bgtype(i) = 3) else '0';
+      drawline_ae(i) <= drawline_acc when (bgtype(i) = 2 or bgtype(i) = 3) else '0';
    end generate;
 
    any_bg_busy <= busy_text(0) or busy_text(1) or busy_text(2) or busy_text(3)
-                  or busy_aff(2) or busy_aff(3) or busy_ext(2) or busy_ext(3);
+                  or busy_ae(2) or busy_ae(3);
 
    -- ================= BG drawers =================
    gen_text : for i in 0 to 3 generate
@@ -763,47 +769,20 @@ begin
       );
    end generate;
 
+   -- ONE rot/scale drawer per BG, doing affine or extended as bgtype says.
+   -- variant / extpalette are passed through unconditionally: is_affine
+   -- overrides both inside the drawer, so there is nothing to gate here.
    gen_affext : for i in 2 to 3 generate
-      iaff : entity work.nds_drawer_affine
+      iae : entity work.nds_drawer_affext
       port map
       (
          clk                  => clk,
          line_trigger         => line_trigger,
-         drawline             => drawline_aff(i),
-         busy                 => busy_aff(i),
-         mapbase              => cfg_mapbase(i),
-         tilebase             => cfg_tilebase(i),
-         screensize           => unsigned(R_bgcnt(i).size),
-         wrapping             => R_bgcnt(i).slotwrap(0),
-         mosaic               => R_bgcnt(i).mosaic(0),
-         Mosaic_H_Size        => unsigned(R_mos_bgh),
-         refX                 => refx_arr(i),
-         refY                 => refy_arr(i),
-         refX_mosaic          => refx_arr(i),
-         refY_mosaic          => refy_arr(i),
-         dx                   => dx_arr(i),
-         dy                   => dy_arr(i),
-         pixel_we             => pix_we_aff(i),
-         pixeldata            => pix_aff(i),
-         pixel_x              => pixx_aff(i),
-         PALETTE_Drawer_addr  => p_addr_aff(i),
-         PALETTE_Drawer_data  => bgp_data(i),
-         PALETTE_Drawer_valid => bgp_valid(i),
-         VRAM_Drawer_req      => v_req_aff(i),
-         VRAM_Drawer_addr     => v_addr_aff(i),
-         VRAM_Drawer_data     => bgv_data,
-         VRAM_Drawer_done     => bgv_done(i)
-      );
-
-      iext : entity work.nds_drawer_extended
-      port map
-      (
-         clk                  => clk,
-         line_trigger         => line_trigger,
-         drawline             => drawline_ext(i),
-         busy                 => busy_ext(i),
+         drawline             => drawline_ae(i),
+         busy                 => busy_ae(i),
+         is_affine            => cfg_isaff(i),
          variant              => cfg_variant(i),
-         mapbase              => cfg_extbase(i),
+         mapbase              => cfg_aebase(i),
          tilebase             => cfg_tilebase(i),
          extpalette           => R_bgextpal(30),
          extpal_slot          => cfg_extslot(i),
@@ -817,19 +796,20 @@ begin
          refY_mosaic          => refy_arr(i),
          dx                   => dx_arr(i),
          dy                   => dy_arr(i),
-         pixel_we             => pix_we_ext(i),
-         pixeldata            => pix_ext(i),
-         pixel_x              => pixx_ext(i),
-         PALETTE_Drawer_addr  => p_addr_ext(i),
+         pixel_we             => pix_we_ae(i),
+         pixeldata            => pix_ae(i),
+         pixel_x              => pixx_ae(i),
+         PALETTE_Drawer_addr  => p_addr_ae(i),
          PALETTE_Drawer_data  => bgp_data(i),
          PALETTE_Drawer_valid => bgp_valid(i),
-         EXTPAL_Drawer_addr   => ep_addr_ext(i),
+         EXTPAL_Drawer_addr   => ep_addr_ae(i),
          EXTPAL_Drawer_data   => bgep_data(i),
          EXTPAL_Drawer_valid  => bgep_valid(i),
-         VRAM_Drawer_req      => v_req_ext(i),
-         VRAM_Drawer_addr     => v_addr_ext(i),
+         VRAM_Drawer_req      => v_req_ae(i),
+         VRAM_Drawer_addr     => v_addr_ae(i),
          VRAM_Drawer_data     => bgv_data,
-         VRAM_Drawer_done     => bgv_done(i)
+         VRAM_Drawer_done     => bgv_done(i),
+         VRAM_Drawer_accept   => bgv_accept(i)
       );
    end generate;
 
@@ -1091,10 +1071,11 @@ begin
    -- BG palette + BG ext-pal service: 4-phase round robin, one BG per slot
    gen_pmux : for i in 0 to 3 generate
       bgp_addr(i)  <= p_addr_text(i)  when bgtype(i) = 1 else
-                      p_addr_aff(i)   when (i >= 2 and bgtype(i) = 2) else
-                      p_addr_ext(i)   when (i >= 2 and bgtype(i) = 3) else 0;
+                      p_addr_ae(i)    when (i >= 2 and (bgtype(i) = 2 or bgtype(i) = 3)) else 0;
+      -- affine never reads the ext palette (the drawer forces it off), so the
+      -- ext-pal client stays gated to extended alone.
       bgep_addr(i) <= ep_addr_text(i) when bgtype(i) = 1 else
-                      ep_addr_ext(i)  when (i >= 2 and bgtype(i) = 3) else 0;
+                      ep_addr_ae(i)   when (i >= 2 and bgtype(i) = 3) else 0;
    end generate;
 
    -- Every BG now has a private read port into both the standard palette and
@@ -1174,11 +1155,9 @@ begin
    end generate;
    gen_vmux23 : for i in 2 to 3 generate
       bgv_req(i)  <= v_req_text(i) when bgtype(i) = 1 else
-                     v_req_aff(i)  when bgtype(i) = 2 else
-                     v_req_ext(i)  when bgtype(i) = 3 else '0';
+                     v_req_ae(i)   when (bgtype(i) = 2 or bgtype(i) = 3) else '0';
       bgv_addr(i) <= v_addr_text(i) when bgtype(i) = 1 else
-                     v_addr_aff(i)  when bgtype(i) = 2 else
-                     v_addr_ext(i)  when bgtype(i) = 3 else 0;
+                     v_addr_ae(i)   when (bgtype(i) = 2 or bgtype(i) = 3) else 0;
    end generate;
 
    -- Pipelined BG channel arbiter. v1 was ARB_IDLE -> ARB_WAIT: one request in
@@ -1361,14 +1340,10 @@ begin
             we := pix_we_text(i);
             wa := pixx_text(i);
             wd := pix_text(i);
-         elsif (bgtype(i) = 2) then
-            we := pix_we_aff(i);
-            wa := pixx_aff(i);
-            wd := pix_aff(i);
-         elsif (bgtype(i) = 3) then
-            we := pix_we_ext(i);
-            wa := pixx_ext(i);
-            wd := pix_ext(i);
+         elsif (bgtype(i) = 2 or bgtype(i) = 3) then
+            we := pix_we_ae(i);
+            wa := pixx_ae(i);
+            wd := pix_ae(i);
          end if;
          lb_we(i) <= we;
          lb_wa(i) <= wa;

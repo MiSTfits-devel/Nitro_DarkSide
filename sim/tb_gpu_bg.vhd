@@ -1,8 +1,12 @@
 -- M5 part 1: NDS BG drawer line tests. Instantiates nds_drawer_text and
--- nds_drawer_affine against behavioral VRAM (512 KB flat BG space), std
--- palette and ext-pal stores, all served on the GBA drawer cadence: the
--- address presented while valid='0' is latched, data + valid='1' on the
--- next cycle, alternating. Cases come from sim/tests/gpu_bg_vectors.hex
+-- nds_drawer_affext against behavioral VRAM (512 KB flat BG space), std
+-- palette and ext-pal stores. Palettes answer UNCONDITIONALLY one cycle after
+-- the address (the private per-BG read ports nds_gpu2d now has) and VRAM
+-- answers in issue order with several requests in flight (the line-server
+-- contract) - see the two model blocks below, both of which had to be brought
+-- forward when the drawers were pipelined. nds_drawer_affext is elaborated
+-- TWICE here, once with is_affine='1' and once with '0'.
+-- Cases come from sim/tests/gpu_bg_vectors.hex
 -- (gen_gpu_bg.py golden model): 16 header words + 256 expected pixels per
 -- case; the rendered line (0x8000 where nothing was written) must match
 -- exactly. Run: sim/run_gpu_bg.sh  (regenerate vectors first)
@@ -79,8 +83,9 @@ architecture sim of tb_gpu_bg is
 
    -- affine drawer memory ports
    signal a_pal_addr    : integer range 0 to 127;
+   signal a_extpal_addr : integer range 0 to 8191;
    signal a_vram_addr   : integer range 0 to 131071;
-   signal a_pal_data, a_vram_data : std_logic_vector(31 downto 0);
+   signal a_pal_data, a_extpal_data, a_vram_data : std_logic_vector(31 downto 0);
    signal a_vram_req : std_logic;
    signal a_vram_done : std_logic := '0';
 
@@ -144,13 +149,19 @@ begin
       VRAM_Drawer_done     => t_vram_done
    );
 
-   idrawer_affine : entity work.nds_drawer_affine
+   -- the merged rot/scale drawer in AFFINE mode. variant / extpalette are fed
+   -- the extended stimulus on purpose: is_affine must override both.
+   idrawer_affine : entity work.nds_drawer_affext
    port map
    (
       clk                  => clk,
       line_trigger         => line_trigger,
       drawline             => drawline_a,
       busy                 => busy_a,
+      is_affine            => '1',
+      variant              => variant,
+      extpalette           => extpalette,
+      extpal_slot          => extpal_slot,
       mapbase              => mapbase,
       tilebase             => tilebase,
       screensize           => screensize,
@@ -169,19 +180,23 @@ begin
       PALETTE_Drawer_addr  => a_pal_addr,
       PALETTE_Drawer_data  => a_pal_data,
       PALETTE_Drawer_valid => mem_valid,
+      EXTPAL_Drawer_addr   => a_extpal_addr,
+      EXTPAL_Drawer_data   => a_extpal_data,
+      EXTPAL_Drawer_valid  => mem_valid,
       VRAM_Drawer_req      => a_vram_req,
       VRAM_Drawer_addr     => a_vram_addr,
       VRAM_Drawer_data     => a_vram_data,
       VRAM_Drawer_done     => a_vram_done
    );
 
-   idrawer_ext : entity work.nds_drawer_extended
+   idrawer_ext : entity work.nds_drawer_affext
    port map
    (
       clk                  => clk,
       line_trigger         => line_trigger,
       drawline             => drawline_e,
       busy                 => busy_e,
+      is_affine            => '0',
       variant              => variant,
       mapbase              => mapbase,
       tilebase             => tilebase,
@@ -212,57 +227,94 @@ begin
       VRAM_Drawer_done     => e_vram_done
    );
 
-   -- palette/ext-pal service on the fixed valid cadence (local BRAMs in
-   -- the real engine); VRAM char/map data on req/done with random latency
-   -- (the line-server contract)
+   -- Palette / ext-pal service: UNCONDITIONAL, one cycle after the address.
+   --
+   -- This model used to answer on alternate cycles, standing in for the old
+   -- round-robin arbitration, and mem_valid toggled with it. That contract no
+   -- longer exists anywhere: nds_gpu2d gives every BG a PRIVATE palette read
+   -- port (see gpal_bg and bgp_valid, which is hardwired '1'), so the answer
+   -- always lands the next cycle and no drawer ever waits for its turn. All
+   -- three v2 drawers therefore take the palette word one cycle after they
+   -- present the address and do not consult PALETTE_Drawer_valid at all -
+   -- against an every-other-cycle model they latch a stale word on half the
+   -- pixels. This is the same staleness the VRAM model below was fixed for,
+   -- and it hit the TEXT cases as well, which is what gives it away.
+   --
+   -- mem_valid is now held high: nothing reads it but the port maps.
    p_mem : process (clk)
    begin
       if rising_edge(clk) then
-         if (mem_valid = '0') then
-            t_pal_data    <= pal(t_pal_addr);
-            t_extpal_data <= extpal(t_extpal_addr);
-            a_pal_data    <= pal(a_pal_addr);
-            e_pal_data    <= pal(e_pal_addr);
-            e_extpal_data <= extpal(e_extpal_addr);
-         end if;
-         mem_valid <= not mem_valid;
+         t_pal_data    <= pal(t_pal_addr);
+         t_extpal_data <= extpal(t_extpal_addr);
+         a_pal_data    <= pal(a_pal_addr);
+         e_pal_data    <= pal(e_pal_addr);
+         a_extpal_data <= extpal(a_extpal_addr);
+         e_extpal_data <= extpal(e_extpal_addr);
+         mem_valid     <= '1';
       end if;
    end process;
 
-   p_vram_t : process
-      variable seed : unsigned(31 downto 0) := to_unsigned(11111, 32);
+   -- VRAM on the line-server contract AS IT IS TODAY: one request accepted per
+   -- cycle, answered IN ISSUE ORDER a fixed number of cycles later.
+   --
+   -- The previous model waited for one request to retire before it would even
+   -- look at the next. Every BG drawer now runs its fetch stage ahead of its
+   -- pixel stage and keeps several requests in flight, so that model silently
+   -- dropped all but the first and the bench timed out - it had already been
+   -- doing so since the text drawer was pipelined, before affine and extended
+   -- joined it. Accept is left at its default '1', which is exactly true of a
+   -- model that takes a request every cycle.
+   --
+   -- Latencies differ per stream so the three drawers do not march in lockstep.
+   p_vram_t : process (clk)
+      type t_pipe is array (0 to 5) of std_logic_vector(31 downto 0);
+      variable d : t_pipe := (others => (others => '0'));
+      variable v : std_logic_vector(0 to 5) := (others => '0');
    begin
-      wait until rising_edge(clk) and t_vram_req = '1';
-      seed := seed xor shift_left(seed, 13); seed := seed xor shift_right(seed, 17); seed := seed xor shift_left(seed, 5);
-      for k in 0 to to_integer(seed(2 downto 0)) loop wait until rising_edge(clk); end loop;
-      t_vram_data <= vram(t_vram_addr);
-      t_vram_done <= '1';
-      wait until rising_edge(clk);
-      t_vram_done <= '0';
+      if rising_edge(clk) then
+         for k in 5 downto 1 loop d(k) := d(k-1); v(k) := v(k-1); end loop;
+         v(0) := '0';
+         if (t_vram_req = '1') then
+            v(0) := '1';
+            d(0) := vram(t_vram_addr);
+         end if;
+         t_vram_done <= v(5);
+         t_vram_data <= d(5);
+      end if;
    end process;
 
-   p_vram_a : process
-      variable seed : unsigned(31 downto 0) := to_unsigned(22222, 32);
+   p_vram_a : process (clk)
+      type t_pipe is array (0 to 3) of std_logic_vector(31 downto 0);
+      variable d : t_pipe := (others => (others => '0'));
+      variable v : std_logic_vector(0 to 3) := (others => '0');
    begin
-      wait until rising_edge(clk) and a_vram_req = '1';
-      seed := seed xor shift_left(seed, 13); seed := seed xor shift_right(seed, 17); seed := seed xor shift_left(seed, 5);
-      for k in 0 to to_integer(seed(2 downto 0)) loop wait until rising_edge(clk); end loop;
-      a_vram_data <= vram(a_vram_addr);
-      a_vram_done <= '1';
-      wait until rising_edge(clk);
-      a_vram_done <= '0';
+      if rising_edge(clk) then
+         for k in 3 downto 1 loop d(k) := d(k-1); v(k) := v(k-1); end loop;
+         v(0) := '0';
+         if (a_vram_req = '1') then
+            v(0) := '1';
+            d(0) := vram(a_vram_addr);
+         end if;
+         a_vram_done <= v(3);
+         a_vram_data <= d(3);
+      end if;
    end process;
 
-   p_vram_e : process
-      variable seed : unsigned(31 downto 0) := to_unsigned(33333, 32);
+   p_vram_e : process (clk)
+      type t_pipe is array (0 to 4) of std_logic_vector(31 downto 0);
+      variable d : t_pipe := (others => (others => '0'));
+      variable v : std_logic_vector(0 to 4) := (others => '0');
    begin
-      wait until rising_edge(clk) and e_vram_req = '1';
-      seed := seed xor shift_left(seed, 13); seed := seed xor shift_right(seed, 17); seed := seed xor shift_left(seed, 5);
-      for k in 0 to to_integer(seed(2 downto 0)) loop wait until rising_edge(clk); end loop;
-      e_vram_data <= vram(e_vram_addr);
-      e_vram_done <= '1';
-      wait until rising_edge(clk);
-      e_vram_done <= '0';
+      if rising_edge(clk) then
+         for k in 4 downto 1 loop d(k) := d(k-1); v(k) := v(k-1); end loop;
+         v(0) := '0';
+         if (e_vram_req = '1') then
+            v(0) := '1';
+            d(0) := vram(e_vram_addr);
+         end if;
+         e_vram_done <= v(4);
+         e_vram_data <= d(4);
+      end if;
    end process;
 
    -- pixel collect
@@ -295,6 +347,18 @@ begin
       variable nfail  : integer := 0;
       variable v_busy : std_logic;
    begin
+      -- Settle before the FIRST case. The drawers have no reset port: they come
+      -- up on their signal initial values and need a few cycles of clock before
+      -- the first drawline, which the real engine always gets (nds_gpu2d resets
+      -- them and the first drawline is a whole frame-start away). This bench
+      -- used to fire its first drawline ~7 cycles after t=0, and case 0 - and
+      -- ONLY case 0, whatever it was configured as - rendered wrong.
+      --
+      -- Measured threshold: 8 settle cycles still fails, 16 and above pass, and
+      -- duplicating case 0 at the front makes the copy fail while the original
+      -- passes at index 1. So it tracks position in the run, not configuration.
+      -- 64 leaves plenty of margin and costs nothing.
+      for k in 1 to 64 loop wait until rising_edge(clk); end loop;
       ncases := to_integer(unsigned(vectors(0)));
       report "running " & integer'image(ncases) & " cases" severity note;
 

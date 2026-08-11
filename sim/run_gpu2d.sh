@@ -24,8 +24,7 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    rtl/proc_bus_gba.vhd \
    rtl/reg_nds_display.vhd \
    rtl/nds_drawer_text.vhd \
-   rtl/nds_drawer_affine.vhd \
-   rtl/nds_drawer_extended.vhd \
+   rtl/nds_drawer_affext.vhd \
    rtl/nds_drawer_obj.vhd \
    rtl/nds_drawer_merge.vhd \
    rtl/nds_gpu2d.vhd \

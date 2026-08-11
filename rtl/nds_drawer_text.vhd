@@ -114,7 +114,11 @@ end entity;
 architecture arch of nds_drawer_text is
 
    constant TQ_DEPTH  : integer := 4;   -- tiles tracked in flight
-   constant TAG_DEPTH : integer := 8;   -- VRAM requests trackable in flight
+   -- TAG_DEPTH was 8, which no instance could ever use: the gpu2d arbiter
+   -- tracks 8 ops across ALL FOUR BGs, and a tile queue 4 deep cannot owe more
+   -- than 8 words anyway. 8 tag slots x 8 text instances was pure fabric.
+   -- Frame bench is bit-identical at 4 (cycles/line unchanged, 0 drops).
+   constant TAG_DEPTH : integer := 4;   -- VRAM requests trackable in flight
 
    -- ================= line configuration, latched at drawline =================
    signal cfg_hicolor    : std_logic := '0';
