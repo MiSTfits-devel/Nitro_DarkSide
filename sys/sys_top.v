@@ -1208,7 +1208,24 @@ always @(posedge clk_vid) begin
 			if(vcnt == vsz - 3) vde <= 0;
 		end
 
+`ifdef NDS_FIXEDRES
+		// LOCAL PATCH, guarded so the vendored file is untouched without the
+		// macro (same pattern as NDS_NO_AUDIO_FILTER in sys/audio_out.v).
+		//
+		// The regeneration below is right for what direct_video is FOR: MiSTer's
+		// own MiSTer.ini calls it "use only with VGA converters", and a converter
+		// wants every pixel that is not sync lit, because its DAC reproduces the
+		// core's blanking as analogue porches. Against a real HDMI/DVI sink it is
+		// wrong - DE is what the sink measures the active window from, and this
+		// reports ~791x519 inside an 858x525 raster, which is not a mode.
+		//
+		// NDS_FIXEDRES emits a complete CEA-861 raster with real porches, so the
+		// core's own DE is already correct and must be the one that ships. It is
+		// aligned with dv_data_osd: both come off the same osd instance.
+		dv_de1 <= vga_de_osd;
+`else
 		dv_de1 <= !{hss,dv_hs_osd} && vde;
+`endif
 	end
 
 	dv_d1  <= dv_data_osd;
