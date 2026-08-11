@@ -87,6 +87,21 @@ entity nds_dma9 is
       io_fast_dout : out std_logic_vector(31 downto 0) := (others => '0');
       io_fast_din  : in  std_logic_vector(31 downto 0);
 
+      -- clk1x fast lane straight into nds_vram, on the same argument as the IO
+      -- one above: nds_vram lives in clk1x, and its cpu9 port is idle for the
+      -- whole dma_bus_on window because the requester it belongs to is paused.
+      --
+      -- This lane bypasses nds_membus9, so it owes the two things membus9 would
+      -- have done: byte enables from the address, and rotating a halfword read
+      -- down out of the returned word.
+      vram_fast_ena  : out std_logic := '0';
+      vram_fast_rnw  : out std_logic := '1';
+      vram_fast_addr : out unsigned(23 downto 2) := (others => '0');
+      vram_fast_be   : out std_logic_vector(3 downto 0) := "1111";
+      vram_fast_din  : out std_logic_vector(31 downto 0) := (others => '0');
+      vram_fast_dout : in  std_logic_vector(31 downto 0);
+      vram_fast_done : in  std_logic;
+
       irq_dma      : out std_logic_vector(3 downto 0) := (others => '0')
    );
 end entity;
@@ -124,7 +139,12 @@ architecture arch of nds_dma9 is
    -- RD_IOW / WR_IOW are the fast-lane counterparts of RD_WAIT / WR_WAIT: the
    -- peripherals see io_fast_ena during that single cycle and answer
    -- combinationally, so there is nothing to wait for beyond it.
-   type t_state is (IDLE, GRANT, LATCH, RD, RD_WAIT, RD_IOW, WR, WR_WAIT, WR_IOW, COMPLETE);
+   --
+   -- RD_VRW / WR_VRW are the VRAM fast lane. Unlike IO, nds_vram takes several
+   -- cycles and pulses done, so these do wait - just without the island in the
+   -- middle.
+   type t_state is (IDLE, GRANT, LATCH, RD, RD_WAIT, RD_IOW, RD_VRW,
+                    WR, WR_WAIT, WR_IOW, WR_VRW, COMPLETE);
    signal state  : t_state := IDLE;
    signal active : integer range 0 to 3 := 0;
 
@@ -144,6 +164,14 @@ architecture arch of nds_dma9 is
    function is_io(a : unsigned(27 downto 0)) return boolean is
    begin
       return a(27 downto 24) = 4;
+   end function;
+
+   -- VRAM is 0x06000000-0x06FFFFFF. nds_vram's own decoder takes adr(23:2) and
+   -- resolves the bank from VRAMCNT, so the region nibble goes no further -
+   -- exactly what nds_membus9 does for T_VRAM.
+   function is_vram(a : unsigned(27 downto 0)) return boolean is
+   begin
+      return a(27 downto 24) = 6;
    end function;
 
    -- byte enables for an access of this size at this address, matching the
@@ -184,8 +212,8 @@ begin
    begin
       if rising_edge(clk) then
          if (state /= IDLE)     then cy := cy + 1; end if;
-         if (state = RD_WAIT or state = RD_IOW) then rw := rw + 1; end if;
-         if (state = WR_WAIT or state = WR_IOW) then ww := ww + 1; end if;
+         if (state = RD_WAIT or state = RD_IOW or state = RD_VRW) then rw := rw + 1; end if;
+         if (state = WR_WAIT or state = WR_IOW or state = WR_VRW) then ww := ww + 1; end if;
          if (unit_ret = '1')    then un := un + 1; end if;
          if (state = COMPLETE and un > 0) then
             report "dma9 census ch" & integer'image(active) & ": " &
@@ -275,9 +303,10 @@ begin
       if rising_edge(clk) then
 
          irq_dma     <= (others => '0');
-         mb_ena      <= '0';
-         io_fast_ena <= '0';
-         unit_ret    <= '0';
+         mb_ena        <= '0';
+         io_fast_ena   <= '0';
+         vram_fast_ena <= '0';
+         unit_ret      <= '0';
 
          if (reset = '1') then
             ch     <= (others => CHAN_INIT);
@@ -422,6 +451,12 @@ begin
                         io_fast_acc <= ACCESS_16BIT;
                      end if;
                      state <= RD_IOW;
+                  elsif (is_vram(ch(active).cur_src)) then
+                     vram_fast_ena  <= '1';
+                     vram_fast_rnw  <= '1';
+                     vram_fast_addr <= ch(active).cur_src(23 downto 2);
+                     vram_fast_be   <= be_of(ch(active).cur_src, ch(active).word32);
+                     state <= RD_VRW;
                   else
                      mb_ena     <= '1';
                      mb_rnw     <= '1';
@@ -458,6 +493,19 @@ begin
                   end if;
                   state <= WR;
 
+               when RD_VRW =>
+                  if (vram_fast_done = '1') then
+                     -- same rotation as RD_IOW, for the same reason
+                     if (ch(active).word32 = '1') then
+                        rdval <= vram_fast_dout;
+                     elsif (ch(active).cur_src(1) = '1') then
+                        rdval <= x"0000" & vram_fast_dout(31 downto 16);
+                     else
+                        rdval <= x"0000" & vram_fast_dout(15 downto 0);
+                     end if;
+                     state <= WR;
+                  end if;
+
                when WR =>
                   if (is_io(ch(active).cur_dst)) then
                      io_fast_ena <= '1';
@@ -473,6 +521,18 @@ begin
                         io_fast_dout <= lane16 & lane16;   -- bEna picks the lane
                      end if;
                      state <= WR_IOW;
+                  elsif (is_vram(ch(active).cur_dst)) then
+                     vram_fast_ena  <= '1';
+                     vram_fast_rnw  <= '0';
+                     vram_fast_addr <= ch(active).cur_dst(23 downto 2);
+                     vram_fast_be   <= be_of(ch(active).cur_dst, ch(active).word32);
+                     if (ch(active).word32 = '1') then
+                        vram_fast_din <= rdval;
+                     else
+                        lane16        := rdval(15 downto 0);
+                        vram_fast_din <= lane16 & lane16;   -- be picks the lane
+                     end if;
+                     state <= WR_VRW;
                   else
                      mb_ena <= '1';
                      mb_rnw <= '0';
@@ -498,6 +558,11 @@ begin
                when WR_IOW =>
                   -- the peripheral latched the write on this cycle's edge
                   retire_unit;
+
+               when WR_VRW =>
+                  if (vram_fast_done = '1') then
+                     retire_unit;
+                  end if;
 
                when COMPLETE =>
                   -- repeat keeps the channel armed for the next trigger;

@@ -479,6 +479,18 @@ architecture arch of nds_top is
    signal vram9_be   : std_logic_vector(3 downto 0);
    signal vram9_din, vram9_dout : std_logic_vector(31 downto 0);
 
+   -- what nds_vram's cpu9 port actually sees: the island's request, or the DMA's
+   -- while it holds the bus
+   signal vr9_ena, vr9_rnw : std_logic;
+   signal vr9_addr : unsigned(23 downto 2);
+   signal vr9_be   : std_logic_vector(3 downto 0);
+   signal vr9_din  : std_logic_vector(31 downto 0);
+
+   signal dma_vr_ena, dma_vr_rnw : std_logic;
+   signal dma_vr_addr : unsigned(23 downto 2);
+   signal dma_vr_be   : std_logic_vector(3 downto 0);
+   signal dma_vr_din  : std_logic_vector(31 downto 0);
+
    signal pal_we, oam_we : std_logic;
    signal pal_addr, oam_addr : integer range 0 to 511;
    signal pal_din, oam_din : std_logic_vector(31 downto 0);
@@ -1499,6 +1511,14 @@ begin
       io_fast_be   => dma_io_be,
       io_fast_dout => dma_io_dout,
       io_fast_din  => io_wired_out9,
+      -- clk1x fast lane into nds_vram, muxed onto its cpu9 port below
+      vram_fast_ena  => dma_vr_ena,
+      vram_fast_rnw  => dma_vr_rnw,
+      vram_fast_addr => dma_vr_addr,
+      vram_fast_be   => dma_vr_be,
+      vram_fast_din  => dma_vr_din,
+      vram_fast_dout => vram9_dout,
+      vram_fast_done => vram9_done,
       irq_dma      => irq_dma9
    );
 
@@ -1938,14 +1958,26 @@ begin
       dbg_mr => dbg_mr_s
    );
 
+   -- ARM9 VRAM mux, same shape and the same safety argument as the io_bus9 one:
+   -- while dma_bus_on is held the island has no transaction in flight (the grant
+   -- waited for CPU_bus_idle, which only returns on gb_bus_done), so vram9_ena
+   -- cannot pulse - it comes from cdc_req_vram toggles that a paused CPU never
+   -- makes. That also satisfies nds_vram's "cpu9 request overrun" assert: only
+   -- one of the two sides can ever have an op outstanding.
+   vr9_ena  <= dma_vr_ena  when dma_bus_on = '1' else vram9_ena;
+   vr9_rnw  <= dma_vr_rnw  when dma_bus_on = '1' else vram9_rnw;
+   vr9_addr <= dma_vr_addr when dma_bus_on = '1' else vram9_addr;
+   vr9_be   <= dma_vr_be   when dma_bus_on = '1' else vram9_be;
+   vr9_din  <= dma_vr_din  when dma_bus_on = '1' else vram9_din;
+
    -- ================= VRAM + engine A render path =================
    ivram : entity work.nds_vram
    generic map ( is_simu => is_simu )
    port map
    (
       clk => clk1x, reset => reset_boot, vramcnt => vramcnt,
-      cpu9_ena => vram9_ena, cpu9_rnw => vram9_rnw, cpu9_addr => vram9_addr,
-      cpu9_be => vram9_be, cpu9_din => vram9_din, cpu9_dout => vram9_dout, cpu9_done => vram9_done,
+      cpu9_ena => vr9_ena, cpu9_rnw => vr9_rnw, cpu9_addr => vr9_addr,
+      cpu9_be => vr9_be, cpu9_din => vr9_din, cpu9_dout => vram9_dout, cpu9_done => vram9_done,
       cpu7_ena => vram7_ena, cpu7_rnw => vram7_rnw, cpu7_addr => vram7_addr,
       cpu7_be => vram7_be, cpu7_din => vram7_din, cpu7_dout => vram7_dout, cpu7_done => vram7_done,
       srv_req => vsrv_req, srv_rnw => vsrv_rnw, srv_bank => vsrv_bank, srv_addr => vsrv_addr,
