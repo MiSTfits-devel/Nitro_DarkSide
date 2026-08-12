@@ -364,9 +364,11 @@ wire [15:0] joy;
 wire [21:0] gamma_bus;
 wire [15:0] joystick_analog_0;
 
-// Keep the DE10 HPS transport behind a dedicated boundary. Its current
-// implementation is the proven framework hps_io; the boundary is the switch
-// point for the Clash command engine once file/SD transactions are covered.
+// Keep the DE10 HPS transport behind a dedicated boundary. The uio/fp command
+// decoder is the source-owned nds_hps_io (clash/rtl/nds_hps_io.sv), a drop-in
+// for the GPL framework hps_io, validated by clash/tests/run_hps_io_diff.sh
+// against the framework reference. SD/file transactions the core does not use
+// are answered with protocol-legal values rather than corrupting state.
 nds_hps_io_boundary #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 (
 	.clk_sys(clk_sys),
@@ -1763,7 +1765,9 @@ nds_clash_video_mixer #(.LINE_LENGTH(600), .GAMMA(VM_GAMMA)) video_mixer
 );
 
 wire [1:0] ar = status[6:5];
-video_freak video_freak
+// Source-owned replacement for the GPL sys/video_freak.sv, independently
+// written rather than ported (clash/rtl/nds_video_freak.sv).
+nds_video_freak video_freak
 (
 	.*,
 	.VGA_DE_IN(VGA_DE),

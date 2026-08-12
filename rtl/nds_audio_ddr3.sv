@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// Licensed under the repo LICENSE (see the LICENSE file at the repo root).
 //
 // nds_audio_ddr3.sv
 // NDS_MiSTfits: DDR3 audio ring reader - the FPGA end of the HPS sound pipe.
