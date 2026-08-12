@@ -95,9 +95,19 @@ set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_YC=1"
 # Disable ALSA audio output to save some resources
 set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ALSA=1"
 
-# Bypass MiSTer's IIR audio low-pass (a LOCAL patch to sys/audio_out.v, guarded
-# so the vendored file still builds unmodified when this is off).
-# MEASURED: IIR_filter is ~430 ALMs (~43 LABs). This image is LAB-bound, not
+# This fit profile already removes HDMI and requires the analog I/O board. Do
+# not spend fabric generating I2S or S/PDIF streams that have no sink here; keep
+# the sigma-delta DAC path, including MiSTer's volume and stereo-mix controls.
+# The removed blocks measure 71 combinational ALUTs and 102 registers in the
+# exact-cadence build (i2s + spdif hierarchy rows).
+set_global_assignment -name VERILOG_MACRO "NDS_ANALOG_AUDIO_ONLY=1"
+
+# Bypass MiSTer's IIR audio low-pass and 40-bit DC blockers (a LOCAL patch to
+# sys/audio_out.v, guarded so the vendored file still builds unmodified when
+# this is off). nds_sound already emits signed, bias-adjusted samples; these are
+# output post-filters, not emulated SPU state.
+# MEASURED before the DC-bypass extension: IIR_filter is ~430 ALMs (~43 LABs).
+# This image is LAB-bound, not
 # ALM-bound - with SOUND_ENABLE=1 + PQ_DEPTH=16 the fitter needed 4,192..4,215
 # LABs against 4,191 across five seeds (0,1,2,3,5), i.e. it missed by as little
 # as ONE. This is what pays for keeping PQ_DEPTH=16, which is worth 8 fewer

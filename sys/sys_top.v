@@ -1591,6 +1591,9 @@ audio_out audio_out
 `ifndef MISTER_DISABLE_ALSA
 	.alsa_l(alsa_l),
 	.alsa_r(alsa_r),
+`else
+	.alsa_l(16'd0),
+	.alsa_r(16'd0),
 `endif
 
 	.i2s_bclk(HDMI_SCLK),
