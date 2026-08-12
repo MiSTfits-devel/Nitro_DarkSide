@@ -287,7 +287,6 @@ architecture arch of nds_drawer_obj is
    signal OAMfetch_sizemult      : integer range 16 to 1024;   -- bytes per sprite tile-row / bitmap row
    signal OAMfetch_x_flip_offset : integer range 3 to 7;
    signal OAMfetch_y_flip_offset : integer range 28 to 56;
-   signal OAMfetch_x_div         : integer range 1 to 2;
    signal OAMfetch_x_size        : integer range 4 to 8;
    signal OAMfetch_addrbase      : integer range 0 to 262143;
 
@@ -322,7 +321,6 @@ architecture arch of nds_drawer_obj is
    signal sizemult          : integer range 16 to 1024;
 
    signal x_flip_offset     : integer range 3 to 7;
-   signal x_div             : integer range 1 to 2;
    signal x_size            : integer range 4 to 8;
 
    signal x                 : integer range 0 to 255;
@@ -766,12 +764,10 @@ begin
                if (OAMRAM_Drawer_data(OAM_HICOLOR) = '0') then
                   OAMfetch_x_flip_offset <= 3;
                   OAMfetch_y_flip_offset <= 28;
-                  OAMfetch_x_div         <= 2;
                   OAMfetch_x_size        <= 4;
                else
                   OAMfetch_x_flip_offset <= 7;
                   OAMfetch_y_flip_offset <= 56;
-                  OAMfetch_x_div         <= 1;
                   OAMfetch_x_size        <= 8;
                end if;
 
@@ -1075,10 +1071,11 @@ begin
                         pixeladdr_x_aff2 <= to_unsigned(((yyy mod 8) * x_size), 18);
                         pixeladdr_x_aff3 <= to_unsigned(((yyy / 8) * 1024), 18);
 
-                        pixeladdr_x_aff4 <= to_unsigned(((xxx mod 8) / x_div), 18);
                         if (Pixel_data0(OAM_HICOLOR) = '0') then
+                           pixeladdr_x_aff4 <= to_unsigned((xxx mod 8) / 2, 18);
                            pixeladdr_x_aff5 <= to_unsigned(((xxx / 8) * 32), 18);
                         else
+                           pixeladdr_x_aff4 <= to_unsigned(xxx mod 8, 18);
                            pixeladdr_x_aff5 <= to_unsigned(((xxx / 8) * 64), 18);
                         end if;
                      end if;
@@ -1100,17 +1097,19 @@ begin
                         pixeladdr_calc := pixeladdr_calc + x * 2;
                      end if;
                   elsif (Pixel_data1(OAM_HFLIP) = '1') then
-                     pixeladdr_calc := pixeladdr_calc + (x_flip_offset - ((x mod 8) / x_div));
                      if (Pixel_data0(OAM_HICOLOR) = '0') then
+                        pixeladdr_calc := pixeladdr_calc + (x_flip_offset - ((x mod 8) / 2));
                         pixeladdr_calc := pixeladdr_calc - (((x / 8) - ((sizeX / 8) - 1)) * 32);
                      else
+                        pixeladdr_calc := pixeladdr_calc + (x_flip_offset - (x mod 8));
                         pixeladdr_calc := pixeladdr_calc - (((x / 8) - ((sizeX / 8) - 1)) * 64);
                      end if;
                   else
-                     pixeladdr_calc := pixeladdr_calc + ((x mod 8) / x_div);
                      if (Pixel_data0(OAM_HICOLOR) = '0') then
+                        pixeladdr_calc := pixeladdr_calc + ((x mod 8) / 2);
                         pixeladdr_calc := pixeladdr_calc + ((x / 8) * 32);
                      else
+                        pixeladdr_calc := pixeladdr_calc + (x mod 8);
                         pixeladdr_calc := pixeladdr_calc + ((x / 8) * 64);
                      end if;
                   end if;
@@ -1348,7 +1347,6 @@ begin
 
             sizemult      <= OAMfetch_sizemult;
             x_flip_offset <= OAMfetch_x_flip_offset;
-            x_div         <= OAMfetch_x_div;
             x_size        <= OAMfetch_x_size;
 
             pixeladdr_base <= OAMfetch_addrbase;
