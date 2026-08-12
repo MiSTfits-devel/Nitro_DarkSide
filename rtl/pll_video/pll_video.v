@@ -1,5 +1,5 @@
 `timescale 1ns/10ps
-// SPDX-License-Identifier: GPL-2.0-or-later
+// Licensed under the repo LICENSE (see the LICENSE file at the repo root).
 // Video-output PLL: exactly 27.000000 MHz for CEA-861 720x480p.
 //
 // WHY A SECOND PLL. The main PLL (rtl/pll/pll_0002.v) is locked to the NDS

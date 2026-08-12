@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// Licensed under the repo LICENSE (see the LICENSE file at the repo root).
 //
 // HPS lightweight-bridge slave: gives the ARM direct register access into the
 // fabric at physical 0xFF200000, span 2 MB.
