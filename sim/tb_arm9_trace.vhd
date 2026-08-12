@@ -7,7 +7,25 @@
 -- pc is the pipeline PC (instruction address + 8 in ARM, + 4 in Thumb) —
 -- the melonDS tracer patch (docs/TRACE_DIFF.md) emits the same tuple, and
 -- sim/tests/compare_trace.py reports the first divergence.
--- Run: sim/run_arm9_trace.sh [MAXINSTR=n] [HEXFILE=...]
+-- Run: sim/run_arm9_trace.sh [MAXINSTR=n] [HEXFILE=...] [LOADADDR=...] [MARKBASE=...]
+--
+-- Two ways to be judged, and a workload picks one:
+--   LOADADDR=0x02000000, no MARKBASE - a melonDS differential workload, run in
+--     main RAM and compared line-by-line by sim/tests/compare_trace.py.
+--   LOADADDR unset (boot ROM at 0xFFFF0000) + MARKBASE - a self-checking
+--     workload that stores 0xCAFEBABE / 0x0BAD0BAD into its marker block; the
+--     verdict below turns that into PASS/FAIL and a non-zero exit.
+--
+-- 2026-08-12: the boot-ROM half of that was dead and had been for a while. This
+-- harness served brom_data combinationally while nds_membus9 latches it on the
+-- next clk1x edge, so every fetch returned the word at addr+4 and every
+-- boot-ROM workload branched into a vector-table `b hang` on its first
+-- instruction and parked there. It looked like a workload with nothing to say
+-- rather than a harness that never ran one. Two things kept it hidden: there
+-- was no verdict (only a 30k-line trace nobody reads), and tb_arm9_island - the
+-- same island with the read port done right - kept passing 12/12, so the RTL
+-- always looked fine. Both are fixed here. The LOADADDR path was never affected:
+-- it boots from main RAM, so the differential results stand.
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -28,6 +46,13 @@ entity tb_arm9_trace is
       -- load HEXFILE into main RAM at this address and boot from it
       -- (0x02000000 for the melonDS differential workloads).
       LOADADDR   : integer := 0;
+      -- Byte address of the workload's 64-byte marker block in main RAM, or 0
+      -- for a workload that is not self-checking (the melonDS differential
+      -- runs, which are judged by sim/tests/compare_trace.py instead).
+      -- Snooping by VALUE alone is not enough: a register holding 0xCAFEBABE
+      -- gets spilled by any stmdb, and the stack write then reads as a passed
+      -- checkpoint. The block address is what makes a marker a marker.
+      MARK_BASE  : integer := 0;
       DBG_T0     : integer := 0;         -- TEMP DEBUG window start/end in ns (0 = off)
       DBG_T1     : integer := 0
    );
@@ -141,12 +166,20 @@ architecture sim of tb_arm9_trace is
    signal mr9_writedata, mr9_readdata : std_logic_vector(31 downto 0);
    signal mainram_active, mainram_busy : std_logic;
    signal model_allow : std_logic := '1';
+   -- pair fills: one request, the aligned 8-byte block back. Leaving these
+   -- unconnected does NOT fail loudly - mem9_pair defaults to '0', so mainram
+   -- happily serves 32 bits while the cache writes a zeroed high word into
+   -- every odd slot of every line. Wire them.
+   signal mr9_pair : std_logic;
+   signal mr9_readdata_hi : std_logic_vector(31 downto 0);
    signal sdram_ena, sdram_rnw : std_logic := '0';
    signal sdram_Adr : std_logic_vector(26 downto 0);
    signal sdram_Din : std_logic_vector(31 downto 0);
    signal sdram_be  : std_logic_vector(3 downto 0);
    signal sdram_Dout : std_logic_vector(31 downto 0) := (others => '0');
    signal sdram_done32 : std_logic := '0';
+   signal sdram_Dout_hi : std_logic_vector(31 downto 0) := (others => '0');
+   signal sdram_done64  : std_logic := '0';
 
    signal io_bus : proc_bus_gb_type;
    signal io_wired_out : std_logic_vector(31 downto 0);
@@ -156,6 +189,17 @@ architecture sim of tb_arm9_trace is
 
    signal irq_in    : std_logic_vector(31 downto 0);
    signal irp_timer : std_logic_vector(3 downto 0);
+
+   -- ARM9 runs at 2x the system/bus clock: the CPU gets ce='1' every clk1x
+   -- cycle while the ARM7-domain peripherals (timers, IRQ fabric) tick on
+   -- ce_half - the pacing nds_top uses (66 MHz core / 33 MHz bus). Running them
+   -- at ce='1' here, as this harness did, ticks every timer at twice its real
+   -- rate, which silently rewrites the workload of any IRQ-cadence test.
+   signal ce_half    : std_logic := '0';
+   signal io_ce_next : std_logic;
+
+   signal pass_marks : natural := 0;
+   signal fail_marks : natural := 0;
 
    signal trace_done : boolean := false;
    signal time_up    : boolean := false;
@@ -283,10 +327,24 @@ begin
       vram_din => vram_din, vram_dout => (others => '0'), vram_done => '0',
       mr_ena => mr9_ena, mr_rnw => mr9_rnw, mr_addr => mr9_addr, mr_be => mr9_be,
       mr_writedata => mr9_writedata, mr_done => mr9_done, mr_readdata => mr9_readdata,
+      mr_pair => mr9_pair, mr_readdata_hi => mr9_readdata_hi,
+      io_ce_next => io_ce_next,
       io_bus => io_bus, io_wired_out => io_wired_out, io_wired_done => io_wired_done
    );
 
-   brom_data <= brom(to_integer(brom_addr));
+   -- The hot-loadable hardware BIOS is an M10K with a REGISTERED read port, and
+   -- nds_membus9 latches the fetch result on the following clk1x edge. Serving
+   -- this combinationally (as this harness did until 2026-08-12) hands back the
+   -- word a cycle early: by the time the bus samples it, brom_addr has already
+   -- advanced to the next fetch, so the CPU executes the instruction at addr+4.
+   -- Every trace run booted straight into a vector-table `b hang` and parked
+   -- there - see tb_arm9_island, which had this right and passed 12/12 all along.
+   process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         brom_data <= brom(to_integer(brom_addr));
+      end if;
+   end process;
 
    process (clk1x)
    begin
@@ -318,10 +376,19 @@ begin
    irq_in <= (3 => irp_timer(0), 4 => irp_timer(1), 5 => irp_timer(2), 6 => irp_timer(3),
               others => '0');
 
+   io_ce_next <= not ce_half;
+
+   p_cehalf : process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         ce_half <= not ce_half;
+      end if;
+   end process;
+
    iirq : entity work.nds_irq
    port map
    (
-      clk => clk1x, ce => '1', reset => reset,
+      clk => clk1x, ce => ce_half, reset => reset,
       gb_bus => io_bus, wired_out => irq_wired_out, wired_done => irq_wired_done,
       irq_in => irq_in, cpu_irq => cpu_irq, cpu_unhalt => cpu_unhalt
    );
@@ -330,7 +397,7 @@ begin
    generic map ( is_simu => '0' )
    port map
    (
-      clk => clk1x, ce => '1', reset => reset,
+      clk => clk1x, ce => ce_half, reset => reset,
       savestate_bus => ss_bus, ss_wired_out => open, ss_wired_done => open,
       loading_savestate => '0',
       gb_bus => io_bus, wired_out => timer_wired_out, wired_done => timer_wired_done,
@@ -358,12 +425,14 @@ begin
       arm7_priority => '0',
       mem9_ena => mr9_ena, mem9_rnw => mr9_rnw, mem9_addr => mr9_addr, mem9_be => mr9_be,
       mem9_writedata => mr9_writedata, mem9_done => mr9_done, mem9_readdata => mr9_readdata,
+      mem9_pair => mr9_pair, mem9_readdata_hi => mr9_readdata_hi,
       mem7_ena => '0', mem7_rnw => '1', mem7_addr => (others => '0'), mem7_be => "0000",
       mem7_writedata => (others => '0'), mem7_done => open, mem7_readdata => open,
       mainram_allow => model_allow, mainram_active => mainram_active, mainram_busy => mainram_busy,
       mr_sdram_ena => sdram_ena, mr_sdram_rnw => sdram_rnw, mr_sdram_Adr => sdram_Adr,
       mr_sdram_Din => sdram_Din, mr_sdram_be => sdram_be,
-      sdram_Dout => sdram_Dout, sdram_done32 => sdram_done32
+      sdram_Dout => sdram_Dout, sdram_done32 => sdram_done32,
+      sdram_Dout_hi => sdram_Dout_hi, sdram_done64 => sdram_done64
    );
 
    psdram : process
@@ -413,7 +482,27 @@ begin
             sdram_done32 <= '1';
             wait until rising_edge(clkMem);
             sdram_done32 <= '0';
-            for k in 1 to 3 loop wait until rising_edge(clkMem); end loop;
+            -- The real controller runs BURST_LENGTH=4, so the upper 32 bits of
+            -- the aligned 8-byte block arrive two clocks after done32 and
+            -- done64 marks them (rtl/sdram.sv ch2_dout_hi / ch2_ready64). The
+            -- pairing is w with w xor 1 rather than w+1 because ACCESS_TYPE is
+            -- sequential: a burst from an odd word wraps inside its aligned
+            -- block, so the "high" half of an odd base is the EVEN word. Pair
+            -- mode is only ever issued on even addresses, but modelling the
+            -- wrap is what makes a violation of that show up here rather than
+            -- as silently transposed data on hardware.
+            wait until rising_edge(clkMem);
+            if (w mod 2) = 0 then
+               sdram_Dout_hi <= mem(w + 1);
+            else
+               sdram_Dout_hi <= mem(w - 1);
+            end if;
+            sdram_done64  <= '1';
+            wait until rising_edge(clkMem);
+            sdram_done64 <= '0';
+            -- the slot stays 10 clkMem cycles long, exactly as before pair
+            -- mode existed, so a non-pair read is cycle-identical to baseline
+            wait until rising_edge(clkMem);
          else
             for k in 1 to 3 loop wait until rising_edge(clkMem); end loop;
             for j in 0 to 3 loop
@@ -422,8 +511,10 @@ begin
                end if;
             end loop;
             sdram_done32 <= '1';
+            sdram_done64 <= '1';   -- a write returns no data; both dones fire
             wait until rising_edge(clkMem);
             sdram_done32 <= '0';
+            sdram_done64 <= '0';
             for k in 1 to 4 loop wait until rising_edge(clkMem); end loop;
          end if;
       elsif (refresh_cnt > 750) then
@@ -467,11 +558,63 @@ begin
       end loop;
    end process;
 
+   -- ================= marker snoop + verdict =================
+   -- The self-checking workloads (sim/tests/ldm_bx_irq, and the island's
+   -- mailbox) report by STORING a magic word to main RAM. Until now this
+   -- harness only wrote the trace, so a run that failed and a run that never
+   -- started looked the same from the outside - you had to read 20k lines of
+   -- arm9_trace.log to tell. Watch the workload's declared marker block for the
+   -- two magics:
+   --   0xCAFEBABE  a checkpoint passed   0x0BAD0BAD  a checkpoint failed
+   p_markers : process (clk1x)
+      -- mr9_addr is a WORD address within main RAM (bits 21..2 of the offset
+      -- from 0x02000000), so the byte offset is *4. It carries only 4 MB of
+      -- range, so the offset reported below is the one inside the 4 MB window -
+      -- 0x02FFFF00 and 0x023FFF00 are the same RAM and print the same.
+      constant MARK_W0 : integer := (MARK_BASE mod 4194304) / 4;
+      variable w : integer;
+   begin
+      if rising_edge(clk1x) then
+         w := to_integer(unsigned(mr9_addr));
+         if (MARK_BASE /= 0 and mr9_ena = '1' and mr9_rnw = '0'
+             and w >= MARK_W0 and w < MARK_W0 + 16) then
+            if (mr9_writedata = x"CAFEBABE") then
+               pass_marks <= pass_marks + 1;
+               report "marker PASS 0xCAFEBABE at main RAM +0x" &
+                      to_hstring(to_unsigned(w * 4, 24)) severity note;
+            elsif (mr9_writedata = x"0BAD0BAD") then
+               fail_marks <= fail_marks + 1;
+               report "marker FAIL 0x0BAD0BAD at main RAM +0x" &
+                      to_hstring(to_unsigned(w * 4, 24)) severity note;
+            end if;
+         end if;
+      end if;
+   end process;
+
    p_watchdog : process
    begin
       wait for TIMEOUT_MS * 1 ms;
       if not trace_done then
          report "tb_arm9_trace: sim time limit reached (trace is still valid)" severity note;
+      end if;
+      -- A workload that parks in `b .` after its last checkpoint always hits the
+      -- time limit; that is the documented end state, not an error. What decides
+      -- the verdict is the markers. Zero of either means the workload never
+      -- reached a checkpoint - which is what a broken harness looks like, and is
+      -- reported as a failure so it can never again pass for "nothing to see".
+      if (fail_marks > 0) then
+         report "tb_arm9_trace: FAIL  " & integer'image(fail_marks) &
+                " fail marker(s), " & integer'image(pass_marks) & " pass marker(s)"
+                severity failure;
+      elsif (MARK_BASE = 0) then
+         report "tb_arm9_trace: no marker block declared (MARKBASE unset) - this " &
+                "run is judged by sim/tests/compare_trace.py, not here" severity note;
+      elsif (pass_marks = 0) then
+         report "tb_arm9_trace: FAIL  the workload wrote no marker at all - it " &
+                "never reached its first checkpoint (read arm9_trace.log)" severity failure;
+      else
+         report "tb_arm9_trace: PASS  " & integer'image(pass_marks) &
+                " pass marker(s), no fail marker" severity note;
       end if;
       time_up <= true;
       wait;

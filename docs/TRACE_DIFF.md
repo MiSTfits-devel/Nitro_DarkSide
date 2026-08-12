@@ -22,8 +22,15 @@ I/F, T and mode bits.
 `is_simu='1'`) and writes `arm9_trace.log`:
 
 ```
-MAXINSTR=10000000 HEXFILE=sim/tests/<workload>.hex sim/run_arm9_trace.sh
+MAXINSTR=10000000 HEXFILE=sim/tests/<workload>.hex \
+   LOADADDR=$((0x02000000)) sim/run_arm9_trace.sh
 ```
+
+`LOADADDR` is not optional for a differential run and this line used to omit
+it. The melonDS side boots the raw binary in main RAM at `0x02000000`; with
+`LOADADDR` unset the RTL side instead loads the same hex as the boot ROM at
+`0xFFFF0000`, so the two sides run different memory maps and diverge on
+instruction 1 for a reason that has nothing to do with the CPU.
 
 Run it on the cluster (`DIRTY=1 build/remote-sim.sh run_arm9_trace.sh`,
 `ENV="MAXINSTR=..."`); fetch `arm9_trace.log` from the pod before it is
