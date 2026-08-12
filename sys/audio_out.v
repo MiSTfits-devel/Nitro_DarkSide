@@ -111,7 +111,10 @@ assign i2s_data  = 1'b0;
 assign spdif     = 1'b0;
 `endif
 
-sigma_delta_dac #(15) sd_l
+// NDS_MiSTfits LOCAL CHANGE: source-owned modulator (clash/rtl/nds_sigma_delta_dac.v).
+// Contract-tested in clash/tests/run_sigma_delta_tb.sh: exact DC tracking,
+// monotonic, idle noise 67.7 LSB vs this file's original 57.8 (~1.4 dB worse).
+nds_sigma_delta_dac #(15) sd_l
 (
 	.CLK(clk),
 	.RESET(reset),
@@ -119,7 +122,7 @@ sigma_delta_dac #(15) sd_l
 	.DACout(dac_l)
 );
 
-sigma_delta_dac #(15) sd_r
+nds_sigma_delta_dac #(15) sd_r
 (
 	.CLK(clk),
 	.RESET(reset),
