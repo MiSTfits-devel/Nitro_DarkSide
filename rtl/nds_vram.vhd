@@ -1392,7 +1392,11 @@ begin
                   if (srv_done = '1') then
                      srv_req          <= '0';
                      v_wq(v_wh).valid := '0';
-                     v_wh             := (v_wh + 1) mod WQ_DEPTH;
+                     if (v_wh = WQ_DEPTH - 1) then
+                        v_wh := 0;
+                     else
+                        v_wh := v_wh + 1;
+                     end if;
                      v_wcnt           := v_wcnt - 1;
                      v_wbusy          := false;
                      state            <= IDLE;
@@ -1452,7 +1456,11 @@ begin
             -- Adjacent halfwords of a 16-bit DMA burst land in the same word, so
             -- the tail entry is nearly always the right one to fold into.
             if (wq_push_now = '1') then
-               v_wprev := (v_wt + WQ_DEPTH - 1) mod WQ_DEPTH;
+               if (v_wt = 0) then
+                  v_wprev := WQ_DEPTH - 1;
+               else
+                  v_wprev := v_wt - 1;
+               end if;
                if (v_wcnt > 0 and v_wq(v_wprev).valid = '1' and
                    v_wq(v_wprev).bank = wq_bank_now and
                    v_wq(v_wprev).addr = dec9_offs(wq_bank_now)(16 downto 2) and
@@ -1466,7 +1474,11 @@ begin
                else
                   v_wq(v_wt) := ('1', wq_bank_now,
                                  dec9_offs(wq_bank_now)(16 downto 2), cpu9_be, cpu9_din);
-                  v_wt   := (v_wt + 1) mod WQ_DEPTH;
+                  if (v_wt = WQ_DEPTH - 1) then
+                     v_wt := 0;
+                  else
+                     v_wt := v_wt + 1;
+                  end if;
                   v_wcnt := v_wcnt + 1;
                end if;
             end if;
