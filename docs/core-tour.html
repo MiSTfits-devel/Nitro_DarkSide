@@ -120,7 +120,7 @@
   <div class="meta">
     <span class="pill">Cyclone V <b>5CSEBA6U23I7</b></span>
     <span class="pill">ALMs <b>41,910</b></span>
-    <span class="pill">M10K <b>557 blocks ≈ 696 KB</b></span>
+    <span class="pill">M10K <b>553 blocks · latest fit 482 used</b></span>
     <span class="pill">clk1x <b>33.514 MHz</b></span>
     <span class="pill">scope <b>2D titles</b></span>
   </div>
@@ -129,8 +129,8 @@
 <section>
   <h2>orientation</h2>
   <h3>Six things that reframe the whole core</h3>
-  <p class="lede">If you've been writing an ARM-focused backport, these are the load-bearing decisions — everything below is
-  just the picture that follows from them.</p>
+  <p class="lede">If you've been writing an ARM-focused backport, these are the decisions that shape the core — everything below is
+  the picture that follows from them.</p>
   <div class="orient">
     <div class="card" style="--ac:var(--c7)"><div class="n">01 · THE ARM7</div>
       <p>The ARM7 core is <em>settled RTL</em>. All of the NDS work on this side sits in its memory map.</p></div>
@@ -141,9 +141,9 @@
     <div class="card" style="--ac:var(--gold)"><div class="n">04 · WHY CACHES AT ALL</div>
       <p>Not an optimisation. 4 MB of main RAM lives in SDRAM; the caches are what make that <em>survivable</em>.</p></div>
     <div class="card" style="--ac:var(--gr)"><div class="n">05 · PACING</div>
-      <p>One clock domain gated by <em>ce</em>. The ARM9 has a real second-domain port — in hardware it's tied 1:1.</p></div>
+      <p>Most of the console advances on clk1x. The ARM9 now uses its real 67 MHz domain at <em>2:1</em>, and timing is still open.</p></div>
     <div class="card" style="--ac:var(--pk)"><div class="n">06 · WHAT COUNTS AS DONE</div>
-      <p>Differential traces against a reference emulator, over <em>millions of instructions</em>, at zero divergence.</p></div>
+      <p>A CPU-only differential ran for <em>ten million instructions</em> with no divergence in the generated workload.</p></div>
   </div>
 </section>
 
@@ -244,8 +244,8 @@
     <!-- ================= spine ================= -->
     <g class="node" style="--ac:#5b6b8c">
       <rect x="60" y="320" width="1080" height="126" rx="14" fill="url(#d1spine)" stroke="#2b364d" stroke-width="1.2"/>
-      <text class="nmb" x="600" y="345" text-anchor="middle">IO PROC-BUS — 28-bit, dual-instantiated: live bus + savestate bus</text>
-      <text class="sb"  x="600" y="359" text-anchor="middle" fill="#8b96ad">every register gets savestate support for free — one convention, applied to all of them</text>
+      <text class="nmb" x="600" y="345" text-anchor="middle">IO PROC-BUS — 28-bit register spine shared by both CPUs</text>
+      <text class="sb"  x="600" y="359" text-anchor="middle" fill="#8b96ad">one register convention; the second instance currently supplies boot presets, not working savestates</text>
     </g>
     <g class="node" style="--ac:var(--gr)">
       <rect class="chip" x="76"   y="368" width="118" height="62" rx="8"/>
@@ -298,8 +298,8 @@
     <g class="node" style="--ac:var(--gold)">
       <rect class="blk" x="60" y="490" width="340" height="200" rx="14"/>
       <text class="hd"  x="78" y="516">M10K BRAM — THE SCARCE COMMODITY</text>
-      <text class="big" x="78" y="552">≈ 418 KB</text>
-      <text class="sb"  x="78" y="568">85% of blocks in the build that closed timing</text>
+      <text class="big" x="78" y="552">482 / 553</text>
+      <text class="sb"  x="78" y="568">87% of M10K blocks in the latest stage-2 fit</text>
       <line x1="78" y1="580" x2="382" y2="580" class="rail"/>
       <text class="sb"  x="78" y="600">VRAM E–I 144K   ·   2D engines ×2  88K</text>
       <text class="sb"  x="78" y="616">ARM7 WRAM 64K   ·   ITCM + DTCM   48K</text>
@@ -319,9 +319,9 @@
       <text class="sb"  x="448" y="600">ch2 — 4 MB main RAM, two guest channels</text>
       <text class="sb"  x="448" y="616">ch2 — CPU / DMA path into VRAM A–D</text>
       <text class="sb"  x="448" y="632">ch1 — renderer line server, read-only</text>
-      <text class="warnt" x="448" y="656">⚠ ch1 holds exactly ONE request in flight.</text>
-      <text class="warnt" x="448" y="670">The ready line back into the core is the</text>
-      <text class="warnt" x="448" y="684">narrowest point in the whole design.</text>
+      <text class="warnt" x="448" y="656">⚠ ch1 allows at most TWO outstanding reads.</text>
+      <text class="warnt" x="448" y="670">accept frees the request slot while the first</text>
+      <text class="warnt" x="448" y="684">operation is still in service.</text>
     </g>
 
     <!-- ================= tier: DDR3 ================= -->
@@ -334,14 +334,14 @@
       <text class="sb"  x="818" y="600">card ROM — up to 128 MB, read in place</text>
       <text class="sb"  x="818" y="616">firmware NVRAM 256 KB</text>
       <text class="sb"  x="818" y="632">framebuffer — write + scanout channels</text>
-      <text class="sb"  x="818" y="648">audio ring, drained by the HPS ARM</text>
+      <text class="sb"  x="818" y="648">optional HPS audio ring — transport only, profile off</text>
       <text class="sbd" x="818" y="672">card timing is slow and FIFO'd, so the</text>
       <text class="sbd" x="818" y="684">deep latency never shows through</text>
     </g>
   </svg>
   </div>
   <figcaption><b>Read it downward.</b> Both CPUs meet at one 28-bit register spine; every peripheral hangs off it and
-  inherits savestates from the same convention. The three tiers below are not a hierarchy — they are three different
+  shares the same register convention and boot-preset path. The three tiers below are not a hierarchy — they are three different
   physical memories, and which tier a thing landed in is the single biggest design decision in the core.</figcaption>
   </figure>
 </section>
@@ -411,7 +411,7 @@
     <g class="node" style="--ac:#7c8aa5">
       <rect class="blk ghost" x="430" y="144" width="248" height="52" rx="8"/>
       <text class="nm" x="442" y="165">IO proc-bus · 0x04</text>
-      <text class="sb" x="442" y="182">register file + savestate shadow</text>
+      <text class="sb" x="442" y="182">register file + boot-preset path</text>
       <rect class="pillsvg" x="690" y="156" width="72" height="26" rx="13"/>
       <text class="sb" x="726" y="173" text-anchor="middle" fill="#a3adc2">pulsed</text>
     </g>
@@ -466,7 +466,7 @@
 <section>
   <h2>diagram 3 — the pixel path</h2>
   <h3>Where the fitting bet actually lives</h3>
-  <p class="lede">Two 2D engines, ten drawers each, and a VRAM server that had to make SDRAM behave like
+  <p class="lede">Two 2D engines, eight drawers each, and a VRAM server that had to make SDRAM behave like
   block RAM. This is the risk in the whole project, drawn.</p>
   <figure>
   <div class="scroller">
@@ -495,11 +495,10 @@
     <g class="node" style="--ac:var(--gr)">
       <rect class="grp" x="268" y="24" width="330" height="140" rx="12"/>
       <text class="hd" x="282" y="46">2D ENGINE A</text>
-      <text class="sb" x="282" y="61">nds_gpu2d, ten drawer instances</text>
-      <rect class="chip" x="282" y="70" width="76" height="26" rx="6"/><text class="sb" x="320" y="87" text-anchor="middle">text ×4</text>
-      <rect class="chip" x="366" y="70" width="76" height="26" rx="6"/><text class="sb" x="404" y="87" text-anchor="middle">affine ×2</text>
-      <rect class="chip" x="450" y="70" width="76" height="26" rx="6"/><text class="sb" x="488" y="87" text-anchor="middle">ext ×2</text>
-      <rect class="chip" x="534" y="70" width="50" height="26" rx="6"/><text class="sb" x="559" y="87" text-anchor="middle">obj</text>
+      <text class="sb" x="282" y="61">nds_gpu2d, eight drawer instances</text>
+      <rect class="chip" x="282" y="70" width="92" height="26" rx="6"/><text class="sb" x="328" y="87" text-anchor="middle">text ×4</text>
+      <rect class="chip" x="382" y="70" width="112" height="26" rx="6"/><text class="sb" x="438" y="87" text-anchor="middle">aff/ext ×2</text>
+      <rect class="chip" x="502" y="70" width="82" height="26" rx="6"/><text class="sb" x="543" y="87" text-anchor="middle">obj</text>
       <rect class="chip" x="282" y="102" width="302" height="26" rx="6"/>
       <text class="sb" x="433" y="119" text-anchor="middle">nds_drawer_merge  →  line buffers</text>
       <text class="sbd" x="282" y="146" font-size="8.6">BG ext-pal shadowed in-engine · one palette per drawer</text>
@@ -508,10 +507,9 @@
       <rect class="grp" x="268" y="180" width="330" height="140" rx="12"/>
       <text class="hd" x="282" y="202">2D ENGINE B</text>
       <text class="sb" x="282" y="217">the same entity, parametrised for the B role</text>
-      <rect class="chip" x="282" y="226" width="76" height="26" rx="6"/><text class="sb" x="320" y="243" text-anchor="middle">text ×4</text>
-      <rect class="chip" x="366" y="226" width="76" height="26" rx="6"/><text class="sb" x="404" y="243" text-anchor="middle">affine ×2</text>
-      <rect class="chip" x="450" y="226" width="76" height="26" rx="6"/><text class="sb" x="488" y="243" text-anchor="middle">ext ×2</text>
-      <rect class="chip" x="534" y="226" width="50" height="26" rx="6"/><text class="sb" x="559" y="243" text-anchor="middle">obj</text>
+      <rect class="chip" x="282" y="226" width="92" height="26" rx="6"/><text class="sb" x="328" y="243" text-anchor="middle">text ×4</text>
+      <rect class="chip" x="382" y="226" width="112" height="26" rx="6"/><text class="sb" x="438" y="243" text-anchor="middle">aff/ext ×2</text>
+      <rect class="chip" x="502" y="226" width="82" height="26" rx="6"/><text class="sb" x="543" y="243" text-anchor="middle">obj</text>
       <rect class="chip" x="282" y="258" width="302" height="26" rx="6"/>
       <text class="sb" x="433" y="275" text-anchor="middle">nds_drawer_merge  →  line buffers</text>
       <text class="sbd" x="282" y="302" font-size="8.6">one implementation, elaborated twice by generic</text>
@@ -563,8 +561,8 @@
       <text class="sb"  x="970" y="257">64-bit reads, line-addressed</text>
       <text class="sbd" x="970" y="271">(the port fetches four halfwords</text>
       <text class="sbd" x="970" y="283">anyway — take the whole line)</text>
-      <text class="warnt" x="970" y="303">⚠ one request in flight;</text>
-      <text class="warnt" x="970" y="315">back-pressure reaches the core</text>
+      <text class="warnt" x="970" y="303">⚠ at most two outstanding reads;</text>
+      <text class="warnt" x="970" y="315">back-pressure still reaches the core</text>
     </g>
 
     <!-- down to video -->
@@ -597,11 +595,11 @@
     <g class="node" style="--ac:var(--gr)">
       <rect class="blk" x="886" y="416" width="286" height="86" rx="10"/>
       <text class="nm"  x="898" y="440">video out — 67.028 MHz</text>
-      <text class="sb"  x="898" y="457">MiSTer scaler → HDMI</text>
+      <text class="sb"  x="898" y="457">native analog path in the checked-in QSF</text>
       <text class="sb"  x="898" y="471">stacked / side-by-side / single</text>
       <text class="sbd" x="898" y="489">swap follows the power register</text>
     </g>
-    <text class="sbd" x="26" y="534" font-size="9.6">sound: 16 uniform channels, built and fitting — now being farmed out to the HPS ARM over a DDR3 ring, because the last few thousand ALMs were needed elsewhere.</text>
+    <text class="sbd" x="26" y="534" font-size="9.6">sound: the fabric mixer fits in a dated no-HDMI image; an optional HPS transport exists in simulation, but the daemon and SPU do not.</text>
   </svg>
   </div>
   <figcaption><b>The bet:</b> VRAM A–D could not be BRAM — the core would not fit. So the renderer reads them out of
@@ -640,12 +638,12 @@
     <g class="node" style="--ac:var(--c9)">
       <rect class="blk ghost" x="398" y="20" width="330" height="44" rx="8"/>
       <text class="nm" x="412" y="39">clk_sys / clk1x — 33.513982 MHz</text>
-      <text class="sbd" x="412" y="55">the whole console, gated by ce</text>
+      <text class="sbd" x="412" y="55">ARM7, IO, 2D engines and core timing</text>
     </g>
     <g class="node" style="--ac:var(--gr)">
       <rect class="blk ghost" x="398" y="83" width="330" height="44" rx="8"/>
-      <text class="nm" x="412" y="102">CLK_VIDEO — 67.027964 MHz</text>
-      <text class="sbd" x="412" y="118">scaler and video out</text>
+      <text class="nm" x="412" y="102">clk_video_67 / clk2x — 67.027964 MHz</text>
+      <text class="sbd" x="412" y="118">ARM9 island and native video path</text>
     </g>
     <g class="node" style="--ac:var(--cy)">
       <rect class="blk ghost" x="398" y="144" width="330" height="44" rx="8"/>
@@ -660,15 +658,15 @@
       <text class="sb"  x="776" y="88">one of them is a legal handshake edge, and everything</text>
       <text class="sb"  x="776" y="102">crossing into memory waits for it.</text>
       <text class="sb"  x="776" y="126">Cross-domain setup budget follows edge alignment, not</text>
-      <text class="sb"  x="776" y="140">period — so only integer ratios are viable. A 2:1 ARM9</text>
-      <text class="sb"  x="776" y="154">island was attempted and would not close timing; the</text>
-      <text class="sb"  x="776" y="168">island survives in the RTL, wired at 1:1.</text>
+      <text class="sb"  x="776" y="140">period — so only integer ratios are viable. The ARM9</text>
+      <text class="sb"  x="776" y="154">island is wired at 2:1 again; the latest fit succeeds,</text>
+      <text class="sb"  x="776" y="168">but its 67 MHz domain still misses setup and hold.</text>
     </g>
   </svg>
   </div>
   <figcaption><b>Consequence for you:</b> the ARM9 "island" is a real clock-domain boundary in the source — toggle
-  requests, edge-detected dones, payload latches — but it is not currently buying a frequency ratio. Treat it as
-  structure that's already paid for, not as speed you can dial up.</figcaption>
+  requests, edge-detected dones, payload latches — and the current source uses it at 2:1. That restores the intended
+  ARM9 rate, but it is not release-ready until the 67 MHz timing paths close.</figcaption>
   </figure>
 </section>
 
