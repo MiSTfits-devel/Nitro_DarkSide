@@ -30,6 +30,9 @@ SEED_OVERRIDE="${SEED_OVERRIDE:-}"
 ARTIFACT_FILES=(
    NDS.rbf NDS.fit.summary NDS.map.summary NDS.sta.summary NDS.sta.rpt
    NDS.paths.rpt NDS.flow.rpt NDS.fit.rpt NDS.map.rpt
+   # Hold failures need endpoint/path detail too; the default STA report only
+   # carries the per-clock summary, which is not enough to fix one.
+   NDS.paths_hold.rpt
    # every path that would violate at 67.028 MHz (14.92 ns). The -npaths 50
    # report only ever shows the worst ~31 ns family, which hid the whole
    # 15-26 ns population - i.e. most of the work needed to raise clk_sys.

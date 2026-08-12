@@ -45,6 +45,7 @@ spec:
           "read_sdc" \
           "update_timing_netlist" \
           "report_timing -setup -npaths 50 -detail full_path -file output_files/NDS.paths.rpt" \
+          "report_timing -hold -npaths 50 -detail full_path -file output_files/NDS.paths_hold.rpt" \
           "report_timing -setup -npaths 3000 -less_than_slack 14.92 -detail summary -file output_files/NDS.paths_67mhz.rpt" \
           "set a9 [get_registers {*icpu9*}]" \
           "set m9 [get_registers {*imembus9*}]" \
