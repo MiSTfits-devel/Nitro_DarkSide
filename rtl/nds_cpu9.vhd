@@ -297,14 +297,14 @@ architecture arch of nds_cpu9 is
       RECEIVETYPE_SIGNEDWORD
    );
    
-   signal decode_data                     : std_logic_vector(31 downto 0);
    signal decode_condition                : std_logic_vector(3 downto 0);
    
-   signal decode_ready                    : std_logic := '0';     
+   signal decode_ready                    : std_logic := '0';
+   signal decode_data                     : std_logic_vector(31 downto 0);
+   signal decode_data_1                   : std_logic_vector(31 downto 0) := (others => '0');
    signal decode_halt                     : std_logic := '0';        
    signal decode_unhalt                   : std_logic := '0';     
    signal decode_PC                       : unsigned(31 downto 0) := (others => '0');
-   signal decode_data_1                   : std_logic_vector(31 downto 0) := (others => '0');
    signal decode_functions_detail         : tFunctions_detail;
    signal decode_datareceivetype          : tdatareceivetype;
    signal decode_clearbit1                : std_logic := '0';
@@ -313,6 +313,13 @@ architecture arch of nds_cpu9 is
    signal decode_Rn_op1                   : std_logic_vector(3 downto 0) := (others => '0');
    signal decode_Rn_op1_save              : std_logic_vector(3 downto 0) := (others => '0');
    signal decode_RM_op2                   : std_logic_vector(3 downto 0) := (others => '0');
+   -- Keep only the four-bit Rn decode/execute boundary. Physical retiming moved
+   -- it through the register mux and address adder, joining instruction decode
+   -- to the operand datapath in one 67 MHz cycle. Preserving the whole register
+   -- bank was counterproductive; preserving decode_RM_op2 was measured too and
+   -- made its CPU path 0.844 ns worse (PC11), so leave that selector movable.
+   attribute preserve : boolean;
+   attribute preserve of decode_Rn_op1 : signal is true;
    signal decode_alu_use_immi             : std_logic := '0';
    signal decode_alu_use_shift            : std_logic := '0';
    signal decode_immidiate                : unsigned(31 downto 0) := (others => '0');
@@ -395,6 +402,11 @@ architecture arch of nds_cpu9 is
    signal alu_result_add                  : unsigned(32 downto 0);
    signal alu_shiftercarry                : std_logic;
    signal alu_wait_shift                  : std_logic := '0';
+   -- ALU writes to r15 take one extra beat.  Besides matching the ARM9's
+   -- refill cost, this registers the ALU/shifter result before it fans into
+   -- the fetch-address mux; without the cut that path spans essentially the
+   -- whole CPU island in one 67 MHz cycle.
+   signal alu_pcwrite_wait                : std_logic := '0';
    signal execute_cacheop_wait            : std_logic := '0';
    
    signal execute_flag_Carry              : std_logic;
@@ -441,6 +453,7 @@ architecture arch of nds_cpu9 is
    type texecute_RW_State is
    (
       DATARW_IDLE,
+      DATARW_ADDRWAIT,      -- register an ARM addressing-mode-2 offset/address before issue
       DATARW_READSTART,
       DATARW_READWAIT,
       DATARW_READWAITDMA,
@@ -450,6 +463,7 @@ architecture arch of nds_cpu9 is
       DATARW_BLOCKREAD,
       DATARW_BLOCKWRITE,
       DATARW_BLOCKSWITCH,  -- ldm^ with pc: CPSR := SPSR + bank swap, one cycle after base writeback
+      DATARW_PCWRITE,      -- register a block-load PC before starting its fetch
       DATARW_READSTART_D2, -- v5TE LDRD: second word
       DATARW_WRITE_D2      -- v5TE STRD: second word
    );
@@ -463,6 +477,10 @@ architecture arch of nds_cpu9 is
    signal execute_busaddress              : unsigned(31 downto 0);
    signal execute_busaddmod               : unsigned(31 downto 0);
    signal execute_RW_dataRead             : std_logic_vector(31 downto 0);
+   -- This register is the existing ALU/load-to-PC timing boundary. Without a
+   -- preserve, physical retiming removes it and rebuilds the full register-file
+   -- -> shifter -> PC-address -> membus path in one 67 MHz cycle.
+   attribute preserve of execute_RW_dataRead : signal is true;
    signal execute_RW_WBaddr               : unsigned(31 downto 0) := (others => '0');
    
    signal execute_blockRW_addr            : unsigned(31 downto 0) := (others => '0');
@@ -882,6 +900,18 @@ begin
                CPU_bus_idle <= '0';
             end if;
             
+            -- ARM addressing mode 2 can put a five-level barrel shift and the
+            -- address adder in front of the membus decode.  Its preparation
+            -- beat deliberately suppresses execute_RW_ena below, so capture
+            -- the result in the address latch that normal requests already
+            -- use; the following ADDRWAIT beat issues from this register.
+            if (execute_now = '1' and execute_skip = '0' and
+                execute_RW_State = DATARW_IDLE and
+                (decode_functions_detail = data_read or decode_functions_detail = data_write) and
+                decode_datatransfer_shiftval = '1') then
+               execute_RW_addr_last <= execute_RW_addr;
+            end if;
+
             if (execute_RW_ena = '1') then
                execute_RW_addr_last <= execute_RW_addr;
                if (gb_bus_ena = '1') then
@@ -933,15 +963,25 @@ begin
    -- the PC-write case FIRST, but execute_branchPC puts the exception vectors
    -- first, so an exception that also writes the PC must still take the vector.
    -- Drop that condition and those branches go to the written value instead.
-   pcwrite_fetch <= '1' when (execute_writeback = '1' and execute_writereg = x"F" and
-                              decode_functions_detail /= IRQ and
-                              decode_functions_detail /= software_interrupt_detail) else '0';
+   -- Only architecturally defined PC writes reach this late fetch mux.  ALU and
+   -- load-to-PC results have both been registered before their named wait state.
+   -- Keeping the generic execute_writereg=x"F" test here let UNPREDICTABLE r15
+   -- destinations on multiply/base-writeback paths fan into the fetch address
+   -- and recreated the full execute -> membus critical path.
+   pcwrite_fetch <= '1' when (alu_pcwrite_wait = '1' or
+                              (execute_RW_State = DATARW_PCWRITE and
+                               (decode_functions_detail = data_read or
+                                decode_functions_detail = block_read))) else '0';
 
-   -- what execute_branchPC_masked used to produce for that case: branchPC is
-   -- writedata(31:1) & '0', then the mask clears bit 1 unless the target is
-   -- thumb and always clears bit 0
-   pcwrite_Addr <= execute_writedata(31 downto 2) &
-                   (execute_writedata(1) and execute_nextIsthumb) & '0';
+   -- Both PC-write states source execute_writedata from execute_RW_dataRead,
+   -- but routing this through the generic writeback mux kept the current ALU
+   -- result on the data port of the final address mux. Static timing therefore
+   -- saw an impossible Rn -> ALU -> PC -> membus path even though pcwrite_fetch
+   -- can only be high after the result has been latched. Consume that existing
+   -- timing boundary directly: bit-exact in both named states, with no new beat.
+   -- As before, bit 1 is kept only for a Thumb target and bit 0 is always clear.
+   pcwrite_Addr <= unsigned(execute_RW_dataRead(31 downto 2) &
+                            (execute_RW_dataRead(1) and execute_nextIsthumb) & '0');
 
    -- the code-fetch address as actually presented on the bus. bus_AddrFetch no
    -- longer covers the PC-write case, so everything that consumed it as "the
@@ -1054,7 +1094,7 @@ begin
    
    
    -- decode
-   
+
    decode_data <= decode_data_1 when (execute_stall = '1') else fetch_data;
    
    process (clk) 
@@ -1102,16 +1142,16 @@ begin
             if (execute_done = '1') then
                decode_ready <= '0';
             end if;
+
+            if (execute_done = '0' and fetch_done = '1') then
+               decode_data_1 <= fetch_data;
+            end if;
             
             if (new_halt = '1') then
                decode_halt <= '1';
             elsif (decode_halt = '1' and unhalt = '1') then
                decode_halt   <= '0';
                decode_unhalt <= '1';
-            end if;
-            
-            if (execute_done = '0' and fetch_done = '1') then
-               decode_data_1 <= fetch_data;
             end if;
             
             if (decode_functions_detail = block_read or decode_functions_detail = block_write) then
@@ -1163,7 +1203,8 @@ begin
                decode_halt <= '1';
             end if;
             
-            if (decode_halt = '0' and fetch_ready = '1' and (((fetch_done = '1' and decode_ready = '0') or execute_done = '1'))) then
+            if (decode_halt = '0' and fetch_ready = '1' and
+                (((fetch_done = '1' and decode_ready = '0') or execute_done = '1'))) then
                decode_ready <= '1';
                decode_PC    <= fetch_PC;
             
@@ -2319,17 +2360,21 @@ begin
    --
    --   (2A + 1) + (2B + C)  =  2(A + B) + 1 + C,  bits [n:1] = A + B + C
    --
-   -- since floor((1+C)/2) is C for C in {0,1}. SBC's 33-bit sum can wrap, which
-   -- is harmless: dropping a multiple of 2^33 before the shift drops a multiple
-   -- of 2^32 after it, and the result is taken mod 2^32 anyway. ADC's 34-bit
-   -- sum cannot wrap (max 2^34-2), so bit 33 is a true carry-out and lands on
-   -- alu_result_add(32), which is what the flag logic reads.
+   -- since floor((1+C)/2) is C for C in {0,1}. Keep the full 34-bit sum for
+   -- subtraction too: bits [32:1] are the result and bit 33 is ARM's carry
+   -- (no-borrow) flag.  This lets result and carry share one chain instead of
+   -- putting a second 32-bit >= comparator after the barrel shifter.
    process (all)
       variable adc_wide : unsigned(33 downto 0);
-      variable sbc_wide : unsigned(32 downto 0);
+      variable sub_wide : unsigned(33 downto 0);
+      variable sub_cin  : std_logic;
    begin
       adc_wide := ('0' & alu_op1 & '1') + ('0' & alu_op2 & Flag_Carry);
-      sbc_wide := (alu_op1 & '1') + ((not alu_op2) & Flag_Carry);
+      sub_cin := Flag_Carry;
+      if (decode_functions_detail = alu_sub) then
+         sub_cin := '1';
+      end if;
+      sub_wide := ('0' & alu_op1 & '1') + ('0' & (not alu_op2) & sub_cin);
       alu_result     <= (others => '0');
       alu_result_add <= (others => '0');
       case (decode_functions_detail) is
@@ -2345,14 +2390,14 @@ begin
             alu_result <= alu_result_add(31 downto 0);
          
          when alu_sub => 
-            alu_result <= alu_op1 - alu_op2;
+            alu_result <= sub_wide(32 downto 1);
          
          when alu_add_withcarry =>
             alu_result_add <= adc_wide(33 downto 1);
             alu_result <= alu_result_add(31 downto 0);
 
          when alu_sub_withcarry =>
-            alu_result <= sbc_wide(32 downto 1);
+            alu_result <= sub_wide(32 downto 1);
  
          when others => null;
       end case;
@@ -2400,11 +2445,7 @@ begin
                else
                   execute_flag_V_Overflow <= '0';
                end if;
-               if (alu_op1 >= alu_op2) then -- subs -> carry is 0 if borror, 1 otherwise
-                  execute_flag_Carry <= '1'; 
-               else
-                  execute_flag_Carry <= '0'; 
-               end if;
+               execute_flag_Carry <= sub_wide(33);
             
             when alu_sub_withcarry =>
                if (alu_result = 0) then execute_flag_Zero <= '1'; else execute_flag_Zero <= '0'; end if; 
@@ -2414,21 +2455,7 @@ begin
                else
                   execute_flag_V_Overflow <= '0';
                end if;
-               if (Flag_Carry = '1') then
-                  if (alu_op1 >= alu_op2) then
-                     execute_flag_Carry <= '1'; 
-                  else
-                     execute_flag_Carry <= '0'; 
-                  end if;
-               else
-                  if (alu_op1 = 0) then
-                     execute_flag_Carry <= '0'; 
-                  elsif ((alu_op1 - 1) >= alu_op2) then
-                     execute_flag_Carry <= '1'; 
-                  else
-                     execute_flag_Carry <= '0'; 
-                  end if;
-               end if;
+               execute_flag_Carry <= sub_wide(33);
          
             when mulboth =>
                if (decode_mul_long = '1') then
@@ -2630,7 +2657,17 @@ begin
          end if;
          
          if (execute_RW_State = DATARW_IDLE) then
-            execute_RW_ena <= execute_now and (not execute_skip); 
+            -- Register-offset LDR/STR is issued from execute_RW_addr_last on
+            -- the next beat. Immediate/base-only forms keep their old timing.
+            if (decode_datatransfer_shiftval = '0') then
+               execute_RW_ena <= execute_now and (not execute_skip);
+            end if;
+            if (decode_functions_detail = data_write) then
+               execute_RW_rnw <= '0';
+            end if;
+         elsif (execute_RW_State = DATARW_ADDRWAIT) then
+            execute_RW_addr <= execute_RW_addr_last;
+            execute_RW_ena  <= '1';
             if (decode_functions_detail = data_write) then
                execute_RW_rnw <= '0';
             end if;
@@ -2832,25 +2869,28 @@ begin
    execute_now      <= ce when (fetch_done = '1' and decode_ready = '1' and decode_halt = '0' and execute_stall = '0') else 
                        '0';
    
-   execute_branch   <= '1'                                  when (execute_writeback = '1' and execute_writereg = x"F") else 
+   execute_branch   <= '1'                                  when (pcwrite_fetch = '1') else
                        (execute_now and (not execute_skip)) when (decode_functions_detail = branch_all or decode_functions_detail = IRQ or decode_functions_detail = software_interrupt_detail) else 
                        '0';
    
    execute_nextIsthumb <= '0'                     when (execute_now = '1' and execute_skip = '0' and (decode_functions_detail = IRQ or decode_functions_detail = software_interrupt_detail)) else
                           execute_msr_setvalue(5) when (execute_msr_setvalue_ena = '1') else
+                          -- DATARW_BLOCKSWITCH has already restored CPSR by
+                          -- the time the registered PC reaches this state.
+                          thumbmode               when (decode_functions_detail = block_read and decode_block_switchmode = '1' and
+                                                        execute_RW_State = DATARW_PCWRITE) else
                           -- ldm^ with pc (exception return): T comes from the SPSR,
                           -- not from bit 0 of the loaded pc (which is a plain
                           -- stacked return address, bit 0 clear even for thumb).
-                          -- Must hold through DATARW_BLOCKSWITCH: the target fetch
-                          -- issues on that cycle, one cycle before thumbmode
-                          -- updates, and drives the fetch step (+2/+4) and size
+                          -- Keep the old-mode value through the wait and switch
+                          -- preparation; DATARW_PCWRITE uses restored thumbmode.
                           SPSR(5)                 when (decode_functions_detail = block_read and decode_block_switchmode = '1' and
                                                         ((execute_writeback = '1' and execute_writereg = x"F") or
                                                          execute_RW_State = DATARW_READWAIT or
                                                          execute_RW_State = DATARW_READWAITDMA or
                                                          execute_RW_State = DATARW_BLOCKSWITCH)) else
                           -- v5: loads to PC interwork from bit 0
-                          execute_writedata(0)    when (execute_writeback = '1' and execute_writereg = x"F" and
+                          execute_RW_dataRead(0)  when (pcwrite_fetch = '1' and
                                                         (decode_functions_detail = data_read or decode_functions_detail = block_read)) else
                           '1'                     when (decode_branch_forcethumb = '1' and execute_branch = '1' and decode_functions_detail = branch_all) else
                           '0'                     when (decode_branch_forcearm   = '1' and execute_branch = '1' and decode_functions_detail = branch_all) else
@@ -2901,6 +2941,9 @@ begin
                when alu_and | alu_xor | alu_add | alu_sub | alu_add_withcarry | alu_sub_withcarry | alu_or | alu_mov | alu_and_not | alu_mov_not =>
                   if (decode_alu_use_shift = '1' and decode_shift_regbased = '1') then
                      -- wait for shift
+                  elsif (decode_writeback = '1' and decode_rdest = x"F") then
+                     -- Register the ALU result before it becomes a fetch
+                     -- address.  The clocked process starts the extra beat.
                   else
                      execute_writedata <= alu_result;
                      execute_writeback <= decode_writeback;
@@ -2978,10 +3021,18 @@ begin
          case decode_functions_detail is
           
             when alu_and | alu_xor | alu_add | alu_sub | alu_add_withcarry | alu_sub_withcarry | alu_or | alu_mov | alu_and_not | alu_mov_not =>
-               execute_done <= '1';
-               execute_writedata <= alu_result;
-               execute_writeback <= decode_writeback;
-               execute_done      <= '1';
+               if (alu_pcwrite_wait = '1') then
+                  execute_writedata <= unsigned(execute_RW_dataRead);
+                  execute_writeback <= '1';
+                  execute_done      <= '1';
+               elsif (alu_wait_shift = '1' and decode_writeback = '1' and decode_rdest = x"F") then
+                  -- A register-specified shift needs its normal second beat
+                  -- before the PC result can be captured.
+               else
+                  execute_writedata <= alu_result;
+                  execute_writeback <= decode_writeback;
+                  execute_done      <= '1';
+               end if;
                
             when mulboth =>
                case (execute_MUL_State) is
@@ -3105,11 +3156,29 @@ begin
 
                if (execute_RW_State = DATARW_SWAPWAIT) then
                   execute_done      <= '1';
-               end if;               
+               end if;
+
+               -- LDR pc takes the same registered final beat as LDM pc.  The
+               -- data is already in execute_RW_dataRead; waiting one beat cuts
+               -- the memory-return -> PC -> next-fetch loop and supplies v5
+               -- interworking from the latched value below.
+               if (decode_functions_detail = data_read and
+                   decode_datatransfer_double = '0' and decode_rdest = x"F") then
+                  if (execute_RW_State = DATARW_READWAIT or
+                      execute_RW_State = DATARW_READWAITDMA) then
+                     execute_writeback <= '0';
+                     execute_done      <= '0';
+                  elsif (execute_RW_State = DATARW_PCWRITE) then
+                     execute_writeback <= '1';
+                     execute_writereg  <= x"F";
+                     execute_writedata <= unsigned(execute_RW_dataRead);
+                     execute_done      <= '1';
+                  end if;
+               end if;
 
             when block_read | block_write =>
                if (execute_RW_State = DATARW_READWAITDMA) then
-                  if (dma_on = '0' and decode_block_switchmode = '0') then
+                  if (dma_on = '0' and decode_block_switchmode = '0' and execute_blockRW_writereg /= 15) then
                      execute_done <= '1';
                   end if;
                end if;
@@ -3123,24 +3192,33 @@ begin
                end if;
 
                if (execute_RW_State = DATARW_READWAIT) then
-                  if ((dma_on_1 = '0' or dma_on = '0') and decode_block_switchmode = '0') then
+                  if ((dma_on_1 = '0' or dma_on = '0') and decode_block_switchmode = '0' and
+                      execute_blockRW_writereg /= 15) then
                      execute_done      <= '1';
                   end if;
                end if;
 
                -- ldm^ with pc: retire on the switch cycle, after the base
                -- writeback landed in the old mode's register
-               if (execute_RW_State = DATARW_BLOCKSWITCH) then
+               if (execute_RW_State = DATARW_BLOCKSWITCH and execute_blockRW_writereg /= 15) then
                   execute_done <= '1';
+               end if;
+
+               if (execute_RW_State = DATARW_PCWRITE) then
+                  execute_writeback <= '1';
+                  execute_writereg  <= x"F";
+                  execute_writedata <= unsigned(execute_RW_dataRead);
+                  execute_done      <= '1';
                end if;
                
                if (decode_functions_detail = block_read) then
                   if (busState = BUSSTATE_WAITDATA and gb_bus_done = '1') then
                      -- writes the LIVE regs(); complement of the user-bank
                      -- redirect, so r8-r12 land here in every mode but FIQ
-                     if (decode_block_usermoderegs = '0' or cpu_mode = CPUMODE_USER or cpu_mode = CPUMODE_SYSTEM or
-                         execute_blockRW_writereg < 8 or execute_blockRW_writereg > 14 or
-                         (execute_blockRW_writereg <= 12 and cpu_mode /= CPUMODE_FIQ)) then
+                     if (execute_blockRW_writereg /= 15 and
+                         (decode_block_usermoderegs = '0' or cpu_mode = CPUMODE_USER or cpu_mode = CPUMODE_SYSTEM or
+                          execute_blockRW_writereg < 8 or execute_blockRW_writereg > 14 or
+                          (execute_blockRW_writereg <= 12 and cpu_mode /= CPUMODE_FIQ))) then
                         execute_writeback <= '1';
                      end if;
                      execute_writereg  <= execute_blockRW_writereg;
@@ -3177,7 +3255,7 @@ begin
 
          if (reset = '1') then
 
-            execute_stall    <= '0';
+            execute_stall        <= '0';
             Flag_Q_Sticky     <= '0';
             execute_dsp_carry <= '0';
             -- Post-BIOS CP15 state. HLE direct boot jumps straight to the
@@ -3251,7 +3329,8 @@ begin
             
             execute_RW_State  <= DATARW_IDLE;
             execute_MUL_State <= MUL_IDLE;
-            alu_wait_shift   <= '0';
+            alu_wait_shift    <= '0';
+            alu_pcwrite_wait  <= '0';
             cache_op_ena         <= '0';
             execute_cacheop_wait <= '0';
 
@@ -3292,9 +3371,20 @@ begin
             
             if (execute_stall = '1') then
 
-               if (alu_wait_shift = '1') then
-                  execute_stall  <= '0';
+               if (alu_pcwrite_wait = '1') then
+                  execute_stall        <= '0';
+                  alu_pcwrite_wait    <= '0';
+               elsif (alu_wait_shift = '1') then
                   alu_wait_shift <= '0';
+                  if (decode_writeback = '1' and decode_rdest = x"F") then
+                     -- The load-data register is idle for an ALU operation;
+                     -- reuse it instead of spending 32 flops on another PC
+                     -- target latch.
+                     execute_RW_dataRead <= std_logic_vector(alu_result);
+                     alu_pcwrite_wait <= '1';
+                  else
+                     execute_stall        <= '0';
+                  end if;
                end if;
 
                -- cache maintenance: wait for nds_cache9 to finish (busy is
@@ -3321,7 +3411,7 @@ begin
                               execute_MUL_State <= MUL_STOREHI;
                            else
                               execute_MUL_State <= MUL_IDLE;
-                              execute_stall     <= '0';
+                              execute_stall        <= '0';
                            end if;
                         end if;
                         
@@ -3330,12 +3420,12 @@ begin
                            execute_MUL_State <= MUL_STOREHI;
                         else
                            execute_MUL_State <= MUL_IDLE;
-                           execute_stall     <= '0';
+                           execute_stall        <= '0';
                         end if;
                         
                      when MUL_STOREHI =>
                         execute_MUL_State <= MUL_IDLE;
-                        execute_stall     <= '0';
+                        execute_stall        <= '0';
 
                      when others => null;
                   end case;
@@ -3353,12 +3443,12 @@ begin
                               Flag_Q_Sticky <= '1';
                            end if;
                            execute_MUL_State <= MUL_IDLE;
-                           execute_stall     <= '0';
+                           execute_stall        <= '0';
                         end if;
 
                      when MUL_DSP_ACCHI =>
                         execute_MUL_State <= MUL_IDLE;
-                        execute_stall     <= '0';
+                        execute_stall        <= '0';
 
                      when others => null;
                   end case;
@@ -3366,6 +3456,12 @@ begin
                
                if (decode_functions_detail = block_read) then
                   if (busState = BUSSTATE_WAITDATA and gb_bus_done = '1') then
+                     if (execute_blockRW_writereg = 15) then
+                        -- Reuse the normal load-data register as the timing
+                        -- cut. The following wait/base-writeback/mode-switch
+                        -- beats finish before DATARW_PCWRITE consumes it.
+                        execute_RW_dataRead <= gb_bus_din;
+                     end if;
                      if (decode_block_usermoderegs = '1' and cpu_mode /= CPUMODE_USER and cpu_mode /= CPUMODE_SYSTEM and
                          ((execute_blockRW_writereg >= 13 and execute_blockRW_writereg <= 14) or
                           (execute_blockRW_writereg >= 8  and execute_blockRW_writereg <= 12 and cpu_mode = CPUMODE_FIQ))) then
@@ -3384,6 +3480,16 @@ begin
                end if;
          
                case (execute_RW_State) is
+                  when DATARW_ADDRWAIT =>
+                     -- The bus request is accepted on this edge from the
+                     -- address registered during the instruction's first
+                     -- execute beat. Continue in the normal wait state.
+                     if (decode_functions_detail = data_read) then
+                        execute_RW_State <= DATARW_READSTART;
+                     else
+                        execute_RW_State <= DATARW_WRITE;
+                     end if;
+
                   when DATARW_READSTART =>
                      if (busState = BUSSTATE_WAITDATA and gb_bus_done = '1') then
                         execute_RW_dataRead <= gb_bus_din;
@@ -3406,9 +3512,14 @@ begin
                      if (dma_on_1 = '0' or dma_on = '0') then
                         if (decode_functions_detail = block_read and decode_block_switchmode = '1') then
                            execute_RW_State <= DATARW_BLOCKSWITCH;
+                        elsif (decode_functions_detail = block_read and execute_blockRW_writereg = 15) then
+                           execute_RW_State <= DATARW_PCWRITE;
+                        elsif (decode_functions_detail = data_read and
+                               decode_datatransfer_double = '0' and decode_rdest = x"F") then
+                           execute_RW_State <= DATARW_PCWRITE;
                         else
                            execute_RW_State <= DATARW_IDLE;
-                           execute_stall    <= '0';
+                           execute_stall        <= '0';
                         end if;
                      else
                         execute_RW_State <= DATARW_READWAITDMA;
@@ -3418,9 +3529,14 @@ begin
                      if (dma_on = '0') then
                         if (decode_functions_detail = block_read and decode_block_switchmode = '1') then
                            execute_RW_State <= DATARW_BLOCKSWITCH;
+                        elsif (decode_functions_detail = block_read and execute_blockRW_writereg = 15) then
+                           execute_RW_State <= DATARW_PCWRITE;
+                        elsif (decode_functions_detail = data_read and
+                               decode_datatransfer_double = '0' and decode_rdest = x"F") then
+                           execute_RW_State <= DATARW_PCWRITE;
                         else
                            execute_RW_State <= DATARW_IDLE;
-                           execute_stall    <= '0';
+                           execute_stall        <= '0';
                         end if;
                      end if;
                      
@@ -3430,14 +3546,14 @@ begin
                            execute_RW_State <= DATARW_WRITE_D2;
                         else
                            execute_RW_State <= DATARW_IDLE;
-                           execute_stall    <= '0';
+                           execute_stall        <= '0';
                         end if;
                      end if;
 
                   when DATARW_WRITE_D2 =>
                      if (busState = BUSSTATE_WAITDATA and gb_bus_done = '1') then
                         execute_RW_State <= DATARW_IDLE;
-                        execute_stall    <= '0';
+                        execute_stall        <= '0';
                      end if;
                      
                   when DATARW_SWAPWRITE =>
@@ -3447,7 +3563,7 @@ begin
                      
                   when DATARW_SWAPWAIT =>
                      execute_RW_State <= DATARW_IDLE;
-                     execute_stall    <= '0';  
+                     execute_stall        <= '0';
                      
                   when DATARW_BLOCKREAD =>
                      if (busState = BUSSTATE_WAITDATA and gb_bus_done = '1') then
@@ -3471,8 +3587,16 @@ begin
                      end if;
 
                   when DATARW_BLOCKSWITCH =>
+                     if (execute_blockRW_writereg = 15) then
+                        execute_RW_State <= DATARW_PCWRITE;
+                     else
+                        execute_RW_State <= DATARW_IDLE;
+                        execute_stall        <= '0';
+                     end if;
+
+                  when DATARW_PCWRITE =>
                      execute_RW_State <= DATARW_IDLE;
-                     execute_stall    <= '0';
+                     execute_stall        <= '0';
 
                   when others => null;
                end case;
@@ -3509,8 +3633,12 @@ begin
                      
                      when alu_and | alu_xor | alu_add | alu_sub | alu_add_withcarry | alu_sub_withcarry | alu_or | alu_mov | alu_and_not | alu_mov_not =>
                         if (decode_alu_use_shift = '1' and decode_shift_regbased = '1') then
-                           execute_stall  <= '1';
+                           execute_stall        <= '1';
                            alu_wait_shift <= '1';
+                        elsif (decode_writeback = '1' and decode_rdest = x"F") then
+                           execute_stall        <= '1';
+                           alu_pcwrite_wait   <= '1';
+                           execute_RW_dataRead <= std_logic_vector(alu_result);
                         end if;
                   
                      when data_processing_MRS => null;
@@ -3548,8 +3676,10 @@ begin
                         end if;
                   
                      when data_read | data_write =>
-                        execute_stall    <= '1';
-                        if (decode_functions_detail = data_read) then
+                        execute_stall        <= '1';
+                        if (decode_datatransfer_shiftval = '1') then
+                           execute_RW_State <= DATARW_ADDRWAIT;
+                        elsif (decode_functions_detail = data_read) then
                            execute_RW_State <= DATARW_READSTART;
                         else
                            execute_RW_State <= DATARW_WRITE;
@@ -3611,7 +3741,7 @@ begin
                         end if;
 
                      when mul_dsp =>
-                        execute_stall     <= '1';
+                        execute_stall        <= '1';
                         execute_MUL_State <= MUL_DSP_ACC;
                         if (decode_dsp_x = '1') then
                            dsp_ra := signed(execute_op2(31 downto 16)); -- Rm half
@@ -3915,4 +4045,3 @@ begin
    
    
 end architecture;
-
