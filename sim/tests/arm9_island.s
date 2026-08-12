@@ -100,8 +100,8 @@ reset:
    ldr  r4, [r2]
    cmp  r4, r3
    bne  report_fail
-   ldr  r5, =0x00007FFC        @ same word as [r2] through the 32 KB mirror
-   ldr  r4, [r0, r5]
+   ldr  r5, =0x00001FFF        @ shifted register offset -> same 0x7FFC word
+   ldr  r4, [r0, r5, lsl #2]  @ exercise address-shifter timing boundary
    cmp  r4, r3
    bne  report_fail
    orr  r9, r9, #8
