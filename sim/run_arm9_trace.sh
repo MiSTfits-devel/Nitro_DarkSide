@@ -10,6 +10,10 @@ MAXINSTR="${MAXINSTR:-1000000}"
 HEXFILE="${HEXFILE:-sim/tests/arm9_island.hex}"
 TIMEOUT_MS="${TIMEOUT_MS:-100}"
 LOADADDR="${LOADADDR:-0}"
+# Byte address of the workload's marker block in main RAM (0 = not self-checking).
+# Self-checking workloads store 0xCAFEBABE / 0x0BAD0BAD there and the testbench
+# turns that into a PASS/FAIL verdict instead of leaving you to read the trace.
+MARKBASE="${MARKBASE:-0}"
 WORK=sim/nvc_work
 mkdir -p "$WORK"
 
@@ -39,5 +43,5 @@ nvc -L "$WORK" --work="$WORK/work" -a --relaxed \
    sim/tb_arm9_trace.vhd
 
 nvc -H 2g -L "$WORK" --work="$WORK/work" -e tb_arm9_trace \
-   -gMAXINSTR="$MAXINSTR" -gHEXFILE="$HEXFILE" -gTIMEOUT_MS="$TIMEOUT_MS" -gLOADADDR="$LOADADDR"
+   -gMAXINSTR="$MAXINSTR" -gHEXFILE="$HEXFILE" -gTIMEOUT_MS="$TIMEOUT_MS" -gLOADADDR="$LOADADDR" -gMARK_BASE="$MARKBASE"
 nvc -H 2g -L "$WORK" --work="$WORK/work" -r tb_arm9_trace --ieee-warnings=off --exit-severity=failure
