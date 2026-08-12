@@ -109,7 +109,7 @@ entity nds_top is
       -- with main RAM IDLE. That is a bug to fix, not a ratio requirement.
       clk2x            : in  std_logic;
       clkMem           : in  std_logic;   -- 100.542 MHz (3x clk1x, phase-locked)
-      clkMemIndex      : in  unsigned(1 downto 0);  -- clkMem phase, 0 on clk1x rising edge
+      clkMemIndex      : in  unsigned(1 downto 0);  -- clkMem phase; current value is ratio-1 at clk1x edge
       reset            : in  std_logic;
       nds_on           : in  std_logic;
       direct_boot      : in  std_logic := '0';  -- synthesize the firmware boot env (stock ROMs)
@@ -417,9 +417,13 @@ architecture arch of nds_top is
    signal mr9_lock  : std_logic := '0';
    signal io9_ena   : std_logic := '0';   -- stretched io_bus9.ena, clk1x domain
    signal cdc_dmab_ena_d, dmab_ena_i9   : std_logic := '0';
+   signal dmab_rnw_i9                    : std_logic := '1';
+   signal dmab_adr_i9, dmab_dout_i9      : std_logic_vector(31 downto 0) := (others => '0');
+   signal dmab_acc_i9, dmab_low_i9       : std_logic_vector(1 downto 0) := (others => '0');
    signal cdc_cpudone_tgl, cdc_cpudone_tgl_d, cpu9_done_1x : std_logic := '0';
    -- per-transaction IO completion, clk1x -> island (see i9_io_done below)
    signal cdc_io_cpl, cdc_io_cpl_d : std_logic := '0';
+   signal io9_resp_1x              : std_logic_vector(31 downto 0) := (others => '0');
    signal dbg_mb9, dbg_cache9, dbg_mr_s      : std_logic_vector(7 downto 0);
    signal dbg_probe                          : std_logic_vector(31 downto 0);
    signal dbg_pk_addr_s        : std_logic_vector(31 downto 0);
@@ -1148,17 +1152,34 @@ begin
       end if;
    end process;
    -- DMA9 masters the ARM9 membus while dma_bus_on, but nds_dma9 is a clk1x unit
-   -- talking to a clk2x membus, so its request pulse is two island cycles wide
-   -- (membus9 would accept it twice) and membus9's one-island-cycle done is only
-   -- half a clk1x period (nds_dma9 would miss it). Narrow one, stretch the other.
-   -- The CPU's own path needs neither: cpu9 is inside the island.
+   -- talking to a clk2x membus. Capture the complete request at the rising edge
+   -- of its clk1x enable and issue a registered, one-island-cycle pulse on the
+   -- following clk2x edge. Besides preventing the two-cycle-wide source pulse
+   -- from being accepted twice, the payload register cuts a path that otherwise
+   -- ran from DMA channel selection and address arithmetic through membus9 and
+   -- back into its response/data mux in one island cycle. The DMA fast IO and
+   -- posted-VRAM lanes bypass this bridge, so their exact two-clk1x cadence is
+   -- unchanged. The CPU's own path needs no bridge: cpu9 is inside the island.
    process (clk2x)
    begin
       if rising_edge(clk2x) then
-         cdc_dmab_ena_d <= dmab_ena;
+         if (resetCpu = '1') then
+            cdc_dmab_ena_d <= '0';
+            dmab_ena_i9    <= '0';
+         else
+            cdc_dmab_ena_d <= dmab_ena;
+            dmab_ena_i9    <= '0';
+            if (dmab_ena = '1' and cdc_dmab_ena_d = '0') then
+               dmab_rnw_i9  <= dmab_rnw;
+               dmab_adr_i9  <= dmab_adr;
+               dmab_acc_i9  <= dmab_acc;
+               dmab_low_i9  <= dmab_low;
+               dmab_dout_i9 <= dmab_dout;
+               dmab_ena_i9  <= '1';
+            end if;
+         end if;
       end if;
    end process;
-   dmab_ena_i9 <= dmab_ena and not cdc_dmab_ena_d;
 
    -- membus9's cpu_done is one ISLAND cycle - half a clk1x period - so a clk1x
    -- process sampling it directly would miss it half the time (the same defect
@@ -1188,7 +1209,10 @@ begin
    -- accesses to claimed addresses. Generate an explicit completion one clk1x
    -- after the access was presented: by then the peripheral has seen io_bus9.ena
    -- and its wired_out is stable (the payload latch holds Adr), so the island can
-   -- sample the read data in the cycle it retires the access.
+   -- sample the registered read data in the cycle it retires the access.
+   -- Registering the word here also keeps the DMA fast-lane address from
+   -- feeding through the wired-IO tree, the paused CPU and back into membus9.
+   -- DMA consumes io_wired_out9 directly and never uses io9_resp_1x.
    --
    -- Unconditional on purpose - it must fire for UNCLAIMED addresses too, or
    -- membus9 would hang in W_IO_RESP on any unmapped IO read. That is still
@@ -1197,7 +1221,10 @@ begin
    process (clk1x)
    begin
       if rising_edge(clk1x) then
-         if (io9_ena = '1') then cdc_io_cpl <= not cdc_io_cpl; end if;
+         if (io9_ena = '1') then
+            io9_resp_1x <= io_wired_out9;
+            cdc_io_cpl  <= not cdc_io_cpl;
+         end if;
       end if;
    end process;
 
@@ -1469,19 +1496,19 @@ begin
       mr_writedata => mr9_writedata, mr_done => i9_mr_done, mr_readdata => mr9_readdata,
       mr_pair => mr9_pair, mr_readdata_hi => mr9_readdata_hi,
       io_ce_next => '1',
-      io_bus => i9_io_bus, io_wired_out => io_wired_out9, io_wired_done => i9_io_done,
+      io_bus => i9_io_bus, io_wired_out => io9_resp_1x, io_wired_done => i9_io_done,
       dbg_mb => dbg_mb9, dbg_cache => dbg_cache9
    );
 
    -- ARM9 bus mux: the DMA owns the membus while dma_bus_on (CPU paused
    -- via dma_on and drained via CPU_bus_idle before the grant)
-   mbus_adr  <= dmab_adr  when dma_bus_on = '1' else cpu9_adr;
-   mbus_rnw  <= dmab_rnw  when dma_bus_on = '1' else cpu9_rnw;
+   mbus_adr  <= dmab_adr_i9  when dma_bus_on = '1' else cpu9_adr;
+   mbus_rnw  <= dmab_rnw_i9  when dma_bus_on = '1' else cpu9_rnw;
    mbus_ena  <= dmab_ena_i9 when dma_bus_on = '1' else cpu9_ena;
    mbus_code <= '0'       when dma_bus_on = '1' else cpu9_code;
-   mbus_acc  <= dmab_acc  when dma_bus_on = '1' else cpu9_acc;
-   mbus_dout <= dmab_dout when dma_bus_on = '1' else cpu9_dout;
-   mbus_low  <= dmab_low  when dma_bus_on = '1' else cpu9_lowbits;
+   mbus_acc  <= dmab_acc_i9  when dma_bus_on = '1' else cpu9_acc;
+   mbus_dout <= dmab_dout_i9 when dma_bus_on = '1' else cpu9_dout;
+   mbus_low  <= dmab_low_i9  when dma_bus_on = '1' else cpu9_lowbits;
 
    idma9 : entity work.nds_dma9
    port map

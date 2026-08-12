@@ -10,8 +10,10 @@
 -- channel keeps the request bus (busy) until both queues drain, so a scheduler
 -- never interleaves a foreign op between our back-to-back grants.
 --
--- clkMemIndex counts the clkMem phases inside one clk1x period (0 on the
--- rising edge of clk1x). GBA used 6 phases at 16.78 MHz x6; the NDS plan is
+-- clkMemIndex counts the clkMem phases inside one clk1x period. Its current
+-- value is CLKMEM_RATIO-1 at the coincident clk1x/clkMem rising edge; the
+-- registered value becomes 0 after that edge, so a phase-0 gate fires on the
+-- following clkMem edge. GBA used 6 phases at 16.78 MHz x6; the NDS plan is
 -- 3 phases at 33.514 MHz x3 — the module only cares about phase 0.
 
 library IEEE;
