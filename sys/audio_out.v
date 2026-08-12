@@ -48,8 +48,12 @@ localparam AUDIO_DW = 16;
 localparam CE_RATE = AUDIO_RATE*AUDIO_DW*8;
 localparam FILTER_DIV = (CE_RATE/(AUDIO_RATE*32))-1;
 
+wire [15:0] acl, acr, adl, adr;
+wire [15:0] al, ar, audio_l_pre, audio_r_pre;
+
 wire [31:0] real_ce = sample_rate ? {CE_RATE[30:0],1'b0} : CE_RATE[31:0];
 
+`ifndef NDS_ANALOG_AUDIO_ONLY
 reg mclk_ce;
 always @(posedge clk) begin
 	reg [31:0] cnt;
@@ -97,6 +101,15 @@ spdif toslink
 	.sample_i({ar,al}),
 	.spdif_o(spdif)
 );
+`else
+// NDS_MiSTfits LOCAL CHANGE: the NOHDMI shipping profile is analog-only.
+// Preserve the sigma-delta DAC below, but do not build two unused digital
+// serializers. See the matching, measured switch in NDS.qsf.
+assign i2s_bclk  = 1'b0;
+assign i2s_lrclk = 1'b0;
+assign i2s_data  = 1'b0;
+assign spdif     = 1'b0;
+`endif
 
 sigma_delta_dac #(15) sd_l
 (
@@ -176,18 +189,21 @@ always @(posedge clk, posedge reset) begin
 	end
 end
 
-wire [15:0] acl, acr;
 `ifdef NDS_NO_AUDIO_FILTER
 // NDS_MiSTfits LOCAL CHANGE to a vendored sys/ file - see NDS.qsf.
-// IIR_filter measures ~430 ALMs (~43 LABs) in this design, and the
+// The IIR + DC filters are post-processing, not part of the emulated SPU.
+// IIR_filter alone measures ~430 ALMs (~43 LABs) in this design, and the
 // SOUND_ENABLE=1 image is LAB-bound: five fitter seeds landed between 1 and 24
 // LABs over the 4,191 the device has. Dropping the user-selectable audio
 // low-pass is what buys full PQ_DEPTH=16 in the renderer, which is worth 8
 // scanlines a frame - a trade the owner called on 2026-08-09.
 //
 // The bypass keeps the EXACT sign conversion the filter was fed
-// (`~is_signed ^ x[15]` - cores may emit signed or offset-binary), so the
-// DC_blocker downstream sees the same format it always did, just unfiltered.
+// (`~is_signed ^ x[15]` - cores may emit signed or offset-binary). The same
+// switch bypasses the two 40-bit DC blockers below. nds_sound already produces
+// signed, bias-adjusted samples; this does change output post-processing but not
+// emulated SPU state. The recovered fabric pays for exact DMA cadence. a_en2
+// still supplies the original startup mute.
 // `cx`/`cx0..cy2` become unused inputs and `flt_ce`/`a_en1`/`dly1` become dead
 // logic; that is deliberate, and the extra savings are free.
 assign acl = {~is_signed ^ cl[15], cl[14:0]};
@@ -216,7 +232,9 @@ IIR_filter #(.use_params(0)) IIR_filter
 );
 `endif
 
-wire [15:0] adl;
+`ifdef NDS_NO_AUDIO_FILTER
+assign adl = a_en2 ? acl : 16'd0;
+`else
 DC_blocker dcb_l
 (
 	.clk(clk),
@@ -226,8 +244,11 @@ DC_blocker dcb_l
 	.din(acl),
 	.dout(adl)
 );
+`endif
 
-wire [15:0] adr;
+`ifdef NDS_NO_AUDIO_FILTER
+assign adr = a_en2 ? acr : 16'd0;
+`else
 DC_blocker dcb_r
 (
 	.clk(clk),
@@ -237,8 +258,26 @@ DC_blocker dcb_r
 	.din(acr),
 	.dout(adr)
 );
+`endif
 
-wire [15:0] al, audio_l_pre;
+`ifdef NDS_ANALOG_AUDIO_ONLY
+// NDS_MiSTfits LOCAL CHANGE: ALSA is disabled in the analog-only profile, so
+// the framework mixer's a1/a2 pipeline merely adds zero and then keeps two
+// separate cross-channel delay paths.  Do the same attenuation and 0/25/50/
+// 100-percent stereo fold in one paired block.  This changes only output
+// latency; the SPU samples and all user-visible mix/volume settings remain.
+aud_mix_analog_pair audmix
+(
+	.clk(clk),
+	.ce(sample_ce),
+	.att(att),
+	.mix(mix),
+	.core_l(adl),
+	.core_r(adr),
+	.out_l(al),
+	.out_r(ar)
+);
+`else
 aud_mix_top audmix_l
 (
 	.clk(clk),
@@ -254,7 +293,6 @@ aud_mix_top audmix_l
 	.out(al)
 );
 
-wire [15:0] ar, audio_r_pre;
 aud_mix_top audmix_r
 (
 	.clk(clk),
@@ -269,6 +307,52 @@ aud_mix_top audmix_r
 	.pre_out(audio_r_pre),
 	.out(ar)
 );
+`endif
+
+endmodule
+
+module aud_mix_analog_pair
+(
+	input             clk,
+	input             ce,
+	input       [4:0] att,
+	input       [1:0] mix,
+	input      [15:0] core_l,
+	input      [15:0] core_r,
+	output reg [15:0] out_l = 0,
+	output reg [15:0] out_r = 0
+);
+
+wire signed [16:0] sample_l = {core_l[15], core_l};
+wire signed [16:0] sample_r = {core_r[15], core_r};
+
+function signed [16:0] stereo_mix;
+	input signed [16:0] own;
+	input signed [16:0] other;
+	input        [1:0] amount;
+	begin
+		case(amount)
+			1: stereo_mix = own - (own >>> 3) + (other >>> 3);
+			2: stereo_mix = own - (own >>> 2) + (other >>> 2);
+			3: stereo_mix = (own >>> 1) + (other >>> 1);
+			default: stereo_mix = own;
+		endcase
+	end
+endfunction
+
+wire signed [16:0] mixed_l = stereo_mix(sample_l, sample_r, mix);
+wire signed [16:0] mixed_r = stereo_mix(sample_r, sample_l, mix);
+
+always @(posedge clk) if (ce) begin
+	if(att[4]) begin
+		out_l <= 0;
+		out_r <= 0;
+	end
+	else begin
+		out_l <= mixed_l >>> att[3:0];
+		out_r <= mixed_r >>> att[3:0];
+	end
+end
 
 endmodule
 
