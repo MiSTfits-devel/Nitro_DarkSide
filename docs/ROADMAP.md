@@ -73,9 +73,15 @@ Repo, docs, vendored primitives + ARM7TDMI, VRAM map decoder + passing unit test
   images ship from one tree, selected by two generics + two QSF macros:
   `NDS_audio_20260806` (41,024 ALMs, sound, no HDMI) and
   `NDS_hdmi_noflicker_20260806` (38,176 ALMs, HDMI, no sound). They cannot be
-  combined — HDMI costs a measured ~3,600 ALMs. Not "at full speed": affine-heavy
-  scenes miss the line budget (docs/TICKET-obj-affine-slowness.md), and known
-  rendering defects remain open in that ticket.
+  combined — HDMI costs a measured ~3,600 ALMs.
+- 2026-08-12: the affine-OBJ slowness that qualified the line above is **fixed** —
+  halfword reuse on the affine path (`09368b1`, −44% VRAM reads), a pipelined
+  rot/scale sum (`2e45055`, −40%), the pixel walk decoupled from VRAM (`ca0244c`,
+  4 dropped lines → 0), and one pipelined rot/scale drawer replacing two FSMs
+  (`1bca051`). The FPGA was also clocking the ARM9 at 1:1 until `7452cc8` — a
+  factor of two on hardware that no sim ever saw. **Kirby's intro now runs at full
+  speed.** The other defects filed alongside the slowness (solid-colour sprites,
+  blank white overworld BG, one missing HP-bar tile) were never tracked to closure.
 
 ## M10 — Compatibility sweep (2D library)
 - The long tail: per-game issues, DISPCAPCNT, main-mem display FIFO, GBA-slot stubs.

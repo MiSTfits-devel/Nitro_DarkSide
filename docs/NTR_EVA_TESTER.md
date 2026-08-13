@@ -543,7 +543,7 @@ never a registered edge, which would leave a cycle to slip through:
 
 **The area wall is real, it is 2 LABs wide, and you cannot measure your way
 across it one edit at a time.** Stage 3 fitted at 4,203 LABs against 4,191. The
-core already sat at 4,189 (`docs/TICKET-arm9-2to1-timing.md`), so `WQ_DEPTH` and
+core already sat at 4,189 (see CLAUDE.md, "Device budget"), so `WQ_DEPTH` and
 the invalidation granularity are area decisions, not comfort ones.
 
 But three fits went **4,203 → 4,197 → 4,216**, and the last two were changes that

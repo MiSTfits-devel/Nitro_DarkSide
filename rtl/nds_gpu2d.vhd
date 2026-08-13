@@ -713,7 +713,10 @@ begin
    -- than its budget, and from then on no line ever completes. It is what stopped
    -- the renderer dead under real VRAM backpressure while the old always-ready
    -- memory model hid it: no line ever exceeded budget there, so a drawline never
-   -- landed on a busy drawer. See docs/TICKET-arm7-firmware-wedge.md.
+   -- landed on a busy drawer. Both prserv models now ASSERT that a request they
+   -- could not take is still on the wire unchanged at the next edge, so a
+   -- requester that pulses and forgets fails at the mistake rather than wedging
+   -- 400,000 cycles later.
    --
    -- Dropping it instead leaves that row at the previous frame's content, which is
    -- what a dropped line means everywhere else here, and progress continues.

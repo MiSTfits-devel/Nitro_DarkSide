@@ -1349,9 +1349,11 @@ nds_port_wrap nds
 	// direct_boot stays 1 because fw_boot short-circuits nds_loader's CARTID_CALC
 	// before ENV_SET is ever reached, so the env-block choice is moot when set.
 	//
-	// KNOWN LIMIT: firmware boot reaches 1.588 s of DS time in sim and then the
-	// ARM7 executes Thumb code in ARM state at 0x037FE28C (lost T bit - see
-	// HANDOFF). Expect it to reach the firmware's video init and then wedge.
+	// The 1.588 s "lost T bit" wedge this comment used to warn about was FIXED in
+	// 96a52c7: ldm^/stm^ sent r8-r12 to the user bank outside FIQ, so the
+	// firmware's scheduler lost r12 restoring a task and branched into I/O space.
+	// Regression: sim/tests/arm7_ctxrestore. Firmware boot has not been re-run
+	// end-to-end past that point since, so treat it as unproven, not as broken.
 	.direct_boot(1'b1),
 	.fw_boot(status[9]),
 	// GPU pace is gone: the core renders one dot per clk1x, always. The 1-of-3
