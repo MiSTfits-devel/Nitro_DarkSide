@@ -136,8 +136,9 @@ entity tb_top_frame is
       -- GPU_FAST=0 pass-through branch, so use it with GPUFAST=0 only; the
       -- generate guard keeps every other run from elaborating those names.
       STALL_CYC  : integer := 0;
-      -- /=0: ARM7 firmware-boot instruments (docs/TICKET-arm7-firmware-wedge.md,
-      -- first ticket). Both are trace-free on purpose: the fault is at 1.588 s,
+      -- /=0: ARM7 firmware-boot instruments (built for the ldm^ context-restore
+      -- hunt, root cause in 96a52c7). Both are trace-free on purpose: the fault
+      -- surfaced at 1.588 s,
       -- ~30M ARM7 instructions, and TRACEFILE costs ~40x, so the answers have to
       -- come out of counters and a write watch rather than out of a trace.
       --   * IRQ census - every ARM7 source's pulse count plus each delivery.

@@ -1,5 +1,6 @@
 #!/bin/sh
-# Assemble the ARM7 context-restore regression (docs/TICKET-arm7-firmware-wedge.md).
+# Assemble the ARM7 context-restore regression (root cause: 96a52c7, ldm^ sent
+# r8-r12 to the user bank outside FIQ).
 # The generated arm7_ctxrestore.hex is checked in, so the sim host never needs
 # the ARM toolchain.
 #

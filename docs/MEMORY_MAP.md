@@ -131,7 +131,8 @@ Two process lessons worth more than the fix:
 - **`renders` was a lying metric.** It counts `line_busy` *rising* edges, so a renderer that
   never goes idle reports one render per frame regardless of what it finished — and 0 when
   `line_busy` is still high at the frame boundary. Quote `done=` (falling edges) and
-  `dropped=` instead. Full write-up in `TICKET-arm7-firmware-wedge.md` §Resolution.
+  `dropped=` instead. Full write-up in git history: `docs/TICKET-arm7-firmware-wedge.md`
+  §Resolution, removed 2026-08-12 once the fixes had landed.
 
 **Still not verified on silicon.** All of the above is nvc against a *model* of `ch1`. The
 64-bit path assumes `sd_ch1_dout[63:0]` is the aligned line in halfword order — read off
