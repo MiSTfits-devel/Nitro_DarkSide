@@ -18,10 +18,13 @@ set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_RETIMING OFF
 set_global_assignment -name PLACEMENT_EFFORT_MULTIPLIER 2.0
 set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
 # At this density Quartus's automatic hold repair inserted roughly 3000 ns of
-# delay and exhausted routing after successful placement. Route the functional
-# design first, then report the exposed hold paths in TimeQuest and validate the
-# seed-2 image on hardware.
-set_global_assignment -name OPTIMIZE_HOLD_TIMING OFF
+# delay and exhausted routing after successful placement, so seed 2 was built
+# with hold repair off and shipped with hold red across every island domain.
+# That repair was failing because it was fighting a 14.784 ns setup deficit for
+# space; NDS_PLL_BRINGUP removes the deficit, so hold repair is back on and is
+# expected to converge. Turn this off again only if the bring-up fit runs out
+# of routing.
+set_global_assignment -name OPTIMIZE_HOLD_TIMING ON
 # Match the fitter policy of the earlier successfully routed Engine-B image.
 # The newer redundant-logic/router overrides repeatedly placed but terminated
 # after more than forty minutes of hold-delay congestion. The sparse timing
@@ -61,6 +64,14 @@ set_global_assignment -name VERILOG_MACRO "NDS_SEAM_DIAGNOSTIC=1"
 # whole family moves together to preserve the exact 4:2:1 phase relationship.
 # HDMI remains on its independent shell clock.
 set_global_assignment -name VERILOG_MACRO "NDS_CLKMEM_4X=1"
+
+# Bring-up cadence: 80/40/20 MHz, the same 4:2:1 family scaled to sit under the
+# Fmax seed 2 actually measured (126.77 / 43.67 / 25.06 MHz). The console runs
+# at 59.7% of native speed, which is the price of an image whose timing is
+# clean enough to tell us whether the RTL executes at all. Remove this macro
+# once the island domains close at the native cadence; NDS_CLKMEM_4X above then
+# takes effect again unchanged.
+set_global_assignment -name VERILOG_MACRO "NDS_PLL_BRINGUP=1"
 
 # Run-time and legacy framebuffer telemetry are both absent from the product.
 # Frame-rate validation uses the external read-only DDR sampler.

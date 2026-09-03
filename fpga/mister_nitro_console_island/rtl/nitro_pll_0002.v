@@ -33,23 +33,44 @@ module nitro_pll_0002(
 		//   3x = 100.541946 MHz (default)
 		//   fast = 134.055928/67.027964/33.513982 MHz (NDS_CLKMEM_4X;
 		//          native DS cadence with a 4x SDRAM clock).
+		//   bring-up = 80/40/20 MHz (NDS_PLL_BRINGUP; see below).
 		// The whole clock family moves together to preserve its exact 4:2:1
 		// phase relationship; changing clkMem alone is not a legal PLL setup.
-`ifdef NDS_CLKMEM_4X
+		//
+		// NDS_PLL_BRINGUP builds the console below its measured Fmax so the
+		// image is timing-clean and can answer one question on hardware: does
+		// the RTL work at all? Seed 2 was constrained at the native cadence and
+		// closed at 126.77 / 43.67 / 25.06 MHz -- the ARM9 domain reaching 65%
+		// of its required frequency across TNS -35,389 ns -- so that image
+		// could not execute regardless of what it showed on screen. clk2x is
+		// the binding domain at 43.67 MHz; 40 MHz leaves 8.4% margin and keeps
+		// the family on exact 4:2:1 round numbers. The console then runs at
+		// 40/67.027964 = 59.7% of native speed. Note the emulated RTC counts
+		// nds_rtc.vhd's CYCLES_PER_SEC = 33513982 clk1x cycles per second and
+		// will therefore run ~1.68x fast in this configuration; that constant
+		// is deliberately left alone so the build differs from a shipping one
+		// by clock frequency only.
+`ifdef NDS_PLL_BRINGUP
+		.output_clock_frequency0("80.0 MHz"),
+`elsif NDS_CLKMEM_4X
 		.output_clock_frequency0("134.055928 MHz"),
 `else
 		.output_clock_frequency0("100.541946 MHz"),
 `endif
 		.phase_shift0("0 ps"),
 		.duty_cycle0(50),
-`ifdef NDS_CLKMEM_4X
+`ifdef NDS_PLL_BRINGUP
+		.output_clock_frequency1("40.0 MHz"),
+`elsif NDS_CLKMEM_4X
 		.output_clock_frequency1("67.027964 MHz"),
 `else
 		.output_clock_frequency1("67.027964 MHz"),
 `endif
 		.phase_shift1("0 ps"),
 		.duty_cycle1(50),
-`ifdef NDS_CLKMEM_4X
+`ifdef NDS_PLL_BRINGUP
+		.output_clock_frequency2("20.0 MHz"),
+`elsif NDS_CLKMEM_4X
 		.output_clock_frequency2("33.513982 MHz"),
 `else
 		.output_clock_frequency2("33.513982 MHz"),
