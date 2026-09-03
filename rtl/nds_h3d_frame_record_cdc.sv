@@ -302,6 +302,45 @@ module nds_h3d_frame_record_cdc #(
     logic promised_swap_boundary;
     logic [63:0] selected_raw_timestamp;
     logic selected_raw_valid;
+    // Timestamp ordering is done on the low TS_CMP_W bits, modularly, not on
+    // all 64. The stored and transported timestamp stays 64 bits wide: it is
+    // an ABI, split into timestamp_low/timestamp_high in the DDR record slot
+    // that Hybrid3DAbi.h parses, and narrowing it would change what the HPS
+    // shadow reads. Only the arbitration below is narrowed, and that is where
+    // the whole cost was.
+    //
+    // Nine 64-bit magnitude comparators in one combinational block put ~11 ns
+    // into a 27.393 ns path, about 40% of it, and that path is not local: this
+    // block's gpu_ready becomes dma_gx_write_ready in nds_nitro_console_top,
+    // which gates ARM9 register writes in the same cycle. Diagnostic
+    // arbitration was therefore setting the console's clk2x ceiling.
+    //
+    // Modular comparison is exact as long as any two timestamps compared here
+    // differ by less than 2**(TS_CMP_W-1) counts. These are snapshots held in
+    // the source skid slots and the 256-entry GX FIFO, so the true separation
+    // is bounded by how long a held source can wait for acceptance. At 32 bits
+    // that budget is 2**31 clk1x counts, over 60 seconds at any cadence this
+    // core runs -- orders of magnitude beyond any stall the service loop can
+    // survive. Raise TS_CMP_W rather than reasoning around a wrap if that ever
+    // stops being true.
+    localparam int TS_CMP_W = 32;
+
+    function automatic logic ts_le(input logic [63:0] a, input logic [63:0] b);
+        logic signed [TS_CMP_W-1:0] d;
+        d = a[TS_CMP_W-1:0] - b[TS_CMP_W-1:0];
+        ts_le = (d <= 0);
+    endfunction
+
+    function automatic logic ts_lt(input logic [63:0] a, input logic [63:0] b);
+        logic signed [TS_CMP_W-1:0] d;
+        d = a[TS_CMP_W-1:0] - b[TS_CMP_W-1:0];
+        ts_lt = (d < 0);
+    endfunction
+
+    function automatic logic ts_eq(input logic [63:0] a, input logic [63:0] b);
+        ts_eq = (a[TS_CMP_W-1:0] == b[TS_CMP_W-1:0]);
+    endfunction
+
     wire gpu_fire = gpu_valid && gpu_ready;
     wire arm9_fire = arm9_vram_valid && arm9_vram_ready;
     wire arm7_fire = arm7_vram_valid && arm7_vram_ready;
@@ -315,10 +354,10 @@ module nds_h3d_frame_record_cdc #(
     // backpressure.
     wire phase_precedes_raw = SPARSE_HBLANK ?
         1'b1 :
-        ((!gpu_valid || phase_timestamp <= gpu_timestamp) &&
-         (!arm9_vram_valid || phase_timestamp <= arm9_vram_timestamp) &&
-         (!arm7_vram_valid || phase_timestamp <= arm7_vram_timestamp) &&
-         (!frame_valid || phase_timestamp <= frame_timestamp));
+        ((!gpu_valid || ts_le(phase_timestamp, gpu_timestamp)) &&
+         (!arm9_vram_valid || ts_le(phase_timestamp, arm9_vram_timestamp)) &&
+         (!arm7_vram_valid || ts_le(phase_timestamp, arm7_vram_timestamp)) &&
+         (!frame_valid || ts_le(phase_timestamp, frame_timestamp)));
 
     always_comb begin
         select_gpu = 0;
@@ -338,25 +377,25 @@ module nds_h3d_frame_record_cdc #(
             selected_raw_timestamp = phase_timestamp;
         end else if (gpu_valid &&
             (!arm9_vram_valid ||
-             gpu_timestamp <= arm9_vram_timestamp) &&
+             ts_le(gpu_timestamp, arm9_vram_timestamp)) &&
             (!arm7_vram_valid ||
-             gpu_timestamp <= arm7_vram_timestamp) &&
+             ts_le(gpu_timestamp, arm7_vram_timestamp)) &&
             (!frame_valid ||
-             gpu_timestamp <= frame_timestamp)) begin
+             ts_le(gpu_timestamp, frame_timestamp))) begin
             select_gpu = 1;
             selected_raw_valid = 1;
             selected_raw_timestamp = gpu_timestamp;
         end else if (arm9_vram_valid &&
                      (!arm7_vram_valid ||
-                      arm9_vram_timestamp <= arm7_vram_timestamp) &&
+                      ts_le(arm9_vram_timestamp, arm7_vram_timestamp)) &&
                      (!frame_valid ||
-                      arm9_vram_timestamp <= frame_timestamp)) begin
+                      ts_le(arm9_vram_timestamp, frame_timestamp))) begin
             select_arm9 = 1;
             selected_raw_valid = 1;
             selected_raw_timestamp = arm9_vram_timestamp;
         end else if (arm7_vram_valid &&
                      (!frame_valid ||
-                      arm7_vram_timestamp <= frame_timestamp)) begin
+                      ts_le(arm7_vram_timestamp, frame_timestamp))) begin
             select_arm7 = 1;
             selected_raw_valid = 1;
             selected_raw_timestamp = arm7_vram_timestamp;
@@ -372,8 +411,8 @@ module nds_h3d_frame_record_cdc #(
         select_gx_head = gx_record_valid &&
             !(SPARSE_HBLANK && select_hblank) &&
             (!selected_raw_valid ||
-             gx_record_timestamp < selected_raw_timestamp ||
-             (gx_record_timestamp == selected_raw_timestamp &&
+             ts_lt(gx_record_timestamp, selected_raw_timestamp) ||
+             (ts_eq(gx_record_timestamp, selected_raw_timestamp) &&
               !select_hblank));
         // The oldest fully normalized SWAP ordered at or before this boundary
         // is a promise that the equal/current frame will close. It may be
@@ -385,7 +424,7 @@ module nds_h3d_frame_record_cdc #(
         promised_swap_boundary = frame_valid &&
             frame_number == logical_frame &&
             ((gx_swap_pending &&
-              gx_oldest_swap_timestamp <= frame_timestamp) ||
+              ts_le(gx_oldest_swap_timestamp, frame_timestamp)) ||
              (select_gx_head && gx_record[15:8] == 8'h50));
 
         gpu_ready = 0;
