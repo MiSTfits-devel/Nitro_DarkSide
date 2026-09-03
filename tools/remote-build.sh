@@ -38,12 +38,12 @@ ARTIFACT_FILES=(
    # fixed from the per-clock summary the default sta.rpt carries.
    NDS4MiSTer.paths.rpt
    NDS4MiSTer.paths_hold.rpt
-   # Every path that would violate at the bring-up clk2x period (25.00 ns).
-   # This is the report that says whether NDS_PLL_BRINGUP actually closed.
-   NDS4MiSTer.paths_40mhz.rpt
-   # Every path that would violate at the native clk2x period (14.92 ns) -
-   # the standing cost of returning to the native cadence, measured for free.
-   NDS4MiSTer.paths_67mhz.rpt
+   # Every violating setup path: did this build close, and if not, what.
+   NDS4MiSTer.paths_violated.rpt
+   # The worst 3000 by slack. Its Data Delay column is cadence-independent:
+   # a path blocks the native cadence when that delay exceeds clk2x's native
+   # 14.92 ns period, whatever this build was constrained at.
+   NDS4MiSTer.paths_delay.rpt
    # ARM9-hierarchy-only paths. The global report is ranked by slack and caps
    # out long before it reaches the CPU, so it cannot answer "would the ARM9
    # close" - this one is scoped to icpu9/imembus9 and can.

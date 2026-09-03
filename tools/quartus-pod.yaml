@@ -47,12 +47,18 @@ spec:
         # Detailed worst-path timing; the default sta.rpt carries per-clock
         # summaries only, which is not enough to fix a path.
         #
-        # Two population reports, deliberately at two thresholds:
-        #   25.00 ns is clk2x's period in the NDS_PLL_BRINGUP cadence (40 MHz).
-        #             Paths here are what this build must fix to be trusted.
-        #   14.92 ns is clk2x's period at the native cadence (67.028 MHz).
-        #             Paths here are the standing cost of getting back to
-        #             native, measured for free on every bring-up build.
+        # Two population reports. -less_than_slack filters on SLACK, not on a
+        # period, so passing a period to it is wrong: against a design whose
+        # clk2x period is 25.00 ns, "-less_than_slack 25.00" matches virtually
+        # every path in the design, caps out at -npaths, and returns the same
+        # bytes as any other large threshold. Report what each question
+        # actually needs instead:
+        #   paths_violated: -less_than_slack 0, i.e. did this build close.
+        #   paths_delay:    the worst 3000 by slack, -detail summary, whose
+        #                   Data Delay column is the cadence-independent
+        #                   number. A path blocks the native cadence when its
+        #                   data delay exceeds clk2x's native 14.92 ns period,
+        #                   whatever this build happened to be constrained at.
         printf '%s\n' \
           "project_open NDS4MiSTer -revision NDS4MiSTer" \
           "create_timing_netlist" \
@@ -60,8 +66,8 @@ spec:
           "update_timing_netlist" \
           "report_timing -setup -npaths 50 -detail full_path -file output_files/NDS4MiSTer.paths.rpt" \
           "report_timing -hold -npaths 50 -detail full_path -file output_files/NDS4MiSTer.paths_hold.rpt" \
-          "report_timing -setup -npaths 3000 -less_than_slack 25.00 -detail summary -file output_files/NDS4MiSTer.paths_40mhz.rpt" \
-          "report_timing -setup -npaths 3000 -less_than_slack 14.92 -detail summary -file output_files/NDS4MiSTer.paths_67mhz.rpt" \
+          "report_timing -setup -npaths 3000 -less_than_slack 0 -detail summary -file output_files/NDS4MiSTer.paths_violated.rpt" \
+          "report_timing -setup -npaths 3000 -detail summary -file output_files/NDS4MiSTer.paths_delay.rpt" \
           "set a9 [get_registers {*icpu9*}]" \
           "set m9 [get_registers {*imembus9*}]" \
           "report_timing -setup -npaths 40 -detail summary -from \$a9 -to \$a9 -file output_files/NDS4MiSTer.paths_cpu9.rpt" \
