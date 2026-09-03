@@ -24,7 +24,7 @@ set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
 # space; NDS_PLL_BRINGUP removes the deficit, so hold repair is back on and is
 # expected to converge. Turn this off again only if the bring-up fit runs out
 # of routing.
-set_global_assignment -name OPTIMIZE_HOLD_TIMING ON
+set_global_assignment -name OPTIMIZE_HOLD_TIMING "ALL PATHS"
 # Match the fitter policy of the earlier successfully routed Engine-B image.
 # The newer redundant-logic/router overrides repeatedly placed but terminated
 # after more than forty minutes of hold-delay congestion. The sparse timing

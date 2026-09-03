@@ -1,0 +1,118 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Headless Quartus 17.0 Lite build pod for the grafted NDS4MiSTer core.
+# Ported from Nitro_DarkSide build/quartus-pod.yaml. Driven by
+# tools/remote-build.sh, which streams the source in with git archive, so the
+# branch never needs to be pushed anywhere.
+#
+# Differences from the Nitro_DarkSide pod: the project is not at the repo root
+# here, it is fpga/mister_nitro_console_island with revision NDS4MiSTer, and
+# its files.qip reaches up into ../../rtl and ../../third_party. The driver
+# therefore streams the repo prefix, not a flat file list, and the flow runs
+# from the project directory.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nds4mister-quartus-build
+  labels:
+    app: nds4mister-quartus-build
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/arch: amd64
+  containers:
+  - name: quartus
+    image: raetro/quartus:17.0
+    # plain -c: a login shell would source /etc/profile and clobber the
+    # image's PATH, which is where quartus_sh lives
+    command: ["/bin/bash", "-c"]
+    args:
+      - |
+        set -u
+        # /work is a REUSED PVC (see the volume below), so the last build's
+        # tree is still here. Clear it: a stale source file that files.qip no
+        # longer lists, or a db/ from a different tree, is exactly the kind of
+        # contamination that makes one build disagree with the next.
+        rm -rf /work/src /work/exitcode
+        mkdir -p /work/src
+        echo "waiting for source (tools/remote-build.sh streams it in)..."
+        while [ ! -f /work/src/.ready ]; do sleep 2; done
+        cd /work/src/fpga/mister_nitro_console_island
+        P=$(cat /work/src/.parallel 2>/dev/null || echo 1)
+        sed -i "s/NUM_PARALLEL_PROCESSORS 1/NUM_PARALLEL_PROCESSORS ${P}/" NDS4MiSTer.qsf
+        echo "=== quartus_sh --flow compile NDS4MiSTer (parallel=${P}) ==="
+        quartus_sh --flow compile NDS4MiSTer
+        rc=$?
+        echo "=== flow finished, exit ${rc} ==="
+        cat "output_files/NDS4MiSTer.fit.summary" 2>/dev/null || true
+        # Detailed worst-path timing; the default sta.rpt carries per-clock
+        # summaries only, which is not enough to fix a path.
+        #
+        # Two population reports, deliberately at two thresholds:
+        #   25.00 ns is clk2x's period in the NDS_PLL_BRINGUP cadence (40 MHz).
+        #             Paths here are what this build must fix to be trusted.
+        #   14.92 ns is clk2x's period at the native cadence (67.028 MHz).
+        #             Paths here are the standing cost of getting back to
+        #             native, measured for free on every bring-up build.
+        printf '%s\n' \
+          "project_open NDS4MiSTer -revision NDS4MiSTer" \
+          "create_timing_netlist" \
+          "read_sdc" \
+          "update_timing_netlist" \
+          "report_timing -setup -npaths 50 -detail full_path -file output_files/NDS4MiSTer.paths.rpt" \
+          "report_timing -hold -npaths 50 -detail full_path -file output_files/NDS4MiSTer.paths_hold.rpt" \
+          "report_timing -setup -npaths 3000 -less_than_slack 25.00 -detail summary -file output_files/NDS4MiSTer.paths_40mhz.rpt" \
+          "report_timing -setup -npaths 3000 -less_than_slack 14.92 -detail summary -file output_files/NDS4MiSTer.paths_67mhz.rpt" \
+          "set a9 [get_registers {*icpu9*}]" \
+          "set m9 [get_registers {*imembus9*}]" \
+          "report_timing -setup -npaths 40 -detail summary -from \$a9 -to \$a9 -file output_files/NDS4MiSTer.paths_cpu9.rpt" \
+          "report_timing -setup -npaths 40 -detail summary -from \$m9 -to \$m9 -append -file output_files/NDS4MiSTer.paths_cpu9.rpt" \
+          "report_timing -setup -npaths 40 -detail summary -from \$a9 -to \$m9 -append -file output_files/NDS4MiSTer.paths_cpu9.rpt" \
+          "report_timing -setup -npaths 40 -detail summary -from \$m9 -to \$a9 -append -file output_files/NDS4MiSTer.paths_cpu9.rpt" \
+          "report_timing -setup -npaths 2 -detail full_path -from \$a9 -to \$a9 -file output_files/NDS4MiSTer.paths_fam.rpt" \
+          "report_timing -setup -npaths 2 -detail full_path -from \$m9 -to \$m9 -append -file output_files/NDS4MiSTer.paths_fam.rpt" \
+          "report_timing -setup -npaths 2 -detail full_path -from \$a9 -to \$m9 -append -file output_files/NDS4MiSTer.paths_fam.rpt" \
+          "report_timing -setup -npaths 2 -detail full_path -from \$m9 -to \$a9 -append -file output_files/NDS4MiSTer.paths_fam.rpt" \
+          "project_close" > paths.tcl
+        quartus_sta -t paths.tcl || true
+        echo ${rc} > /work/exitcode
+        # stay alive so the driver can kubectl cp the artifacts out
+        sleep infinity
+    resources:
+      requests:
+        # cpu is compressible - reserve little, burst to the limit
+        cpu: "1"
+        memory: 8Gi
+      limits:
+        cpu: "12"
+        memory: 24Gi
+    volumeMounts:
+    - name: work
+      mountPath: /work
+  volumes:
+  - name: work
+    persistentVolumeClaim:
+      claimName: nds4mister-quartus-build-work
+---
+# /work must not be an emptyDir: that lives under /var/lib/kubelet, the same
+# node filesystem holding every container image, and a Cyclone V fit writes
+# several GB of db/, incremental_db/ and output_files/ on top of this image's
+# own ~6 GB. See the Nitro_DarkSide pod for the eviction this caused.
+#
+# The claim name must CONTAIN the pod name, because remote-build.sh selects a
+# pod with `sed s/nds4mister-quartus-build/$POD/g` over this whole file. A name
+# that sed does not touch means every POD= override mounts the SAME RWO claim,
+# and the second build either sits Pending on multi-attach or wipes the first
+# one's tree at startup.
+#
+# Named separately from nds-quartus-build-work so a graft build and a
+# Nitro_DarkSide build can run concurrently without touching each other.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nds4mister-quartus-build-work
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 60Gi
