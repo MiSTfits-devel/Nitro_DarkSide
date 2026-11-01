@@ -106,6 +106,7 @@ int main(int argc, char** argv)
     const char* rompath     = nullptr;
     int frames = 0;
     int iters  = 100;
+    bool threaded = false;
     u32 mashMask = 0xFFF;   // KEYINPUT polarity: a 0 bit is a pressed button
 
     // KEYINPUT bit order, with X/Y in the two bits SetKeyMask folds up to 16/17.
@@ -120,6 +121,7 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "--capture") && i + 1 < argc) capturePath = argv[++i];
         else if (!strcmp(argv[i], "--frames")  && i + 1 < argc) frames      = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--iters")   && i + 1 < argc) iters       = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--threaded"))                threaded    = true;
         else if (!strcmp(argv[i], "--mash")    && i + 1 < argc)
         {
             char* list = strdup(argv[++i]);
@@ -143,7 +145,7 @@ int main(int argc, char** argv)
     {
         fprintf(stderr,
             "usage: %s [--capture <state>] [--state <state>] [--frames n]\n"
-            "          [--mash a,start,...] [--iters n] <game.nds>\n",
+            "          [--mash a,start,...] [--iters n] [--threaded] <game.nds>\n",
             argv[0]);
         return 2;
     }
@@ -189,7 +191,7 @@ int main(int argc, char** argv)
     if (!soft) { fprintf(stderr, "current renderer is not the SoftRenderer\n"); return 1; }
     SoftRenderer3D* soft3d = soft->Get3DRenderer();
     if (!soft3d) { fprintf(stderr, "no 3D renderer\n"); return 1; }
-    soft3d->SetThreaded(false);
+    soft3d->SetThreaded(threaded);
 
     if (statePath)
     {
@@ -207,7 +209,7 @@ int main(int argc, char** argv)
         printf("loaded state %s (%ld bytes)\n", statePath, slen);
         // A state load leaves the renderer's threading mode to whatever the
         // object had; re-assert it rather than trusting the restore.
-        soft3d->SetThreaded(false);
+        soft3d->SetThreaded(threaded);
     }
 
     if (frames > 0)
@@ -284,6 +286,9 @@ int main(int argc, char** argv)
         nds.GPU.GPU3D.RenderFrameIdentical = false;
         double t0 = now_ms();
         soft3d->RenderFrame();
+        // Threaded mode posts a semaphore and returns; the completion fence
+        // is what turns the post into a measurement of the dual-core raster.
+        if (threaded) soft3d->FinishRendering();
         ms.push_back(now_ms() - t0);
     }
 
