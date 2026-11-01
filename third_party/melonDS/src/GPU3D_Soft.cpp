@@ -4691,6 +4691,13 @@ void SoftRenderer3D::FinishRendering()
 
 void SoftRenderer3D::RenderFrame()
 {
+    RenderFrame(GPU3D.RenderPolygonRAM.data(), GPU3D.RenderNumPolygons);
+}
+
+void SoftRenderer3D::RenderFrame(Polygon** polygons, u32 npolys)
+{
+    FramePolygons = polygons;
+    FramePolygonCount = npolys;
     RenderFrameFinished = false;
     RenderCancelRequested.store(false, std::memory_order_relaxed);
     RenderFrameCanceled.store(false, std::memory_order_relaxed);
@@ -4745,7 +4752,7 @@ void SoftRenderer3D::RenderFrame()
     else if (!FrameIdentical)
     {
         ClearBuffers();
-        RenderPolygons(false, &GPU3D.RenderPolygonRAM[0], GPU3D.RenderNumPolygons);
+        RenderPolygons(false, FramePolygons, static_cast<int>(FramePolygonCount));
     }
 }
 
@@ -4778,7 +4785,7 @@ void SoftRenderer3D::RenderThreadFunc()
         else if (ParallelClear && DualCoreRaster && FullFrameCompletion)
         {
             RenderPolygonsDualCore(
-                true, &GPU3D.RenderPolygonRAM[0], GPU3D.RenderNumPolygons, true);
+                true, FramePolygons, static_cast<int>(FramePolygonCount), true);
         }
         else
         {
@@ -4793,12 +4800,12 @@ void SoftRenderer3D::RenderThreadFunc()
             {
                 if (DualCoreRaster)
                     RenderPolygonsDualCore(
-                        true, &GPU3D.RenderPolygonRAM[0],
-                        GPU3D.RenderNumPolygons);
+                        true, FramePolygons,
+                        static_cast<int>(FramePolygonCount));
                 else
                     RenderPolygons(
-                        true, &GPU3D.RenderPolygonRAM[0],
-                        GPU3D.RenderNumPolygons);
+                        true, FramePolygons,
+                        static_cast<int>(FramePolygonCount));
             }
         }
 
