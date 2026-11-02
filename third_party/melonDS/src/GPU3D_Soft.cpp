@@ -1512,6 +1512,14 @@ SoftRenderer3D::RenderCachedModulatePerspectiveInteriorBatch4(
         spanAttributes.GetConstantColor(packedSpanColor);
     const auto coefficients = spanAttributes.PreparePerspectiveBatch();
 
+    // The four-lane factor kernel was already written and never called: the loop
+    // advanced the exact recurrence one lane at a time, and on this scene the
+    // correction path fired about twice per pixel (93,473 wide normalizations
+    // per frame against 48,315 SetX calls). Use the vector kernel when its
+    // preconditions hold and fall back to the scalar recurrence otherwise.
+    const bool batchFactors =
+        interpX.CanBatchPerspectiveFactors(firstX, endX);
+
     for (; firstX + 3 < endX; firstX += 4)
     {
         alignas(16) u32 factors[4];
@@ -1520,15 +1528,22 @@ SoftRenderer3D::RenderCachedModulatePerspectiveInteriorBatch4(
         u32 passingPixels = 0;
         bool allFront = true;
 
-        if constexpr (BatchWDepth)
+        if (batchFactors)
+        {
+            interpX.GetPerspectiveFactors4(firstX, factors);
+            for (unsigned lane = 0; lane < 4; ++lane)
+                interpX.SetPerspectiveBatchX(firstX + lane, factors[lane]);
+        }
+        else
         {
             for (unsigned lane = 0; lane < 4; ++lane)
             {
                 interpX.SetXFast<true>(firstX + lane);
                 factors[lane] = interpX.PerspectiveFactor();
             }
-            spanDepth.InterpolatePerspectiveDepthBatch4(factors, depths);
         }
+        if constexpr (BatchWDepth)
+            spanDepth.InterpolatePerspectiveDepthBatch4(factors, depths);
 
         for (u32 lane = 0; lane < 4; ++lane)
         {
@@ -1641,6 +1656,12 @@ SoftRenderer3D::RenderCachedModulatePerspectiveInteriorBatch4(
             }
         }
     }
+
+    // The vector kernel writes yfactor/x directly; rebuild the exact
+    // quotient/remainder recurrence from that state so a scalar tail pixel
+    // continues without a fresh divide.
+    if (batchFactors)
+        interpX.FinishPerspectiveBatch();
 
     return firstX;
 }
@@ -4670,6 +4691,13 @@ void SoftRenderer3D::FinishRendering()
 
 void SoftRenderer3D::RenderFrame()
 {
+    RenderFrame(GPU3D.RenderPolygonRAM.data(), GPU3D.RenderNumPolygons);
+}
+
+void SoftRenderer3D::RenderFrame(Polygon** polygons, u32 npolys)
+{
+    FramePolygons = polygons;
+    FramePolygonCount = npolys;
     RenderFrameFinished = false;
     RenderCancelRequested.store(false, std::memory_order_relaxed);
     RenderFrameCanceled.store(false, std::memory_order_relaxed);
@@ -4724,7 +4752,7 @@ void SoftRenderer3D::RenderFrame()
     else if (!FrameIdentical)
     {
         ClearBuffers();
-        RenderPolygons(false, &GPU3D.RenderPolygonRAM[0], GPU3D.RenderNumPolygons);
+        RenderPolygons(false, FramePolygons, static_cast<int>(FramePolygonCount));
     }
 }
 
@@ -4757,7 +4785,7 @@ void SoftRenderer3D::RenderThreadFunc()
         else if (ParallelClear && DualCoreRaster && FullFrameCompletion)
         {
             RenderPolygonsDualCore(
-                true, &GPU3D.RenderPolygonRAM[0], GPU3D.RenderNumPolygons, true);
+                true, FramePolygons, static_cast<int>(FramePolygonCount), true);
         }
         else
         {
@@ -4772,12 +4800,12 @@ void SoftRenderer3D::RenderThreadFunc()
             {
                 if (DualCoreRaster)
                     RenderPolygonsDualCore(
-                        true, &GPU3D.RenderPolygonRAM[0],
-                        GPU3D.RenderNumPolygons);
+                        true, FramePolygons,
+                        static_cast<int>(FramePolygonCount));
                 else
                     RenderPolygons(
-                        true, &GPU3D.RenderPolygonRAM[0],
-                        GPU3D.RenderNumPolygons);
+                        true, FramePolygons,
+                        static_cast<int>(FramePolygonCount));
             }
         }
 

@@ -1164,6 +1164,10 @@ public:
     }
 
     void RenderFrame() override;
+    // Render one frame from an explicit polygon list. The default entry point
+    // reads GPU3D's completed bank; a second render context reads its own bank so
+    // two frames can be in flight at once. Both paths run the same code.
+    void RenderFrame(Polygon** polygons, u32 npolys);
     void FinishRendering() override;
     void RestartFrame() override;
 
@@ -2502,6 +2506,13 @@ private:
     // frame-done fence and drained the per-line tokens, completed scanlines
     // can be read without taking the same 192 semaphore locks again.
     bool RenderFrameFinished = false;
+
+    // The polygon list the render thread is working on. RenderFrame() fills it
+    // from GPU3D's completed bank; the per-context entry point fills it from the
+    // caller's bank, which is what lets a second context render a different
+    // frame while this one is still in flight.
+    Polygon** FramePolygons = nullptr;
+    u32 FramePolygonCount = 0;
 
     // Used by the main thread to tell the render thread to start rendering a frame
     Platform::Semaphore* Sema_RenderStart;
