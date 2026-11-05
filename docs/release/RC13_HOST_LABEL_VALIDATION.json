@@ -1,0 +1,9 @@
+{
+  "changed_sections": [],
+  "executable_code_identical": true,
+  "host_label": "NDS4MiSTer v0.9.0-rc13",
+  "host_sha256": "0c989e15a7d941f85eb630abf21d608dfac7dd99e33a5a4219e355d8cd438733",
+  "source_matches_frozen_host_build": true,
+  "state": "exact_tested_beta9_host_reused",
+  "supervisor_difference_from_beta9": "Release version text only"
+}

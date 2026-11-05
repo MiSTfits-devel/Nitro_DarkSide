@@ -57,6 +57,15 @@ def starts(trace: Path) -> list[list[str]]:
     return [entry for entry in records(trace) if "-S" in entry]
 
 
+def wait_for(predicate, message: str, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    raise RuntimeError(message)
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="h3d-supervisor-") as temporary:
         test_root = Path(temporary)
@@ -75,6 +84,11 @@ def main() -> int:
         trace = runtime / "fake-ssd.jsonl"
         snapshot_marker = runtime / "fake-snapshot-requested"
         fake_proc = runtime / "proc"
+        fake_proc.mkdir()
+        core_name = runtime / "CORENAME"
+        core_name.write_text("MENU\n", encoding="ascii")
+        fake_service_start_state = runtime / "fake-service-start"
+        fake_service_start_state.write_text("1000\n", encoding="ascii")
         fake_mister_pid = 4242
         fake_mister = fake_proc / str(fake_mister_pid)
         fake_mister.mkdir(parents=True)
@@ -87,6 +101,12 @@ def main() -> int:
         )
         fake_affinity = runtime / "fake-mister-affinity"
         fake_affinity.write_text("1\n", encoding="ascii")
+        fake_mister_pid_state = runtime / "fake-mister-pids"
+        fake_mister_pid_state.write_text(f"{fake_mister_pid}\n", encoding="ascii")
+        fake_taskset_mode = runtime / "fake-taskset-mode"
+        fake_taskset_mode.write_text("ok\n", encoding="ascii")
+        fake_taskset_entered = runtime / "fake-taskset-entered"
+        fake_taskset_release = runtime / "fake-taskset-release"
         fake_taskset_trace = runtime / "fake-taskset.jsonl"
         fake_taskset = runtime / "taskset"
         fake_taskset.write_text(
@@ -94,11 +114,17 @@ def main() -> int:
             "set -eu\n"
             "state=$H3D_FAKE_AFFINITY_STATE\n"
             "trace=$H3D_FAKE_TASKSET_TRACE\n"
+            "mode=$(cat \"$H3D_FAKE_TASKSET_MODE\")\n"
             "if [ \"$#\" -eq 2 ] && [ \"$1\" = -pc ]; then\n"
             "  printf \"pid %s's current affinity list: %s\\n\" \"$2\" \"$(cat \"$state\")\"\n"
             "elif [ \"$#\" -eq 3 ] && [ \"$1\" = -pc ]; then\n"
-            "  printf '%s\\n' \"$2\" >\"$state\"\n"
             "  printf '[\"%s\",\"%s\"]\\n' \"$2\" \"$3\" >>\"$trace\"\n"
+            "  printf '%s\\n' \"$2\" >\"$state\"\n"
+            "  if [ \"$mode\" = block-set ] && [ \"$2\" = 0 ]; then\n"
+            "    : >\"$H3D_FAKE_TASKSET_ENTERED\"\n"
+            "    while [ ! -f \"$H3D_FAKE_TASKSET_RELEASE\" ]; do sleep 0.01; done\n"
+            "  fi\n"
+            "  [ \"$mode\" != mutate-fail ] || exit 1\n"
             "  printf \"pid %s's current affinity list: %s\\n\" \"$3\" \"$2\"\n"
             "else\n"
             "  exit 2\n"
@@ -106,9 +132,12 @@ def main() -> int:
             encoding="ascii",
         )
         fake_taskset.chmod(0o755)
+        fake_pidof_trace = runtime / "fake-pidof-calls"
         fake_pidof = runtime / "pidof"
         fake_pidof.write_text(
-            f"#!/bin/sh\n[ \"${{1:-}}\" = MiSTer ] && echo {fake_mister_pid}\n",
+            "#!/bin/sh\n"
+            "printf 'call\\n' >>\"$H3D_FAKE_PIDOF_TRACE\"\n"
+            "[ \"${1:-}\" = MiSTer ] && cat \"$H3D_FAKE_MISTER_PID_STATE\"\n",
             encoding="ascii",
         )
         fake_pidof.chmod(0o755)
@@ -131,13 +160,43 @@ def main() -> int:
                 "H3D_TEST_START_STOP_DAEMON": str(FAKE_SSD),
                 "H3D_FAKE_SSD_TRACE": str(trace),
                 "H3D_FAKE_SNAPSHOT_MARKER": str(snapshot_marker),
+                "H3D_FAKE_PROC_ROOT": str(fake_proc),
+                "H3D_FAKE_SERVICE_START_STATE": str(fake_service_start_state),
                 "H3D_TEST_TASKSET": str(fake_taskset),
                 "H3D_TEST_PIDOF": str(fake_pidof),
                 "H3D_TEST_PROC_ROOT": str(fake_proc),
                 "H3D_FAKE_AFFINITY_STATE": str(fake_affinity),
                 "H3D_FAKE_TASKSET_TRACE": str(fake_taskset_trace),
+                "H3D_FAKE_TASKSET_MODE": str(fake_taskset_mode),
+                "H3D_FAKE_TASKSET_ENTERED": str(fake_taskset_entered),
+                "H3D_FAKE_TASKSET_RELEASE": str(fake_taskset_release),
+                "H3D_FAKE_MISTER_PID_STATE": str(fake_mister_pid_state),
+                "H3D_FAKE_PIDOF_TRACE": str(fake_pidof_trace),
+                "H3D_TEST_MISTER_WATCH_INTERVAL": "0.05",
             }
         )
+
+        mister_dirs = {fake_mister_pid}
+
+        def set_misters(entries: list[tuple[int, int]], affinity: str = "1") -> None:
+            nonlocal mister_dirs
+            for old_pid in mister_dirs:
+                shutil.rmtree(fake_proc / str(old_pid), ignore_errors=True)
+            mister_dirs = {pid for pid, _ in entries}
+            for pid, start_time in entries:
+                proc_dir = fake_proc / str(pid)
+                proc_dir.mkdir(parents=True, exist_ok=True)
+                proc_dir.joinpath("stat").write_text(
+                    f"{pid} (MiSTer) R "
+                    + " ".join(["0"] * 18)
+                    + f" {start_time} 0\n",
+                    encoding="ascii",
+                )
+            fake_mister_pid_state.write_text(
+                " ".join(str(pid) for pid, _ in entries) + "\n",
+                encoding="ascii",
+            )
+            fake_affinity.write_text(f"{affinity}\n", encoding="ascii")
 
         run_control("preflight", environment)
         wc_module.write_bytes(b"test WC module")
@@ -177,14 +236,80 @@ def main() -> int:
                     str(pidfile), "start used a non-fixed pidfile path")
             require(first_starts[0][first_starts[0].index("-N") + 1] == "-20",
                     "start did not prioritize the H3D service")
-            require(fake_affinity.read_text(encoding="ascii").strip() == "0",
-                    "start did not move only the MiSTer frontend to CPU0")
+            require(fake_affinity.read_text(encoding="ascii").strip() == "1",
+                    "Kickstart changed the pre-load MiSTer frontend")
 
-            # Idempotent start must not create a second process.
+            # Idempotent start must not create a second service or watcher.
             twice = run_control("start", environment)
             require("already running" in twice.stdout,
                     "second start did not report the resident instance")
             require(len(starts(trace)) == 1, "second start launched another process")
+            wait_for(
+                lambda: (runtime / "nds-h3d-mister-watch.lock").is_dir(),
+                "affinity watcher did not hold its singleton lock",
+            )
+
+            # A stable replacement is pinned only after CORENAME says NDS.
+            set_misters([(4343, 111111)])
+            time.sleep(0.15)
+            require(fake_affinity.read_text(encoding="ascii").strip() == "1",
+                    "replacement was pinned before the NDS core gate")
+            core_name.write_text("NDS\n", encoding="ascii")
+            wait_for(
+                lambda: fake_affinity.read_text(encoding="ascii").strip() == "0",
+                "stable replacement MiSTer epoch was not pinned",
+            )
+            require(len(records(fake_taskset_trace)) == 1,
+                    "watcher repeated the CPU0 taskset write")
+
+            # Reopening NDS can replace the frontend without restarting the
+            # resident renderer. Every new epoch needs its own affinity; the
+            # old watcher exited after the first pin and missed this reload.
+            set_misters([(4444, 111112)])
+            wait_for(
+                lambda: fake_affinity.read_text().strip() == "0",
+                "reloaded frontend was left competing with the renderer",
+            )
+            require(len(records(fake_taskset_trace)) == 2,
+                    "reload did not issue exactly one new pin")
+            schedule_state = runtime / "nds-h3d-mister-scheduling.state"
+            require(schedule_state.read_text().strip() == "4444 111112 1",
+                    "reload did not retain the new frontend's original affinity")
+            run_control("start", environment)
+            time.sleep(0.15)
+            require(len(starts(trace)) == 1 and
+                    len(records(fake_taskset_trace)) == 2 and
+                    schedule_state.read_text().strip() == "4444 111112 1",
+                    "repeated Kickstart duplicated work or lost original affinity")
+
+            # The launch window must not expire during a running game. Leaving
+            # NDS restores an unchanged frontend; returning to it is observed
+            # even when MiSTer retains that same PID/start-time pair.
+            core_name.write_text("NDS", encoding="ascii")  # Live MiSTer uses no LF.
+            scans_before = len(fake_pidof_trace.read_text().splitlines())
+            time.sleep(2.2)  # More than the test's 40 * 0.05-second launch window.
+            require((runtime / "nds-h3d-mister-watch.lock").is_dir(),
+                    "watcher expired during active NDS gameplay")
+            require(len(fake_pidof_trace.read_text().splitlines()) == scans_before,
+                    "watcher kept scanning all processes during stable gameplay")
+
+            # The cheap steady-state check still detects PID reuse, rather
+            # than trusting the cached numeric PID after its frontend exits.
+            set_misters([(4444, 111113)])
+            wait_for(lambda: fake_affinity.read_text().strip() == "0",
+                     "steady-state watcher missed reuse of the frontend PID")
+            require(schedule_state.read_text().strip() == "4444 111113 1",
+                    "PID reuse retained stale scheduling state")
+            core_name.write_text("MENU\n", encoding="ascii")
+            wait_for(lambda: fake_affinity.read_text().strip() == "1",
+                     "leaving NDS did not restore the same frontend")
+            wait_for(lambda: not schedule_state.exists(),
+                     "leaving NDS left stale scheduling state")
+            core_name.write_text("NDS\n", encoding="ascii")
+            wait_for(lambda: fake_affinity.read_text().strip() == "0",
+                     "returning to NDS with the same frontend was missed")
+            require(len(records(fake_taskset_trace)) == 5,
+                    "same-frontend core switch repeated an affinity change")
             run_control("status", environment)
             dump = run_control("dump", environment)
             require("snapshot requested" in dump.stdout,
@@ -202,7 +327,148 @@ def main() -> int:
                     "stop did not restore MiSTer's original affinity: "
                     f"affinity={fake_affinity.read_text(encoding='ascii')!r} "
                     f"trace={fake_taskset_trace.read_text(encoding='ascii')!r}")
+            require(len(records(fake_taskset_trace)) == 6,
+                    "stop did not perform exactly one restoring write")
             run_control("status", environment, 3)
+
+            # Before NDS is loaded the bounded launch window still expires.
+            # Kickstart then adopts an already-running NDS frontend, without
+            # requiring another frontend restart or a second ARM service.
+            wait_for(lambda: not (runtime / "nds-h3d-mister-watch.lock").exists(),
+                     "watcher outlived its stopped service")
+            core_name.write_text("MENU\n", encoding="ascii")
+            short_window = environment | {"H3D_TEST_MISTER_WATCH_LIMIT": "4"}
+            run_control("start", short_window)
+            wait_for(lambda: (runtime / "nds-h3d-mister-watch.lock").exists(),
+                     "bounded launch watcher did not start")
+            wait_for(lambda: not (runtime / "nds-h3d-mister-watch.lock").exists(),
+                     "watcher did not expire outside NDS")
+            require(fake_affinity.read_text().strip() == "1",
+                    "waiting for NDS changed menu affinity")
+            starts_before_adoption = len(starts(trace))
+            core_name.write_text("NDS\n", encoding="ascii")
+            run_control("start", environment)
+            wait_for(lambda: fake_affinity.read_text().strip() == "0",
+                     "Kickstart missed an already-running NDS frontend")
+            require(len(starts(trace)) == starts_before_adoption,
+                    "adopting NDS restarted the ARM service")
+            run_control("stop", environment)
+
+            # PID reuse is distinguished by /proc start time.  The same
+            # numeric PID with a new epoch must be treated as the replacement.
+            core_name.write_text("MENU\n", encoding="ascii")
+            run_control("start", environment)
+            before_writes = len(records(fake_taskset_trace))
+            set_misters([(4343, 222222)])
+            core_name.write_text("NDS\n", encoding="ascii")
+            wait_for(lambda: len(records(fake_taskset_trace)) == before_writes + 1,
+                     "PID reuse was not recognized as a new MiSTer epoch")
+            run_control("stop", environment)
+
+            # Ambiguous pidof output is never acted on.  Once it becomes one
+            # stable replacement, exactly one write is allowed.
+            core_name.write_text("MENU\n", encoding="ascii")
+            run_control("start", environment)
+            before_writes = len(records(fake_taskset_trace))
+            set_misters([(5001, 300001), (5002, 300002)])
+            core_name.write_text("NDS\nextra\n", encoding="ascii")
+            time.sleep(0.2)
+            require(len(records(fake_taskset_trace)) == before_writes,
+                    "duplicate MiSTer PIDs or non-exact CORENAME were acted on")
+            set_misters([(5002, 300002)])
+            core_name.write_text("NDS\n", encoding="ascii")
+            wait_for(lambda: len(records(fake_taskset_trace)) == before_writes + 1,
+                     "singleton replacement after duplicate PIDs was not pinned")
+            time.sleep(0.15)
+            require(len(records(fake_taskset_trace)) == before_writes + 1,
+                    "watcher repeated taskset for the same epoch")
+            run_control("stop", environment)
+
+            # A taskset that mutates CPU affinity but reports failure is
+            # detected by post-state, retained for restoration, and not retried.
+            core_name.write_text("MENU\n", encoding="ascii")
+            run_control("start", environment)
+            fake_taskset_mode.write_text("mutate-fail\n", encoding="ascii")
+            before_writes = len(records(fake_taskset_trace))
+            set_misters([(6001, 400001)])
+            core_name.write_text("NDS\n", encoding="ascii")
+            wait_for(lambda: fake_affinity.read_text().strip() == "0",
+                     "partial taskset mutation was not observed")
+            time.sleep(0.15)
+            require(len(records(fake_taskset_trace)) == before_writes + 1,
+                    "partial-success taskset was repeated")
+            fake_taskset_mode.write_text("ok\n", encoding="ascii")
+            run_control("stop", environment)
+            require(fake_affinity.read_text().strip() == "1",
+                    "partial-success taskset was not restored on stop")
+
+            # Pin-before-stop: taskset holds the operation mutex while Stop
+            # waits; after verification, Stop restores the same epoch.
+            core_name.write_text("MENU\n", encoding="ascii")
+            run_control("start", environment)
+            fake_taskset_mode.write_text("block-set\n", encoding="ascii")
+            fake_taskset_entered.unlink(missing_ok=True)
+            fake_taskset_release.unlink(missing_ok=True)
+            before_writes = len(records(fake_taskset_trace))
+            set_misters([(7001, 500001)])
+            core_name.write_text("NDS\n", encoding="ascii")
+            wait_for(fake_taskset_entered.exists,
+                     "watcher did not enter forced taskset race")
+            stopping = subprocess.Popen(
+                [str(CONTROL), "stop"], env=environment,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            time.sleep(0.1)
+            require(stopping.poll() is None,
+                    "Stop bypassed the affinity operation mutex")
+            fake_taskset_release.touch()
+            stop_stdout, stop_stderr = stopping.communicate(timeout=5)
+            require(stopping.returncode == 0,
+                    f"pin-before-stop failed: {stop_stdout!r} {stop_stderr!r}")
+            fake_taskset_mode.write_text("ok\n", encoding="ascii")
+            require(fake_affinity.read_text().strip() == "1",
+                    "pin-before-stop did not restore original affinity")
+            require(len(records(fake_taskset_trace)) == before_writes + 2,
+                    "pin-before-stop did not issue one pin and one restore")
+
+            # Stop-before-pin: hold Stop's mutex, present a stable replacement,
+            # then release it. The watcher must recheck the dead service epoch.
+            core_name.write_text("MENU\n", encoding="ascii")
+            run_control("start", environment)
+            stop_marker = runtime / "fake-stop-lock-entered"
+            stop_release = runtime / "fake-stop-lock-release"
+            stop_marker.unlink(missing_ok=True)
+            stop_release.unlink(missing_ok=True)
+            stop_environment = environment.copy()
+            stop_environment.update({
+                "H3D_TEST_STOP_LOCK_MARKER": str(stop_marker),
+                "H3D_TEST_STOP_LOCK_RELEASE": str(stop_release),
+            })
+            before_writes = len(records(fake_taskset_trace))
+            stopping = subprocess.Popen(
+                [str(CONTROL), "stop"], env=stop_environment,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            wait_for(stop_marker.exists, "Stop did not acquire operation mutex")
+            set_misters([(8001, 600001)])
+            core_name.write_text("NDS\n", encoding="ascii")
+            time.sleep(0.12)
+            stop_release.touch()
+            stop_stdout, stop_stderr = stopping.communicate(timeout=5)
+            require(stopping.returncode == 0,
+                    f"stop-before-pin failed: {stop_stdout!r} {stop_stderr!r}")
+            time.sleep(0.15)
+            require(len(records(fake_taskset_trace)) == before_writes,
+                    "watcher pinned MiSTer after its H3D service epoch stopped")
+
+            # Accepted three-field state survives an in-boot launcher upgrade.
+            (runtime / "nds-h3d-mister-scheduling.state").write_text(
+                "8001 600001 1\n", encoding="ascii"
+            )
+            fake_affinity.write_text("0\n", encoding="ascii")
+            run_control("stop", environment)
+            require(fake_affinity.read_text().strip() == "1",
+                    "legacy state did not restore the same MiSTer epoch")
 
             # A stale pidfile, even one naming a live unrelated PID, must be
             # replaced without signalling that process.
@@ -213,14 +479,16 @@ def main() -> int:
             Path(str(pidfile) + ".alive").write_text(
                 "unrelated\n", encoding="ascii"
             )
+            starts_before_stale = len(starts(trace))
             run_control("start", environment)
-            require(len(starts(trace)) == 2,
+            require(len(starts(trace)) == starts_before_stale + 1,
                     "stale pidfile prevented a clean service start")
             os.kill(os.getpid(), 0)
 
             # Restart performs a bounded TERM stop followed by one fresh start.
+            starts_before_restart = len(starts(trace))
             run_control("restart", environment)
-            require(len(starts(trace)) == 3,
+            require(len(starts(trace)) == starts_before_restart + 1,
                     "restart did not launch exactly one replacement")
             run_control("stop", environment)
 
@@ -229,6 +497,50 @@ def main() -> int:
             run_control("stop", environment)
             require(logfile.stat().st_size == 65536,
                     "stopped logfile was not bounded to 64 KiB")
+
+            # A clean launch must select the packaged MATCH4 protocol and
+            # raster settings while retaining both WC/fallback choices.
+            env_capture = runtime / "helper-environment.json"
+            environment["H3D_FAKE_ENV_CAPTURE"] = str(env_capture)
+            # Even a stale diagnostic parent must launch production settings.
+            environment["NDS4MISTER_H3D_DIAGNOSTICS"] = "1"
+            environment["NDS4MISTER_BLACK_EVENT_TRACE"] = "1"
+            environment["NDS4MISTER_H3D_UPLOAD_SNAPSHOT"] = "0"
+            environment["NDS4MISTER_GX_MATRIX_PREFIX"] = "off"
+            environment["NDS4MISTER_GX_QUERY_FAST_POLL"] = "0"
+            environment["NDS4MISTER_PACKET_NC"] = "1"
+            environment["NDS_GPU_STANDARD_PALETTE_CACHE"] = "0"
+            environment.pop("NDS4MISTER_MATCHED_DISPLAY_TEST", None)
+            environment.pop("NDS4MISTER_MATCHED_DISPLAY_FULL_RATE", None)
+            environment.pop("NDS4MISTER_WEIGHTED_RASTER_BANDS", None)
+            environment.pop("NDS4MISTER_DUAL_CORE_3D", None)
+            environment.pop("NDS4MISTER_ADAPTIVE_RASTER_SPLIT", None)
+            environment.pop("NDS4MISTER_RASTER_BAND_QUEUE", None)
+            environment.pop("NDS4MISTER_RASTER_X_PARTITION", None)
+            for mode in ("0", "1"):
+                environment["NDS4MISTER_H3D_DISABLE_WC"] = mode
+                run_control("start", environment)
+                captured = json.loads(env_capture.read_text())
+                require(captured == {
+                    "NDS4MISTER_H3D_DISABLE_WC": mode,
+                    "NDS4MISTER_H3D_DIAGNOSTICS": "0",
+                    "NDS4MISTER_DIRECT_PLANE_PUBLICATION": "1",
+                    "NDS4MISTER_GX_MATRIX_PREFIX": "fast",
+                    "NDS4MISTER_GX_QUERY_FAST_POLL": "1",
+                    "NDS4MISTER_PACKET_NC": "0",
+                    "NDS_GPU_STANDARD_PALETTE_CACHE": "1",
+                    "NDS4MISTER_H3D_UPLOAD_SNAPSHOT": "1",
+                    "NDS4MISTER_BLACK_EVENT_TRACE": "0",
+                    "NDS4MISTER_MATCHED_DISPLAY_TEST": "1",
+                    "NDS4MISTER_MATCHED_DISPLAY_FULL_RATE": "1",
+                    "NDS4MISTER_WEIGHTED_RASTER_BANDS": "1",
+                    "NDS4MISTER_DUAL_CORE_3D": "1",
+                    "NDS4MISTER_ADAPTIVE_RASTER_SPLIT": "1",
+                    "NDS4MISTER_RASTER_BAND_QUEUE": "1",
+                    "NDS4MISTER_RASTER_X_PARTITION": "1",
+                }, "launcher lost MATCH4 protocol, raster, or WC settings")
+                run_control("stop", environment)
+            environment.pop("NDS4MISTER_H3D_DISABLE_WC")
 
             # A changed executable is rejected before start-stop-daemon sees a
             # launch request.

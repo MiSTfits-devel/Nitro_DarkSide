@@ -26,6 +26,7 @@
 #include "GPU3D_Soft.h"
 #include "Platform.h"
 #include "GPU3D.h"
+#include "NDS4MiSTer_GXClipFastPath.h"
 #include "NDS4MiSTer_2DTrace.h"
 #include "NDS4MiSTer_GXClipMath.h"
 #include "NDS4MiSTer_GXVertexTransform.h"
@@ -187,7 +188,11 @@ void Vertex::DoSavestate(Savestate* file) noexcept
 
 void GPU3D::ResetRenderingState() noexcept
 {
+    // Power-off replaces the latched plane even without a SWAP. A renderer
+    // retaining its previous pixels must not reuse a pre-reset identity hint.
+    RenderFrameIdentical = false;
     RenderNumPolygons = 0;
+    ++RenderStateRevision;
 
     RenderDispCnt = 0;
     RenderAlphaRef = 0;
@@ -210,6 +215,8 @@ void GPU3D::Reset() noexcept
     CmdPIPE.Clear();
 
     CmdStallQueue.Clear();
+    ExternalOverflow.clear();
+    ExternalOverflowPeak = 0;
 
     ZeroDotWLimit = 0xFFFFFF;
 
@@ -574,6 +581,7 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
     file->Var32(&TexPalette);
 
     RenderFrameIdentical = false;
+    if (!file->Saving) ++RenderStateRevision;
 }
 
 
@@ -726,6 +734,29 @@ void GPU3D::AddCycles(s32 num) noexcept
 {
     CycleCount += num;
 
+    // The exact 600-frame NSMB replay reaches this fully idle state on
+    // 151,960 / 166,884 calls (91.1%). Test both pipeline counters once so
+    // the dominant path returns without entering the pipeline state machine.
+    u32 pipelinesActive;
+#if defined(__arm__)
+    // Keep the two loads in caller-saved registers. GCC otherwise preserves
+    // r4 around this tiny leaf, adding a stack store/load to its dominant path.
+    asm volatile(
+        "ldr %[active], %[vertex]\n\t"
+        "ldr r12, %[polygon]\n\t"
+        "orrs %[active], %[active], r12"
+        : [active] "=&r" (pipelinesActive)
+        : [vertex] "m" (VertexPipeline),
+          [polygon] "m" (PolygonPipeline)
+        : "r12", "cc");
+#else
+    pipelinesActive = VertexPipeline | PolygonPipeline;
+#endif
+    if (pipelinesActive != 0) AdvancePipelines(num);
+}
+
+void GPU3D::AdvancePipelines(s32 num) noexcept
+{
     if (VertexPipeline > 0)
     {
         if (VertexPipeline > num) VertexPipeline -= num;
@@ -906,10 +937,19 @@ void ClipSegment(Vertex* outbuf, Vertex* vin, Vertex* vout)
 #undef INTERPOLATE
 }
 
+// Every caller's vertex array holds 10 entries (SubmitPolygon's clippedvertices,
+// the box-test faces, temp below). A convex quad clipped against the six planes
+// never exceeds that, but a twisted or self-intersecting quad can: each outside
+// vertex with two inside neighbours emits two. Unchecked, the extra vertices were
+// written past the end of the stack arrays; on the MiSTer's ARM build the stack
+// protector then aborts the H3D service (GTA: Chinatown Wars' first cutscene).
+// Drop the excess instead.
+constexpr int MaxClipVertices = 10;
+
 template<int comp, bool attribs>
 int ClipAgainstPlane(const GPU3D& gpu, Vertex* vertices, int nverts, int clipstart)
 {
-    Vertex temp[10];
+    Vertex temp[MaxClipVertices];
     int prev, next;
     int c = clipstart;
 
@@ -930,20 +970,20 @@ int ClipAgainstPlane(const GPU3D& gpu, Vertex* vertices, int nverts, int clipsta
             if ((comp == 2) && (!(gpu.CurPolygonAttr & (1<<12)))) return 0;
 
             Vertex* vprev = &vertices[prev];
-            if (vprev->Position[comp] <= vprev->Position[3])
+            if (vprev->Position[comp] <= vprev->Position[3] && c < MaxClipVertices)
             {
                 ClipSegment<comp, 1, attribs>(&temp[c], &vtx, vprev);
                 c++;
             }
 
             Vertex* vnext = &vertices[next];
-            if (vnext->Position[comp] <= vnext->Position[3])
+            if (vnext->Position[comp] <= vnext->Position[3] && c < MaxClipVertices)
             {
                 ClipSegment<comp, 1, attribs>(&temp[c], &vtx, vnext);
                 c++;
             }
         }
-        else
+        else if (c < MaxClipVertices)
             temp[c++] = vtx;
     }
 
@@ -957,20 +997,20 @@ int ClipAgainstPlane(const GPU3D& gpu, Vertex* vertices, int nverts, int clipsta
         if (vtx.Position[comp] < -vtx.Position[3])
         {
             Vertex* vprev = &temp[prev];
-            if (vprev->Position[comp] >= -vprev->Position[3])
+            if (vprev->Position[comp] >= -vprev->Position[3] && c < MaxClipVertices)
             {
                 ClipSegment<comp, -1, attribs>(&vertices[c], &vtx, vprev);
                 c++;
             }
 
             Vertex* vnext = &temp[next];
-            if (vnext->Position[comp] >= -vnext->Position[3])
+            if (vnext->Position[comp] >= -vnext->Position[3] && c < MaxClipVertices)
             {
                 ClipSegment<comp, -1, attribs>(&vertices[c], &vtx, vnext);
                 c++;
             }
         }
-        else
+        else if (c < MaxClipVertices)
             vertices[c++] = vtx;
     }
 
@@ -999,6 +1039,15 @@ int ClipPolygon(GPU3D& gpu, Vertex* vertices, int nverts, int clipstart)
     // TODO: the hardware seems to use a different algorithm. it reacts differently to vertices with W=0
     // some vertices that should get Y=-0x1000 get Y=0x1000 for some reason on hardware. it doesn't make sense.
     // clipping seems to process the Y plane before the X plane.
+
+    if constexpr (attribs)
+    {
+        if (__builtin_expect(
+                NDS4MiSTerGXClipPolygonIsUnchanged(
+                    vertices, nverts, clipstart),
+                true))
+            return nverts;
+    }
 
     // Z clipping
     nverts = ClipAgainstPlane<2, attribs>(gpu, vertices, nverts, clipstart);
@@ -1204,8 +1253,19 @@ void GPU3D::SubmitPolygon() noexcept
             }
 
             den <<= 1;
+#if defined(__arm__)
+            const auto viewportQuotients =
+                NDS4MiSTerGXDivideViewportPair(
+                    posX * Viewport[4], posY * Viewport[5], den);
+            posX = viewportQuotients.X + Viewport[0];
+            posY = viewportQuotients.Y + Viewport[3];
+#else
+            // Desktop targets have hardware integer division; keep upstream's
+            // shorter native path there. The paired reciprocal is specifically
+            // for Cortex-A9, where both operations call a software divider.
             posX = ((posX * Viewport[4]) / den) + Viewport[0];
             posY = ((posY * Viewport[5]) / den) + Viewport[3];
+#endif
         }
 
         vtx->FinalPosition[0] = posX & 0x1FF;
@@ -1375,8 +1435,7 @@ void GPU3D::SubmitPolygon() noexcept
         u32 w = (u32)vtx->Position[3];
         if (w == 0) poly->Degenerate = true;
 
-        while ((w >> wsize) && (wsize < 32))
-            wsize += 4;
+        wsize = std::max(wsize, NDS4MiSTerGXNormalizedWSize(w));
     }
 
     poly->VTop = vtop; poly->VBottom = vbot;
@@ -1822,6 +1881,19 @@ void GPU3D::CmdFIFOWrite(const CmdFIFOEntry& entry) noexcept
             // worst case is if a STMxx opcode causes this, which is why our stall queue
             // has 64 entries. this is less complicated than trying to make STMxx stall-able.
 
+            if (ExternalCommandReplay &&
+                (CmdStallQueue.IsFull() || !ExternalOverflow.empty()))
+            {
+                if (ExternalOverflow.size() >= ExternalOverflowLimit)
+                    GXCommandDrops++;
+                else
+                {
+                    ExternalOverflow.push_back(entry);
+                    if (ExternalOverflow.size() > ExternalOverflowPeak)
+                        ExternalOverflowPeak = ExternalOverflow.size();
+                }
+                return;
+            }
             if (CmdStallQueue.IsFull()) GXCommandDrops++;
             CmdStallQueue.Write(entry);
             NDS.GXFIFOStall();
@@ -1860,11 +1932,23 @@ GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
         // CmdFIFO should not be full at this point.
         if (!CmdStallQueue.IsEmpty())
         {
-            while (!CmdStallQueue.IsEmpty())
+            // External overflow queues strictly behind the stall queue. Keep
+            // the invariants "overflow non-empty => stall queue full" and
+            // "stall queue non-empty => FIFO full", so a later direct write
+            // can never overtake either older tail.
+            for (;;)
             {
-                if (CmdFIFO.IsFull()) break;
-                CmdFIFOEntry entry = CmdStallQueue.Read();
-                CmdFIFOWrite(entry);
+                while (!CmdStallQueue.IsEmpty() && !CmdFIFO.IsFull())
+                {
+                    CmdFIFOEntry entry = CmdStallQueue.Read();
+                    CmdFIFOWrite(entry);
+                }
+                while (!ExternalOverflow.empty() && !CmdStallQueue.IsFull())
+                {
+                    CmdStallQueue.Write(ExternalOverflow.front());
+                    ExternalOverflow.pop_front();
+                }
+                if (CmdFIFO.IsFull() || CmdStallQueue.IsEmpty()) break;
             }
 
             if (CmdStallQueue.IsEmpty())
@@ -1888,15 +1972,35 @@ GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
 
 void GPU3D::ExternalBatchWrite(const CmdFIFOEntry& entry) noexcept
 {
-    if (ExternalBatchCount < ExternalBatchCapacity)
+    if (CmdPIPE.IsEmpty())
     {
+        if (ExternalBatchCount == ExternalBatch.size())
+        {
+            // A blocked SWAP can hold more than the old 512-entry bank plus
+            // 16K stall queue. SM64 DS lost 1,177 commands entering Bob-omb
+            // Battlefield, leaving a partial vertex parameter in the next
+            // projection load and collapsing the whole scene to one line.
+            // Reuse consumed space first; grow only when all entries are live.
+            // No allocation or copy occurs on the ordinary append/pop path.
+            if (ExternalBatchRead != 0)
+            {
+                const u32 pending = ExternalBatchCount - ExternalBatchRead;
+                std::move(ExternalBatch.begin() + ExternalBatchRead,
+                          ExternalBatch.begin() + ExternalBatchCount,
+                          ExternalBatch.begin());
+                ExternalBatchRead = 0;
+                ExternalBatchCount = pending;
+            }
+            else
+                ExternalBatch.resize(ExternalBatch.size() * 2);
+        }
         ExternalBatch[ExternalBatchCount++] = entry;
     }
     else
     {
-        // This cannot occur with H3B's proven 256-command run boundary. Keep
-        // a future oversized caller lossless and ordered behind the complete
-        // contiguous batch rather than silently dropping its command.
+        // Preserve ordering if external mode was enabled with an existing
+        // ordinary FIFO tail. Normal hybrid sessions start with empty FIFOs
+        // and keep their entire normalized stream in the growable bank.
         CmdFIFOWrite(entry);
         return;
     }
@@ -2800,6 +2904,8 @@ void GPU3D::VBlank() noexcept
                     && memcmp(RenderToonTable, ToonTable, 32*2) == 0;
             }
 
+            if (!RenderFrameIdentical) ++RenderStateRevision;
+
             RenderDispCnt = DispCnt;
             RenderAlphaRef = AlphaRef;
 
@@ -2963,6 +3069,20 @@ void GPU3D::WriteExternalNormalizedCommandTriple(
             NDS4MiSTer::EmitTrace3DCommand(
                 NDS.NumFrames, NDS.ARM9Timestamp,
                 entry.Command, entry.Param);
+    }
+    // These three commands cannot affect GX stack/test counters. Keep
+    // command order, trace emission, geometry-enable and FIFO-tail behavior.
+    // Only amortize queue admission when all entries fit without compaction.
+    if (ExternalCommandReplay && UseSpriteRasterSpans &&
+        (packedCommands & 0x00E0E0E0u) == 0x00202020u &&
+        CmdPIPE.IsEmpty() && ExternalBatch.size() - ExternalBatchCount >= 3)
+    {
+        ExternalBatch[ExternalBatchCount] = entries[0];
+        ExternalBatch[ExternalBatchCount + 1] = entries[1];
+        ExternalBatch[ExternalBatchCount + 2] = entries[2];
+        ExternalBatchCount += 3;
+        GXStat |= (1 << 27);
+        return;
     }
     if (ExternalCommandReplay)
     {

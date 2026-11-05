@@ -41,7 +41,79 @@ public:
     void GetOBJBufferHashes(u64& lineHash, u64& windowHash) const;
 
 private:
+    // The paired output cache compares these buffers before X mosaic changes
+    // them, after sprite preparation and any parallel worker have completed.
+    friend class SoftRenderer;
     SoftRenderer& Parent;
+
+    // Experimental, opt-in B-only cache of the pre-mosaic sprite result.
+    struct SpritePhaseCache
+    {
+        struct Key
+        {
+            u64 OAMEpoch = 0, VRAMEpoch = 0;
+            u32 DispCnt = 0, MosaicLine = 0;
+            bool operator==(const Key& other) const
+            {
+                return OAMEpoch == other.OAMEpoch && VRAMEpoch == other.VRAMEpoch &&
+                    DispCnt == other.DispCnt && MosaicLine == other.MosaicLine;
+            }
+        };
+        struct Entry
+        {
+            Key Input;
+            alignas(8) u32 Line[256];
+            u8 Window[256];
+            u32 Count = 0;
+            bool Valid = false, OutputValid = false;
+        };
+        std::array<Entry,192> Lines;
+        std::array<u8,1024> OAM {};
+        u64 OAMEpoch = 0, ObservedWriteEpoch = 0;
+        bool OAMValid = false;
+        void Invalidate()
+        {
+            for (auto& entry : Lines) entry.Valid = false;
+            OAMValid = false;
+        }
+    };
+    std::unique_ptr<SpritePhaseCache> SpriteCache;
+
+    // OAM-only setup: pixel data, palettes, mosaic phase, and affine matrices
+    // are still read at the original sprite phase. Preserve OAM priority order.
+    struct SpriteSetupCache
+    {
+        struct Entry
+        {
+            u16 Number, Attr0;
+            s16 X;
+            u8 Y, Width, Height, BoundWidth, BoundHeight;
+        };
+        std::array<Entry, 128> Sprites;
+        std::array<u8, 1024> OAM {};
+        u64 ObservedWriteEpoch = 0;
+        unsigned Count = 0;
+        bool Valid = false;
+    };
+    std::unique_ptr<SpriteSetupCache> SpriteSetup;
+    void UpdateSpriteSetup();
+    bool SpriteBatch = true;
+    bool SpritePriorityIndex = true;
+    bool AffineTileCache = true;
+    bool AffinePackedRows = false;
+    bool StandardPaletteCache = true;
+    bool StandardPaletteValid = false, StandardPaletteChecked = false;
+    alignas(16) u16 StandardPaletteRaw[256] {};
+    alignas(16) u32 StandardPaletteColors[256] {};
+    const u32* GetStandardBGColors(const u16* palette);
+    template<bool cached> static void DrawPalettePixel(u32* dst, u32 color, u32 flag);
+    u8 SpritePriorityPixels[4][256];
+    u16 SpritePriorityCount[4] {};
+    void IndexSpritePriorities();
+    template<bool window> void DrawSpritePixelBatch8(
+        const u8* src, bool fourBit, bool flip, u32 pixelattr, s32 xpos);
+
+
 
     enum
     {
@@ -91,8 +163,10 @@ private:
 
     void DrawBG_3D();
     template<bool mosaic> void DrawBG_Text(u32 line, u32 bgnum);
+    template<bool mosaic, bool cached> void DrawBG_TextImpl(u32 line, u32 bgnum);
     template<bool mosaic> void DrawBG_Affine(u32 line, u32 bgnum);
     template<bool mosaic> void DrawBG_Extended(u32 line, u32 bgnum);
+    template<bool mosaic, bool cached> void DrawBG_ExtendedImpl(u32 line, u32 bgnum);
     template<bool mosaic> void DrawBG_Large(u32 line);
 
     void ApplySpriteMosaicX();

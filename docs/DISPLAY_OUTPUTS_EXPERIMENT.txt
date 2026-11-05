@@ -1,0 +1,160 @@
+NDS4MiSTer display experiment (based on v0.9.0-rc.5)
+
+DV1 means MiSTer's Direct Video with crop/pixel-repetition metadata for
+receivers such as RetroTINK-4K. It is distinct from dvi_mode. Use HDMI mode
+(dvi_mode=0) for DV1 metadata and audio.
+
+This branch restores native analog RGB/component and Direct Video routing.
+Beta 7 also enables the standard FPGA composite/S-Video encoder.
+It also restores the standard vga_scaler path for computer VGA monitors.
+These are experimental paths; simulation is not physical-display validation.
+
+Component CRT
+-------------
+Select CRT Mode: On. CRT Screen switches Main/Touch; Screen Order
+still reverses the panel order. The 256x192 panel is centered in a 320x240
+canvas. The source line rate is 15.625 kHz and frame rate approximately
+59.83 Hz, matching the existing presentation cadence without changing the
+DS or ARM renderer clocks. The CRT mode cannot select a stacked 31 kHz image.
+
+MiSTer's effective NDS configuration needs:
+  vga_mode=ypbpr
+  composite_sync=1
+  forced_scandoubler=0
+  vga_scaler=0
+  direct_video=0          (ordinary HDMI alongside the component CRT)
+
+Use the analog I/O board's component cable and enable its Sync-on-Green
+switch. Older Main versions may use ypbpr=1 instead of vga_mode=ypbpr.
+Preserve other INI options and make a backup before changing the NDS section.
+The experimental package must not overwrite the user's MiSTer.ini.
+After changing INI options, exit to the normal MiSTer menu and relaunch
+Scripts -> NDS_Display_Beta so Main applies them before the host takes over.
+
+RetroTINK-4K / DV1
+-----------------
+Connect MiSTer's HDMI port directly to the RetroTINK-4K's digital input.
+Set direct_video=1 and dvi_mode=0 in the effective NDS INI section, keeping
+vga_scaler=0. CRT Mode: Off retains the original native side/stack/single
+raster; On supplies the centered single-panel raster instead.
+Video Rotation applies to the MiSTer scaler, not the native DV1/analog path.
+Use the receiver's rotation feature when needed for native output.
+
+For DV1 and component simultaneously, retain vga_mode=ypbpr and
+composite_sync=1. Main then configures the HDMI transmitter for YPbPr; the
+RetroTINK input color range may need YCbCr 709. This combination needs an
+explicit color-bar check on the physical receiver.
+
+The standalone host inherits Main's transmitter bus, reads measured geometry
+via UIO_GET_VRES, and refreshes DV1 SPD packets after two stable samples.
+Menu-open metadata follows the actual OSD, including loading messages.
+No HDMI audio/color configuration is rewritten by the standalone host.
+
+Ordinary VGA monitors
+---------------------
+Use vga_scaler=1, vga_mode=rgb and a video_mode accepted by the monitor.
+The analog port then mirrors the HDMI scaler, including rotation and OSD.
+forced_scandoubler alone does not double this core's native 15 kHz raster.
+
+Screen Peek (display beta 2)
+---------------------------
+In Define Buttons, assign the optional Screen Peek prompt after Blow into Mic.
+Hold that button (or keyboard F10) to see the other panel while using a Left
+or Right single-screen layout, including CRT Screen Main/Touch. Release it to
+return to the selected panel. Both-screen layouts are unaffected.
+
+Peek does not change saved display settings. Opening the menu, resetting,
+loading another game or disconnecting the controller restores the selection.
+Existing controller mappings remain unchanged until you define a peek button.
+Space skips the optional prompt if you do not want to assign one.
+
+Private kit defaults
+--------------------
+Launch Scripts -> NDS_Display_Beta. The launcher filename is NDS_Display_Beta.sh;
+spaces in script filenames break Main's unquoted shell launch wrapper.
+The test kit starts in CRT Mode with Main selected and both rotations off.
+The HDMI scaler menu follows Video Rotation; the native analog menu stays
+upright, including file browsing and loading dialogs. The old NDS_osd.cfg override and MiSTer.ini osd_rotate do
+not override that choice in this beta. Existing games, saves, production settings,
+renderer, write-combining modules and 1 GHz clock policy are retained.
+
+Display beta 3
+--------------
+Keep all three related Nitro clocks on global networks, matching the working
+rc.5 topology. This repairs the game-boot regression introduced by the native
+video build without changing clock frequencies or renderer settings.
+
+Right-stick touch now has a 3% dead zone on each centered axis. Resting stick
+jitter stays neutral instead of repeatedly revealing the crosshair. Input
+outside the dead zone keeps its original coordinates and full screen reach.
+Mouse input and the touch-press button are unchanged.
+
+Display beta 4
+--------------
+Rename Output Timing to CRT Mode: Off/On. This selects the 240p single-screen
+picture; it does not switch the analog port on or off. MiSTer.ini still
+controls analog routing, signal format and Direct Video.
+
+CRT Screen appears directly below CRT Mode when enabled. A blank row
+separates these controls from 3D FPS Counter. Turning CRT Mode off restores
+Video Layout near the top of the menu.
+
+Menus and loading dialogs follow Video Rotation immediately and on relaunch.
+Touch Rotation remains independent. Beta 4 initially shared one menu
+orientation between outputs; beta 6 separates them. FPGA, renderer, clocks
+and controller mappings are unchanged.
+
+Display beta 5
+--------------
+Correct the swapped CW/CCW menu commands from beta 4 so menus rotate in the
+same direction as the selected video image. Both CRT and standard modes,
+including loading dialogs, are checked through the actual OSD pixel pipeline.
+
+Display beta 6
+--------------
+Use the existing HDMI and native analog OSDs independently. HDMI's scaled
+picture and menu follow Video Rotation, while the native CRT picture and
+menu stay upright. No additional menu setting is needed.
+
+Text updates and hide commands still go to both OSDs; enable/rotation commands
+target each OSD separately. File browsers and loading dialogs follow the same
+rule. This uses the existing qualified FPGA image and changes only the host.
+
+Direct Video uses the native analog video/OSD path, so its menu stays aligned
+with that unrotated picture. VGA scaler mode mirrors the already composed
+HDMI image and menu, including rotation. Independent game-screen selection
+for HDMI and analog remains unimplemented.
+
+Independent HDMI and analog DS panels are not implemented in this beta.
+Both outputs currently display the same selected panel or composed image.
+Separate panel scanout remains the lower-priority next experiment.
+
+Primary references:
+https://www.retrotink.com/blog/introducing-the-retrotink-4k
+https://mister-devel.github.io/MkDocs_MiSTer/advanced/ini/
+https://mister-devel.github.io/MkDocs_MiSTer/advanced/crt/
+https://github.com/MiSTer-devel/Main_MiSTer/blob/master/video.cpp
+
+Display beta 7: composite and S-Video color
+-----------------------------------------
+Enable the standard MiSTer YC encoder previously excluded from the FPGA
+build. Main applies the active profile before the standalone host takes over.
+The 60 MHz video clock is unchanged, so its carrier settings remain valid
+when switching between native layouts and CRT Mode.
+
+SuperStation One composite or S-Video, using its FPGA encoder:
+  - Keep switch 3 UP and select the SVID MiSTer INI profile.
+  - For an NTSC CRT, use the manufacturer's NTSC switch positions.
+  - Use CRT Mode: On in NDS.
+  - The SVID profile uses vga_mode=svideo even for the SS1 composite socket.
+    Its hardware combines the Y/C signals; do not change this to cvbs.
+  - Keep forced_scandoubler=0, vga_scaler=0, composite_sync=1 and
+    direct_video=0 for ordinary HDMI alongside the CRT.
+
+Other analog hardware must use the profile expected by its encoder/cable.
+Generic packed-composite adapters can use vga_mode=cvbs. External Sony
+encoder mode on SS1 instead uses switch 3 DOWN with vga_mode=subcarrier.
+The package does not change MiSTer INI profiles or yc.txt.
+
+SS1 setup reference:
+https://github.com/Takiiiiiiii/SuperStation-Documentation#ss1-color-black-and-white-display-issue-over-s-video-or-composite

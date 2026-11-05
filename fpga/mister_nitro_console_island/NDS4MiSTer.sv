@@ -12,7 +12,9 @@ module emu
     assign {SD_SCK,SD_MOSI,SD_CS}='Z;
     assign VGA_F1=0;
     assign VGA_SCALER=0;
-    assign VGA_DISABLE=0;
+    // Native stacked video is 31 kHz. Keep it off a 15 kHz analog display
+    // unless the user explicitly selected a computer-monitor configuration.
+    assign VGA_DISABLE=!video_split_active && video_layout_active == 1 && !forced_scandoubler;
     assign HDMI_FREEZE=0;
     assign HDMI_BLACKOUT=0;
     assign HDMI_BOB_DEINT=0;
@@ -26,20 +28,18 @@ module emu
     // Put the alpha label in the version line, not in the core-name field.
     localparam CONF_STR={
         "NDS;;",
-        "FS3,NDS,Load NDS (max 128 MiB),30000000;",
+        "FS3,NDS,Load NDS,30000000;",
         "-;",
         "O[6:5],Video Layout,Left/Right,Top/Bottom,Left Only,Right Only;",
-        "O[7],Screen Order,Top First,Bottom First;",
+        "O[7],Screen Order,Main First,Touch First;",
         // MiSTer initializes a new config version to option value zero. Keep
         // the user-facing default at eight pixels while retaining None.
         "O[9:8],Screen Gap,8 Pixels,None,16 Pixels,24 Pixels;",
         "O[4],3D FPS Counter,Off,On;",
-        "P4,Credits;",
-        "P4-;",
-        "P4-,Heni: ARM9 and FPGA 2D;",
-        "P4-,SplashDev88: HPS 3D/integration;",
-        "P4-,Robert Peip: upstream foundation;",
-        "P4-,MiSTer/melonDS contributors;",
+        "O[12:11],Video Rotation,Off,90 CCW,90 CW;",
+        "O[13],Output Timing,Standard,CRT 240p;",
+        "O[14],Independent Outputs,Off,On;",
+        "O[15],Analog Screen,Main,Touch;",
         "T[0],Reset;",
         "J1,A,B,X,Y,L,R,Select,Start,Touch;",
         "v,1;",
@@ -72,10 +72,21 @@ module emu
     wire [15:0] save_sd_buff_dout;
     wire [15:0] save_sd_buff_din;
     wire save_sd_buff_wr;
+    wire [1:0] media_img_mounted,media_sd_ack;
+    wire firmware_sd_rd,firmware_sd_wr;
+    wire [31:0] firmware_sd_lba;
+    wire [15:0] firmware_sd_buff_din;
+    wire [35:0] firmware_ext_bus;
+    wire [64:0] host_rtc;
+    assign save_img_mounted=media_img_mounted[0];
+    assign save_sd_ack=media_sd_ack[0];
     wire [1:0] video_layout_active;
     wire video_screen_order_active;
     wire [1:0] video_gap_active;
     wire video_fps_active;
+    wire video_crt_active;
+    wire video_split_active;
+    assign NDS_SPLIT_ACTIVE=video_split_active;
     // Translate the menu ordering back to scanout's 0/1/2/3 =
     // 0/8/16/24-pixel ABI.
     wire [1:0] video_gap_select = status[9:8] == 2'd0 ? 2'd1 :
@@ -84,11 +95,34 @@ module emu
 
     // Request the largest exact integer multiple of the frame-boundary-latched
     // source canvas. This keeps menu changes and scaler geometry atomic.
+    wire [12:0] normal_arx, normal_ary, rotated_arx, rotated_ary;
+    // Retain v0.4.0-beta's stored Off/CCW values. New CW uses option 2;
+    // reserved option 3 is Off. Controls remain native for a turned monitor.
+    wire [1:0] rotation_select = {status[11] & ~status[12],
+                                 status[12] & ~status[11]};
+    assign VIDEO_ROTATION = rotation_select;
+    assign VIDEO_SOURCE_WIDTH = video_crt_active ? 10'd320 : video_layout_active == 0
+        ? 10'd512 + {video_gap_active,3'd0} : 10'd256;
+    assign VIDEO_SOURCE_HEIGHT = video_crt_active ? 10'd240 : (video_layout_active == 1
+        ? 10'd384 + {video_gap_active,3'd0} : 10'd192) +
+        (video_fps_active ? 10'd6 : 10'd0);
+    (* async_reg = "true" *) reg [1:0] rotation_meta=0, rotation_applied=0;
+    always @(posedge clk_sys) begin
+        rotation_meta <= VIDEO_ROTATION_APPLIED;
+        rotation_applied <= rotation_meta;
+    end
+    assign VIDEO_ARX = rotation_applied != 0 ? rotated_arx : video_crt_active ? 13'd4 : normal_arx;
+    assign VIDEO_ARY = rotation_applied != 0 ? rotated_ary : video_crt_active ? 13'd3 : normal_ary;
+    nds_tate_scale tate_scale (
+        .clk(clk_sys), .reset(RESET), .hdmi_width(HDMI_WIDTH),
+        .hdmi_height(HDMI_HEIGHT), .source_width(VIDEO_SOURCE_WIDTH),
+        .source_height(VIDEO_SOURCE_HEIGHT), .arx(rotated_arx), .ary(rotated_ary)
+    );
     nds_nitro_integer_scale integer_scale (
         .hdmi_width(HDMI_WIDTH),.hdmi_height(HDMI_HEIGHT),
         .layout(video_layout_active),.gap(video_gap_active),
         .fps_enabled(video_fps_active),
-        .video_arx(VIDEO_ARX),.video_ary(VIDEO_ARY)
+        .video_arx(normal_arx),.video_ary(normal_ary)
     );
 
     wire clk_sys,shell_pll_locked;
@@ -106,8 +140,8 @@ module emu
         .locked(nitro_pll_locked)
     );
 
-    hps_io #(.CONF_STR(CONF_STR),.WIDE(1)) hps_io(
-        .clk_sys(clk_sys),.HPS_BUS(HPS_BUS),.EXT_BUS(),
+    hps_io #(.CONF_STR(CONF_STR),.WIDE(1),.VDNUM(2)) hps_io(
+        .clk_sys(clk_sys),.HPS_BUS(HPS_BUS),.EXT_BUS(firmware_ext_bus),.RTC(host_rtc),
         .gamma_bus(gamma_bus),
         .joystick_0(joystick_0),.joystick_1(joystick_1),
         .joystick_r_analog_0(touch_analog_0),
@@ -117,13 +151,13 @@ module emu
         .ioctl_download(ioctl_download),.ioctl_addr(ioctl_addr),
         .ioctl_dout(ioctl_dout),.ioctl_wr(ioctl_wr),
         .ioctl_index(ioctl_index),.ioctl_wait(ioctl_wait),
-        .img_mounted(save_img_mounted),
+        .img_mounted(media_img_mounted),
         .img_readonly(save_img_readonly),.img_size(save_img_size),
-        .sd_lba('{save_sd_lba}),.sd_blk_cnt('{6'd0}),
-        .sd_rd(save_sd_rd),.sd_wr(save_sd_wr),.sd_ack(save_sd_ack),
+        .sd_lba('{0:save_sd_lba,1:firmware_sd_lba}),.sd_blk_cnt('{6'd0,6'd0}),
+        .sd_rd({firmware_sd_rd,save_sd_rd}),.sd_wr({firmware_sd_wr,save_sd_wr}),.sd_ack(media_sd_ack),
         .sd_buff_addr(save_sd_buff_addr),
         .sd_buff_dout(save_sd_buff_dout),
-        .sd_buff_din('{save_sd_buff_din}),.sd_buff_wr(save_sd_buff_wr)
+        .sd_buff_din('{0:save_sd_buff_din,1:firmware_sd_buff_din}),.sd_buff_wr(save_sd_buff_wr)
     );
 
     // Mounted media belongs to the loaded core, not to a DS CPU reset epoch.
@@ -132,6 +166,7 @@ module emu
     wire media_reset=RESET|~shell_pll_locked;
     wire core_reset=media_reset|status[0]|buttons[1];
     wire touch_pressed;
+    // TATE targets a physically rotated monitor: retain native DS controls.
     wire [15:0] touch_analog;
     wire [31:0] joystick_touch = {
         joystick_0[31:13],touch_pressed,joystick_0[11:0]
@@ -169,10 +204,26 @@ module emu
         .video_screen_order_select(status[7]),
         .video_gap_select(video_gap_select),
         .video_fps_select(status[4]),
+        .video_crt_select(status[13]),.video_crt_active,
+        .video_split_select(status[14] && NDS_NATIVE_OUTPUT_ALLOWED),
+        .video_analog_screen_select(status[15]), .video_split_active,
+        .video_analog_screen_active(),
+        .analog_ce(NDS_ANALOG_CE), .analog_de(NDS_ANALOG_DE),
+        .analog_hs(NDS_ANALOG_HS), .analog_vs(NDS_ANALOG_VS),
+        .analog_r(NDS_ANALOG_R), .analog_g(NDS_ANALOG_G), .analog_b(NDS_ANALOG_B),
+        // Both DS engines are required. Ignore the legacy saved Off bit.
+        .engine_b_select(1'b1),
         .video_layout_active,.video_screen_order_active,
         .video_gap_active,.video_fps_active,
         .joystick(joystick_touch),.joystick_analog(touch_analog),
-        .ioctl_download,.ioctl_index,.ioctl_wait,
+        .ioctl_download,.ioctl_index,.ioctl_addr,.ioctl_dout,.ioctl_wr,.ioctl_wait,
+        .firmware_io_enable(firmware_ext_bus[34]),.firmware_io_strobe(firmware_ext_bus[33]),
+        .firmware_io_din(firmware_ext_bus[31:16]),
+        .firmware_io_override(firmware_ext_bus[32]),.firmware_io_dout(firmware_ext_bus[15:0]),
+        .host_rtc,
+        .firmware_img_mounted(media_img_mounted[1]),.firmware_img_readonly(save_img_readonly),
+        .firmware_img_size(save_img_size),.firmware_sd_lba,.firmware_sd_rd,.firmware_sd_wr,
+        .firmware_sd_ack(media_sd_ack[1]),.firmware_sd_buff_din,
         .save_img_mounted,.save_img_readonly,.save_img_size,
         .save_sd_lba,.save_sd_rd,.save_sd_wr,.save_sd_ack,
         .save_sd_buff_addr,.save_sd_buff_dout,
@@ -222,10 +273,9 @@ module emu
     assign AUDIO_L=nitro_audio_left;
     assign AUDIO_R=nitro_audio_right;
 
-    // Direct-to-DDR host loads do not emit per-beat ioctl_wr and report their
-    // file size through only the 27-bit ioctl_addr field.  A >128 MiB image is
-    // therefore indistinguishable from its wrapped size in fabric.  The OSD
-    // label is the user-visible first-beta preflight contract; the donor card
-    // address port itself spans exactly 128 MiB.
+    // Direct-to-DDR standalone loads validate image size/padding in the host.
+    // ioctl_addr remains the unused 27-bit MiSTer transfer counter; FS3 index
+    // bits 8/9 enable 256/512 MiB capacity. Bit11 selects the464MiB backed
+    // layout, avoiding scaler/TATE/graphics buffers. Omitted bytes must be FF.
     assign LED_USER=nitro_boot_error|nitro_boundary_fault|~nitro_cart_loaded;
 endmodule

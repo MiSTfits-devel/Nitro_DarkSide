@@ -45,6 +45,16 @@ public:
 
     void SetRenderSettings(RendererSettings& settings) override;
 
+    bool SetExternalFramebuffers(u32* top, u32* bottom) override
+    {
+        if ((top == nullptr) != (bottom == nullptr)) return false;
+        if (top && (!PackedOutput || EngineBOnly ||
+                    ((reinterpret_cast<uintptr_t>(top) |
+                      reinterpret_cast<uintptr_t>(bottom)) & 7))) return false;
+        ExternalFramebuffer[0] = top;
+        ExternalFramebuffer[1] = bottom;
+        return true;
+    }
     void DrawScanline(u32 line) override;
     void DrawSprites(u32 line) override;
     void SetExternalLineCacheReuse(u32 line, bool engineA,
@@ -68,6 +78,16 @@ public:
 
     bool GetFramebuffers(void** top, void** bottom) override;
     u32* Get3DScanline(u32 line) override { return Rend3D->GetLine(line); }
+    const u32* GetLastComposited3DLine() const override { return Output3D; }
+    bool DumpCompleted3DInputs(const char* path) const override
+    {
+        return static_cast<const SoftRenderer3D*>(Rend3D.get())
+            ->DumpCompletedInputs(path);
+    }
+    void Record3DPalettePhase215() override
+    {
+        static_cast<SoftRenderer3D*>(Rend3D.get())->RecordPalettePhase215();
+    }
     bool Is3DFrameIdentical() const override
     {
         return static_cast<const SoftRenderer3D*>(Rend3D.get())
@@ -92,8 +112,10 @@ public:
     bool GetRenderedScanlines(u32 line, u32** top, u32** bottom) override
     {
         if (line >= 192) return false;
-        *top = &Framebuffer[BackBuffer][0][line * 256];
-        *bottom = &Framebuffer[BackBuffer][1][line * 256];
+        *top = &(ExternalFramebuffer[0] ? ExternalFramebuffer[0] :
+                 Framebuffer[BackBuffer][0])[line * 256];
+        *bottom = &(ExternalFramebuffer[1] ? ExternalFramebuffer[1] :
+                    Framebuffer[BackBuffer][1])[line * 256];
         return true;
     }
     bool GetOBJBufferHashes(u64 hashes[4]) override
@@ -108,9 +130,14 @@ private:
     friend class SoftRenderer3D;
 
     u32* Framebuffer[2][2];
+    u32* ExternalFramebuffer[2] {};
     bool PackedOutput = false;
     bool LineCache = false;
+    bool PairedBCache = false;
+    bool PreparedSpriteLineReuse = false;
     bool EngineBOnly = false;
+    bool EngineAOnly = false;
+    bool EngineBPixelsEnabled = true;
     bool StageProfileEnabled = false;
     ExternalRendererStageProfile StageProfile {};
 
@@ -165,6 +192,34 @@ private:
     EngineLineState LineCacheState[2][192] {};
     bool LineCacheStateValid[2][192] {};
 
+    // OBJ pixels are prepared before the composition phase. Current OAM,
+    // VRAM and registers alone cannot identify those already-prepared pixels.
+    struct PreparedBSpriteKey
+    {
+        u64 OAMRevision = 0;
+        u64 VRAMEpoch = 0;
+        u32 DispCnt = 0;
+        u32 MosaicLine = 0;
+        u32 Line = 0;
+        u32 OBJEnable = 0;
+    };
+    static_assert(sizeof(PreparedBSpriteKey) == 32);
+    PreparedBSpriteKey PreparedBSprites {};
+    PreparedBSpriteKey CachedBSprites[192] {};
+    bool PreparedBSpritesValid = false;
+
+    struct PreparedSpriteIdentity
+    {
+        alignas(8) u32 Pixels[256];
+        u8 Window[256];
+        u32 Count = 0;
+        bool Valid = false;
+    };
+    // Allocate only for the opt-in game profile. This stores pre-mosaic
+    // inputs corresponding to a committed cached output, never just a prep.
+    std::unique_ptr<std::array<PreparedSpriteIdentity, 192>> BSpriteIdentity;
+    void InvalidateBSpriteIdentity();
+
     enum class Parallel2DTask
     {
         None,
@@ -198,7 +253,7 @@ private:
 
     void DrawScanlineA(u32 line, u32* dst);
     void DrawScanlineB(u32 line, u32* dst);
-    EngineLineState CaptureLineState(u32 engine) const;
+    EngineLineState CaptureLineState(u32 engine, bool ignoreOAM = false) const;
 
     void SetParallel2D(bool enabled);
     void Parallel2DThreadFunc();

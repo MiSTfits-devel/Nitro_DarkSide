@@ -1,5 +1,6 @@
 library IEEE;
 use IEEE.std_logic_1164.all;
+use IEEE.numeric_std.all;
 use std.env.all;
 
 use work.pProc_bus_gba.all;
@@ -56,6 +57,8 @@ begin
          assert wired_out = expected
             report "unexpected Engine B shadow readback" severity failure;
       end procedure;
+      variable rmw_value : std_logic_vector(31 downto 0);
+      variable tile_destination, map_destination : unsigned(31 downto 0);
    begin
       reset <= '1';
       wait until rising_edge(clk);
@@ -64,34 +67,141 @@ begin
 
       read_expect(x"0000000", x"00000000");
 
-      -- This is the exact NSMB failure sequence.  The game enables display
-      -- mode 1, later updates low control bits through a read/modify/write,
-      -- and must not lose bit 16 merely because the large B renderer is off.
+      -- Preserve unaffected bytes across partial writes before exercising the
+      -- complete NSMB read/modify/write below.
       write_word(x"0000000", x"00010000", "1111");
       read_expect(x"0000000", x"00010000");
       write_word(x"0000000", x"00000400", "0011");
-      read_expect(x"0000000", x"00010000");
+      read_expect(x"0000000", x"00010400");
       -- A CPU read now supplies bit 16 to the software merge, so the full
       -- writes captured by the ARM transport retain the correct mode.
       write_word(x"0000000", x"00010400", "1111");
-      read_expect(x"0000000", x"00010000");
+      read_expect(x"0000000", x"00010400");
       write_word(x"0000000", x"00011400", "1111");
-      read_expect(x"0000000", x"00010000");
+      read_expect(x"0000000", x"00011400");
 
-      -- Only the supported Engine B display-mode bit is retained in this
-      -- space-constrained compatibility shadow.
+      -- This is the exact frame-4677 failure captured on hardware. NSMB first
+      -- has display mode 1 plus BG0-BG3/OBJ enabled, then performs a
+      -- read/modify/write to set bit 4. Returning only bit 16 turns the
+      -- correct 0x00011F10 write into 0x00010010 and blanks every B layer.
+      write_word(x"0000000", x"00011F00", "1111");
+      read_expect(x"0000000", x"00011F00");
+      rmw_value := wired_out or x"00000010";
+      write_word(x"0000000", rmw_value, "1111");
+      read_expect(x"0000000", x"00011F10");
+
+      -- Match melonDS's Engine-B unsupported/reserved-bit mask.
       write_word(x"0000000", x"FFFFFFFF", "1111");
-      read_expect(x"0000000", x"00010000");
+      read_expect(x"0000000", x"C0B1FFF7");
 
-      -- All other Engine B words remain unclaimed in this minimum footprint.
-      read_expect(x"0000008", x"00000000", '0');
+      -- Kirby uses BG3CNT readback to obtain the graphics upload addresses.
+      -- The hardware capture has map data at 0x06200000, but the melonDS ROM
+      -- oracle writes the identical data to 0x06203800. A zero readback loses
+      -- screen-base 7 and character-base 1 despite the renderer seeing 0x0707.
+      write_word(x"000000C", x"07070000", "1100");
+      read_expect(x"000000C", x"07070000");
+      tile_destination := x"06200000" + shift_left(resize(unsigned(wired_out(21 downto 18)), 32), 14);
+      map_destination := x"06200000" + shift_left(resize(unsigned(wired_out(28 downto 24)), 32), 11);
+      assert tile_destination = x"06204000" and map_destination = x"06203800"
+         report "Kirby BG3 upload destinations lost their register base" severity failure;
+      read_expect(x"0000008", x"00000000");
+      write_word(x"0000008", x"ABCD1234", "1111");
+      read_expect(x"0000008", x"ABCD1234");
+      write_word(x"0000008", x"00560000", "0100");
+      read_expect(x"0000008", x"AB561234");
+      write_word(x"000000C", x"000089AB", "0011");
+      read_expect(x"000000C", x"070789AB");
+      write_word(x"000000C", x"12000000", "1000");
+      read_expect(x"000000C", x"120789AB");
       read_expect(x"0000018", x"00000000", '0');
+
+      -- Metroid sets window 0, reads WININ, then enables window 1. A zero
+      -- readback turns 0x3F3F into 0x3F00 and hides the left 128 pixels.
+      write_word(x"0000048", x"0000003F", "0011");
+      read_expect(x"0000048", x"0000003F");
+      rmw_value := (wired_out and x"FFFFC0FF") or x"00003F00";
+      write_word(x"0000048", rmw_value, "0011");
+      read_expect(x"0000048", x"00003F3F");
+      write_word(x"0000048", x"00200000", "1100");
+      read_expect(x"0000048", x"00203F3F");
+      -- Byte stores leave all other window masks untouched, including the
+      -- upper-half WINOUT registers. Reserved bits read as zero.
+      write_word(x"0000048", x"FFFFFFFF", "1111");
+      read_expect(x"0000048", x"3F3F3F3F");
+      for lane in 0 to 3 loop
+         write_word(x"0000048", x"00000000",
+                    std_logic_vector(shift_left(to_unsigned(1, 4), lane)));
+         rmw_value := x"3F3F3F3F";
+         for cleared in 0 to lane loop
+            rmw_value(cleared*8+7 downto cleared*8) := x"00";
+         end loop;
+         read_expect(x"0000048", rmw_value);
+      end loop;
+
+      -- BLDCNT and BLDALPHA share a bus word but preserve independent
+      -- programmed fields, including coefficients greater than 16.
+      write_word(x"0000050", x"FFFFFFFF", "1111");
+      read_expect(x"0000050", x"1F1F3FFF");
+      write_word(x"0000050", x"00003F48", "0011");
+      read_expect(x"0000050", x"1F1F3F48");
+      write_word(x"0000050", x"030D0000", "1100");
+      read_expect(x"0000050", x"030D3F48");
+      write_word(x"0000050", x"00000080", "0001");
+      read_expect(x"0000050", x"030D3F80");
+      write_word(x"0000050", x"001F0000", "0100");
+      read_expect(x"0000050", x"031F3F80");
+      -- Unselected/disabled transactions and write-only register words do
+      -- not mutate or claim these readable effects registers.
+      write_word(x"0000050", x"FFFFFFFF", "0000");
+      read_expect(x"0000050", x"031F3F80");
+      write_word(x"0000040", x"80000080", "1111");
+      read_expect(x"0000040", x"00000000", '0');
+      read_expect(x"000004C", x"00000000", '0');
+      read_expect(x"0000054", x"00000000", '0');
+      read_expect(x"FFFFFFF", x"00000000", '0');
+
+      -- Master brightness is also readable when Engine B is shadowed. A
+      -- fade can update the factor using read/modify/write without losing
+      -- its brighten/darken mode. Keep programmed factors above 16; only
+      -- rendering clamps them. Reserved bits and the upper half read zero.
+      write_word(x"000006C", x"00008010", "0011");
+      read_expect(x"000006C", x"00008010");
+      rmw_value := std_logic_vector(unsigned(wired_out) - 1);
+      write_word(x"000006C", rmw_value, "0011");
+      read_expect(x"000006C", x"0000800F");
+      write_word(x"000006C", x"FFFFFFFF", "1111");
+      read_expect(x"000006C", x"0000C01F");
+      write_word(x"000006C", x"00004000", "0010");
+      read_expect(x"000006C", x"0000401F");
+      write_word(x"000006C", x"00000008", "0001");
+      read_expect(x"000006C", x"00004008");
+      write_word(x"000006C", x"00000000", "1100");
+      read_expect(x"000006C", x"00004008");
+      write_word(x"000006C", x"00000000", "0000");
+      read_expect(x"000006C", x"00004008");
+      read_expect(x"0000068", x"00000000", '0');
 
       gb_bus.rst <= '1';
       wait until rising_edge(clk);
       wait until falling_edge(clk);
       gb_bus.rst <= '0';
       read_expect(x"0000000", x"00000000");
+      read_expect(x"0000008", x"00000000");
+      read_expect(x"000000C", x"00000000");
+      read_expect(x"0000048", x"00000000");
+      read_expect(x"0000050", x"00000000");
+      read_expect(x"000006C", x"00000000");
+
+      write_word(x"0000048", x"00203F3F", "1111");
+      write_word(x"0000050", x"030D3F48", "1111");
+      write_word(x"000006C", x"00008010", "1111");
+      reset <= '1';
+      wait until rising_edge(clk);
+      wait until falling_edge(clk);
+      reset <= '0';
+      read_expect(x"0000048", x"00000000");
+      read_expect(x"0000050", x"00000000");
+      read_expect(x"000006C", x"00000000");
 
       report "PASS: Engine B register shadow preserves read/modify/write state"
          severity note;

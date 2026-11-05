@@ -58,9 +58,28 @@ if [[ -z "$build_dir" ]]; then
     "$cmake_bin" --build "$build_dir" --target core -j 8 >/dev/null
 fi
 
+"${CXX:-c++}" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic \
+    -I"$repo_dir/src" "$repo_dir/src/replay/Hybrid3DMemoryMappingTest.cpp" \
+    -o "$tmp_dir/h3d_memory_mapping_test"
+"$tmp_dir/h3d_memory_mapping_test"
+
 link_options=(-pthread)
 if [[ $(uname -s) != Darwin ]]; then
     link_options+=(-ldl)
+fi
+
+"${CXX:-c++}" \
+    -std=c++17 -O2 -fwrapv -Wall -Wextra -Werror -pedantic \
+    -DNDS4MISTER_H3D_FRAME_PACKET_TEST_INSTRUMENTATION \
+    -I"$repo_dir/src" \
+    "$repo_dir/src/replay/Hybrid3DFramePacketTest.cpp" \
+    "$repo_dir/src/replay/Hybrid3DFramePacket.cpp" \
+    -o "$tmp_dir/h3d_frame_packet_test"
+
+if [[ ${H3D_FRAME_PACKET_BENCHMARK:-0} == 1 ]]; then
+    "$tmp_dir/h3d_frame_packet_test" --benchmark
+else
+    "$tmp_dir/h3d_frame_packet_test"
 fi
 
 "${CXX:-c++}" \

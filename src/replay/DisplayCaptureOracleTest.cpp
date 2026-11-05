@@ -7,6 +7,7 @@
 #include "replay/Hybrid3DAbi.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -70,9 +71,14 @@ u16* bank_words(melonDS::GPU& gpu, unsigned bank)
     return reinterpret_cast<u16*>(gpu.VRAM[bank]);
 }
 
-bool source_a_and_destination_offset()
+bool source_a_and_destination_offset(bool engine_b_only = false,
+                                     bool pixels_enabled = true)
 {
     auto nds = make_nds();
+    melonDS::RendererSettings settings {};
+    settings.EngineBOnly = engine_b_only;
+    settings.EngineBPixelsEnabled = pixels_enabled;
+    nds->GPU.GetRenderer().SetRenderSettings(settings);
     constexpr unsigned line = 7;
     constexpr unsigned destination_bank = 1;
     constexpr unsigned destination_offset = 2;
@@ -109,9 +115,13 @@ bool source_a_and_destination_offset()
     return true;
 }
 
-bool source_b_fifo()
+bool source_b_fifo(bool engine_b_only = false, bool pixels_enabled = true)
 {
     auto nds = make_nds();
+    melonDS::RendererSettings settings {};
+    settings.EngineBOnly = engine_b_only;
+    settings.EngineBPixelsEnabled = pixels_enabled;
+    nds->GPU.GetRenderer().SetRenderSettings(settings);
     constexpr unsigned line = 3;
     constexpr unsigned destination_bank = 2;
     constexpr unsigned destination_offset = 1;
@@ -138,9 +148,13 @@ bool source_b_fifo()
     return true;
 }
 
-bool source_b_vram_offset()
+bool source_b_vram_offset(bool engine_b_only = false, bool pixels_enabled = true)
 {
     auto nds = make_nds();
+    melonDS::RendererSettings settings {};
+    settings.EngineBOnly = engine_b_only;
+    settings.EngineBPixelsEnabled = pixels_enabled;
+    nds->GPU.GetRenderer().SetRenderSettings(settings);
     constexpr unsigned line = 4;
     constexpr unsigned source_bank = 0;
     constexpr unsigned source_offset = 2;
@@ -175,9 +189,206 @@ bool source_b_vram_offset()
     return true;
 }
 
-bool blended_sources()
+bool production_engine_b_source_b_capture(bool pixels_enabled = true)
 {
     auto nds = make_nds();
+    constexpr unsigned source_bank = 0;
+    constexpr unsigned source_offset = 2;
+    constexpr unsigned destination_bank = 3;
+    constexpr unsigned destination_offset = 1;
+    constexpr unsigned width = 128;
+    constexpr u16 sentinel = 0x2d15;
+    auto* source = bank_words(nds->GPU, source_bank);
+    auto* destination = bank_words(nds->GPU, destination_bank);
+    std::fill_n(source, 0x10000, u16 {0});
+    std::fill_n(destination, 0x10000, sentinel);
+    const unsigned source_base = source_offset << 14;
+    for (unsigned x = 0; x < width; ++x)
+        source[source_base + x] = static_cast<u16>(
+            0x8000u | ((x * 41u + 5u) & 0x7fffu));
+
+    nds->GPU.GPU2D_A.DispCnt = 1u << 16;
+    nds->GPU.VRAMMap_LCDC = (1u << source_bank) |
+                           (1u << destination_bank);
+    nds->GPU.CaptureCnt = (1u << 31) | (1u << 29) |
+        (destination_bank << 16) | (destination_offset << 18) |
+        (source_offset << 26);
+
+    // Match Hybrid3DService's split-video settings and phase calls. Source B
+    // is deliberately selected so this regression isolates whether the
+    // Engine-B-only path executes display capture; it does not depend on the
+    // intentionally omitted Engine-A renderer or independent 3D output.
+    melonDS::RendererSettings settings {
+        1, false, false, false, true, false, false, false, true, true,
+        pixels_enabled};
+    auto& renderer = nds->GPU.GetRenderer();
+    renderer.SetRenderSettings(settings);
+    const bool phases_ok = nds->GPU.ApplyExternalRendererPhase(
+        2, 0, 0, 0, 0, 17, true, true, true);
+    const bool capture_armed = nds->GPU.CaptureEnable;
+    const bool draw_ok = phases_ok && nds->GPU.ApplyExternalRendererPhase(
+        1, 0, 0, 2, 2, 17, true, false, true);
+
+    const unsigned destination_base = destination_offset << 14;
+    bool matched = phases_ok && capture_armed && draw_ok &&
+        destination[destination_base - 1] == sentinel &&
+        destination[destination_base + width] == sentinel;
+    for (unsigned x = 0; matched && x < width; ++x)
+        matched = destination[destination_base + x] ==
+                  source[source_base + x];
+
+    // CheckCaptureStart deliberately tracks the captured block until a CPU
+    // access needs synchronization. Clear that oracle bookkeeping before the
+    // fixture is destroyed so a later fixture cannot inherit allocator bytes
+    // that resemble a live capture before its renderer has been installed.
+    nds->GPU.SyncVRAM_LCDC(
+        0x06800000u + destination_bank * 0x20000u +
+            destination_offset * 0x8000u,
+        true);
+    return matched;
+}
+
+bool production_engine_b_source_a_capture(bool source_3d)
+{
+    constexpr unsigned destination_bank = 1;
+    constexpr unsigned width = 128;
+    using CapturedLine = std::array<u16, width>;
+
+    const auto render = [=](bool engine_b_only, bool pixels_enabled,
+                           CapturedLine& captured) {
+        auto nds = make_nds();
+        auto* destination = bank_words(nds->GPU, destination_bank);
+        std::fill_n(destination, 0x10000, u16 {0x1357});
+        auto* palette = reinterpret_cast<u16*>(nds->GPU.Palette);
+        palette[0] = 0x4210;
+        nds->ARM9Write16(0x04000304, 0x020f);
+        nds->ARM9Write32(
+            0x04000000,
+            (1u << 16) | (source_3d ? 0u : ((1u << 8) | (1u << 3))));
+        nds->GPU.GPU2D_A.DispCntLatch[0] = nds->GPU.GPU2D_A.DispCnt;
+        nds->GPU.GPU2D_A.DispCntLatch[1] = nds->GPU.GPU2D_A.DispCnt;
+        nds->GPU.GPU2D_A.DispCntLatch[2] = nds->GPU.GPU2D_A.DispCnt;
+        nds->GPU.GPU2D_A.LayerEnable = source_3d ? 0 : 1;
+        nds->GPU.VRAMMap_LCDC = 1u << destination_bank;
+
+        melonDS::RendererSettings settings {
+            1, false, false, false, true, false, false, false, true,
+            engine_b_only, pixels_enabled};
+        auto& renderer = nds->GPU.GetRenderer();
+        renderer.SetRenderSettings(settings);
+        auto* source = renderer.Get3DScanline(0);
+        if (!source) return false;
+        for (unsigned x = 0; x < 256; ++x) {
+            const u32 red = (x * 3 + 1) & 0x3f;
+            const u32 green = (x * 5 + 2) & 0x3f;
+            const u32 blue = (x * 7 + 3) & 0x3f;
+            source[x] = red | (green << 8) | (blue << 16) |
+                        0x1f000000u;
+        }
+
+        nds->GPU.CaptureCnt = (1u << 31) |
+            (destination_bank << 16) | (source_3d ? (1u << 24) : 0u);
+        const bool start_ok = nds->GPU.ApplyExternalRendererPhase(
+            2, 0, 0, 0, 0, 19, true, true, engine_b_only);
+        const bool armed = nds->GPU.CaptureEnable;
+        const bool draw_ok = start_ok &&
+            nds->GPU.ApplyExternalRendererPhase(
+                1, 0, 0, 2, 2, 19, true, false, engine_b_only);
+        std::copy_n(destination, width, captured.begin());
+        nds->GPU.SyncVRAM_LCDC(0x06820000u, true);
+        return start_ok && armed && draw_ok;
+    };
+
+    CapturedLine oracle {};
+    CapturedLine engine_b {};
+    CapturedLine disabled_b {};
+    return render(false, true, oracle) && render(true, true, engine_b) &&
+           render(true, false, disabled_b) &&
+           oracle == engine_b && oracle == disabled_b &&
+           std::any_of(oracle.begin(), oracle.end(),
+               [](u16 pixel) { return pixel != 0 && pixel != 0x1357; });
+}
+
+// Match the live Strange Journey stack: a threaded whole-frame 3D job is
+// pending when Engine B's display-capture phase asks for a 3D scanline.
+// Compare against an explicit pre-capture fence, then exercise the service's
+// later fence and a second frame. Baseline hangs on the absent scanline token.
+bool production_threaded_capture(bool source_3d, bool blend,
+                                 bool pixels_enabled)
+{
+    constexpr unsigned width = 128;
+    constexpr unsigned rows = 3;
+    using Captured = std::array<u16, width * rows>;
+    const auto run = [=](bool fence_before_capture,
+                         std::array<Captured, 4>& captures) {
+        auto nds = make_nds();
+        nds->GPU.GPU3D.SetEnabled(true, true);
+        nds->GPU.GPU3D.SetExternalCommandReplay(true);
+        melonDS::RendererSettings settings {
+            1, true, false, false, true, false, false, false, true,
+            true, pixels_enabled};
+        auto& renderer = nds->GPU.GetRenderer();
+        renderer.SetRenderSettings(settings);
+        renderer.Finish3DRendering();
+        for (unsigned frame = 0; frame < captures.size(); ++frame) {
+            if (frame == 2) {
+                // A new renderer epoch must re-arm its initial completion,
+                // even when the preceding frame was already fenced.
+                nds->GPU.GPU3D.AbortFrame = false;
+                renderer.Restart3DRendering();
+                renderer.Finish3DRendering();
+            }
+            nds->ARM9Write16(0x04000304, 0x020f);
+            nds->ARM9Write32(0x04000000,
+                (1u << 16) | (source_3d ? 0u : ((1u << 8) | (1u << 3))));
+            for (auto& latch : nds->GPU.GPU2D_A.DispCntLatch)
+                latch = nds->GPU.GPU2D_A.DispCnt;
+            nds->GPU.GPU2D_A.LayerEnable = source_3d ? 0 : 1;
+            nds->GPU.VRAMMap_LCDC = 1u << 1;
+            auto* destination = bank_words(nds->GPU, 1);
+            std::fill_n(destination, 0x10000, u16{0x1357});
+            for (unsigned x = 0; x < 256; ++x)
+                nds->GPU.DispFIFOBuffer[x] = u16(0x8000u | ((x * 29u) & 0x7fffu));
+            nds->GPU.GPU3D.RenderNumPolygons = 0;
+            nds->GPU.GPU3D.RenderFrameIdentical = false;
+            nds->GPU.GPU3D.RenderClearAttr1 =
+                0x001f0000u | (frame & 1 ? 0x7c00u : 0x001fu);
+            renderer.Start3DRendering();
+            if (fence_before_capture) renderer.Finish3DRendering();
+            nds->GPU.CaptureCnt = (1u << 31) | (1u << 16) |
+                (source_3d ? (1u << 24) : 0u) |
+                (blend ? ((2u << 29) | (1u << 25) | 12u | (7u << 8)) : 0u);
+            for (unsigned line = 0; line < rows; ++line) {
+                if (!nds->GPU.ApplyExternalRendererPhase(
+                        line == 0 ? 2u : 0u, line, line, 0, 0,
+                        frame + 1, true, line == 0, true) ||
+                    !nds->GPU.CaptureEnable ||
+                    !nds->GPU.ApplyExternalRendererPhase(
+                        1, line, line, 2, 2, frame + 1, true, false, true))
+                    return false;
+            }
+            std::copy_n(destination, width * rows, captures[frame].begin());
+            renderer.Finish3DRendering();
+            renderer.Finish3DRendering();
+            nds->GPU.SyncVRAM_LCDC(0x06820000u, true);
+        }
+        return true;
+    };
+    std::array<Captured, 4> oracle {}, early_capture {};
+    if (!run(false, early_capture) || !run(true, oracle) ||
+        oracle != early_capture || oracle[0] == oracle[1])
+        return false;
+    return std::all_of(early_capture[0].begin(), early_capture[0].end(),
+                      [](u16 p) { return p != 0x1357; });
+}
+
+bool blended_sources(bool engine_b_only = false, bool pixels_enabled = true)
+{
+    auto nds = make_nds();
+    melonDS::RendererSettings settings {};
+    settings.EngineBOnly = engine_b_only;
+    settings.EngineBPixelsEnabled = pixels_enabled;
+    nds->GPU.GetRenderer().SetRenderSettings(settings);
     constexpr unsigned line = 0;
     constexpr unsigned destination_bank = 0;
     constexpr unsigned width = 256;
@@ -352,6 +563,31 @@ bool production_engine_b_publication(bool swap)
 
 int main()
 {
+    for (bool pixels : {false, true}) {
+        for (bool source_3d : {false, true}) {
+            for (bool blend : {false, true}) {
+                if (!production_threaded_capture(source_3d, blend, pixels)) {
+                    std::cerr << "FAIL: threaded full-frame capture fence\n";
+                    return 1;
+                }
+            }
+        }
+    }
+    std::cout << "PASS: threaded full-frame capture, 8 modes, 4 frames each, "
+                 "early reads match completed-frame oracle; repeated fences "
+                 "and renderer restart return\n" << std::flush;
+
+    for (bool pixels_enabled : {false, true}) {
+        if (!source_a_and_destination_offset(true, pixels_enabled) ||
+            !source_b_fifo(true, pixels_enabled) ||
+            !source_b_vram_offset(true, pixels_enabled) ||
+            !blended_sources(true, pixels_enabled) ||
+            !production_engine_b_source_b_capture(pixels_enabled)) {
+            std::cerr << "FAIL: capture changed with Engine B pixels "
+                      << pixels_enabled << '\n';
+            return 1;
+        }
+    }
     if (!source_a_and_destination_offset()) {
         std::cerr << "FAIL: display capture source A or destination offset\n";
         return 1;
@@ -362,6 +598,16 @@ int main()
     }
     if (!source_b_vram_offset()) {
         std::cerr << "FAIL: display capture VRAM source B offset\n";
+        return 1;
+    }
+    if (!production_engine_b_source_b_capture()) {
+        std::cerr << "FAIL: Engine-B-only renderer skipped display capture\n";
+        return 1;
+    }
+    if (!production_engine_b_source_a_capture(false) ||
+        !production_engine_b_source_a_capture(true)) {
+        std::cerr << "FAIL: Engine-B-only source-A capture differs from "
+                     "the full-renderer oracle\n";
         return 1;
     }
     if (!blended_sources()) {
@@ -379,6 +625,6 @@ int main()
     }
     std::cout << "PASS: DISPCAPCNT sources, offsets, RGB666-to-RGB555 "
                  "capture, blending, POWCNT1 screen swap, and production "
-                 "Engine-B publication\n";
+                 "Engine-B publication; Off/On capture equivalence\n";
     return 0;
 }

@@ -193,6 +193,7 @@ bool Consumer::begin_into(
     bool external_records)
 {
     output_records.clear();
+    acquisition_started_ = {};
     const auto reject = [this, &output_records](std::uint32_t fault) {
         output_records.clear();
         return fail(fault);
@@ -214,6 +215,7 @@ bool Consumer::begin_into(
         return reject(FaultSequence);
     if (producer < expected_sequence_) return false;
 
+    if (measure_acquisition_) acquisition_started_ = std::chrono::steady_clock::now();
     auto* slot_bytes = slot(expected_sequence_);
     PacketHeader first{};
     if (!snapshot_header(first)) return reject(FaultTornHeader);
@@ -243,8 +245,13 @@ bool Consumer::begin_into(
     auto diagnostic_state = chain_active_ ? chain_diagnostic_state_ :
                                             DiagnosticCrcInitial;
     auto selected_count = chain_active_ ? chain_selected_count_ : 0u;
-    for (const auto& record : output_records) {
+    for (std::size_t index = 0; index < output_records.size(); ++index) {
+        const auto& record = output_records[index];
         if (!validate_record(record)) return reject(FaultBadRecord);
+        if (record_kind(record) == RecordKind::GxReadbackFence &&
+            (first.flags != FlagContinuation ||
+             index + 1 != output_records.size()))
+            return reject(FaultBadRecord);
         if (require_diagnostic_ && diagnostic_record_selected(record)) {
             const auto added = diagnostic_selected_count(record);
             if (added > std::numeric_limits<std::uint32_t>::max() -
@@ -508,6 +515,8 @@ bool Consumer::validate_header(const PacketHeader& header) const
 bool Consumer::validate_record(const Record& record) const
 {
     const auto kind = record_kind(record);
+    if (kind == RecordKind::GxReadbackFence)
+        return valid_readback_fence(record);
     if (kind == RecordKind::GxPacked) return true;
     if ((record.metadata & 0xc0000000u) != 0 ||
         (!record_has_scanline(record) &&
@@ -517,6 +526,7 @@ bool Consumer::validate_record(const Record& record) const
     if (kind != RecordKind::GxCommand &&
         kind != RecordKind::GxRegister &&
         kind != RecordKind::VramWrite &&
+        kind != RecordKind::VramWritePair &&
         kind != RecordKind::VramMap &&
         kind != RecordKind::Gpu2DRegister &&
         kind != RecordKind::PaletteWrite &&
@@ -530,6 +540,11 @@ bool Consumer::validate_record(const Record& record) const
         !nds4mister::arm_video::validate_record(record))
         return false;
     if (kind == RecordKind::VramWrite && record_byte_enable(record) == 0)
+        return false;
+    if (kind == RecordKind::VramWritePair &&
+        (record_byte_enable(record) != 0x0f ||
+         record_tag(record) != 2u ||
+         (record.address_or_aux & 3u) != 0))
         return false;
     return true;
 }

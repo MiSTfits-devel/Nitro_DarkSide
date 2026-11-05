@@ -17,12 +17,39 @@ option(NDS4MISTER_NO_VIDEO_RENDER "Diagnostic: skip melonDS video renderer outpu
 option(NDS4MISTER_NO_2D_RENDER "Diagnostic: skip melonDS 2D scanline and sprite rendering while preserving LCD timing" OFF)
 option(NDS4MISTER_NO_3D_RENDER "Diagnostic: skip melonDS 3D frame rendering while preserving LCD timing" OFF)
 option(NDS4MISTER_NO_AUDIO_MIX "Diagnostic: skip melonDS audio mixer work while preserving SPU event timing" OFF)
+option(NDS4MISTER_EXPERIMENTAL_FMV_PACKED_COLOR
+    "Private prototype: consume explicitly marked planar movie uploads" OFF)
+option(NDS4MISTER_EXPERIMENTAL_FMV_VIDEO_DECODE
+    "Private prototype: decode explicitly marked MODSN3 movie packets" OFF)
+option(NDS4MISTER_EXPERIMENTAL_FMV_VX_DECODE
+    "Private prototype: also accept explicitly marked older VX packets" OFF)
+set(NDS4MISTER_FFMPEG_ROOT "" CACHE PATH "Private minimal FFmpeg static installation")
 option(NDS4MISTER_FPGA_AUDIO_OFFLOAD
     "Build default-off FPGA-audio offload support with a lightweight SPU status shadow"
     OFF)
 option(NDS4MISTER_EXTERNAL_TIME_WINDOW
     "Build the default-off host/simulator external scheduler time-window proof API"
     OFF)
+
+add_executable(nds_game_query_profile_test src/replay/GameQueryProfileTest.cpp)
+target_include_directories(nds_game_query_profile_test PRIVATE src)
+target_compile_options(nds_game_query_profile_test PRIVATE -Wall -Wextra -Wpedantic)
+if(BUILD_TESTING)
+    add_test(NAME nds_game_query_profile COMMAND nds_game_query_profile_test)
+endif()
+
+add_executable(nds_matched_recovery_test src/replay/MatchedDisplayRecoveryTest.cpp)
+target_include_directories(nds_matched_recovery_test PRIVATE src)
+target_compile_options(nds_matched_recovery_test PRIVATE -Wall -Wextra -Wpedantic)
+if(BUILD_TESTING)
+    add_test(NAME nds_matched_recovery COMMAND nds_matched_recovery_test)
+endif()
+
+add_executable(nds_full_frame_publication_bench EXCLUDE_FROM_ALL
+    tools/benchmark_full_frame_publication.cpp)
+target_include_directories(nds_full_frame_publication_bench PRIVATE src)
+target_compile_options(nds_full_frame_publication_bench PRIVATE
+    -Wall -Wextra -Wpedantic)
 
 if(NDS4MISTER_FPGA_AUDIO_OFFLOAD AND NDS4MISTER_NO_AUDIO_MIX)
     message(FATAL_ERROR
@@ -60,6 +87,30 @@ if(NDS4MISTER_USE_MELONDS)
     set(ENABLE_JIT ${NDS4MISTER_ENABLE_JIT} CACHE BOOL "" FORCE)
     set(ENABLE_LTO_RELEASE ${NDS4MISTER_ENABLE_LTO_RELEASE} CACHE BOOL "" FORCE)
     add_subdirectory(third_party/melonDS EXCLUDE_FROM_ALL)
+    if(NDS4MISTER_EXPERIMENTAL_FMV_PACKED_COLOR)
+        target_compile_definitions(core PUBLIC NDS4MISTER_EXPERIMENTAL_FMV_PACKED_COLOR=1)
+    endif()
+    if(NDS4MISTER_EXPERIMENTAL_FMV_VX_DECODE)
+        if(NOT NDS4MISTER_EXPERIMENTAL_FMV_VIDEO_DECODE)
+            message(FATAL_ERROR "VX decoding requires the private movie decoder")
+        endif()
+        target_compile_definitions(core PUBLIC NDS4MISTER_EXPERIMENTAL_FMV_VX_DECODE=1)
+    endif()
+    if(NDS4MISTER_EXPERIMENTAL_FMV_VIDEO_DECODE)
+        if(NOT NDS4MISTER_EXPERIMENTAL_FMV_PACKED_COLOR)
+            message(FATAL_ERROR "Movie decoding requires the private packed-color receiver")
+        endif()
+        if(NOT EXISTS "${NDS4MISTER_FFMPEG_ROOT}/include/libavcodec/avcodec.h" OR
+           NOT EXISTS "${NDS4MISTER_FFMPEG_ROOT}/lib/libavcodec.a" OR
+           NOT EXISTS "${NDS4MISTER_FFMPEG_ROOT}/lib/libavutil.a")
+            message(FATAL_ERROR "A matching minimal FFmpeg static installation is required")
+        endif()
+        target_compile_definitions(core PUBLIC NDS4MISTER_EXPERIMENTAL_FMV_VIDEO_DECODE=1)
+        target_include_directories(core PUBLIC "${NDS4MISTER_FFMPEG_ROOT}/include")
+        target_link_libraries(core PUBLIC
+            "${NDS4MISTER_FFMPEG_ROOT}/lib/libavcodec.a"
+            "${NDS4MISTER_FFMPEG_ROOT}/lib/libavutil.a" Threads::Threads m)
+    endif()
     target_compile_definitions(core PUBLIC NDS4MISTER_CORE_TIMING=$<BOOL:${NDS4MISTER_CORE_TIMING}>)
     target_compile_definitions(core PUBLIC NDS4MISTER_NO_VIDEO_RENDER=$<BOOL:${NDS4MISTER_NO_VIDEO_RENDER}>)
     target_compile_definitions(core PUBLIC NDS4MISTER_NO_2D_RENDER=$<BOOL:${NDS4MISTER_NO_2D_RENDER}>)
@@ -78,6 +129,43 @@ target_compile_options(nds_headless_save PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(nds_headless_save PUBLIC Threads::Threads)
 
 if(BUILD_TESTING)
+    add_executable(nds_scoped_timer_slack_test
+        src/replay/ScopedTimerSlackTest.cpp)
+    target_include_directories(nds_scoped_timer_slack_test PRIVATE src/replay)
+    target_compile_options(nds_scoped_timer_slack_test PRIVATE -Wall -Wextra -Wpedantic)
+    target_link_libraries(nds_scoped_timer_slack_test PRIVATE Threads::Threads)
+    add_test(NAME nds_scoped_timer_slack COMMAND nds_scoped_timer_slack_test)
+
+    add_executable(nds_scoped_query_priority_test
+        src/replay/ScopedQueryPriorityTest.cpp)
+    target_include_directories(nds_scoped_query_priority_test PRIVATE src/replay)
+    target_compile_options(nds_scoped_query_priority_test PRIVATE -Wall -Wextra -Wpedantic)
+    target_link_libraries(nds_scoped_query_priority_test PRIVATE Threads::Threads)
+    add_test(NAME nds_scoped_query_priority COMMAND nds_scoped_query_priority_test)
+
+    add_executable(nds_near_black_event_gate_test
+        src/replay/NearBlackEventGateTest.cpp)
+    target_include_directories(nds_near_black_event_gate_test PRIVATE src)
+    target_compile_options(nds_near_black_event_gate_test PRIVATE
+        -Wall -Wextra -Wpedantic)
+    add_test(NAME nds_near_black_event_gate COMMAND nds_near_black_event_gate_test)
+
+    add_executable(nds_h3d_memory_mapping_test
+        src/replay/Hybrid3DMemoryMappingTest.cpp)
+    target_include_directories(nds_h3d_memory_mapping_test PRIVATE src)
+    target_compile_options(nds_h3d_memory_mapping_test PRIVATE
+        -Wall -Wextra -Wpedantic)
+    add_test(NAME nds_h3d_memory_mapping COMMAND nds_h3d_memory_mapping_test)
+
+    add_executable(nds_full_frame_publication_test
+        src/replay/FullFramePublicationTest.cpp)
+    target_include_directories(nds_full_frame_publication_test PRIVATE src)
+    target_compile_definitions(nds_full_frame_publication_test PRIVATE
+        NDS4MISTER_H3D_TEST_INSTRUMENTATION)
+    target_compile_options(nds_full_frame_publication_test PRIVATE
+        -Wall -Wextra -Wpedantic)
+    add_test(NAME nds_full_frame_publication COMMAND nds_full_frame_publication_test)
+
     add_executable(nds_headless_save_test
         src/replay/HeadlessSaveManagerTest.cpp)
     target_include_directories(nds_headless_save_test PRIVATE src)
@@ -118,6 +206,28 @@ target_compile_options(nds_bench PRIVATE
 )
 
 if(NDS4MISTER_USE_MELONDS)
+    # Focused ROM-free background oracle/timer; built explicitly.
+    add_executable(nds_background_palette_test EXCLUDE_FROM_ALL
+        tools/test_background_palette_cache.cpp src/melonds/HeadlessPlatform.cpp)
+    target_include_directories(nds_background_palette_test PRIVATE src third_party/melonDS/src)
+    target_link_libraries(nds_background_palette_test PRIVATE core ${CMAKE_DL_LIBS})
+    set_property(TARGET nds_background_palette_test PROPERTY
+        INTERPROCEDURAL_OPTIMIZATION_RELEASE ${NDS4MISTER_ENABLE_LTO_RELEASE})
+    add_executable(nds_background_palette_bench EXCLUDE_FROM_ALL
+        tools/benchmark_background_palette.cpp src/melonds/HeadlessPlatform.cpp)
+    target_include_directories(nds_background_palette_bench PRIVATE src third_party/melonDS/src)
+    target_link_libraries(nds_background_palette_bench PRIVATE core ${CMAKE_DL_LIBS})
+    set_property(TARGET nds_background_palette_bench PROPERTY
+        INTERPROCEDURAL_OPTIMIZATION_RELEASE ${NDS4MISTER_ENABLE_LTO_RELEASE})
+    # Focused ROM-free raster oracle/timer; explicitly built when benchmarking.
+    add_executable(nds_raster_batch_bench EXCLUDE_FROM_ALL
+        tools/benchmark_raster_batch.cpp src/melonds/HeadlessPlatform.cpp)
+    target_include_directories(nds_raster_batch_bench PRIVATE
+        src third_party/melonDS/src)
+    target_link_libraries(nds_raster_batch_bench PRIVATE core ${CMAKE_DL_LIBS})
+    set_property(TARGET nds_raster_batch_bench PROPERTY
+        INTERPROCEDURAL_OPTIMIZATION_RELEASE ${NDS4MISTER_ENABLE_LTO_RELEASE})
+
     target_sources(nds_bench PRIVATE
         src/melonds/HeadlessPlatform.cpp
         src/melonds/MelonDsBackend.cpp
@@ -157,6 +267,17 @@ if(NDS4MISTER_USE_MELONDS)
     target_link_libraries(nds_hybrid_3d_service PRIVATE
         core ${CMAKE_DL_LIBS})
 
+    add_executable(nds_effective_render_write_test
+        src/replay/EffectiveRenderWriteTest.cpp
+        src/replay/Hybrid3DFramePacket.cpp src/replay/ArmVideoShadow.cpp
+        src/replay/ArmCrashDump.cpp src/replay/FpgaCrashMonitor.cpp
+        src/melonds/HeadlessPlatform.cpp)
+    target_include_directories(nds_effective_render_write_test PRIVATE
+        src third_party/melonDS/src)
+    set_property(TARGET nds_effective_render_write_test PROPERTY
+        INTERPROCEDURAL_OPTIMIZATION_RELEASE ${NDS4MISTER_ENABLE_LTO_RELEASE})
+    target_link_libraries(nds_effective_render_write_test PRIVATE core ${CMAKE_DL_LIBS})
+
     add_executable(hps_gpu_ring_test src/replay/RingTest.cpp)
     target_include_directories(hps_gpu_ring_test PRIVATE src)
 
@@ -188,6 +309,20 @@ if(NDS4MISTER_USE_MELONDS)
     target_link_libraries(nds_live_hgs_test PRIVATE
         core nds_headless_save ${CMAKE_DL_LIBS})
 
+    foreach(oracle IN ITEMS TextureDirtyRange TextureHistory)
+        string(TOLOWER "${oracle}" oracle_name)
+        add_executable(nds_${oracle_name}_test
+            src/replay/${oracle}Test.cpp src/melonds/HeadlessPlatform.cpp)
+        target_include_directories(nds_${oracle_name}_test PRIVATE
+            src third_party/melonDS/src)
+        target_compile_options(nds_${oracle_name}_test PRIVATE -fno-access-control)
+        target_link_libraries(nds_${oracle_name}_test PRIVATE
+            core nds_headless_save ${CMAKE_DL_LIBS})
+        if(BUILD_TESTING)
+            add_test(NAME nds_${oracle_name} COMMAND nds_${oracle_name}_test)
+        endif()
+    endforeach()
+
     add_executable(nds_layer_capture
         src/replay/LayerCapture.cpp
         src/melonds/MelonDsBackend.cpp
@@ -208,6 +343,78 @@ if(NDS4MISTER_USE_MELONDS)
     if(BUILD_TESTING)
         add_test(NAME nds_display_capture_oracle
             COMMAND nds_display_capture_oracle_test)
+    endif()
+
+    add_executable(nds_gx_overflow_order_test
+        src/replay/GXOverflowOrderTest.cpp
+        src/melonds/HeadlessPlatform.cpp)
+    target_include_directories(nds_gx_overflow_order_test PRIVATE
+        src third_party/melonDS/src)
+    target_compile_options(nds_gx_overflow_order_test PRIVATE
+        -Wall -Wextra -Wpedantic)
+    target_link_libraries(nds_gx_overflow_order_test PRIVATE
+        core ${CMAKE_DL_LIBS})
+    if(BUILD_TESTING)
+        add_test(NAME nds_gx_overflow_order COMMAND nds_gx_overflow_order_test)
+    endif()
+
+    add_executable(nds_gx_matrix_prefix_test
+        src/replay/GxMatrixPrefixTest.cpp src/melonds/HeadlessPlatform.cpp)
+    target_include_directories(nds_gx_matrix_prefix_test PRIVATE
+        src third_party/melonDS/src)
+    target_compile_options(nds_gx_matrix_prefix_test PRIVATE -Wall -Wextra -Wpedantic)
+    target_link_libraries(nds_gx_matrix_prefix_test PRIVATE core ${CMAKE_DL_LIBS})
+    if(BUILD_TESTING)
+        add_test(NAME nds_gx_matrix_prefix COMMAND nds_gx_matrix_prefix_test)
+    endif()
+
+    add_executable(nds_2d_background_bench EXCLUDE_FROM_ALL
+        tools/benchmark_2d_background.cpp src/melonds/HeadlessPlatform.cpp)
+    target_include_directories(nds_2d_background_bench PRIVATE
+        src src/replay src/melonds third_party/melonDS/src)
+    target_compile_definitions(nds_2d_background_bench PRIVATE NDS_BENCH_DIRECT=1)
+    target_link_libraries(nds_2d_background_bench PRIVATE core ${CMAKE_DL_LIBS})
+
+    add_executable(nds_sprite_priority_index_test
+        src/replay/SpritePriorityIndexTest.cpp src/melonds/HeadlessPlatform.cpp)
+    target_include_directories(nds_sprite_priority_index_test PRIVATE
+        src third_party/melonDS/src)
+    target_link_libraries(nds_sprite_priority_index_test PRIVATE core ${CMAKE_DL_LIBS})
+    if(BUILD_TESTING)
+        add_test(NAME nds_sprite_priority_index COMMAND nds_sprite_priority_index_test)
+    endif()
+
+    add_executable(nds_sprite_setup_cache_test
+        src/replay/SpriteSetupCacheTest.cpp src/melonds/HeadlessPlatform.cpp)
+    target_include_directories(nds_sprite_setup_cache_test PRIVATE
+        src third_party/melonDS/src)
+    target_link_libraries(nds_sprite_setup_cache_test PRIVATE core ${CMAKE_DL_LIBS})
+    if(BUILD_TESTING)
+        add_test(NAME nds_sprite_setup_cache COMMAND nds_sprite_setup_cache_test)
+    endif()
+
+    add_executable(nds_engine_a_only_test
+        src/replay/EngineAOnlyTest.cpp src/melonds/HeadlessPlatform.cpp)
+    target_include_directories(nds_engine_a_only_test PRIVATE src third_party/melonDS/src)
+    target_compile_options(nds_engine_a_only_test PRIVATE -Wall -Wextra -Wpedantic)
+    target_link_libraries(nds_engine_a_only_test PRIVATE core nds_headless_save ${CMAKE_DL_LIBS})
+    if(BUILD_TESTING)
+        add_test(NAME nds_engine_a_only COMMAND nds_engine_a_only_test)
+    endif()
+
+    add_executable(nds_engine_b_line_cache_test
+        src/replay/EngineBLineCacheTest.cpp
+        src/melonds/HeadlessPlatform.cpp)
+    target_include_directories(nds_engine_b_line_cache_test PRIVATE
+        src third_party/melonDS/src)
+    target_compile_options(nds_engine_b_line_cache_test PRIVATE
+        -Wall -Wextra -Wpedantic)
+    target_link_libraries(nds_engine_b_line_cache_test PRIVATE
+        core ${CMAKE_DL_LIBS})
+    if(BUILD_TESTING)
+        add_test(NAME nds_engine_b_line_cache COMMAND nds_engine_b_line_cache_test)
+        add_test(NAME nds_paired_b_line_cache COMMAND nds_engine_b_line_cache_test --paired)
+        add_test(NAME nds_direct_framebuffer COMMAND nds_engine_b_line_cache_test --direct-output)
     endif()
 
     add_executable(nds_touch_oracle_probe

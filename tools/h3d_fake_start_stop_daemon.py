@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -136,6 +137,28 @@ def main(argv: list[str]) -> int:
                   file=sys.stderr)
             return 2
         environment = os.environ.copy()
+        capture_path = environment.get("H3D_FAKE_ENV_CAPTURE")
+        if capture_path:
+            Path(capture_path).write_text(json.dumps({
+                key: environment.get(key) for key in (
+                    "NDS4MISTER_H3D_DISABLE_WC",
+                    "NDS4MISTER_H3D_DIAGNOSTICS",
+                    "NDS4MISTER_DIRECT_PLANE_PUBLICATION",
+                    "NDS4MISTER_GX_MATRIX_PREFIX",
+                    "NDS4MISTER_GX_QUERY_FAST_POLL",
+                    "NDS4MISTER_PACKET_NC",
+                    "NDS_GPU_STANDARD_PALETTE_CACHE",
+                    "NDS4MISTER_H3D_UPLOAD_SNAPSHOT",
+                    "NDS4MISTER_BLACK_EVENT_TRACE",
+                    "NDS4MISTER_MATCHED_DISPLAY_TEST",
+                    "NDS4MISTER_MATCHED_DISPLAY_FULL_RATE",
+                    "NDS4MISTER_WEIGHTED_RASTER_BANDS",
+                    "NDS4MISTER_DUAL_CORE_3D",
+                    "NDS4MISTER_ADAPTIVE_RASTER_SPLIT",
+                    "NDS4MISTER_RASTER_BAND_QUEUE",
+                    "NDS4MISTER_RASTER_X_PARTITION",
+                )
+            }), encoding="utf-8")
         environment["H3D_FAKE_SERVICE_MARKER"] = str(marker)
         marker.write_text("running\n", encoding="ascii")
         child = subprocess.Popen(
@@ -143,6 +166,19 @@ def main(argv: list[str]) -> int:
             start_new_session=True,
             env=environment,
         )
+        proc_root_text = os.environ.get("H3D_FAKE_PROC_ROOT")
+        if proc_root_text:
+            proc_dir = Path(proc_root_text) / str(child.pid)
+            proc_dir.mkdir(parents=True, exist_ok=True)
+            start_state = Path(os.environ["H3D_FAKE_SERVICE_START_STATE"])
+            start_time = int(start_state.read_text(encoding="ascii")) + 1
+            start_state.write_text(f"{start_time}\n", encoding="ascii")
+            proc_dir.joinpath("stat").write_text(
+                f"{child.pid} (h3d-service) S "
+                + " ".join(["0"] * 18)
+                + f" {start_time} 0\n",
+                encoding="ascii",
+            )
         pidfile.write_text(f"{child.pid}\n", encoding="ascii")
         execfile.write_text(str(parsed["executable"]), encoding="utf-8")
         return 0
@@ -160,6 +196,9 @@ def main(argv: list[str]) -> int:
     if alive(pid) and marker.exists():
         os.kill(pid, signal.SIGKILL)
     if parsed["remove"]:
+        proc_root_text = os.environ.get("H3D_FAKE_PROC_ROOT")
+        if proc_root_text and pid is not None:
+            shutil.rmtree(Path(proc_root_text) / str(pid), ignore_errors=True)
         pidfile.unlink(missing_ok=True)
         execfile.unlink(missing_ok=True)
         marker.unlink(missing_ok=True)

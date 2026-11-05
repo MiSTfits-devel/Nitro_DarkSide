@@ -37,6 +37,8 @@ module tb_nds_nitro_fb_telemetry;
         .FB_HW_BASE(FB_BASE), .FB_BURST(8'd128),
         .RUNTIME_TELEMETRY(1'b1)
     ) dut (
+        .reset_read(reset_sys), .external_enable(1'b1),
+        .external_quiescent(),
         .clk_sys, .CLK_VIDEO(clk_video), .reset_sys, .reset_video,
         .pix_x, .pix_y, .pix_d, .pix_we,
         .pixb_x, .pixb_y, .pixb_d, .pixb_we, .source_fault,

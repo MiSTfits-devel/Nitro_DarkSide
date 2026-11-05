@@ -4,7 +4,7 @@
 -- Product-local derivative of authenticated Nitro_DarkSide d2dabe/rtl/nds_membus9.vhd.
 -- Donor SHA-256: a219e85218e022fe6096e38bfc4b17cfc3aa88069f215e97a8fbbf9913a4dd62.
 -- Intentional delta: palette/OAM writes wait for the existing IO CDC completion;
--- reads retain the donor FINISH behavior. Entity name intentionally remains nds_membus9.
+-- palette/OAM reads wait for synchronous readback shadows. Entity name remains nds_membus9.
 -- ARM9 memory bus decoder. Same request/done idiom as nds_membus7 (accepts a
 -- new CPU request on every completing cycle), plus the ARM946E-S TCM overlay:
 --
@@ -37,6 +37,7 @@ entity nds_membus9 is
    (
       clk            : in  std_logic;
       reset          : in  std_logic;
+      native_mode    : in  std_logic := '0';
 
       -- CP15 configuration (from nds_cpu9)
       itcm_ena       : in  std_logic;
@@ -50,6 +51,9 @@ entity nds_membus9 is
       -- cache attributes of the current address + maintenance (from nds_cpu9)
       bus_cacheable_i : in  std_logic;
       bus_cacheable_d : in  std_logic;
+      bus_bufferable_d : in std_logic := '0';
+      -- PU forbids a privileged data write at the CPU's address (nds_cpu9)
+      bus_wdenied_d   : in  std_logic := '0';
       cache_op_ena    : in  std_logic;
       cache_op        : in  std_logic_vector(3 downto 0);
       cache_op_addr   : in  std_logic_vector(31 downto 0);
@@ -64,6 +68,7 @@ entity nds_membus9 is
       cpu_rnw        : in  std_logic;
       cpu_ena        : in  std_logic;
       cpu_code       : in  std_logic;
+      cpu_lock       : in  std_logic := '0';
       cpu_acc        : in  std_logic_vector(1 downto 0);
       cpu_dout       : in  std_logic_vector(31 downto 0);
       cpu_lowbits    : in  std_logic_vector(1 downto 0);
@@ -117,18 +122,19 @@ entity nds_membus9 is
       vram_dout      : in  std_logic_vector(31 downto 0);
       vram_done      : in  std_logic;
 
-      -- palette / OAM write ports (word index 0..255 = engine A, 256..511 =
+      -- palette / OAM ports (word index 0..255 = engine A, 256..511 =
       -- engine B half of each 2 KB mirror; the integration splits them onto
-      -- the two nds_gpu2d instances. CPU readback is a known gap - reads
-      -- return 0 until the BRAMs grow a read port)
+      -- the two nds_gpu2d instances. Both readback paths have synchronous shadows.)
       pal_we         : out std_logic := '0';
       pal_addr       : out integer range 0 to 511 := 0;
       pal_din        : out std_logic_vector(31 downto 0) := (others => '0');
       pal_be         : out std_logic_vector(3 downto 0) := (others => '0');
+      pal_readdata   : in  std_logic_vector(31 downto 0) := (others => '0');
       oam_we         : out std_logic := '0';
       oam_addr       : out integer range 0 to 511 := 0;
       oam_din        : out std_logic_vector(31 downto 0) := (others => '0');
       oam_be         : out std_logic_vector(3 downto 0) := (others => '0');
+      oam_readdata   : in  std_logic_vector(31 downto 0) := (others => '0');
 
       -- main RAM (nds_mainram mem9 port)
       mr_ena         : out std_logic := '0';
@@ -141,6 +147,7 @@ entity nds_membus9 is
       -- cache line fills ask for an aligned 8-byte pair per request; the second
       -- word arrives beside mr_readdata on the same mr_done
       mr_pair        : out std_logic := '0';
+      mr_lock        : out std_logic := '0';
       mr_readdata_hi : in  std_logic_vector(31 downto 0) := (others => '0');
 
       -- IO register bus. The peripherals may live in a slower ce domain
@@ -171,7 +178,7 @@ architecture arch of nds_membus9 is
    -- falls back to x"00000000" for an unclaimed T_IO. Every ARM9 IO read returned
    -- zero. Measured with sim/tests/iotest: IPCSYNC, IE, DISPCNT and POWCNT1 all
    -- read back 0 where melonDS returns the written value.
-   type t_state  is (IDLE, FINISH, W_WRAMSH, W_VRAM, W_MAIN, W_IO_ALIGN, W_IO_RESP);
+   type t_state  is (IDLE, FINISH, W_WRAMSH, W_VRAM, W_MAIN, W_IO_ALIGN, W_IO_RESP, W_VIDEO_READ);
 
    signal state    : t_state  := IDLE;
    signal target   : t_target := T_OPEN;
@@ -203,6 +210,9 @@ architecture arch of nds_membus9 is
    signal be         : std_logic_vector(3 downto 0);
 
    signal accept_now : std_logic;
+   -- A CPU data store the PU forbids. It retires through FINISH with no side
+   -- effects - the stand-in for the data abort this core does not take.
+   signal store_denied : std_logic;
    signal itcm_sel   : std_logic;
    signal dtcm_sel   : std_logic;
 
@@ -231,10 +241,16 @@ architecture arch of nds_membus9 is
    signal dtcm_rd_eff : std_logic_vector(31 downto 0);
 
    -- cache <-> CPU-request side (main RAM only; the cache owns the mr_* port)
-   signal creq_ena       : std_logic := '0';
+   signal creq_ena       : std_logic;
+   signal creq_issued    : std_logic := '0';
    signal creq_rnw       : std_logic := '1';
    signal creq_code      : std_logic := '0';
+   -- Private native-firmware isolation policy. This is reset-stable, like the
+   -- cache read policy: changing the live session input cannot alter an access.
+   signal native_mainram_uncached : std_logic := '0';
    signal creq_cacheable : std_logic := '0';
+   signal creq_bufferable : std_logic := '0';
+   signal creq_lock      : std_logic := '0';
    signal creq_addr      : std_logic_vector(31 downto 0) := (others => '0');
    signal creq_be        : std_logic_vector(3 downto 0) := (others => '0');
    signal creq_wdata     : std_logic_vector(31 downto 0) := (others => '0');
@@ -265,6 +281,22 @@ architecture arch of nds_membus9 is
 
 begin
 
+   -- The request payload and W_MAIN are registered together. Issue exactly
+   -- once on the following edge, matching the original registered pulse.
+   -- Completion rearms even when a new MAIN request replaces the old one.
+   -- Never reissue merely because the cache is idle or a response is late.
+   creq_ena <= '1' when reset = '0' and state = W_MAIN and creq_issued = '0' else '0';
+   process (clk)
+   begin
+      if rising_edge(clk) then
+         if reset = '1' or state /= W_MAIN or cresp_done = '1' then
+            creq_issued <= '0';
+         else
+            creq_issued <= '1';
+         end if;
+      end if;
+   end process;
+
    -- BIOS9 uses a synchronous hot-loadable RAM in hardware. Drive its read
    -- address in the accept cycle so the registered word is ready in FINISH.
    brom_addr <= unsigned(cpu_adr(14 downto 2));
@@ -278,10 +310,13 @@ begin
    (
       clk           => clk,
       reset         => reset,
+      native_mode   => native_mode,
       req_ena       => creq_ena,
       req_rnw       => creq_rnw,
       req_code      => creq_code,
       req_cacheable => creq_cacheable,
+      req_bufferable => creq_bufferable,
+      req_lock      => creq_lock,
       req_addr      => creq_addr,
       req_be        => creq_be,
       req_wdata     => creq_wdata,
@@ -298,6 +333,7 @@ begin
       mem_done      => mr_done,
       mem_rdata     => mr_readdata,
       mem_pair      => mr_pair,
+      mem_lock      => mr_lock,
       mem_rdata_hi  => mr_readdata_hi,
       op_ena        => cache_op_ena,
       op            => cache_op,
@@ -338,13 +374,15 @@ begin
    --   dec_target = T_ITCM  <->  itcm_hit
    --   dec_target = T_DTCM  <->  dtcm_hit and not itcm_hit
    -- and nothing above ITCM can claim the address.
-   itcm_sel       <= accept_now and cpu_ena and itcm_hit;
+   store_denied   <= bus_wdenied_d and not cpu_rnw and not cpu_code and not dma_bus;
+
+   itcm_sel       <= accept_now and cpu_ena and itcm_hit and not store_denied;
    itcm_addr      <= unsigned(cpu_adr(14 downto 2));
    itcm_we        <= itcm_sel and not cpu_rnw;
    itcm_be        <= be;
    itcm_writedata <= wdata;
 
-   dtcm_sel       <= accept_now and cpu_ena and dtcm_hit and not itcm_hit;
+   dtcm_sel       <= accept_now and cpu_ena and dtcm_hit and not itcm_hit and not store_denied;
    dtcm_addr      <= unsigned(cpu_adr(13 downto 2));
 
    -- ================= DTCM deferred store =================
@@ -567,13 +605,19 @@ begin
 
          wsh_ena  <= '0';
          vram_ena <= '0';
-         creq_ena <= '0';
          pal_we   <= '0';
          oam_we   <= '0';
          io_bus.ena <= '0';
          io_bus.rst <= reset;
 
+         -- Preserve the complete VRAM wait interval while avoiding target decode
+         -- on this data-register enable. Extra unqualified captures are unused.
+         if (accept_now = '1') then
+            vram_din <= wdata;
+         end if;
+
          if (reset = '1') then
+            native_mainram_uncached <= native_mode;
             state <= IDLE;
          else
             can_accept := (accept_now = '1');
@@ -592,9 +636,20 @@ begin
             -- CPU's next request and it waits forever for a done that never comes.
             -- That is exactly how the first version of this fix hung the ARM9 on
             -- its second IO access.
+            elsif state = W_VIDEO_READ then
+               -- The palette/OAM address was registered on acceptance. The
+               -- shadow samples it now; FINISH exposes its registered word. No IO
+               -- request is emitted and a new access may be accepted in FINISH.
+               state <= FINISH;
             elsif can_accept then
                state <= IDLE;
-               if (cpu_ena = '1') then
+               if (cpu_ena = '1' and store_denied = '1') then
+                  -- PU-forbidden store: complete without touching any target
+                  target <= T_OPEN;
+                  r_acc  <= cpu_acc;
+                  r_low  <= cpu_adr(1 downto 0);
+                  state  <= FINISH;
+               elsif (cpu_ena = '1') then
                   target <= dec_target;
                   r_acc  <= cpu_acc;
                   r_low  <= cpu_adr(1 downto 0);
@@ -623,37 +678,40 @@ begin
                         vram_rnw  <= cpu_rnw;
                         vram_addr <= unsigned(cpu_adr(23 downto 2));
                         vram_be   <= be;
-                        vram_din  <= wdata;
                         state     <= W_VRAM;
 
                      when T_PAL =>
                         -- std palettes: 2 KB mirror, engine A low / B high
+                        pal_addr <= to_integer(unsigned(cpu_adr(10 downto 2)));
                         if (cpu_rnw = '0') then
                            pal_we   <= '1';
-                           pal_addr <= to_integer(unsigned(cpu_adr(10 downto 2)));
                            pal_be   <= be;
                            pal_din  <= wdata;
                            state    <= W_IO_RESP;
                         else
-                           state    <= FINISH;
+                           state    <= W_VIDEO_READ;
                         end if;
 
                      when T_OAM =>
                         -- OAM: 2 KB mirror, engine A low / B high
+                        oam_addr <= to_integer(unsigned(cpu_adr(10 downto 2)));
                         if (cpu_rnw = '0') then
                            oam_we   <= '1';
-                           oam_addr <= to_integer(unsigned(cpu_adr(10 downto 2)));
                            oam_be   <= be;
                            oam_din  <= wdata;
                            state    <= W_IO_RESP;
                         else
-                           state    <= FINISH;
+                           state    <= W_VIDEO_READ;
                         end if;
 
                      when T_MAIN =>
-                        creq_ena   <= '1';
                         creq_rnw   <= cpu_rnw;
                         creq_code  <= cpu_code;
+                        creq_bufferable <= bus_bufferable_d and not dma_bus and not cpu_code and not native_mainram_uncached;
+                        -- Associate the lock with this accepted CPU data access,
+                        -- not with a later cache fill or maintenance writeback.
+                        creq_lock  <= cpu_lock and not cpu_code and
+                                      not dma_bus and (native_mainram_uncached or not bus_cacheable_d);
                         creq_addr  <= cpu_adr;
                         creq_be    <= be;
                         creq_wdata <= wdata;
@@ -682,7 +740,10 @@ begin
                         -- transfer looked perfect - correct address, correct data,
                         -- correct handshake - which is why this survived a probe of
                         -- the DMA path itself.
-                        if (dma_bus = '1') then
+                        -- Only external main RAM bypasses allocation/posting.
+                        -- Keep TCM, IO, permissions and real CP15 maintenance
+                        -- unchanged. Direct sessions retain their original policy.
+                        if (dma_bus = '1' or (native_mainram_uncached = '1' and cpu_code = '0')) then
                            creq_cacheable <= '0';
                         elsif (cpu_code = '1') then
                            creq_cacheable <= bus_cacheable_i;
@@ -726,7 +787,8 @@ begin
                 brom_data     when target = T_BROM   else
                 wsh_dout      when target = T_WRAMSH else
                 vram_dout     when target = T_VRAM   else
-                x"00000000"   when (target = T_PAL or target = T_OAM) else -- readback gap: BRAMs are write-only from the CPU
+                pal_readdata  when target = T_PAL    else
+                oam_readdata  when target = T_OAM    else
                 cresp_rdata   when target = T_MAIN   else
                 -- unclaimed NDS9 IO reads 0 (not GBA open bus): calico probes SCFG
                 -- 0x04004000 for NTR/TWL detection. io_wired_out is a wired-OR tree

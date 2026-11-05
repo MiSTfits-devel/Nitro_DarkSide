@@ -11,12 +11,15 @@
 -- Clearing ARM9 IF while the condition remains true therefore reasserts on
 -- the next IRQ-controller evaluation, as hardware does.
 --
--- Matrix stack/test busy, geometry busy, stack pointers, polygon/vertex
--- counts, and test/matrix result registers are not fabricated here. GXSTAT
--- returns zero for those fields. Addresses 0x04000604 and above remain
--- unclaimed and therefore read zero through the product's existing NDS open-
--- IO behavior. Workloads needing synchronous result-register semantics are a
--- later phase and must not infer them from packet-transport state.
+-- Bits 0/1 are supplied by the ordered test-result owner. Ordinary GXSTAT
+-- polls remain local; that owner fences only after a new BOX/POS command.
+-- Bits 8..13 (position/projection stack levels) and 15 (stack error) come
+-- from the packet frontend, which tracks MTX_MODE/PUSH/POP in submission
+-- order. Writing 1 to bit 15 pulses stack_ack to clear the error and reset
+-- the projection/texture pointers. Bit 27 accepts the optional source-clock
+-- geometry busy state. Matrix-stack busy and polygon/vertex counts still
+-- read zero here. The separate result owner also
+-- handles clip-matrix reads.
 --
 -- DISP3DCNT at 0x04000060 is a CPU-visible read/modify/write register even
 -- though its renderer-side writes are also transported to the HPS. Retain the
@@ -38,6 +41,11 @@ entity nds_h3d_gx_status is
       reset          : in  std_logic;
       service_ready  : in  std_logic;
       fifo_level     : in  std_logic_vector(8 downto 0) := (others => '0');
+      geometry_busy  : in  std_logic := '0';
+      -- {error, projection level, position level[4:0]}
+      stack_status   : in  std_logic_vector(6 downto 0) := (others => '0');
+      stack_ack      : out std_logic := '0';
+      test_result_bits : in std_logic_vector(1 downto 0) := "00";
 
       gb_bus         : in  proc_bus_gb_type;
       wired_out      : out std_logic_vector(31 downto 0) := (others => '0');
@@ -67,9 +75,13 @@ begin
    process (all)
    begin
       gxstat_word <= (others => '0');
+      gxstat_word(1 downto 0) <= test_result_bits;
+      gxstat_word(13 downto 8) <= stack_status(5 downto 0);
+      gxstat_word(15) <= stack_status(6);
       gxstat_word(24 downto 16) <= fifo_level;
       gxstat_word(25) <= fifo_below_half;
       gxstat_word(26) <= fifo_empty;
+      gxstat_word(27) <= geometry_busy;
       gxstat_word(31 downto 30) <= irq_mode;
    end process;
 
@@ -89,10 +101,15 @@ begin
    process (clk)
    begin
       if rising_edge(clk) then
+         stack_ack <= '0';
          if (reset = '1') then
             irq_mode <= "00";
             disp3dcnt <= (others => '0');
          elsif (gb_bus.ena = '1' and gb_bus.rnw = '0') then
+            if (gb_bus.Adr = ADR_GXSTAT and gb_bus.bEna(1) = '1' and
+                gb_bus.Din(15) = '1') then
+               stack_ack <= '1';
+            end if;
             if (gb_bus.Adr = ADR_GXSTAT and gb_bus.bEna(3) = '1') then
                -- The membus aligns Adr to 0x600 and places byte/halfword data
                -- in the selected lanes. Thus this covers word writes,

@@ -1,11 +1,16 @@
 # Hybrid 3D ABI (H3D1)
 
-## Goal
+## Current and historical paths
 
-H3D1 adds Nintendo DS 3D and the missing Engine B display path to the FPGA
-console core. The FPGA keeps the two CPUs, timing, DMA, memory, VRAM, Engine A
-2D, input, sound, saves, and video timing. A small HPS service runs melonDS 3D
-geometry/software rasterization plus GPU2D-B only.
+The current standalone matched-screen core retains FPGA DS CPUs, timing, DMA,
+memory and sound, while ARM replays graphics state and composes both 2D engines
+and 3D into complete Main/Touch pairs. Engine B is present. See the
+[current architecture](architecture.md) and [session policy](hybrid-3d-session-policy.md).
+
+H3D1 retains wire structures for the earlier 3D-plane/split-renderer paths. The
+legacy line-fetch and FPGA BG0 blend sections below describe those modes; they
+must not be used to infer the active standalone rendering split. Source contracts
+in `src/replay` and `rtl` are authoritative for optional extensions.
 
 ## Rules
 
@@ -14,14 +19,13 @@ geometry/software rasterization plus GPU2D-B only.
    records. Register and virtual-VRAM records preserve address, width, byte
    enables, source CPU, and data.
 3. The packet link must not drop, repeat, or reorder an accepted record.
-4. HPS publishes a complete 3D frame and, when present, a complete Engine B
-   physical screen before FPGA can use either one.
-5. A late or invalid 3D line is transparent. It must not stop the 2D engine.
-6. The 3D plane enters engine A as BG0 before priority, window, blend, and
-   master-brightness operations.
-7. Screen order changes placement only; DS power control determines which
-   physical panel receives Engine B, and touch remains on the bottom panel.
-8. High-volume per-pixel telemetry stays off. Public crash telemetry may only
+4. HPS completes the active mode's pixel payload before FPGA can adopt its descriptor.
+5. Matched mode publishes a complete screen pair. A slow renderer can repeat an
+   older complete pair; it does not have an independently rendered FPGA 2D layer.
+6. 3D enters Engine A as BG0 before priority, window, blend and master brightness.
+   In matched mode those operations run on ARM. The legacy split path does them
+   in FPGA and substitutes transparent pixels for invalid tagged 3D lines.
+7. High-volume per-pixel telemetry stays off. Public crash telemetry may only
    reuse an existing control-header transaction and must not touch the CPU,
    GPU, DMA, audio, cartridge, renderer, or display fast paths.
 
@@ -34,8 +38,6 @@ The MiSTer DDR bridge adds `0x30000000` to the local FPGA byte address.
 | H3D1 control and packet mailbox | `0x0FC00000` | `0x3FC00000` | 320 KiB used |
 | 3D frame bank 0 | `0x0FD00000` | `0x3FD00000` | 256 KiB |
 | 3D frame bank 1 | `0x0FD40000` | `0x3FD40000` | 256 KiB |
-| Engine B screen bank 0 | `0x0FD80000` | `0x3FD80000` | 256 KiB |
-| Engine B screen bank 1 | `0x0FDC0000` | `0x3FDC0000` | 256 KiB |
 | Final framebuffer bank 0 | `0x0FE00000` | `0x3FE00000` | 512 KiB |
 | Final framebuffer bank 1 | `0x0FE80000` | `0x3FE80000` | 512 KiB |
 | Final framebuffer bank 2 | `0x0FF00000` | `0x3FF00000` | 512 KiB |
@@ -46,13 +48,10 @@ Each 3D frame bank stores 256 by 192 little-endian 32-bit pixels. Pixel bits
 A5. Other bits are zero. The HPS service converts melonDS's sparse native
 pixel word to this packed form before publication.
 
-Each Engine B bank stores one complete physical screen using packed RGB666.
-Descriptor bank bit 1 selects that bank and bit 2 identifies its physical
-screen. Pixel format 3 marks the composite 3D-plus-Engine-B publication.
-
 Each final framebuffer bank holds the paired 256x192 top and bottom screens.
-The FPGA publishes only a completely drained, order-valid pair; video scanout
-selects that bank only at its own frame boundary. Four banks keep the next
+ARM publishes the completed pair in matched mode; FPGA validates/adopts it.
+The legacy FPGA composition path publishes a completely drained, order-valid pair.
+Video scanout selects that bank only at its own frame boundary. Four banks keep the next
 source frame from overwriting the displayed frame, an unacknowledged
 publication, or a complete frame that is still draining.
 
@@ -65,13 +64,13 @@ All fields are little-endian. All 64-bit fields are naturally aligned.
 | `0x00` | magic `H3D1`, ABI version, header size |
 | `0x08` | FPGA session |
 | `0x10` | 32-bit committed-packet sequence plus zero reserved word, written by FPGA |
-| `0x18` | 32-bit applied-packet sequence plus zero reserved word, written by HPS |
+| `0x18` | 32-bit accepted-packet sequence plus zero reserved word, written by HPS; see async ownership below |
 | `0x20` | separate 32-bit sticky FPGA and HPS fault words |
 | `0x28` | HPS service state and accepted session |
 | `0x30` | 32-bit published frame sequence plus zero reserved word |
 | `0x38` | 32-bit acknowledged frame sequence plus zero reserved word |
 | `0x40` | published frame descriptor |
-| `0x60` | FPGA heartbeat and one slowly rotating tagged telemetry word |
+| `0x60` | optional FPGA CPU/telemetry words; zero in the current product core |
 | `0x68` | HPS heartbeat and a normally-zero manual snapshot token |
 | `0x70` | 32-bit FPGA quiesce generation plus zero reserved word |
 | `0x78` | 32-bit HPS quiesce acknowledgement plus zero reserved word |
@@ -102,22 +101,36 @@ overwriting the active plane bank. A quiesce-generation mismatch makes an old
 service read-only even if a prior session number is repeated after FPGA
 reconfiguration.
 
+### Source queue fault details
+
+The experimental bug-fix core retains aggregate source-fault bit `0x00000100`
+and adds sticky reason bits in the FPGA fault word: `0x00400000` identifies
+HBlank queue exhaustion; `0x00800000` identifies frame-boundary queue exhaustion.
+Both reasons may be set. Aggregate and reason bits are published from the same
+synchronized sample. Older cores report only the aggregate bit, so their crash
+reports cannot identify which queue filled. The header layout and ABI version
+are unchanged, and existing readers still treat any nonzero fault word as a
+failure. These details identify the exhausted queue, not the cause of the
+upstream stall; they do not authorize dropping records or changing LCD pacing.
+
 ### Public crash reports
 
-The HPS service keeps a 128-sample flight recorder at 10 Hz. Each sample reads
-the existing 128-byte control header; it creates no new FPGA DDR command and
+The HPS service keeps a 128-sample flight recorder at 10 Hz by default;
+standalone pacing tracing extends it to 1,024 samples. Each sample reads the
+existing 128-byte control header; it creates no new FPGA DDR command and
 runs in a `SCHED_IDLE` thread behind renderer work. A packet-consumer stall,
 frame-acknowledgement stall, or sticky FPGA fault writes a versioned
-`NDS4MISTER_FPGA_CRASH_V1` text report under `/media/fat`. The report contains
-counters, ownership state, frame metadata, CPU progress, and tagged FPGA
-subsystem telemetry. It never contains ROM, save, texture, framebuffer, or
+`NDS4MISTER_FPGA_CRASH_V2` text report under `/media/fat`. The report contains
+counters, ownership state, frame metadata, and fields for optional CPU progress
+and tagged FPGA subsystem telemetry. It never contains ROM, save, texture, framebuffer, or
 other game payload data.
 
-`SIGUSR1` requests a manual snapshot. HPS publishes a fresh token in control
-word `0x68`; FPGA detects it through the normal header poll and holds ARM9 and
-ARM7 for at most about 100 ms. During that bounded hold the HPS recorder takes
-a short high-rate burst, writes the report, and clears the token. FPGA releases
-the CPUs on its own even if HPS dies. Ordinary gameplay never enters this hold.
+`SIGUSR1` requests a manual snapshot from the renderer process. The current
+implementation takes a short read-only sample burst and writes the report;
+it does not publish a diagnostic token or halt the emulated CPUs. The older
+token/hold path is disabled because it could itself latch `BAD_HEADER` during
+healthy gameplay. CPU PC/telemetry fields remain zero in the product core,
+so their presence in the report format does not prove CPU instruction progress.
 
 Fatal HPS signals write `NDS4MISTER_ARM_CRASH_V1`, including native ARM
 registers, a small stack snapshot, and the same shared control state. Automatic
@@ -143,10 +156,16 @@ at most 60 KiB (3,840 records) of payload. Its fields are:
 FPGA writes the payload first, header beats 0 through 6 next, the slot commit
 last, and only then publishes the producer sequence at control offset `0x10`.
 HPS snapshots the full header, copies the payload, snapshots the header again,
-and accepts it only when both copies and all reserved fields match. It applies
-the complete packet in record order and publishes one acknowledgement only
-after every record is applied. It revalidates the active lifecycle and packet
-session immediately before that acknowledgement.
+and accepts it only when both copies and all reserved fields match. It
+revalidates the active lifecycle and packet session immediately before the
+acknowledgement. In the current asynchronous matched path, intake first reserves
+capacity in its private replay ring and completely copies/validates the immutable
+packet. It then returns the shared-slot credit and release-publishes the owned
+copy for ordered replay. The acknowledgement is transport acceptance, not proof
+that geometry has executed or pixels have been displayed. The synchronous legacy
+path instead acknowledges after applying records. Neither path may access an
+acknowledged shared slot. Native GX/SWAP retirement credits are separate from
+transport-slot credits; do not conflate them when changing backpressure.
 
 Each payload record is 16 bytes:
 
@@ -170,13 +189,14 @@ Record kinds are:
 | 7 | OAM write. |
 | 8 | HBlank marker. |
 | 9 | Three normalized GX commands packed into one transport record. |
+| 10 | Ordered GX readback fence; not a guest MMIO write or scanline event. |
+| 11 | Two consecutive full ARM9 VRAM words, with the original scanline tag. |
 
 For ordinary write records, tag bits 1:0 carry access width and VRAM-write tag
 bit 2 selects ARM7. VRAM writes retain their virtual address and byte enables
 so melonDS continues to own VRAM mapping and overlap behavior. Kinds 5 through
-8 preserve the HPS GPU/VRAM mirror's state and ordering. The service uses
-scanline-tagged writes and sparse HBlank markers to reconstruct Engine B
-without shadowing FPGA Engine A.
+8 preserve the HPS GPU/VRAM mirror's state and ordering. They support active
+ARM 2D composition in matched mode as well as the historical diagnostic path.
 
 Kind 9 uses tag bytes in metadata bits `15:8`, `23:16`, and `31:24`. The three
 corresponding 32-bit command values occupy words 1, 2, and 3. The normal
@@ -193,8 +213,10 @@ stored in packet records.
 `SWAP_BUFFERS` must be the final record in a terminal packet. A VBlank token
 also closes a partial or empty frame when software issued no swap. Oversize
 frames are split into `CONT` packets followed by one `FRAME_END`; HPS advances
-the renderer at each continuation boundary and renders only the terminal
-packet. A new session resets all packet ownership.
+the legacy renderer at continuation boundaries and select terminal rendering.
+Current matched drawing is admitted from LCD-phase/replay state; a terminal
+packet is not a count of rendered or displayed pictures. A new session resets
+all packet ownership.
 
 ## Backpressure and faults
 
@@ -213,7 +235,7 @@ service fault and resets the console without waiting for all packet slots to
 fill. The timeout is intentionally much longer than a valid frame render or
 copy stall.
 
-## Frame publication
+## Legacy 3D-plane publication
 
 HPS writes the inactive 3D frame bank. It completes all cache maintenance and
 a release barrier before it publishes this descriptor:
@@ -228,16 +250,14 @@ session. Later publications compare against that bank's packed HPS shadow and
 write only changed 32-bit words; the descriptor is still published every
 frame, including an unchanged frame.
 
-FPGA latches a new complete descriptor at VBlank. Composite format descriptors
-atomically select the 3D plane bank, Engine B bank, and Engine B physical
-screen. FPGA acknowledges adoption before HPS can reuse the old bank.
+FPGA latches a new complete descriptor at VBlank. It acknowledges the
+descriptor before HPS can reuse the old bank.
 
-FPGA fetches each 256-pixel line into an inactive line-RAM slot and promotes it
-only after the complete line arrives. A 3D line record carries session, frame,
-bank, and Y tags; a tag mismatch or missed deadline makes that plane line
-transparent without exposing a partially fetched screen line.
+FPGA fetches one 256-pixel line into one of two ping-pong line RAMs. A line
+record carries session, frame, bank, and Y tags. A tag mismatch or a missed
+deadline makes every pixel in that line transparent.
 
-## Engine-A blend contract
+## Legacy FPGA Engine-A blend contract
 
 When engine-A `DISPCNT.BG0_3D` is set, the returned 3D pixel replaces the
 normal BG0 pixel input. BG0 priority, windows, and target masks still apply.
@@ -251,13 +271,13 @@ evb = 32 - eva
 out = min(63, (source6 * eva + destination6 * evb + 16) >> 5)
 ```
 
-Other effects use the existing 2D merge rules. Engine B has no direct 3D BG0
-input. Dual-screen 3D display capture remains outside the accepted production
-claim until live traces and hardware tests accompany the software oracle.
+Other effects use the existing 2D merge rules. Engine B has no 3D BG0 input.
 
-## Public-beta acceptance gate
+## Historical initial 3D-only acceptance gate
 
-The initial public compatibility target is New Super Mario Bros.
+The following was the initial 3D-only beta gate, retained as history. It does
+not qualify the current matched-screen package; use the freeze record and its
+scene/correctness/control gates. The initial target was New Super Mario Bros.
 
 1. The service accepts one full session with zero packet faults and zero drops.
 2. The title and first playable 3D scene have stable polygons and textures.

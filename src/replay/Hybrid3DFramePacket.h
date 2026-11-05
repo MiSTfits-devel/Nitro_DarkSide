@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <type_traits>
 #include <vector>
 
@@ -54,6 +55,12 @@ enum class RecordKind : std::uint8_t {
     // Three normalized GX commands packed as
     // {data2, data1, data0, tag2, tag1, tag0, kind}.
     GxPacked = 9,
+    // Ordered execution fence, never a guest MMIO write or scanline event.
+    GxReadbackFence = 10,
+    // Two consecutive full ARM9 VRAM words folded by the FPGA packer:
+    // address_or_aux = word 0's address, data = {word1, word0}, byte enable
+    // 0xf, tag = 32-bit ARM9 access, same scanline tag as a VramWrite.
+    VramWritePair = 11,
 };
 
 enum Fault : std::uint32_t {
@@ -135,6 +142,13 @@ constexpr RecordKind record_kind(const Record& record)
     return static_cast<RecordKind>(record.metadata & 0xffu);
 }
 
+constexpr bool valid_readback_fence(const Record& record)
+{
+    return record.metadata ==
+               static_cast<std::uint32_t>(RecordKind::GxReadbackFence) &&
+           record.address_or_aux != 0 && record.data == 0;
+}
+
 constexpr std::uint8_t record_tag(const Record& record)
 {
     return static_cast<std::uint8_t>((record.metadata >> 8) & 0xffu);
@@ -205,6 +219,18 @@ constexpr Record pack_gx_commands(
     };
 }
 
+// One word of a VramWritePair as the ordinary VramWrite it stands for.
+constexpr Record unpack_vram_pair(const Record& record, std::size_t index)
+{
+    return Record {
+        (record.metadata & ~0xffu) |
+            static_cast<std::uint32_t>(RecordKind::VramWrite),
+        record.address_or_aux + static_cast<std::uint32_t>(index) * 4u,
+        index == 0 ? static_cast<std::uint32_t>(record.data) :
+                     static_cast<std::uint32_t>(record.data >> 32),
+    };
+}
+
 constexpr bool diagnostic_record_selected(const Record& record)
 {
     const auto kind = record_kind(record);
@@ -265,6 +291,8 @@ public:
         void* mapping, std::size_t mapping_size,
         bool require_diagnostic = true);
 
+    void enable_acquisition_timing(bool enabled) { measure_acquisition_ = enabled; }
+    std::chrono::steady_clock::time_point acquisition_started() const { return acquisition_started_; }
     bool initialize(std::uint32_t expected_session);
     bool begin(PacketHeader& header);
     bool begin(PacketHeader& header, std::vector<Record>& records);
@@ -323,6 +351,8 @@ private:
     bool pending_ = false;
     bool exhausted_ = false;
     bool require_diagnostic_ = true;
+    bool measure_acquisition_ = false;
+    std::chrono::steady_clock::time_point acquisition_started_ {};
     bool chain_active_ = false;
     std::uint32_t chain_frame_ = 0;
     std::uint32_t chain_diagnostic_state_ = DiagnosticCrcInitial;

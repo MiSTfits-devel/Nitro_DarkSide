@@ -1,0 +1,633 @@
+{
+  "schema_version": 1,
+  "game_code": "A6FE",
+  "revision": 0,
+  "title": "Final Fantasy Tactics A2: Grimoire of the Rift",
+  "header_sha1": "803a0122db39ea3ddc99b56a7167d623aea004c3",
+  "header_bytes": 352,
+  "rom_sha256": "3b5d469aae5d351de31a89cf2bf592c98cb5b68cb4efc30b34426a119fee2372",
+  "arm9_sha256": "4fcd888fa0730f89aea0252f953401e007165b6ca5230ad3e140511ecdc00a62",
+  "baseline": "rc12 plus accepted FFTA2 Beta2; no new guest patch enabled",
+  "budget": "bit-exact framebuffers, audio, saves and checkpoint RAM except declared instruction bytes and proven scratch",
+  "patches": [
+    {
+      "id": "copy16-compact-branches",
+      "pattern": "branch-heavy-halfword-copy",
+      "cpu": "arm9",
+      "target": "arm9.bin/main_loaded",
+      "addr": "0x20093e0",
+      "mode": "arm",
+      "expect": "00c0a0e302005ce1000000ba000000eabc3090e1000000ba000000eabc3081e1000000ba000000ea02c08ce2f4ffffba1eff2fe1",
+      "replace": "00c0a0e302005ce11eff2fa1bc3090e1bc3081e102c08ce202005ce1faffffba1eff2fe10000a0e10000a0e10000a0e10000a0e1",
+      "hook": null,
+      "enabled": false,
+      "status": "rejected_full_replay_mismatch",
+      "scratch_bytes": 0,
+      "overlay": null,
+      "validated": {
+        "fb": "failed: 16 of 4400 top-screen frames differ; bottom screen equal",
+        "ram": "failed after exact 52-byte instruction normalization",
+        "audio": "failed: first sample difference at 12.55127 seconds",
+        "save": "bit-exact in 4400-frame replay",
+        "native": "not run; failed software gate"
+      },
+      "gain": {
+        "native_cycles": null,
+        "native_game_progress": null,
+        "synthetic_copy64_instruction_count": {
+          "before": 266,
+          "after": 164
+        },
+        "software_arm9_instructions_2600_4399": {
+          "before": 391329973,
+          "after": 385205747,
+          "reduction_percent": 1.5649774927922522,
+          "qualifies": false
+        }
+      },
+      "notes": "Rejected and disabled. Synthetic function-level equivalence does not preserve whole-game framebuffer, RAM or audio output. Same halfword accesses and no scratch, but actual callers include RAM, palette, VRAM and toon-table MMIO. Do not accept timing differences as benign without proof and explicit budget approval.",
+      "synthetic_validation": {
+        "cases": 1276,
+        "receipt": "GUEST_COPY16_SYNTHETIC_V1.json",
+        "receipt_sha256": "fd14f1003827076bda5e4a0631b317956e0c2f430d7f21bdbc4138f6ace884fc"
+      },
+      "reference_instruction_sample_share_percent": {
+        "LUSO": 4.172203116470322,
+        "FIRE": 4.175132979224705,
+        "LIBRARY": 0.2368569664748147
+      },
+      "replay_rejection": {
+        "receipt": "GUEST_COPY16_REJECTION_ANALYSIS.json",
+        "receipt_sha256": "06cf894d0ade309f438c2b0ac3718198e282838b42e313161d3c303cc137e80a",
+        "input_manifest": "GUEST_COPY16_REPLAY_INPUT_MANIFEST.json",
+        "input_manifest_sha256": "3b5f5258f5d42fc0312936780f50132aec83a71e166c3086130cc6e7af90668e"
+      }
+    },
+    {
+      "id": "vertex-pack-redundant-shifts",
+      "pattern": "redundant-bitfield-shift-chain",
+      "cpu": "arm9",
+      "target": "arm9.bin/main_loaded",
+      "addr": "0x208cd44",
+      "mode": "arm",
+      "expect": "0030a0e3180000ea0c00a0e3930001e0010098e7011088e00004a0e14008a0e10028a0e104c091e50600a0e3930001e00c04a0e14008a0e10008a0e12008a0e10008a0e1220880e1000085e5b10097e1011087e0b210d1e1ba23d6e1013083e2010880e1000084e5002084e5040053e3e4ffffba",
+      "replace": "0030a0e3150000ea0c00a0e3930001e0010098e7011088e00004a0e14008a0e10028a0e104c091e50600a0e3930001e02c04a0e10008a0e1220880e1000085e5b10097e1011087e0b210d1e1ba23d6e1013083e2010880e1000084e5002084e5040053e3e7ffffba0000a0e10000a0e10000a0e1",
+      "hook": null,
+      "enabled": false,
+      "status": "disabled_timing_investigation_current_budget_failed",
+      "scratch_bytes": 0,
+      "overlay": null,
+      "validated": {
+        "fb": "All43400 top frames exact; bottom differs in0/4400 Luso,1/9000 Fire,2/30000 library",
+        "ram": "Failed strict gate: live elapsed-time accounting, existing thread stacks/context and other frame-boundary state need semantic validation",
+        "audio": "Failed: differing stereo samples Luso1194,Fire257,library233754; maximum signed16 deltas77,53,3203 respectively",
+        "save": "All43400 per-frame save hashes and all3 final saves bit-exact",
+        "native": "Not run; no qualified guest-patch speedup"
+      },
+      "gain": {
+        "native_cycles": null,
+        "native_game_progress": null,
+        "software_arm9_instructions_2600_4399": {
+          "before": 391329973,
+          "after": 388375792,
+          "reduction_percent": 0.7549079303465489,
+          "qualifies": false
+        },
+        "software_arm9_instructions_6500_8999": {
+          "before": 543588049,
+          "after": 540131288,
+          "reduction_percent": 0.6359155625954536,
+          "qualifies": false
+        },
+        "software_arm9_instructions_23300_29999": {
+          "before": 750160463,
+          "after": 742351141,
+          "reduction_percent": 1.0410202063661678,
+          "qualifies": false
+        }
+      },
+      "notes": "Compact five shifts to two: both compute ((ip >> 8) & 0xffff) << 16. Preserve flags and every memory access; relocate the entry jump to the loop test and the local tail, retaining the back-edge target. Three NOPs execute once on loop exit. No multiply, graphics command, scratch or game logic is removed.",
+      "synthetic_validation": {
+        "cases": 1536,
+        "receipt": "GUEST_VERTEX_SYNTHETIC_V1.json",
+        "before_instructions": 112,
+        "after_instructions": 103,
+        "data_accesses": 32
+      },
+      "replay_rejection": {
+        "receipt": "GUEST_VERTEX_REJECTION_ANALYSIS_V1.json",
+        "receipt_sha256": "2c9f4bd6e9b822f94e72ff129ac885d176be63369af92289cba00e2a3473dd62",
+        "input_manifest": "GUEST_VERTEX_INPUT_MANIFEST_V1.json",
+        "input_manifest_sha256": "4140545031db7ab873d9f087dee06af9056daf05ef5e618f39eb3e4adf0b2bcb"
+      },
+      "timing_review": {
+        "user_direction": "Investigate bounded timing differences",
+        "acceptance_budget_changed": false,
+        "accepted": false,
+        "report": "GUEST_VERTEX_ALL_SCENES_BEFORE_AFTER_V2.csv",
+        "report_sha256": "eb755a33d1eefc7aec6e19731131d247515b2db5f5cbf47ffd0f4cd9d88372a5",
+        "Luso_completed_block_pairs": 549874,
+        "Luso_paired_block_payload_or_register_mismatches": 0,
+        "unpaired_cutoff_tail": true,
+        "limits": "Luso source changes are explained by three identical cartridge stores moving across a fetch boundary while audio remains enabled at3/128 volume. Software trace only; high-level ownership/native interleaving not proven. Fire source/decoded values match with four control-timing output differences; library source/paired steps match with37 retained tails. Scanline causality, full RAM semantics, audibility and native qualification remain open. Budget unchanged; no release approval.",
+        "library_completed_block_pairs": 3286148,
+        "library_paired_block_payload_or_register_mismatches": 0,
+        "library_block_unpaired_tail": false,
+        "library_sound_register_writes": 539880,
+        "library_sound_register_payload_mismatches": 0,
+        "library_sound_write_timestamp_delta_ticks": [
+          -1323,
+          1323
+        ],
+        "library_sound_writes_crossing_mix_boundary": 755,
+        "library_sound_write_mix_boundary_delta": [
+          -2,
+          2
+        ],
+        "evidence": {
+          "GUEST_VERTEX_DIAGNOSTIC_STABILITY_V4.json": "fc17dec5ba79ad1d0049d5dd5e8b3dff63f6d934f0ad08ee6fdee96edef5a9c0",
+          "GUEST_VERTEX_BLOCK_COMPARISON_LIBRARY_V4.json": "e45412bb8c474e29a83ef0f886d56b9a775a0a9f7fcf7465ff6bde52e6b97772",
+          "GUEST_VERTEX_SPU_COMPARISON_LIBRARY_V4.json": "96662a9bc00d710c5f44ce9637fded5e7dcb28224edcf3009493974f00287424",
+          "GUEST_VERTEX_LIBRARY_PIXEL_REVIEW_V4.json": "98b03c97b6e2289c9fa4064dc3b3740416155a85259a190d427607d82a87d128",
+          "GUEST_VERTEX_SAMPLE_COMPARISON_UNIT_V5.json": "319a8b6a596971b5d17427a704555bd6ad81cb80d762f6d57dd26295d240bf07",
+          "GUEST_VERTEX_SAMPLE_COMPARISON_LIBRARY_V5.json": "69bdfbe5f14483e840af6e2a7e061275a9d47e864ee8996717c373d4bf1a3e82",
+          "GUEST_VERTEX_NOTE_TAIL_REVIEW_V5.json": "cb0735acf150b6d53066ce1281722651a2d8b7e9ace530b3adfdfce4c9b6664b",
+          "GUEST_VERTEX_OUTPUT_PHASE_REVIEW_V5.json": "d01237079d51a4ae980d44a72f8ef2cfb5eb0306e4bd0eb124673a1298c676da",
+          "GUEST_VERTEX_CHANNEL_OUTPUT_EXPLANATION_V5.json": "8dd6aee651e7efa9d786e50b14ee8fc69ba0bdd5796fe5ed200f2429feae615c",
+          "GUEST_VERTEX_SAMPLE_COMPARISON_UNIT_LUSO_V5.json": "ee9a9f4a745b212b282956ca93a9f940cb7f07020495b25a02d28eb39d72f31f",
+          "GUEST_VERTEX_SAMPLE_COMPARISON_LUSO_V5.json": "07af9da47b6440dd3ed721dbae6384087b34dae1c1ee8ffb92b59759bb523b65",
+          "GUEST_VERTEX_SPU_COMPARISON_LUSO_V5.json": "af48599defb1f5c244db3d66b3c35e1cc1b26a836e9c76f82cf4c5c3e11e5078",
+          "GUEST_VERTEX_CHANNEL_OUTPUT_EXPLANATION_LUSO_V5.json": "76294f6bcd53c3bfdaddb59f6ce96c9a49b99d2f85ed88f51b7f36325c320761",
+          "GUEST_VERTEX_SAMPLE_COMPARISON_UNIT_FIRE_V5.json": "998a4ffad601223ffd723c253eed25f9ede6f1c5ebd1a8bf817dc10dc5bee6a2",
+          "GUEST_VERTEX_SAMPLE_COMPARISON_FIRE_V5.json": "dba233a5153509ebd879ed3e9578058518914679c9f2d6e3ee53cb136022ff2c",
+          "GUEST_VERTEX_SPU_COMPARISON_FIRE_V5.json": "3c973b2e482e3510c7724dd4e1ef08073927ca8603f206a877282531bb1736b3",
+          "GUEST_VERTEX_CHANNEL_OUTPUT_EXPLANATION_FIRE_V5.json": "a697afbbce56846b61fa44c418d0abbd7d101c0476a4375b0d0c175662446e5d",
+          "GUEST_VERTEX_LUSO_CHANGED_SOURCE_ROM_SEARCH_V5.json": "cd28e83b9129b0e10ec99beac92aab9ce25fb5129f09bc46b47fc215cdcd5a86",
+          "GUEST_VERTEX_LUSO_CHANGED_SOURCE_FILES_V5.json": "10f2a6419a5b9e9a8e0c1419b23c6a544c48fa3b18c4d2e93f0f3f24e5230aa5",
+          "GUEST_VERTEX_LUSO_SOURCE_FRONTIER_V5.json": "783cba65228abed6509679f6b4e891de2d96260b2147ae73085b0c77da2d1576",
+          "GUEST_SPU_OUTPUT_STREAM_REGRESSION_V5.json": "513a33d6113f6ef75c719a3e70c7cb1eb9276829d54f3642710ad7826e24b7e3",
+          "GUEST_VERTEX_RAM_WRITER_FINDINGS_LUSO_V6.json": "e85903714e4c5ba12666bccf186b4918a7b44323177adf7e16dfad64120b69fb",
+          "GUEST_VERTEX_RAM_CONTROL_AUDIT_LUSO_V6.json": "ed34ff06c0a6eae4345958fb95aa09eb37d1c8501bde1216819157cf88d5f619",
+          "GUEST_VERTEX_RAM_CANDIDATE_AUDIT_LUSO_V6.json": "dc98ef873adc3f05f37e8f93889df9494c25adefb492dc0d856fa108d2ed0798",
+          "GUEST_RAM_OBSERVER_SOURCE_CHECKS_V6.json": "e9eab7cd03045840b4ba9304e0eb46018699b1c56cffefe14f5e576e5a643677",
+          "GUEST_RAM_BUS_AUDITOR_CHECKS_V6.json": "c277ebfbfaa1272bbcb6d9a2016d413e96faad51bd4b0d8c151d176d7ce22c9a",
+          "GUEST_RAM_BUS_AUDITOR_EMPTY_CHECK_V6.json": "347c22e602a955e391298a42987eb9ab08b4a3079b672de739719859af3b7334",
+          "GUEST_RAM_RANGE_PARSER_CHECKS_V6.json": "72716fa7731a579a7b89259c50aece4d094c6a78e84ae6f70bbe1b3735b71dee"
+        },
+        "library_fifo_words": 46439652,
+        "library_fifo_word_payload_mismatches": 0,
+        "library_channel_starts": 5309,
+        "library_channel_start_parameter_mismatches": 0,
+        "library_paired_decoded_steps": 371300720,
+        "library_paired_decoded_value_mismatches": 0,
+        "library_unpaired_decoded_steps": [
+          15,
+          22
+        ],
+        "library_note_tails_with_different_lengths": 15,
+        "library_max_note_tail_step_count_difference": 4,
+        "library_paired_sample_mix_delta": [
+          -1,
+          1
+        ],
+        "library_channel_output_windows": [
+          [
+            11900,
+            12400
+          ],
+          [
+            22700,
+            23200
+          ]
+        ],
+        "library_channel_output_records_per_arm": 8752960,
+        "library_unexplained_channel_output_records": 0,
+        "battle_audio_coverage": {
+          "LUSO": {
+            "totals": {
+              "fifo": {
+                "control": 2291193,
+                "candidate": 2291193,
+                "paired": 2291193,
+                "payload_mismatches": 3,
+                "unpaired": [
+                  0,
+                  0
+                ]
+              },
+              "samples": {
+                "control": 8760071,
+                "candidate": 8760071,
+                "paired": 8760071,
+                "payload_mismatches": 1182,
+                "unpaired": [
+                  0,
+                  0
+                ]
+              },
+              "output": {
+                "control": 38457840,
+                "candidate": 38457840,
+                "paired": 38457840,
+                "payload_mismatches": 467,
+                "unpaired": [
+                  0,
+                  0
+                ]
+              }
+            },
+            "start_counts": [
+              311,
+              311
+            ],
+            "start_payload_mismatches": 0,
+            "unexplained_channel_outputs": [
+              0,
+              0
+            ],
+            "SPU_write_counts": [
+              20403,
+              20403
+            ],
+            "SPU_write_payload_mismatches": 0,
+            "SPU_write_unpaired": [
+              0,
+              0
+            ],
+            "SPU_timing": {
+              "frame": {
+                "differing": 0,
+                "min_delta": 0,
+                "max_delta": 0
+              },
+              "arm7_timestamp": {
+                "differing": 396,
+                "min_delta": -611,
+                "max_delta": 183
+              },
+              "mix_calls": {
+                "differing": 3,
+                "min_delta": -1,
+                "max_delta": 1
+              }
+            }
+          },
+          "FIRE": {
+            "totals": {
+              "fifo": {
+                "control": 4826361,
+                "candidate": 4826361,
+                "paired": 4826361,
+                "payload_mismatches": 0,
+                "unpaired": [
+                  0,
+                  0
+                ]
+              },
+              "samples": {
+                "control": 13939336,
+                "candidate": 13939336,
+                "paired": 13939336,
+                "payload_mismatches": 0,
+                "unpaired": [
+                  0,
+                  0
+                ]
+              },
+              "output": {
+                "control": 78721488,
+                "candidate": 78721488,
+                "paired": 78721488,
+                "payload_mismatches": 4,
+                "unpaired": [
+                  0,
+                  0
+                ]
+              }
+            },
+            "start_counts": [
+              364,
+              364
+            ],
+            "start_payload_mismatches": 0,
+            "unexplained_channel_outputs": [
+              0,
+              0
+            ],
+            "SPU_write_counts": [
+              21251,
+              21251
+            ],
+            "SPU_write_payload_mismatches": 0,
+            "SPU_write_unpaired": [
+              0,
+              0
+            ],
+            "SPU_timing": {
+              "frame": {
+                "differing": 0,
+                "min_delta": 0,
+                "max_delta": 0
+              },
+              "arm7_timestamp": {
+                "differing": 735,
+                "min_delta": -1321,
+                "max_delta": 550
+              },
+              "mix_calls": {
+                "differing": 4,
+                "min_delta": -1,
+                "max_delta": 1
+              }
+            }
+          }
+        },
+        "Luso_source_change": {
+          "channel": 6,
+          "generation": 23,
+          "mix_index": 1450863,
+          "addresses": [
+            "0x02172f90",
+            "0x02172f94",
+            "0x02172f98"
+          ],
+          "source_word_differences": 3,
+          "decoded_value_differences": 1182,
+          "sample_positions_formats_and_timestamps_identical": true,
+          "mechanism": "ARM9 cartridge writes overlap active sound reads in both software runs. Three identical stores move before the same sound-fetch boundary; control fetched old words, candidate new words.",
+          "writer_pc": "0x02010180",
+          "writer_opcode": "0x3785010c",
+          "executing_DMA_mask": 0,
+          "candidate_store_earlier_raw_ARM9_ticks": 1740,
+          "channel_cnt_at_fetch": "0xd0400303",
+          "channel_volume_at_fetch": 3,
+          "mix_callbacks_until_disable": 480,
+          "all_observed_write_payloads_equal": true,
+          "observed_writes_per_arm": 17272,
+          "observed_sound_fetches_per_arm": 9959,
+          "fetches_inconsistent_with_recorded_stores": 0
+        }
+      }
+    },
+    {
+      "id": "nibble-decode-exact-arithmetic",
+      "pattern": "scaled-nibble-decoder-arithmetic",
+      "cpu": "arm9",
+      "target": "arm9.bin/main_loaded",
+      "addr": "0x2020080",
+      "mode": "arm",
+      "expect": "f84f2de9bc409fe500a0a0e302e5a0e3600093e80a70a0e1064194e7a8909fe500e06ee2a4c09fe5220000ea00005ae30780a0110170d004012042e22782a0010f70070200005ae301a0a00308b199e700a0a0130b6096e00060a043580056e35860a0c3c4b1a0e1040018e304b08b10020018e3c4b08b10010018e344b18b10080018e30b5045100b5085000e0055e10e50a0b10c0055e10c50a0c180b085e220409fe5cb83a0e1288c8be04884a0e1064194e7b280c1e0000052e3daffffca600083e8f88fbde8",
+      "replace": "f84f2de9bc409fe500a0a0e302e5a0e3600093e80a70a0e1064194e7a8909fe500e06ee2a4c09fe51d0000ea00005ae30780a0110170d004012042e22782a0010f70070201a02ae208b199e70b6096e00060a043580056e35860a0c307b008e2940b0be08bb084e0cbb1a0e1080018e30b5045100b5085000e0055e10e50a0b10c0055e10c50a0c180b085e234409fe5cb83a0e1288c8be04884a0e1064194e7b280c1e0000052e3dfffffca600083e8f88fbde80000a0e10000a0e10000a0e10000a0e10000a0e1",
+      "data_guards": [
+        {
+          "addr": "0x2020148",
+          "expect": "8c9611024c96110200ff7f00",
+          "purpose": "Unchanged literal pool pointers and predictor clamp"
+        },
+        {
+          "addr": "0x211964c",
+          "expect": "ffffffffffffffffffffffffffffffff02000000040000000600000008000000ffffffffffffffffffffffffffffffff02000000040000000600000008000000000700000008000000090000000a0000000b0000000c0000000d0000000e0000001000000011000000130000001500000017000000190000001c0000001f0000002200000025000000290000002d00000032000000370000003c00000042000000490000005000000058000000610000006b00000076000000820000008f0000009d000000ad000000be000000d1000000e6000000fd0000001701000033010000510100007301000098010000c1010000ee010000200200005602000092020000d40200001c0300006c030000c3030000240400008e040000020500008305000010060000ab0600005607000012080000e0080000c3090000bd0a0000d00b0000ff0c00004c0e0000ba0f00004c11000007130000ee1400000617000054190000dc1b0000a51e0000b621000015250000ca280000df2c00005b3100004b360000b93b0000b2410000444800007e4f0000715700002f600000ce69000062740000ff7f00",
+          "purpose": "Exact index and scaled step tables used by arithmetic proof"
+        }
+      ],
+      "hook": null,
+      "enabled": false,
+      "status": "rejected_current_bit_exact_budget_after_three_routes_and_audio_traces",
+      "scratch_bytes": 0,
+      "overlay": null,
+      "validated": {
+        "fb": "Luso and library exact; Fire top exact but1892/9000 bottom frames differ",
+        "ram": "Failed in both battles; library30000 frames exact after only declared200 code bytes normalized",
+        "audio": "Failed in both battles; library24069760 stereo samples exact",
+        "save": "Exact every-frame and final hashes in Luso, Fire and library",
+        "native": "Not run",
+        "other_replays": "Library/forest30000-frame route passed; cold/save-reload/reset/native lifecycle not newly qualified"
+      },
+      "gain": {
+        "target_scene_ARM9_instructions_before": 391329973,
+        "target_scene_ARM9_instructions_after": 381498749,
+        "target_scene_instruction_reduction_percent": 2.512259391896874,
+        "scope": "Software executed ARM9 instructions in Luso frames2600-4399; not native cycles or speed",
+        "native_cycles": null,
+        "native_game_progress": null,
+        "native_frame_time_p50_p95_max": null,
+        "native_dropped_frames": null,
+        "HPS_load": null,
+        "load_times": null,
+        "qualifies_for_release": false
+      },
+      "notes": "Replace duplicate parity compare/two conditional moves with flag-preserving XOR; compute the nibble step contribution with four exact arithmetic instructions instead of seven. Guard positive step values divisible by8 with15*step below signed32 overflow. Compact within the same200-byte function and retain literal locations, all memory accesses, predictor clamps and persistent state. No decoding work or output samples removed. Whole-function equivalence requires the original following TST to overwrite changed N/Z before use; unrotated removed TST immediates preserve C/V. Synthetic proof and exact screens/saves do not approve changed RAM/audio. No native guest hook is installed.",
+      "synthetic_validation": {
+        "cases": 4885,
+        "state": "passed",
+        "checks": [
+          "registers and CPSR",
+          "data/stack/table memory",
+          "ordered data accesses"
+        ],
+        "instructions_per_256_outputs": [
+          9487,
+          8207
+        ],
+        "ordered_accesses": 1180,
+        "receipt": "GUEST_NIBBLE_SYNTHETIC_V1.json",
+        "scope": "Ordinary-memory synthetic cases; no interrupt/DMA/cache/native qualification"
+      },
+      "input_manifest": {
+        "file": "GUEST_NIBBLE_INPUT_MANIFEST_V1.json",
+        "sha256": "c3fe73fcf5713082cbeafe4c640dc4f565fadb66504959a5d2334436336ecc69"
+      },
+      "replay_rejection": {
+        "receipt": "GUEST_NIBBLE_FIRST_REPLAY_REVIEW_V1.json",
+        "different_frames": {
+          "top": 0,
+          "bottom": 0,
+          "mainram": 1579,
+          "dtcm": 2356,
+          "arm7wram": 264,
+          "itcm": 0,
+          "sharedwram": 0
+        },
+        "audio_rms_signed16_delta": 0.7969910731312213,
+        "accepted": false,
+        "no_extra_RAM_masks": true
+      },
+      "invariant_evidence": {
+        "admission": "GUEST_NIBBLE_STREAM_ADMISSION_V1.json",
+        "table_and_literal_watch": "GUEST_NIBBLE_FIRST_REPLAY_REVIEW_V1.json",
+        "writes": 108,
+        "writes_after_initial_frame": 0,
+        "entry_contract": "GUEST_NIBBLE_ENTRY_CONTRACT_LUSO_V1.json",
+        "calls": 12456,
+        "entry_indices": [
+          0,
+          72
+        ],
+        "scope": "Table/literal write watch covers Luso, Fire and library; entry-index contract covers Luso only. Loading-time guards are not runtime protection.",
+        "additional_routes": {
+          "FIRE": "GUEST_NIBBLE_PAIR_FIRE_V1.json",
+          "LIBRARY": "GUEST_NIBBLE_PAIR_LIBRARY_V1.json"
+        }
+      },
+      "consumer_evidence": "GUEST_NIBBLE_CONSUMER_FINDINGS_LUSO_V1.json",
+      "additional_replay_coverage": {
+        "FIRE": {
+          "receipt": "GUEST_NIBBLE_PAIR_FIRE_V1.json",
+          "frames": 9000,
+          "different_top_frames": 0,
+          "different_bottom_frames": 1892,
+          "audio": {
+            "stereo_samples": [
+              7220926,
+              7220926
+            ],
+            "lengths_equal": true,
+            "different_stereo_samples": 132737,
+            "max_signed16_delta": 65535,
+            "rms_delta": 777.3621050302868,
+            "first_sample": 1282872,
+            "last_sample": 6157031,
+            "scope": "Same-index signed16 samples; no alignment, masking or audibility judgment"
+          },
+          "RAM_frame_differences": {
+            "frame": 0,
+            "mainram": 6826,
+            "itcm": 0,
+            "dtcm": 7005,
+            "arm7wram": 5281,
+            "sharedwram": 0,
+            "save": 0
+          },
+          "instruction_measurement": {
+            "before": 543588049,
+            "after": 530006396,
+            "reduction_percent": 2.498519425691053,
+            "first_frame": 6500,
+            "end_frame_exclusive": 9000,
+            "scope": "Software executed instructions; not native cycles or speed"
+          },
+          "save_exact": true,
+          "table_and_literal_writes_after_frame0": 0,
+          "accepted": false
+        },
+        "LIBRARY": {
+          "receipt": "GUEST_NIBBLE_PAIR_LIBRARY_V1.json",
+          "frames": 30000,
+          "different_top_frames": 0,
+          "different_bottom_frames": 0,
+          "audio": {
+            "stereo_samples": [
+              24069760,
+              24069760
+            ],
+            "lengths_equal": true,
+            "different_stereo_samples": 0,
+            "max_signed16_delta": 0,
+            "rms_delta": 0.0,
+            "first_sample": null,
+            "last_sample": null,
+            "scope": "Same-index signed16 samples; no alignment, masking or audibility judgment"
+          },
+          "RAM_frame_differences": {
+            "frame": 0,
+            "mainram": 0,
+            "itcm": 0,
+            "dtcm": 0,
+            "arm7wram": 0,
+            "sharedwram": 0,
+            "save": 0
+          },
+          "instruction_measurement": {
+            "before": 750160463,
+            "after": 750160463,
+            "reduction_percent": 0.0,
+            "first_frame": 23300,
+            "end_frame_exclusive": 30000,
+            "scope": "Software executed instructions; not native cycles or speed"
+          },
+          "save_exact": true,
+          "strict_replay_state": "passed_replay_equivalence",
+          "table_and_literal_writes_after_frame0": 0,
+          "accepted": false
+        }
+      },
+      "timing_investigation": {
+        "state": "three_routes_and_both_battle_audio_mechanisms_recorded_not_accepted",
+        "Fire_neighbor_image_receipt": "GUEST_NIBBLE_FIRE_NEIGHBOR_HASH_V1.json",
+        "Fire_audio_plan": "GUEST_NIBBLE_FIRE_AUDIO_PLAN_V1.json",
+        "approval_for_non_bit_exact_release": false,
+        "native_measured": false,
+        "Fire_audio_findings": "GUEST_NIBBLE_FIRE_AUDIO_FINDINGS_V1.json",
+        "Luso_audio_findings": "GUEST_NIBBLE_LUSO_AUDIO_FINDINGS_V1.json",
+        "Luso_writer_findings": "GUEST_NIBBLE_RAM_WRITER_FINDINGS_LUSO_V1.json",
+        "Fire_source_words_exact": 4826361,
+        "Fire_decoded_steps_exact": 13939336,
+        "Fire_changed_note_start_times": 14,
+        "Fire_max_control_mix_callback_shift": 682,
+        "Luso_source_word_mismatches": 3,
+        "Luso_decoded_value_mismatches": 1182,
+        "Luso_ordered_write_payloads_exact": 17272,
+        "Luso_critical_write_ARM9_timestamp_delta": -15605,
+        "all_guest_patches_disabled": true,
+        "remaining": "Native/lifecycle, high-level buffer ownership and remaining visual/RAM semantics unqualified; current version parked under strict gate; continue other FFTA2 hotspots"
+      }
+    },
+    {
+      "id": "dispatch-postindex-search",
+      "pattern": "linear-key-handler-dispatch",
+      "cpu": "arm9",
+      "target": "arm9.bin/main_loaded",
+      "addr": "0x203c094",
+      "mode": "arm",
+      "expect": "10402de90040e0e300e0a0e3080000ea00c092e501005ce10300001a042092e532ff2fe10040a0e1030000ea01e08ee2082082e203005ee1f4ffffba0400a0e11080bde8",
+      "replace": "10402de90040e0e300e0a0e3070000ea08c092e401005ce10300001a042012e532ff2fe10040a0e1020000ea01e08ee203005ee1f5ffffba0400a0e11080bde80000a0e1",
+      "hook": null,
+      "scratch_bytes": 0,
+      "enabled": false,
+      "data_guards": [
+        {
+          "addr": "0x21199c4",
+          "expect": "0100000010b803020200000044b803020300000078b8030204000000acb803020500000010b90302060000002cb903020700000068b903020800000068b903020900000068b903020a00000068b903020c000000f0b903020b00000094ba03021000000038bb03022000000050bb03020d0000009cbb03020e000000e4bb03020f00000008bc0302110000005cbc030212000000b0bc030230000000f4bc03023100000030bd0302320000008cbd030233000000c8bd0302400000001cbe030241000000f4be030242000000e8bf0302430000000cc003023400000064c00302"
+        },
+        {
+          "addr": "0x2119d20",
+          "expect": "000100006c77060201010000488a060202010000948a060203010000a48a060240010000f08a0602040100002c8b060205010000608b060241010000b08b060206010000588c060207010000688d060208010000fc8d06024b010000a48e060209010000c48e06020a0100002c8f06020b010000348f06020c0100004c8f06020d0100008090060261010000089106020e010000c49106020f010000e8910602100100002c92060211010000bc92060212010000dc930602130100006094060214010000ac94060215010000d49406021601000008950602530100002c950602170100005c95060218010000c895060219010000e0950602200100007496060221010000449706022201000078970602230100006099060239010000409b060224010000649b060225010000889b060226010000289c060227010000a49c060228010000bc9c060229010000909e060230010000f49f06023101000040a006023201000068a0060233010000a4a0060234010000aca0060235010000bca0060236010000c4a0060237010000d4a0060238010000dca006025901000020a106023a01000078a106023b01000090a106023c010000bca106023d01000034a206023e01000088a206023f010000a8a2060242010000c0a206024301000008a306024401000020a306024501000038a306024601000070a3060247010000aca3060248010000bca3060249010000e4a306024a01000048a406024c01000080a406024d010000c4a506024f01000074a60602500100000ca706025101000030a70602520100004ca7060254010000b4a8060255010000eca8060256010000fca806025701000060a90602580100008ca906025a010000d4a906025b01000024b006025c010000a0b006025d010000bcb006025e01000060b106025f01000094b1060260010000b8b1060262010000f8b10602630100001cb206026401000050b2060265010000b4b2060266010000ccb2060267010000f0b206026801000000b306026901000034b306026a0100004cb306026b0100008cb306026c0100009cb306026d010000a4b306026e01000014b406026f01000050b406027001000074b40602710100007cb4060272010000a8b40602730100007cb5060274010000e0b50602750100004cb606027601000074b606027701000094b6060278010000acb6060279010000c4b606027a010000d4b606027b010000ecb606027c01000000b706027d01000040b706027e01000058b706027f010000e4b7060280010000fcb70602810100005cb80602820100009cb8060283010000d4b80602840100002cbc0602850100003cbc0602860100006cbc060287010000dcbc06028801000074be0602890100009cbe06028a010000bcbe06028b01000000bf06028c01000034bf06028d01000088bf06028e010000ecbf06028f010000a0c0060290010000f8c006029101000020c306029201000070c306029301000088c306029401000034c406029501000058c406029601000040c60602"
+        },
+        {
+          "addr": "0x211aa80",
+          "expect": "00050000e0120c020105000030130c020205000064130c0203050000c0130c0210050000d0130c021105000010140c022005000058140c022105000098140c0222050000d8140c022305000008150c023005000094150c02400500002c160c024105000098160c0242050000e0160c02430500003c170c024405000098170c02500500000c180c025105000090180c0260050000e0180c026105000054190c026205000084190c0270050000e4190c0272050000e81a0c02730500005c1b0c02640500009c1b0c0265050000f01b0c0266050000381c0c0267050000881c0c0274050000e81c0c0276050000541e0c02750500002c1f0c0224050000f8200c02770500005c220c022607000068230c0225050000b4230c02260500000c240c022705000044240c02780500008c240c02790500002c250c0228050000b4250c0229050000fc250c027a0500002c260c027b05000090260c026805000098270c02"
+        },
+        {
+          "addr": "0x211abe0",
+          "expect": "0007000038790d0201070000e0790d0208070000547a0d02090700009c7a0d020a070000d87a0d020c070000187b0d0210070000c47c0d0211070000087d0d0212070000507d0d0213070000947d0d0214070000e07d0d0215070000307e0d0216070000747e0d0217070000fc7e0d0218070000607f0d0219070000b87f0d021a07000010800d021b0700005c800d021c07000044810d021d070000a4810d021e070000e8810d020207000088820d0203070000a0820d020407000028830d0207070000b4830d0205070000f8830d0206070000cc840d020b07000018850d024007000070850d0241070000bc850d02420700004c860d0243070000e8860d024407000030870d024507000078870d02460700006c880d0247070000a0880d020d070000d4880d0248070000ec880d024907000090890d024a070000ac890d020f070000c8890d021f070000008b0d024b070000d08c0d0220070000208d0d024c070000ac8d0d024d070000d08d0d024e070000e88d0d024f070000088e0d02500700003c8e0d0251070000988e0d0252070000cc8e0d0253070000908f0d022107000010900d025407000054900d025507000070900d0256070000a4900d022207000010910d02230700007c910d0224070000bc910d0225070000f0910d022607000074920d0257070000c0920d025807000048930d025a0700006c930d025b07000020940d025c070000bc940d025d07000080950d025e070000dc950d025f07000010960d02600700004c960d026107000088960d0262070000bc960d022707000004970d022807000060970d0229070000c0970d02630700000c980d026407000024980d02650700006c980d0266070000a8980d0267070000e4980d02680700004c990d0269070000689a0d026a0700005c9b0d026b070000a09b0d026c070000309c0d022a070000889c0d026d070000a09c0d026e070000e09c0d026f070000189d0d0270070000c89d0d0278070000409e0d0279070000649e0d027a070000c09e0d027b070000f49e0d027c070000349f0d027d070000589f0d027f0700007c9f0d0280070000d49f0d028107000014a00d028207000078a00d0283070000aca00d0284070000d0a00d0285070000fca00d022b07000038a10d022c070000f8a10d02860700002ca20d028807000080a20d0289070000f8a20d028a07000054a30d028b070000d8a30d028c07000034a40d028d0700007ca40d022d070000b4a40d022e07000014a50d022f07000070a50d02"
+        },
+        {
+          "addr": "0x211b1a8",
+          "expect": "3007000014e20e02310700001ce20e023207000024e20e023307000034e20e02340700003ce20e02"
+        }
+      ],
+      "status": "rejected_current_bit_exact_budget_after_library_replay",
+      "validated": {
+        "synthetic_cases": 1520,
+        "fb": "top exact30000/30000; bottom differs1/30000",
+        "ram": "fails after exact68-byte code normalization",
+        "audio": "405899/24069760stereo samples differ; max signed16delta4025",
+        "save": "bit-exact all frames and final",
+        "lifecycle": "not qualified",
+        "native": "not measured"
+      },
+      "gain": {
+        "library_ARM9_instruction_reduction_percent": 0.7134864157723545,
+        "native": null
+      },
+      "notes": "Same-size68-byte candidate. Postindexed key load advances by8; hit handler pointer uses-4. BLX remains0203c0b4 to preserve callee LR and stack bytes. Same ordered reads on each path; no extra memory. Five table guards constrain initial qualification, not runtime immutability. Full library replay fails; no additional battle/native trials for this rejected version. No audio-source or audibility equivalence claimed.",
+      "evidence": [
+        "GUEST_DISPATCH_SYNTHETIC_V1.json",
+        "GUEST_DISPATCH_ADMISSION_V1.json",
+        "GUEST_DISPATCH_PAIR_LIBRARY_V1.json",
+        "GUEST_DISPATCH_CHECKPOINTS_LIBRARY_V1.json"
+      ]
+    }
+  ],
+  "arm9_crc32": "5f2f17b3"
+}

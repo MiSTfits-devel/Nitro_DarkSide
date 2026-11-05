@@ -47,6 +47,10 @@ module tb_nds_h3d_frame_packet_writer;
     logic [63:0] write_log_data [0:MAX_WRITES-1];
     integer write_log_count = 0;
     integer accepted_reads = 0;
+    integer burst_index = 0;
+    logic [28:0] burst_base;
+    logic [7:0] burst_length;
+    logic [28:0] effective_write_address;
     integer input_handshakes = 0;
     integer boundary_handshakes = 0;
     integer completed_packets = 0;
@@ -117,6 +121,10 @@ module tb_nds_h3d_frame_packet_writer;
             address,
             12'd0, 4'hf, tag, kind
         };
+    endfunction
+
+    function automatic logic [127:0] fence_for(input logic [31:0] request_id);
+        fence_for = {64'd0, request_id, 32'd10};
     endfunction
 
     task automatic wait_initialized;
@@ -286,6 +294,7 @@ module tb_nds_h3d_frame_packet_writer;
             ddram_busy = 0;
             ddram_accept_enable = 0;
             read_pending = 0;
+            burst_index = 0;
             delayed_read_ready = 0;
             session = new_session;
             memory[CONTROL_BASE + 1] = {32'd0, new_session};
@@ -326,9 +335,10 @@ module tb_nds_h3d_frame_packet_writer;
     end
 
     always @(posedge clk) begin
-        if (ddram_burst_count !== 8'd1 ||
-            ddram_byte_enable !== 8'hff)
-            $fatal(1, "writer used burst or partial DDR byte enable");
+        if (ddram_byte_enable !== 8'hff)
+            $fatal(1, "writer used partial DDR byte enable");
+        if (ddram_read && (ddram_burst_count !== 8'd1 || burst_index != 0))
+            $fatal(1, "read interrupted a payload burst");
         if (ddram_busy && (ddram_read || ddram_write))
             $fatal(1, "writer requested DDR while busy was asserted");
         if ((ddram_read || ddram_write) && !ddram_busy &&
@@ -364,15 +374,25 @@ module tb_nds_h3d_frame_packet_writer;
         end
 
         if (ddram_command_accepted && ddram_write) begin
-            if (ddram_address >= MEMORY_WORDS)
-                $fatal(1, "DDR write outside test memory: %h",
-                       ddram_address);
+            if (burst_index == 0) begin
+                burst_base = ddram_address;
+                burst_length = ddram_burst_count;
+                if (burst_length < 1 || burst_length > 8)
+                    $fatal(1, "invalid payload burst length");
+            end else if (ddram_address !== burst_base ||
+                         ddram_burst_count !== burst_length)
+                $fatal(1, "burst address/count changed before final beat");
+            effective_write_address = burst_base + burst_index;
+            if (effective_write_address >= MEMORY_WORDS)
+                $fatal(1, "DDR write outside test memory");
             if (write_log_count >= MAX_WRITES)
                 $fatal(1, "write log overflow");
-            write_log_address[write_log_count] = ddram_address;
+            write_log_address[write_log_count] = effective_write_address;
             write_log_data[write_log_count] = ddram_write_data;
             write_log_count = write_log_count + 1;
-            memory[ddram_address] = ddram_write_data;
+            memory[effective_write_address] = ddram_write_data;
+            burst_index = burst_index + 1;
+            if (burst_index == burst_length) burst_index = 0;
         end
 
         if (ddram_command_accepted && ddram_read) begin
@@ -540,6 +560,132 @@ module tb_nds_h3d_frame_packet_writer;
         send_boundary(32'd81);
         wait_packet(packet_target);
         verify_packet(log_start, 8, 2, 81, 32'h00000002);
+
+        pulse_flush(9, 0, 64'd0);
+        wait_initialized();
+
+        // A short prefix ends at the query immediately, without a SWAP or
+        // VBlank. Frame ownership remains open for the next continuation.
+        log_start = write_log_count;
+        expected_record_count = 2;
+        expected_records[0] = record_for(40);
+        expected_records[1] = fence_for(32'hface0001);
+        packet_target = completed_packets + 1;
+        send_record(expected_records[0], 90, 0);
+        send_record(expected_records[1], 90, 0);
+        wait_packet(packet_target);
+        verify_packet(log_start, 9, 1, 90, 32'h00000001);
+
+        // The prior packet can end exactly at capacity before the fence,
+        // making the fence the only record of the next continuation.
+        log_start = write_log_count;
+        expected_record_count = 3;
+        packet_target = completed_packets + 1;
+        for (index = 0; index < 3; index = index + 1) begin
+            expected_records[index] = record_for(41 + index);
+            send_record(expected_records[index], 90, 0);
+        end
+        wait_packet(packet_target);
+        verify_packet(log_start, 9, 2, 90, 32'h00000001);
+        log_start = write_log_count;
+        expected_record_count = 1;
+        expected_records[0] = fence_for(32'hface0002);
+        packet_target = completed_packets + 1;
+        send_record(expected_records[0], 90, 0);
+        wait_packet(packet_target);
+        verify_packet(log_start, 9, 3, 90, 32'h00000001);
+
+        // A fence at the final available record is still exactly one CONT,
+        // never an extra empty packet or an accidental FRAME_END.
+        log_start = write_log_count;
+        expected_record_count = 3;
+        expected_records[0] = record_for(44);
+        expected_records[1] = record_for(45);
+        expected_records[2] = fence_for(32'hface0003);
+        packet_target = completed_packets + 1;
+        for (index = 0; index < 3; index = index + 1)
+            send_record(expected_records[index], 90, 0);
+        wait_packet(packet_target);
+        verify_packet(log_start, 9, 4, 90, 32'h00000001);
+        if (!full)
+            $fatal(1, "readback continuations did not fill four-slot ring");
+
+        // The fifth query cannot be dropped, acknowledged, or overwrite a
+        // live slot; it remains held until HPS grants a physical slot credit.
+        log_start = write_log_count;
+        expected_record_count = 1;
+        expected_records[0] = fence_for(32'hface0004);
+        packet_target = completed_packets + 1;
+        handshakes_before_full = input_handshakes;
+        fork
+            send_record(expected_records[0], 90, 0);
+            begin
+                repeat (40) begin
+                    @(posedge clk);
+                    #1;
+                    if (write_log_count != log_start ||
+                        input_handshakes != handshakes_before_full ||
+                        producer_sequence != 4)
+                        $fatal(1, "full ring lost or prematurely accepted query");
+                end
+                @(negedge clk);
+                memory[CONTROL_BASE + 3] = 64'd1;
+            end
+        join
+        wait_packet(packet_target);
+        verify_packet(log_start, 9, 5, 90, 32'h00000001);
+        @(negedge clk);
+        memory[CONTROL_BASE + 3] = 64'd5;
+        wait_initialized();
+
+        // A later VBlank closes the continued frame with an empty terminal
+        // packet; a later real SWAP and next-frame fence retain their roles.
+        log_start = write_log_count;
+        expected_record_count = 0;
+        packet_target = completed_packets + 1;
+        send_boundary(90);
+        wait_packet(packet_target);
+        verify_packet(log_start, 9, 6, 90, 32'h00000002);
+        log_start = write_log_count;
+        expected_record_count = 1;
+        expected_records[0] = record_for_fields(46, 1, 8'h50, 0);
+        packet_target = completed_packets + 1;
+        send_record(expected_records[0], 91, 1);
+        wait_packet(packet_target);
+        verify_packet(log_start, 9, 7, 91, 32'h00000002);
+        log_start = write_log_count;
+        expected_records[0] = fence_for(32'hface0005);
+        packet_target = completed_packets + 1;
+        send_record(expected_records[0], 92, 0);
+        wait_packet(packet_target);
+        verify_packet(log_start, 9, 8, 92, 32'h00000001);
+        $display("stage readback immediate CONT, capacity edge, full ring, and frame boundaries");
+
+        // Fences have an exact ABI: no ID zero, payload, scanline tag, or
+        // frame-end bit. Reject malformed inputs before touching slot memory.
+        for (index = 0; index < 4; index = index + 1) begin
+            pulse_flush(32'd20 + index, 0, 64'd0);
+            wait_initialized();
+            log_start = write_log_count;
+            @(negedge clk);
+            record = fence_for(32'hface0006);
+            record_frame = 100;
+            record_frame_end = index == 3;
+            case (index)
+                0: record[63:32] = 0;
+                1: record[127:64] = 1;
+                2: record[29:20] = {1'b1, 9'd262};
+                default: begin end
+            endcase
+            record_valid = 1;
+            @(posedge clk);
+            @(negedge clk);
+            record_valid = 0;
+            record_frame_end = 0;
+            if (!fault || fault_reason != 5'd19 ||
+                write_log_count != log_start || producer_sequence != 0)
+                $fatal(1, "malformed query %0d was accepted/published", index);
+        end
 
         // Corrupt HPS acknowledgement (reserved high word nonzero) must fault
         // during initialization and can never release a slot.

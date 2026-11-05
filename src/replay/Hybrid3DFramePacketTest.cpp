@@ -1,6 +1,8 @@
 #include "replay/Hybrid3DFramePacket.h"
+#include "replay/Hybrid3DGxReadback.h"
 
 #include <array>
+#include <chrono>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -11,6 +13,7 @@
 #include <string>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 using namespace nds4mister::h3d::frame_packet;
@@ -135,6 +138,194 @@ Record make_record(RecordKind kind, std::uint32_t ordinal)
     record.address_or_aux = 0x06000000u + ordinal * 4;
     record.data = 0x1234000000000000ull | ordinal;
     return record;
+}
+
+void test_readback_fences()
+{
+    const Record fence {10, 0x12345678, 0};
+    {
+        Fixture fixture;
+        fixture.publish(1, 12, FlagContinuation, {fence});
+        Consumer consumer(fixture.bytes, MappingBytes);
+        PacketHeader header {};
+        std::vector<Record> records;
+        if (!consumer.initialize(fixture.session) ||
+            !consumer.begin(header, records) || records.size() != 1 ||
+            !consumer.accept_all_records() || !consumer.acknowledge())
+            die("valid final-continuation readback fence rejected");
+        if (diagnostic_record_selected(fence) || diagnostic_selected_count(fence))
+            die("readback fence entered texture diagnostic CRC");
+    }
+    const std::vector<Record> malformed {
+        {10, 0, 0}, {10, 1, 1}, {10, 1, std::uint64_t{1} << 32},
+        {10 | (1u << 8), 1, 0}, {10 | (1u << 16), 1, 0},
+        {10 | (1u << 29), 1, 0}, {10 | (1u << 31), 1, 0}
+    };
+    for (const auto& record : malformed) {
+        Fixture fixture;
+        fixture.publish(1, 12, FlagContinuation, {record});
+        Consumer consumer(fixture.bytes, MappingBytes);
+        PacketHeader header {};
+        if (!consumer.initialize(fixture.session) || consumer.begin(header) ||
+            !(consumer.local_faults() & FaultBadRecord))
+            die("malformed readback fence accepted");
+    }
+    for (bool terminal : {false, true}) {
+        Fixture fixture;
+        fixture.publish(1, 12, terminal ? FlagFrameEnd : FlagContinuation,
+            terminal ? std::vector<Record>{fence} :
+                       std::vector<Record>{fence, {1, 0, 0}});
+        Consumer consumer(fixture.bytes, MappingBytes);
+        PacketHeader header {};
+        if (!consumer.initialize(fixture.session) || consumer.begin(header) ||
+            !(consumer.local_faults() & FaultBadRecord))
+            die("readback fence accepted outside continuation tail");
+    }
+}
+
+void test_vram_pair_and_fence()
+{
+    static_assert(static_cast<unsigned>(RecordKind::GxReadbackFence) == 10);
+    static_assert(static_cast<unsigned>(RecordKind::VramWritePair) == 11);
+    const Record pair{make_record_metadata(RecordKind::VramWritePair, 2, 15),
+                      0x06000004, 0x8765432112345678ull};
+    for (unsigned scanline : {0u, 191u, 262u}) {
+        auto tagged = pair;
+        tagged.metadata |= RecordScanlineValid | (scanline << 20);
+        const auto lo = unpack_vram_pair(tagged, 0);
+        const auto hi = unpack_vram_pair(tagged, 1);
+        if (lo.address_or_aux != 0x06000004 || hi.address_or_aux != 0x06000008 ||
+            lo.data != 0x12345678u || hi.data != 0x87654321u ||
+            record_kind(lo) != RecordKind::VramWrite ||
+            record_tag(hi) != 2 || record_byte_enable(lo) != 15 ||
+            record_scanline(hi) != scanline)
+            die("VRAM pair lost word order, access width or scanline");
+        Fixture fixture;
+        const Record fence{10, 123, 0};
+        fixture.publish(1, 10, FlagContinuation, {tagged, fence});
+        Consumer consumer(fixture.bytes, MappingBytes);
+        PacketHeader header{};
+        std::vector<Record> records;
+        if (!consumer.initialize(fixture.session) || !consumer.begin(header, records) ||
+            records.size() != 2 || record_kind(records[0]) != RecordKind::VramWritePair ||
+            record_kind(records[1]) != RecordKind::GxReadbackFence ||
+            !consumer.accept_all_records() || !consumer.acknowledge())
+            die("VRAM pair and ordered readback fence did not coexist");
+    }
+    for (unsigned malformed = 0; malformed < 6; ++malformed) {
+        auto record = pair;
+        switch (malformed) {
+        case 0: record.metadata = make_record_metadata(RecordKind::VramWritePair, 0, 15); break;
+        case 1: record.metadata = make_record_metadata(RecordKind::VramWritePair, 1, 15); break;
+        case 2: record.metadata = make_record_metadata(RecordKind::VramWritePair, 6, 15); break;
+        case 3: record.metadata = make_record_metadata(RecordKind::VramWritePair, 2, 3); break;
+        case 4: record.address_or_aux += 2; break;
+        default: record.metadata |= 0x8000u; break;
+        }
+        Fixture fixture;
+        fixture.publish(1, 10, FlagFrameEnd, {record});
+        Consumer consumer(fixture.bytes, MappingBytes);
+        PacketHeader header{};
+        if (!consumer.initialize(fixture.session) || consumer.begin(header) ||
+            !(consumer.local_faults() & FaultBadRecord))
+            die("malformed VRAM pair accepted");
+    }
+}
+
+void test_readback_publication()
+{
+    namespace rb = nds4mister::h3d::gx_readback;
+    std::vector<std::uint32_t> reads;
+    const auto snapshot = rb::capture(7, 42, [&](std::uint32_t address) {
+        reads.push_back(address);
+        return address ^ 0x12345678u;
+    });
+    if (reads.size() != 26 || reads[0] != 0x04000600 ||
+        reads[1] != 0x04000640 || reads[16] != 0x0400067c ||
+        reads[17] != 0x04000680 || reads[25] != 0x040006a0 ||
+        snapshot[3] != 0 || snapshot[31] != 0)
+        die("readback snapshot address/layout mismatch");
+    std::array<std::uint32_t, 34> guarded;
+    guarded.fill(0xa5a5a5a5);
+    std::vector<std::pair<std::size_t, std::uint32_t>> writes;
+    unsigned session_checks = 0;
+    const auto write = [&](std::size_t index, std::uint32_t value) {
+        if (index >= 32) die("readback wrote outside reply");
+        writes.emplace_back(index, value);
+        guarded[index + 1] = value;
+    };
+    if (!rb::publish(snapshot, [&] {
+            ++session_checks;
+            if (session_checks == 2) {
+                if (guarded[rb::CommitWord + 1] != 0)
+                    die("readback committed before ownership recheck");
+                for (std::size_t i = 0; i < 32; ++i)
+                    if (i != rb::CommitWord && guarded[i + 1] != snapshot[i])
+                        die("readback rechecked ownership before payload");
+            }
+            return true;
+        }, write) || session_checks != 2 || writes.size() != 33 ||
+        writes.front() != std::make_pair(rb::CommitWord, std::uint32_t{0}) ||
+        writes.back() != std::make_pair(rb::CommitWord, std::uint32_t{42}) ||
+        guarded.front() != 0xa5a5a5a5 || guarded.back() != 0xa5a5a5a5)
+        die("readback clear/payload/commit order or range mismatch");
+    writes.clear();
+    session_checks = 0;
+    if (rb::publish(snapshot, [&] { return ++session_checks == 1; }, write) ||
+        guarded[rb::CommitWord + 1] != 0 || writes.size() != 32)
+        die("readback committed after session loss");
+    writes.clear();
+    if (rb::publish(snapshot, [] { return false; }, write) || !writes.empty())
+        die("stale readback touched reply memory");
+}
+
+std::vector<Record> make_copy_oracle_records(std::size_t count)
+{
+    std::vector<Record> records(count);
+    for (std::size_t index = 0; index < records.size(); ++index) {
+        auto& record = records[index];
+        record.metadata = make_record_metadata(
+            RecordKind::GxCommand,
+            static_cast<std::uint8_t>((index * 37u + 11u) & 0xffu), 0);
+        record.address_or_aux =
+            0x89abcdefu ^ static_cast<std::uint32_t>(index * 0x10204081u);
+        record.data = 0x0123456789abcdefull ^
+            (static_cast<std::uint64_t>(index) * 0x0101010101010101ull);
+    }
+    return records;
+}
+
+std::vector<Record> make_captured_264_record_packet()
+{
+    // The retained four-slot H3B1 board snapshot contains this exact record
+    // distribution in every slot: 263 HBlank markers and one VRAM write.
+    std::vector<Record> records(264);
+    for (std::size_t index = 0; index + 1 < records.size(); ++index) {
+        records[index] = Record{
+            make_record_metadata(RecordKind::HBlank, 0, 0),
+            static_cast<std::uint32_t>(index),
+            static_cast<std::uint32_t>(index * 7u + 3u)};
+    }
+    records.back() = make_record(RecordKind::VramWrite, 263);
+    return records;
+}
+
+std::vector<Record> make_busy_1799_record_packet()
+{
+    // This is the measured frame-903 failure shape retained by the service
+    // self-test: 1,799 contiguous halfword VRAM writes in one terminal packet.
+    std::vector<Record> records(1799);
+    for (std::size_t index = 0; index < records.size(); ++index) {
+        const bool upper_half = (index & 1u) != 0;
+        auto& record = records[index];
+        record.metadata = make_record_metadata(
+            RecordKind::VramWrite, 1, upper_half ? 0x0c : 0x03);
+        record.address_or_aux =
+            0x0600c000u + static_cast<std::uint32_t>(index * 2);
+        record.data = static_cast<std::uint32_t>(index) <<
+            (upper_half ? 16 : 0);
+    }
+    return records;
 }
 
 void test_known_rtl_crc()
@@ -296,6 +487,79 @@ void test_direct_packet_copy()
         (torn.local_faults() & FaultTornHeader) == 0 ||
         torn_fixture.word(ControlAcknowledgeOffset) != 0)
         die("direct-copy torn packet exposed or acknowledged");
+}
+
+void test_payload_copy_sizes()
+{
+    // Exercise every four-record remainder plus the two retained real packet
+    // sizes and the protocol maximum. The byte comparison is the copy oracle.
+    constexpr std::array<std::size_t, 13> counts{
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 264, 1799, MaxRecordCount};
+    for (const auto count : counts) {
+        Fixture fixture;
+        const auto records = make_copy_oracle_records(count);
+        fixture.publish(1, 24, FlagFrameEnd, records);
+        Consumer consumer(fixture.bytes, MappingBytes);
+        if (!consumer.initialize(fixture.session))
+            die("payload-size copy init failed");
+        PacketHeader header{};
+        std::vector<Record> copied;
+        if (!consumer.begin(header, copied) || copied.size() != records.size() ||
+            (!records.empty() &&
+             std::memcmp(copied.data(), records.data(),
+                         records.size() * sizeof(Record)) != 0))
+            die("payload-size copy oracle mismatch");
+        if (!consumer.accept_all_records() || !consumer.acknowledge())
+            die("payload-size copy acknowledgement failed");
+    }
+}
+
+void benchmark_payload_case(
+    const char* name, const std::vector<Record>& records,
+    std::uint32_t measured_iterations)
+{
+    constexpr std::uint32_t warmup_iterations = 16;
+    Fixture fixture;
+    Consumer consumer(fixture.bytes, MappingBytes, false);
+    if (!consumer.initialize(fixture.session))
+        die("payload benchmark init failed");
+    PacketHeader header{};
+    std::vector<Record> copied;
+    std::chrono::nanoseconds elapsed{};
+    const auto iterations = warmup_iterations + measured_iterations;
+    for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+        const auto sequence = iteration + 1;
+        fixture.publish(sequence, sequence, FlagFrameEnd, records);
+        const auto start = std::chrono::steady_clock::now();
+        const bool accepted = consumer.begin(header, copied);
+        const auto stop = std::chrono::steady_clock::now();
+        if (!accepted || copied.size() != records.size() ||
+            (!records.empty() &&
+             std::memcmp(copied.data(), records.data(),
+                         records.size() * sizeof(Record)) != 0))
+            die("payload benchmark copy mismatch");
+        if (iteration >= warmup_iterations) elapsed += stop - start;
+        if (!consumer.accept_all_records() || !consumer.acknowledge())
+            die("payload benchmark acknowledgement failed");
+    }
+    const auto nanoseconds = elapsed.count();
+    const auto records_copied =
+        static_cast<std::uint64_t>(records.size()) * measured_iterations;
+    std::cout << "payload_benchmark " << name
+              << " records=" << records.size()
+              << " iterations=" << measured_iterations
+              << " ns_per_packet=" << nanoseconds / measured_iterations
+              << " ps_per_record=" <<
+                     (nanoseconds * 1000) / records_copied
+              << '\n';
+}
+
+void run_payload_benchmark()
+{
+    benchmark_payload_case(
+        "captured_hblank_vram", make_captured_264_record_packet(), 5000);
+    benchmark_payload_case(
+        "frame903_vram_burst", make_busy_1799_record_packet(), 1000);
 }
 
 void test_misaligned_mapping()
@@ -532,12 +796,16 @@ void test_full_four_slot_order()
 
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
     test_known_rtl_crc();
     test_packed_gx_record();
+    test_readback_fences();
+    test_vram_pair_and_fence();
+    test_readback_publication();
     test_one_frame();
     test_direct_packet_copy();
+    test_payload_copy_sizes();
     test_misaligned_mapping();
     test_continuation_chain();
     test_bad_diagnostic();
@@ -550,8 +818,10 @@ int main()
         "H3D frame-packet consumer test\n"
         "known_rtl_crc32c: passed\n"
         "packed_gx_record: passed\n"
+        "readback_validation_commit_order_session_loss: passed\n"
         "one_frame: passed\n"
         "direct_packet_copy: passed\n"
+        "payload_copy_sizes: passed\n"
         "misaligned_mapping: passed\n"
         "continuation_chain: passed\n"
         "diagnostic_match_torn_continuation: passed\n"
@@ -560,4 +830,9 @@ int main()
         "session_change_before_ack: passed\n"
         "malformed_length_kind_reserved: passed\n"
         "full_four_slot_order: passed\n";
+    if (argc == 2 && std::strcmp(argv[1], "--benchmark") == 0) {
+        run_payload_benchmark();
+    } else if (argc != 1) {
+        die("usage: Hybrid3DFramePacketTest [--benchmark]");
+    }
 }

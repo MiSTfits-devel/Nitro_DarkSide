@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "title": "Pokemon SoulSilver",
+  "game_code": "IPGE",
+  "revision": 0,
+  "header_bytes": 352,
+  "header_sha1": "a91340f00feab7b2e4ba9299b22517e0f2bb85e2",
+  "header_crc32": "3a631784",
+  "rom_sha256": "51d0f94a16af7d77c067b4cb7d821ba890a13203a2e2c76049623332c0582e20",
+  "arm9_sha256": "86cbdfa319442e3cadb0dc7a40e0d8d476f9ae8ef87d7d04043b3016529f542a",
+  "arm9_crc32": "63d4835c",
+  "arm7_sha256": "746355ed51b324933542a7c4fcf109a5f83755a97c95b834ffd08caf6d4fafea",
+  "arm7_crc32": "3b3c3c25",
+  "arm7_code_settings_offset": "0x198",
+  "delivery": "append-decoded-overlays-v1",
+  "status": "bounded_native_qualified_private_beta_preparation",
+  "budget": "User-authorized functional/perceptual budget. Raw timing/RAM/audio differences retained.",
+  "patches": [
+    {
+      "id": "overlay1-terrain-visibility",
+      "pattern": "coarse-offscreen-model-culling",
+      "cpu": "arm9",
+      "target": "arm9.overlay",
+      "overlay": 1,
+      "overlay_ram": "0x21e5900",
+      "overlay_file_id": 1,
+      "overlay_sha256": "b6e5572a8098eb76c5527c6dcd873870cb497ea5a7ec4549aa9fd219336756e7",
+      "overlay_stored_sha256": "7365d028537207cf4c72eeb62c0aac28a8323d2f5b93adb30e595aff509ca591",
+      "addr": "0x21f5996",
+      "mode": "thumb",
+      "expect": "184b0baa03cb03c21868164b106002aa042703cb03c27f1efbd118680bab10600220a159800208180ea902aa29f6c7fd",
+      "replace": "a05902218902471878680ea9164a144b29f6f3ff00280bd038000ea9124a104b29f6cdfdc046c046c046c046c046c046",
+      "enabled": false,
+      "hook": null,
+      "scratch_bytes": 0,
+      "data_guards": [
+        {
+          "addr": "0x21f59f8",
+          "expect": "d86b2002e46b2002"
+        },
+        {
+          "addr": "0x2206bd8",
+          "expect": "001000000010000000100000"
+        },
+        {
+          "addr": "0x2206be4",
+          "expect": "001000000000000000000000000000000010000000000000000000000000000000100000"
+        }
+      ],
+      "notes": "Guarded transfer of the accepted HeartGold implementation, independently qualified on owned SoulSilver. Test-only guest-clock fixture excluded from packages. Default disabled; private beta selection must be explicit.",
+      "validated": {
+        "static": "Owned IPGErev0 ROM/header/stored/decoded overlay identity; expected Thumb bytes and constants guarded. No scratch or new service.",
+        "reference": "9600 top-screen hashes exact versus decoded delivery; one bottom-menu redraw difference. Indoor3600 screens exact. RAM/audio timing drift retained.",
+        "native": "Independent native Save and soft-reset reload; cold original/control/candidate loads; house entry/exit and Bag; matched noon stationary views at1GHz.",
+        "scope": "New Bark Town and house only. No whole-game or native full-motion human acceptance claim.",
+        "human_audiovisual_approval": false
+      },
+      "gain": {
+        "reference_arm9_instruction_reduction_percent": 4.353703740282988,
+        "native_plaza_publications_vs_original_percent": 6.466292568434251,
+        "native_plaza_publications_vs_delivery_percent": 6.876572418441795,
+        "native_original_publications_per_second": 18.81204791282064,
+        "native_candidate_publications_per_second": 20.02848996897765,
+        "scope": "Two45-second within-session windows per separately cold-started arm at the same guest noon seed; complete screen-pair publications, not unique FPS."
+      },
+      "evidence": [
+        "SOULSILVER_GUEST_PATCH_REPORT.md",
+        "NATIVE_TERRAIN_CLOCKED_FINDINGS_V1.json",
+        "TERRAIN_REFERENCE_FINDINGS_V1.json",
+        "NATIVE_TERRAIN_VISUAL_REVIEW_V1.json"
+      ],
+      "status": "bounded_native_qualified"
+    },
+    {
+      "id": "overlay61-starter-idle-identical-draw",
+      "pattern": "identical-idle-display-list",
+      "cpu": "arm9",
+      "target": "arm9.overlay",
+      "overlay": 61,
+      "overlay_ram": "0x21e5900",
+      "overlay_file_id": 61,
+      "overlay_sha256": "0e611760f0634ba97ed02053ab5406a5e1c5686b87379ed4e7fdd66c9be89716",
+      "overlay_stored_sha256": "91e057269e046bc2a4b62c4a5977734893436306adafa65b1b413fd5c96659b3",
+      "addr": "0x21e5ef8",
+      "mode": "thumb",
+      "expect": "11e0022803d1201c00f0c8fc0be0d1218900605800220260081c083020581031026060580260da20800023185a68012011680003081810605a689068116880880003814201db00201060201c00f05af9002010b0f8bdc046",
+      "replace": "0ee0022803d1201c00f0c8fc08e0d121890009190a6810608a6810600a691060db20800022581168090b0131682900d300210b0313602b68052b07d13c302058002803d101314907890f02d1201c00f059f9002010b0f8bd",
+      "enabled": false,
+      "hook": null,
+      "scratch_bytes": 0,
+      "notes": "Guarded transfer from HeartGold, independently qualified on owned SoulSilver. Preserves the 104-phase light update and all active selection states; omits duplicate idle draws only in app state5/selection0. No scratch or new service. Default disabled; explicit private beta selection required.",
+      "status": "bounded_native_qualified",
+      "validated": {
+        "static": "Full ROM/header/stored/decoded overlay61 identity and 88 original Thumb bytes guarded. Exact code/resources support reuse of HeartGold synthetic contract; original receipt retained.",
+        "reference": "All3600 idle and8400 selection screen pairs and saves exact against cumulative delivery control. Unrelated house all65 files exact. Intermediate RAM/audio drift retained.",
+        "native": "Matched cold baseline/delivery/candidate at stock1GHz; light period, all species/rotation/zoom/cancel/choice, normal Save, soft reset, cold Continue/party and lab exit checked.",
+        "scope": "Bounded starter selection and adjacent lab/field coverage. Screen-pair publications are not unique animation FPS or whole-game speed. Persistent core save states unsupported.",
+        "human_audiovisual_approval": false
+      },
+      "gain": {
+        "reference_idle_arm9_instruction_reduction_percent": 50.5866388965031,
+        "reference_selection_arm9_instruction_reduction_percent": 7.3602547870344175,
+        "native_baseline_publications_per_second": 14.23100626610488,
+        "native_candidate_publications_per_second": 43.94432321918842,
+        "native_publications_vs_beta1_percent": 208.7928035268603,
+        "native_publications_vs_delivery_percent": 209.16695334845076,
+        "renderer_cpu_reduction_percent": 32.24454773041624,
+        "scope": "Two30-second windows within one independently cold-started session per arm. Complete screen-pair publications, not unique animation FPS, guest cycles, or whole-game speed. No confidence interval claimed."
+      },
+      "evidence": [
+        "SOULSILVER_GUEST_PATCH_REPORT.md",
+        "STARTER_TRANSFER_REFERENCE_QUALIFICATION_V1.json",
+        "STARTER_DRAW_NATIVE_QUALIFICATION_V1.json",
+        "STARTER_DRAW_NATIVE_BEFORE_AFTER_V1.csv"
+      ]
+    }
+  ]
+}

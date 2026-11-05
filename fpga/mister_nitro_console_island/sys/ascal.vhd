@@ -101,6 +101,8 @@ USE ieee.numeric_std.ALL;
 -- PALETTE   : Enable palette for framebuffer 8bpp mode
 -- PALETTE2  : Enable palette for framebuffer 8bpp mode supplied by core
 -- DOWNSCALE : True=Support downscaling False=Downscaling disabled
+-- NEAREST_ONLY: MODE[2:0] must be 000, ADAPTIVE=false, DOWNSCALE_NN=true.
+--             Keep the same nearest pipeline using shifts instead of DSPs.
 -- BYTESWAP  : Little/Big endian byte swap
 -- FRAC      : Fractional bits, subpixel resolution
 -- OHRES     : Max. output horizontal resolution. 1024, 2048, 2304, 2560, 4096
@@ -114,6 +116,7 @@ USE ieee.numeric_std.ALL;
 ENTITY ascal IS
 	GENERIC (
 		MASK         : unsigned(7 DOWNTO 0) :=x"FF";
+		NEAREST_ONLY : boolean := false;
 		RAMBASE      : unsigned(31 DOWNTO 0);
 		RAMSIZE      : unsigned(31 DOWNTO 0) := x"0080_0000"; -- =8MB
 		INTER        : boolean := true;
@@ -129,7 +132,8 @@ ENTITY ascal IS
 		IHRES        : natural RANGE 1 TO 2048 :=2048;
 		N_DW         : natural RANGE 64 TO 128 := 128;
 		N_AW         : natural RANGE 8 TO 32 := 32;
-		N_BURST      : natural := 256 -- 256 bytes per burst
+		N_BURST      : natural := 256; -- 256 bytes per burst
+		INPUT_BURST_RAM_STYLE : string := "no_rw_check"
 		);
 	PORT (
 		------------------------------------
@@ -143,6 +147,7 @@ ENTITY ascal IS
 		i_de  : IN  std_logic; -- Display Enable
 		i_ce  : IN  std_logic; -- Clock Enable
 		i_clk : IN  std_logic; -- Input clock
+		i_capture_disable : IN std_logic := '0'; -- External rotated capture owns writes
 
 		------------------------------------
 		-- Output video
@@ -380,7 +385,7 @@ ARCHITECTURE rtl OF ascal IS
 	SIGNAL i_head : unsigned(127 DOWNTO 0);
 	SIGNAL i_acpt : natural RANGE 0 TO 15;
 	SIGNAL i_dpram : arr_dw(0 TO BLEN*2-1);
-	ATTRIBUTE ramstyle OF i_dpram : SIGNAL IS "no_rw_check";
+	ATTRIBUTE ramstyle OF i_dpram : SIGNAL IS INPUT_BURST_RAM_STYLE;
 	SIGNAL i_endframe0,i_endframe1,i_vss : std_logic;
 	SIGNAL i_wad : natural RANGE  0 TO BLEN*2-1;
 	SIGNAL i_dw : unsigned(N_DW-1 DOWNTO 0);
@@ -1054,6 +1059,23 @@ ARCHITECTURE rtl OF ascal IS
 							 p  : arr_pix(0 TO 3)) RETURN type_poly_t IS
 		VARIABLE t : type_poly_t;
 	BEGIN
+		IF NEAREST_ONLY THEN
+			-- poly_cvt(poly_nn(...)) gives t0=t3=0 and t1/t2=0 or
+			-- 32768. Preserve both partial sums and all pipeline registers
+			-- exactly; multiplication by 32768 is a 15-bit left shift.
+			t := (OTHERS => to_signed(0, 27));
+			IF fi.t1(15)='1' THEN
+				t.r0 := shift_left(resize(signed('0' & p(1).r),27),15);
+				t.g0 := shift_left(resize(signed('0' & p(1).g),27),15);
+				t.b0 := shift_left(resize(signed('0' & p(1).b),27),15);
+			END IF;
+			IF fi.t2(15)='1' THEN
+				t.r1 := shift_left(resize(signed('0' & p(2).r),27),15);
+				t.g1 := shift_left(resize(signed('0' & p(2).g),27),15);
+				t.b1 := shift_left(resize(signed('0' & p(2).b),27),15);
+			END IF;
+			RETURN t;
+		END IF;
 		-- 3.15 * 1.8 = 4.23
 		t.r0:=(fi.t0 * signed('0' & p(0).r) +
 					 fi.t1 * signed('0' & p(1).r));
@@ -1176,7 +1198,7 @@ BEGIN
 			i_push<='0';
 			i_pushhead<='0';
 			i_eol<='0'; -- End Of Line
-			i_freeze <=freeze; -- <ASYNC>
+			i_freeze <=freeze OR i_capture_disable; -- <ASYNC>, input writes only
 			i_bob_deint <= bob_deint;
 			i_iauto<=iauto; -- <ASYNC>
 			i_wreq<='0';

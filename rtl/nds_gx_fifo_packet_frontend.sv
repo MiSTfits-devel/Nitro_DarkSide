@@ -2,10 +2,10 @@
 //
 // Accepted ARM9 GXFIFO and direct-command writes are normalized with the same
 // packed-command rules as nds_gx_command_frontend, then retained in a real
-// 256-entry FIFO until the packet sink accepts them.  Occupancy is therefore
-// the number of normalized command records pending downstream, not raw bus
-// writes.  The input ready signal may stall both CPU and DMA sources; a source
-// must hold valid and payload until acceptance.
+// 256-entry FIFO until the packet sink accepts them. With optional SWAP
+// retirement, occupancy also retains commands waiting behind a SWAP until
+// native VBlank. Counts represent normalized command records, not bus writes.
+// Input ready may stall CPU and DMA; sources hold their payload until accepted.
 //
 // Packet ABI:
 //   [  7:  0] kind = 1 (GX_COMMAND)
@@ -20,10 +20,14 @@
 // record.  A downstream writer closes the frame only after accepting that
 // record; no separate marker is allowed to pass it.
 module nds_gx_fifo_packet_frontend #(
-    parameter integer FIFO_DEPTH = 256
+    parameter integer FIFO_DEPTH = 256,
+    parameter bit SWAP_VBLANK_RETIREMENT = 0
 ) (
     input  logic         clk,
     input  logic         reset,
+    // Native source-clock pulse, independent of queued transport markers.
+    input  logic         lcd_vblank,
+    input  logic         geometry_enabled,
 
     input  logic         write_valid,
     output logic         write_ready,
@@ -48,8 +52,24 @@ module nds_gx_fifo_packet_frontend #(
     output logic         fifo_empty,
     output logic         fifo_below_half,
     output logic         fifo_full,
+    // Minimum architectural busy state, including an empty FIFO whose SWAP
+    // is still waiting for native VBlank. Ordinary command latency is not
+    // modeled by this experiment. Power-off freezes an existing wait.
+    output logic         geometry_busy,
     output logic         packed_active,
-    output logic         protocol_error
+    // Autonomous packed-command expansion still owed for accepted input.
+    // Unlike packed_active, this excludes commands waiting for future params.
+    output logic         normalization_pending,
+    output logic         protocol_error,
+
+    // GXSTAT matrix-stack view (bits 8..13 and 15), tracked from the
+    // normalized command stream in submission order. stack_ack is a GXSTAT
+    // write with bit 15 set: clear the error and reset the projection and
+    // texture stack pointers, as melonDS does.
+    input  logic         stack_ack,
+    output logic [4:0]   pos_stack_level,
+    output logic         proj_stack_level,
+    output logic         stack_error
 );
     localparam integer POINTER_WIDTH =
         FIFO_DEPTH <= 2 ? 1 : $clog2(FIFO_DEPTH);
@@ -125,6 +145,11 @@ module nds_gx_fifo_packet_frontend #(
     // downstream boundary arbiter can identify the oldest real promise
     // without scanning or adding a second read port to the main GX FIFO.
     logic [63:0] swap_timestamp_memory [0:FIFO_DEPTH-1];
+
+    logic [1:0] matrix_mode;
+    logic [5:0] pos_pointer;
+    logic       proj_pointer;
+    logic       tex_pointer;
     logic [POINTER_WIDTH-1:0] swap_write_pointer;
     logic [POINTER_WIDTH-1:0] swap_read_pointer;
     logic [COUNT_WIDTH-1:0] swap_count;
@@ -166,18 +191,35 @@ module nds_gx_fifo_packet_frontend #(
         record_valid && record_ready &&
         command_memory[read_pointer] == 8'h50;
 
-    assign fifo_level = 9'(count);
-    assign fifo_empty = count == 0;
-    assign fifo_below_half = count <= COUNT_WIDTH'(127);
-    assign fifo_full = count == FIFO_DEPTH_COUNT;
+    // Transport acceptance is not geometry retirement. A SWAP stalls the
+    // geometry engine until the next native VBlank, even if ARM has already
+    // received its record. Keep a separate one-bit command-order queue for
+    // this minimum architectural barrier. Ordinary command execution latency
+    // is not modeled here. Never hold transport at SWAP: doing so can block
+    // the ordered LCD events needed by the renderer to complete that SWAP.
+    logic [COUNT_WIDTH-1:0] retirement_count;
+    logic retirement_pop;
+
+    // Report the larger pressure from the two queues. Disabled-geometry
+    // writes still travel to ARM, which ignores them; they consume no new
+    // retirement slots and must not be blocked by an older geometry wait.
+    wire [COUNT_WIDTH-1:0] visible_count =
+        count > retirement_count ? count : retirement_count;
+    assign fifo_level = 9'(visible_count);
+    assign fifo_empty = visible_count == 0;
+    assign fifo_below_half = visible_count <= COUNT_WIDTH'(127);
+    assign fifo_full = visible_count == FIFO_DEPTH_COUNT;
     assign packed_active = packed_command_count != 0;
 
     wire output_pop = record_valid && record_ready;
     wire swap_output_pop = record_frame_end;
-    wire fifo_has_space = !fifo_full || output_pop;
+    wire fifo_has_space =
+        (count != FIFO_DEPTH_COUNT || output_pop) &&
+        (!geometry_enabled || retirement_count != FIFO_DEPTH_COUNT || retirement_pop);
     wire packed_zero_phase =
         packed_command_count != 0 &&
         packed_parameters_remaining == 0;
+    assign normalization_pending = packed_zero_phase;
     wire packed_zero_emits =
         packed_commands[7:0] != 0 ||
         (packed_command_count == 4 && packed_commands == 0);
@@ -220,10 +262,56 @@ module nds_gx_fifo_packet_frontend #(
         ? packed_word_frame : write_frame;
     wire [63:0] enqueue_timestamp = packed_zero_enqueue
         ? packed_word_timestamp : write_timestamp;
+    // MTX_POP's parameter is a signed 6-bit count; modulo-64 subtraction of
+    // its raw bits is the same as melonDS's sign-extended subtraction.
+    wire [5:0] pos_after_pop = pos_pointer - enqueue_parameter[5:0];
+    assign pos_stack_level = pos_pointer[4:0];
+    assign proj_stack_level = proj_pointer;
     assign swap_enqueued = enqueue && enqueue_command == 8'h50;
     assign swap_pending = swap_count != 0;
     assign oldest_swap_timestamp = swap_pending
         ? swap_timestamp_memory[swap_read_pointer] : 64'd0;
+
+    generate if (SWAP_VBLANK_RETIREMENT) begin : swap_retirement
+        logic swap_memory [0:FIFO_DEPTH-1];
+        logic [POINTER_WIDTH-1:0] pointer, tail;
+        logic waiting_vblank;
+        assign geometry_busy = waiting_vblank || retirement_count != 0;
+        wire retirement_enqueue = enqueue && geometry_enabled;
+        assign retirement_pop =
+            retirement_count != 0 && !waiting_vblank && geometry_enabled;
+        always_ff @(posedge clk) begin
+            if (reset) begin
+                pointer <= 0;
+                tail <= 0;
+                retirement_count <= 0;
+                waiting_vblank <= 0;
+            end else begin
+                if (retirement_enqueue) begin
+                    swap_memory[tail] <= enqueue_command == 8'h50;
+                    if (tail == LAST_POINTER) tail <= 0;
+                    else tail <= tail + 1'b1;
+                end
+                if (waiting_vblank && lcd_vblank && geometry_enabled)
+                    waiting_vblank <= 0;
+                if (retirement_pop) begin
+                    // A SWAP starting on VBlank waits for the NEXT pulse.
+                    if (swap_memory[pointer]) waiting_vblank <= 1;
+                    if (pointer == LAST_POINTER) pointer <= 0;
+                    else pointer <= pointer + 1'b1;
+                end
+                case ({retirement_enqueue, retirement_pop})
+                    2'b10: retirement_count <= retirement_count + 1'b1;
+                    2'b01: retirement_count <= retirement_count - 1'b1;
+                    default: ;
+                endcase
+            end
+        end
+    end else begin : transport_only
+        assign retirement_count = 0;
+        assign retirement_pop = 0;
+        assign geometry_busy = 0;
+    end endgenerate
 
     initial begin
         if (FIFO_DEPTH != 256)
@@ -245,6 +333,11 @@ module nds_gx_fifo_packet_frontend #(
             swap_read_pointer <= 0;
             swap_count <= 0;
             protocol_error <= 0;
+            matrix_mode <= 0;
+            pos_pointer <= 0;
+            proj_pointer <= 0;
+            tex_pointer <= 0;
+            stack_error <= 0;
         end else begin
             if (write_valid && gx_aperture &&
                 (!word_access || !aligned_access))
@@ -304,6 +397,47 @@ module nds_gx_fifo_packet_frontend #(
                 2'b01: count <= count - 1'b1;
                 default: count <= count;
             endcase
+
+            // Matrix stacks, mirroring melonDS GPU3D MTX_PUSH/MTX_POP. Games
+            // such as GTA: Chinatown Wars read the position-stack level from
+            // GXSTAT and pop exactly that many at the start of each frame; a
+            // constant zero level lets the pointer drift until it wraps onto
+            // the camera slot.
+            if (stack_ack) begin
+                stack_error <= 1'b0;
+                proj_pointer <= 1'b0;
+                tex_pointer <= 1'b0;
+            end
+            if (enqueue) begin
+                case (enqueue_command)
+                    8'h10: matrix_mode <= enqueue_parameter[1:0];
+                    8'h11: begin
+                        if (matrix_mode == 2'd0) begin
+                            if (proj_pointer) stack_error <= 1'b1;
+                            proj_pointer <= ~proj_pointer;
+                        end else if (matrix_mode == 2'd3) begin
+                            if (tex_pointer) stack_error <= 1'b1;
+                            tex_pointer <= ~tex_pointer;
+                        end else begin
+                            if (pos_pointer > 6'd30) stack_error <= 1'b1;
+                            pos_pointer <= pos_pointer + 6'd1;
+                        end
+                    end
+                    8'h12: begin
+                        if (matrix_mode == 2'd0) begin
+                            if (!proj_pointer) stack_error <= 1'b1;
+                            proj_pointer <= ~proj_pointer;
+                        end else if (matrix_mode == 2'd3) begin
+                            if (!tex_pointer) stack_error <= 1'b1;
+                            tex_pointer <= ~tex_pointer;
+                        end else begin
+                            if (pos_after_pop > 6'd30) stack_error <= 1'b1;
+                            pos_pointer <= pos_after_pop;
+                        end
+                    end
+                    default: ;
+                endcase
+            end
 
             // Exact state transition order from the existing frontend and
             // melonDS GPU3D::WriteToGXFIFO normalization.

@@ -22,15 +22,37 @@ module nds_nitro_console_island (
     input  logic        video_screen_order_select,
     input  logic [1:0]  video_gap_select,
     input  logic        video_fps_select,
+    input  tri0         video_crt_select,
+    input  tri0         video_split_select,
+    input  tri0         video_analog_screen_select,
+    output logic        video_split_active,
+    output logic        video_analog_screen_active,
+    // Pending OSD choice, sampled only at Reset / completed ROM load.
+    input  logic        engine_b_select,
     output logic [1:0]  video_layout_active,
     output logic        video_screen_order_active,
     output logic [1:0]  video_gap_active,
     output logic        video_fps_active,
+    output logic        video_crt_active,
     input  logic [31:0] joystick,
     input  logic [15:0] joystick_analog,
     input  logic        ioctl_download,
     input  logic [15:0] ioctl_index,
+    input  logic [26:0] ioctl_addr,
+    input  logic [15:0] ioctl_dout,
+    input  logic        ioctl_wr,
     output logic        ioctl_wait,
+    input  logic        firmware_io_enable, firmware_io_strobe,
+    input  logic [15:0] firmware_io_din,
+    output logic       firmware_io_override,
+    output logic [15:0] firmware_io_dout,
+    input  logic [64:0] host_rtc,
+    input  logic        firmware_img_mounted, firmware_img_readonly,
+    input  logic [63:0] firmware_img_size,
+    output logic [31:0] firmware_sd_lba,
+    output logic        firmware_sd_rd, firmware_sd_wr,
+    input  logic        firmware_sd_ack,
+    output logic [15:0] firmware_sd_buff_din,
     // MiSTer mounted-save block channel (slot zero, opened automatically by
     // the FS3 ROM selector in the retained shell).
     input  logic        save_img_mounted,
@@ -56,6 +78,8 @@ module nds_nitro_console_island (
     output logic [7:0]  video_r,
     output logic [7:0]  video_g,
     output logic [7:0]  video_b,
+    output logic        analog_ce, analog_de, analog_hs, analog_vs,
+    output logic [7:0]  analog_r, analog_g, analog_b,
     output logic        boundary_fault,
     output logic [15:0] audio_left,
     output logic [15:0] audio_right,
@@ -137,6 +161,75 @@ end
 
 wire cart_hold_ddr = cart_state != CART_READY;
 wire cart_loaded_ddr = cart_state == CART_READY;
+wire firmware_hold, firmware_native, firmware_fault;
+wire firmware_bios7_ready,firmware_bios9_ready,firmware_profile_ready;
+wire firmware_direct_profile_ready;
+wire firmware_mounted,firmware_clean,firmware_cache_fault;
+wire firmware_persist_pending,firmware_flush,firmware_commit;
+wire [15:0] firmware_persist_sequence,firmware_commit_sequence;
+wire [11:0] bios7_load_addr;
+wire [9:0] bios9_load_addr;
+wire [31:0] bios7_load_data,bios9_load_data;
+wire [3:0] bios7_load_be,bios9_load_be;
+wire bios7_load_we,bios9_load_we;
+wire [6:0] builtin_profile_addr;
+wire [31:0] builtin_profile_data;
+wire [3:0] builtin_profile_be;
+wire builtin_profile_we;
+wire [4:0] firmware_profile_addr;
+wire [31:0] firmware_profile_data,firmware_profile_offset,firmware_profile_checksums;
+wire boot_ready_ddr=!firmware_hold && !firmware_fault &&
+    (firmware_native ? (firmware_bios7_ready && firmware_bios9_ready &&
+                       firmware_profile_ready && firmware_mounted) : cart_loaded_ddr);
+wire host_save_ready;
+wire [31:0] host_save_code;
+wire [3:0] host_save_type;
+wire [55:0] rtc_datetime;
+wire rtc_date_written, rtc_io_override, lifecycle_io_override;
+wire [15:0] rtc_io_dout, lifecycle_io_dout;
+assign firmware_io_override = rtc_io_override | lifecycle_io_override;
+assign firmware_io_dout = rtc_io_override ? rtc_io_dout : lifecycle_io_dout;
+nds_rtc_host_bridge rtc_host_bridge (
+    .clk(ddr_clk), .rtc_clk(clk1x), .rtc_datetime, .rtc_date_written,
+    .io_enable(firmware_io_enable), .io_strobe(firmware_io_strobe),
+    .io_din(firmware_io_din), .io_override(rtc_io_override), .io_dout(rtc_io_dout)
+);
+(* async_reg="true" *) logic [2:0] host_save_ready_sync=0;
+always_ff @(posedge clk1x) host_save_ready_sync <= {host_save_ready_sync[1:0],host_save_ready};
+// The bundled code/type are immutable from profile commit until the next ROM
+// download, with CPUs held through both edges and a three-clock valid delay.
+nds_firmware_control #(
+    .CART_464(1),
+`ifdef NDS_ARM_AREA
+    .HOST_SAVE_PROFILE(1), .NAND_SAVES(1)
+`else
+    .HOST_SAVE_PROFILE(0)
+`endif
+) firmware_control (
+    .clk(ddr_clk),.clk7(clk1x),.clk9(clk2x),.reset(media_reset),
+    .cart_download(cart_download_raw),.cart_profile_ready(host_save_ready),
+    .cart_profile_code(host_save_code),.cart_profile_type(host_save_type),
+    .io_enable(firmware_io_enable),.io_strobe(firmware_io_strobe),
+    .io_din(firmware_io_din),.io_override(lifecycle_io_override),.io_dout(lifecycle_io_dout),
+    .ioctl_download,.ioctl_wr,.ioctl_index,.ioctl_dout,.ioctl_addr,.ioctl_wait,
+    .mounted(firmware_mounted),.clean(firmware_clean),.cache_fault(firmware_cache_fault),
+    .persist_pending(firmware_persist_pending),.persist_sequence(firmware_persist_sequence),
+    .hold_console(firmware_hold),.native_mode(firmware_native),
+    .bios7_ready(firmware_bios7_ready),.bios9_ready(firmware_bios9_ready),
+    .profile_ready(firmware_profile_ready),.direct_profile_ready(firmware_direct_profile_ready),.fault(firmware_fault),
+    .flush_req(firmware_flush),.commit_ack(firmware_commit),.commit_sequence(firmware_commit_sequence),
+    .bios7_addr(bios7_load_addr),.bios7_data(bios7_load_data),.bios7_be(bios7_load_be),.bios7_we(bios7_load_we),
+    .bios9_addr(bios9_load_addr),.bios9_data(bios9_load_data),.bios9_be(bios9_load_be),.bios9_we(bios9_load_we),
+    .builtin_addr(builtin_profile_addr),.builtin_data(builtin_profile_data),
+    .builtin_be(builtin_profile_be),.builtin_we(builtin_profile_we),
+    .profile_addr(firmware_profile_addr),.profile_data(firmware_profile_data),
+    .profile_fw_offset(firmware_profile_offset),.profile_fw_checksums(firmware_profile_checksums)
+);
+`ifdef NDS_GX_READBACK_BURST
+localparam bit H3D_READBACK_BURST = 1;
+`else
+localparam bit H3D_READBACK_BURST = 0;
+`endif
 // A hybrid-3D product never lets either CPU run against an absent, stale, or
 // restarting HPS renderer.  The control block lives outside console_reset and
 // raises this release only after its ordered H3DQ/H3D1 session handshake.
@@ -152,8 +245,8 @@ wire h3d_boundary_fatal = 1'b0;
 `endif
 wire save_ready;
 wire console_reset_request = shell_reset | ~island_locked | ~enable |
-    cart_download_raw | cart_hold_ddr | ~h3d_console_release |
-    h3d_fatal_reset | ~save_ready;
+    cart_download_raw | ~boot_ready_ddr | ~h3d_console_release |
+    h3d_fatal_reset | (~firmware_native & ~save_ready);
 // Async assertion prevents either CPU from observing a partially rewritten
 // image.  Each receiving domain deasserts locally; the PLL outputs are related,
 // but none of the four reset releases relies on that relationship.
@@ -165,8 +258,8 @@ wire console_reset_request = shell_reset | ~island_locked | ~enable |
 // fail-closed H3D/CPU reset must not hold HS/VS/CE inactive: doing so makes
 // HDMI sinks report an invalid mode exactly when the console faults.  Keep
 // the scanout and its line-buffer read port alive through cartridge/session
-// and H3D resets; their contents may go black or retain the last frame, but
-// the raster remains continuously valid.
+// and H3D resets. Session validity blanks retained pixels independently,
+// while the raster remains continuously valid.
 wire video_output_reset_request = shell_reset | ~island_locked | ~enable;
 (* async_reg = "true" *) logic [1:0] video_output_reset_sync = 2'b11;
 always_ff @(posedge clk1x or posedge console_reset_request) begin
@@ -194,6 +287,12 @@ wire console_reset_2x = console_reset_sync_2x[1];
 wire console_reset_mem = console_reset_sync_mem[1];
 wire console_reset_ddr = console_reset_sync_ddr[1];
 wire video_output_reset = video_output_reset_sync[1];
+(* async_reg = "true" *) logic [1:0] video_session_reset_sync = 2'b11;
+always_ff @(posedge clk_video or posedge console_reset_request) begin
+    if (console_reset_request) video_session_reset_sync <= 2'b11;
+    else video_session_reset_sync <= {video_session_reset_sync[0], 1'b0};
+end
+wire video_session_reset = video_session_reset_sync[1];
 
 // The card pager is infrastructure for completing the cache-displacing read;
 // unlike the CPUs, it must remain alive throughout CART_DOWNLOAD/CART_FLUSH.
@@ -211,6 +310,7 @@ wire bridge_reset_ddr = bridge_reset_sync_ddr[1];
 // The complete chip address goes to the bridge while only its low nine bits
 // select this M10K.
 wire [19:0] backup_addr;
+wire [3:0] backup_bank;
 wire [7:0] backup_write_data;
 wire backup_write_enable;
 wire [7:0] backup_read_data;
@@ -374,7 +474,11 @@ defparam
     backup_ram.width_byteena_b = 1,
     backup_ram.wrcontrol_wraddress_reg_b = "CLOCK1";
 
-nds_nitro_save_bridge save_bridge (
+// hps_io pipelines the sector-data strobe. Retain the selected slot through
+// that final cycle, so firmware traffic cannot populate the cartridge cache.
+logic [1:0] sector_payload_owner=0;
+always_ff @(posedge clk_video) sector_payload_owner<={firmware_sd_ack,save_sd_ack};
+nds_nitro_save_bridge #(.SAVE_ADDR_BITS(24)) save_bridge (
     .clk(clk_video),
     .reset(save_bridge_reset_video),
     .cart_download(save_cart_event_pulse),
@@ -383,7 +487,7 @@ nds_nitro_save_bridge save_bridge (
     .img_size(save_mount_size),
     .backup_save_type(backup_save_type_sync_video),
     .backup_profile_valid(backup_profile_valid_sync_video),
-    .backup_linear_addr(backup_addr),
+    .backup_linear_addr({backup_bank, backup_addr}),
     .backup_access_active(backup_access_active),
     .backup_write_toggle(backup_write_toggle),
     .save_ready(save_ready),
@@ -396,7 +500,7 @@ nds_nitro_save_bridge save_bridge (
     .sd_buff_addr(save_sd_buff_addr),
     .sd_buff_dout(save_sd_buff_dout),
     .sd_buff_din(save_sd_buff_din),
-    .sd_buff_wr(save_sd_buff_wr),
+    .sd_buff_wr(save_sd_buff_wr && sector_payload_owner[0]),
     .backup_host_addr(backup_host_addr),
     .backup_host_write_data(backup_host_write_data),
     .backup_host_write_enable(backup_host_write_enable),
@@ -410,21 +514,21 @@ nds_nitro_save_bridge save_bridge (
 // from its FPGA-owned word 14, so a same-RBF reload and a reconfiguration
 // cannot accidentally reuse an HPS renderer generation.
 logic [31:0] h3d_session_trigger;
-logic h3d_cart_ready_d;
-always_ff @(posedge ddr_clk or posedge bridge_reset_ddr) begin
-    if (bridge_reset_ddr) begin
-        h3d_session_trigger <= 32'd0;
-        h3d_cart_ready_d <= 1'b0;
-    end else begin
-        h3d_cart_ready_d <= cart_loaded_ddr;
-        if (cart_loaded_ddr && !h3d_cart_ready_d) begin
-            if (h3d_session_trigger == 32'hffffffff)
-                h3d_session_trigger <= 32'd1;
-            else
-                h3d_session_trigger <= h3d_session_trigger + 1'b1;
-        end
-    end
+logic h3d_engine_b_applied;
+(* async_reg = "true" *) logic [1:0] h3d_engine_b_sync_1x;
+always_ff @(posedge clk1x or posedge bridge_reset_ddr) begin
+    if (bridge_reset_ddr) h3d_engine_b_sync_1x <= 2'b00;
+    else h3d_engine_b_sync_1x <=
+        {h3d_engine_b_sync_1x[0], h3d_engine_b_applied};
 end
+wire h3d_cart_ready_rise;
+nds_h3d_session_policy_latch h3d_policy_latch (
+    .clk(ddr_clk), .reset(bridge_reset_ddr),
+    .cart_ready(boot_ready_ddr), .engine_b_select(firmware_native || engine_b_select),
+    .session_trigger(h3d_session_trigger),
+    .engine_b_applied(h3d_engine_b_applied),
+    .cart_ready_rise(h3d_cart_ready_rise)
+);
 `endif
 
 // hps_io registers these levels on clk_video/ddr_clk.  Buttons are slow and
@@ -447,9 +551,16 @@ always_ff @(posedge clk1x or posedge console_reset_1x) begin
 end
 
 // Convert the public beta's right analog stick to native DS pixels for both
-// the console and scanout pointer. Flipping X's sign bit maps -128..127 to
-// 0..255; multiplying Y by 3/4 maps it to 0..191, centered at (128,96).
-wire [7:0] touch_x = {~analog_sync[7],analog_sync[6:0]};
+// the console and scanout pointer. MiSTer's controller range is -127..127, so
+// sign-bit inversion naturally produces X=1..255. Coalesce only native X=1
+// into X=0 after mouse/controller arbitration. This reaches the left edge
+// with a shared one-bit decode; the explicit tradeoff is that mouse X=1 also
+// displays/reports as X=0. Every other mouse pixel remains exact.
+wire [7:0] touch_x_raw = {~analog_sync[7],analog_sync[6:0]};
+wire [7:0] touch_x = {
+    touch_x_raw[7:1],
+    touch_x_raw[0] & (|touch_x_raw[7:1])
+};
 wire [7:0] touch_y_unscaled = {~analog_sync[15],analog_sync[14:8]};
 wire [9:0] touch_y_scaled = {2'b00,touch_y_unscaled} +
                              {2'b00,touch_y_unscaled} +
@@ -485,17 +596,45 @@ always_ff @(posedge clk1x or posedge console_reset_1x) begin
 end
 always_comb begin
     cart_loaded = cart_loaded_sync[1];
-    ioctl_wait = 1'b0;
 end
-wire nds_on = cart_loaded_sync[1] && !console_reset_1x;
+(* async_reg="true" *) logic [1:0] boot_ready_sync=0;
+(* async_reg="true" *) logic [1:0] firmware_native_sync=0,firmware_mounted_sync=0;
+(* async_reg="true" *) logic [1:0] firmware_profile_sync=0,bios7_ready_sync=0,bios9_ready_sync=0;
+always_ff @(posedge clk1x) begin
+    boot_ready_sync<={boot_ready_sync[0],boot_ready_ddr};
+    firmware_native_sync<={firmware_native_sync[0],firmware_native};
+    firmware_mounted_sync<={firmware_mounted_sync[0],firmware_mounted};
+    firmware_profile_sync<={firmware_profile_sync[0],firmware_profile_ready};
+    bios7_ready_sync<={bios7_ready_sync[0],firmware_bios7_ready};
+    bios9_ready_sync<={bios9_ready_sync[0],firmware_bios9_ready};
+end
+wire nds_on = boot_ready_sync[1] && !console_reset_1x;
 
 // Card request/response toggle bridge: the donor card port permits one
 // outstanding word, so payloads stay stable until the acknowledgement returns.
 wire card_ena;
-wire [24:0] card_addr;
+// The standalone host marks extended FS3 media: bit 8 selects LR1,
+// bits 9:8 select the old 316 MiB layout; bits 11,9,8 select the 464 MiB layout.
+// Preserve the old 128 MiB alias for every unmarked download, including all
+// existing hosts. Media mode changes only during replacement, never reset.
+logic cart_large_rom = 1'b0;
+logic cart_512_rom = 1'b0;
+logic cart_464_rom = 1'b0;
+always_ff @(posedge ddr_clk) begin
+    if (cart_download_raw) begin
+        cart_large_rom <= (ioctl_index[5:0] == 6'h03) && ioctl_index[8];
+        cart_512_rom <= (ioctl_index[5:0] == 6'h03) && (&ioctl_index[9:8]);
+        cart_464_rom <= (ioctl_index[5:0] == 6'h03) && (ioctl_index[11] && (&ioctl_index[9:8]));
+    end
+end
+wire [26:0] card_addr;
 logic [31:0] card_din;
 logic card_done;
-logic [24:0] card_addr_hold;
+logic [26:0] card_addr_hold;
+wire [26:0] card_addr_effective = {
+    card_addr_hold[26] & cart_512_rom,
+    card_addr_hold[25] & cart_large_rom, card_addr_hold[24:0]
+};
 logic card_req_toggle;
 (* async_reg = "true" *) logic [2:0] card_rsp_sync;
 logic card_rsp_toggle;
@@ -525,26 +664,44 @@ end
 logic card_req_seen;
 logic cd_busy;
 logic cd_flush;
+logic cd_cancel;
 logic cd_req;
-logic [24:0] cd_addr;
+logic [25:0] cd_addr;
+logic cd_padding;
+logic cd_altbank;
+wire card_upper_bank = cart_512_rom && (card_addr_effective >= 27'h3f00000);
+wire card_padding = cart_464_rom ? (card_addr_effective >= 27'h7400000)
+                   : cart_512_rom ? (card_addr_effective >= 27'h4f00000)
+                                    : (&card_addr_effective[25:20]);
 // ddram ch2 retains one aligned four-beat cartridge read-ahead line. Probe
 // byte 0, then byte 32 (beat 4): the probes cannot share a line, so probe 1
 // proves a real post-download DDR read displaced any stale pre-download line.
-localparam logic [24:0] FLUSH_PROBE0_WORD = 25'd0;
-localparam logic [24:0] FLUSH_PROBE1_WORD = 25'd8;
+localparam logic [25:0] FLUSH_PROBE0_WORD = 26'd0;
+localparam logic [25:0] FLUSH_PROBE1_WORD = 26'd8;
 logic [1:0] flush_probe_count;
 wire cd_ready;
 wire [31:0] cd_dout;
-always_ff @(posedge ddr_clk or posedge bridge_reset_ddr) begin
-    if (bridge_reset_ddr) begin
+// ddram ch2 has no guest reset. Keep its queued/accepted command owned until
+// the response drains, just like framebuffer ch6 and the outer DDR fabric.
+`ifdef NDS_HYBRID_3D
+logic h3d_fabric_boot_reset = 1'b1;
+wire card_bridge_boot_reset = h3d_fabric_boot_reset;
+`else
+wire card_bridge_boot_reset = bridge_reset_ddr;
+`endif
+always_ff @(posedge ddr_clk or posedge card_bridge_boot_reset) begin
+    if (card_bridge_boot_reset) begin
         card_req_sync <= '0;
         card_req_seen <= 1'b0;
         card_rsp_toggle <= 1'b0;
         card_rsp_data <= '0;
         cd_busy <= 1'b0;
         cd_flush <= 1'b0;
+        cd_cancel <= 1'b0;
         cd_req <= 1'b0;
         cd_addr <= '0;
+        cd_padding <= 1'b0;
+        cd_altbank <= 1'b0;
         flush_probe_count <= 2'd0;
         flush_complete <= 1'b0;
     end else begin
@@ -552,15 +709,22 @@ always_ff @(posedge ddr_clk or posedge bridge_reset_ddr) begin
         cd_req <= 1'b0;
         flush_complete <= 1'b0;
 
-        // Start a new bridge epoch with the download.  While the console is
-        // held reset, continuously consume/align any old toggle that was still
-        // crossing so it cannot become the first request of the new image.
-        if (cart_download_ddr && !cart_download_d) begin
+        // A CPU/HPS reset also clears the source toggle, even with the same
+        // ROM still mounted. Align both ends without treating that clear as
+        // a new read of word zero. Retire old replies without delivering them
+        // to the new CPU epoch; do not cancel the physical DDR transaction.
+        if (console_reset_ddr) begin
+            card_req_sync <= '0;
+            card_req_seen <= 1'b0;
+            card_rsp_toggle <= 1'b0;
+            if (cd_busy && !cd_flush) cd_cancel <= 1'b1;
+        end
+        if (bridge_reset_ddr || (cart_download_ddr && !cart_download_d)) begin
             card_req_sync <= '0;
             card_req_seen <= 1'b0;
             card_rsp_toggle <= 1'b0;
             flush_probe_count <= 2'd0;
-        end else if (cart_state != CART_READY) begin
+        end else if (!console_reset_ddr && cart_state != CART_READY) begin
             card_req_seen <= card_req_sync[2];
         end
 
@@ -570,32 +734,53 @@ always_ff @(posedge ddr_clk or posedge bridge_reset_ddr) begin
             // Both probes win over card requests. Do not launch one on the
             // first edge of a replacement download; any already-outstanding
             // probe may drain, but its completion cannot qualify that epoch.
-            if ((cart_state == CART_FLUSH) && !cart_download_raw &&
-                !cart_download_ddr && (flush_probe_count != 2'd2)) begin
+            if (!bridge_reset_ddr && (cart_state == CART_FLUSH) &&
+                !cart_download_raw && !cart_download_ddr && (flush_probe_count != 2'd2)) begin
                 cd_addr <= (flush_probe_count == 2'd0)
                     ? FLUSH_PROBE0_WORD : FLUSH_PROBE1_WORD;
+                cd_altbank <= 1'b0;
                 cd_flush <= 1'b1;
+                cd_padding <= 1'b0;
+                cd_cancel <= 1'b0;
                 cd_req <= 1'b1;
                 cd_busy <= 1'b1;
                 flush_probe_count <= flush_probe_count + 1'b1;
-            end else if ((cart_state == CART_READY) && !cart_download_raw &&
-                         !cart_download_ddr &&
+            end else if (!console_reset_ddr && (cart_state == CART_READY) &&
+                         !cart_download_raw && !cart_download_ddr &&
                          (card_req_sync[2] != card_req_seen)) begin
                 card_req_seen <= card_req_sync[2];
-                cd_addr <= card_addr_hold;
+                // 464 mode maps 252..276 MiB to 0x22800000..0x24000000,
+                // then 276..464 MiB to 0x24400000..0x30000000. Scaler and
+                // TATE buffers retain exclusive ownership of the gaps.
+                // Old 512 hosts retain their rotated 64 MiB bank at0x28000000.
+                if (card_upper_bank && cart_464_rom)
+                    cd_addr <= card_addr_effective < 27'h4500000
+                        ? card_addr_effective - 27'h3500000
+                        : card_addr_effective - 27'h3400000;
+                else
+                    cd_addr <= card_upper_bank ? {2'b10,card_addr_effective[23:0]}
+                                               : card_addr_effective[25:0];
+                cd_altbank <= card_upper_bank;
                 cd_flush <= 1'b0;
-                cd_req <= 1'b1;
+                cd_cancel <= 1'b0;
+                // The matching host validates every omitted byte as FF.
+                // LR1 protects 252..256 MiB; 512 modes protect their validated FF tail.
+                // All boundaries are 32-byte aligned, so a four-beat refill
+                // below them cannot cross into graphics or omitted padding.
+                cd_padding <= card_padding;
+                cd_req <= !card_padding;
                 cd_busy <= 1'b1;
             end
-        end else if (cd_ready) begin
+        end else if (cd_ready || cd_padding) begin
             cd_busy <= 1'b0;
             if (cd_flush) begin
-                if ((flush_probe_count == 2'd2) && !cart_download_raw &&
-                    !cart_download_ddr)
+                if (!bridge_reset_ddr && (flush_probe_count == 2'd2) &&
+                    !cart_download_raw && !cart_download_ddr)
                     flush_complete <= 1'b1;
-            end else if ((cart_state == CART_READY) && !cart_download_raw &&
-                         !cart_download_ddr) begin
-                card_rsp_data <= cd_dout;
+            end else if (!console_reset_ddr && !cd_cancel &&
+                         (cart_state == CART_READY) &&
+                         !cart_download_raw && !cart_download_ddr) begin
+                card_rsp_data <= cd_padding ? 32'hffffffff : cd_dout;
                 card_rsp_toggle <= ~card_rsp_toggle;
             end
         end
@@ -622,15 +807,42 @@ wire [31:0] fw_data;
 wire fw_wr;
 wire [1:0] fw_wlane;
 wire [7:0] fw_wdata;
+wire fw_release,fw_busy,native_fw_busy;
+wire generated_fw_done,native_fw_done;
+wire [31:0] generated_fw_data,native_fw_data;
+logic generated_write_done=0;
+// Supplied firmware backs the optional native GUI only. A mounted GUI image
+// must not add SD-backed SPI reads or busy stalls to ordinary cartridge play.
+wire use_native_firmware=firmware_native_sync[1] && firmware_mounted_sync[1];
+always_ff @(posedge clk1x) generated_write_done<=fw_wr && !use_native_firmware;
+assign fw_done=use_native_firmware?native_fw_done:(generated_fw_done|generated_write_done);
+assign fw_data=use_native_firmware?native_fw_data:generated_fw_data;
+assign fw_busy=use_native_firmware && native_fw_busy;
 nds_nitro_firmware firmware (
     .clk(clk1x),
     .fw_addr(fw_addr),
-    .fw_req(fw_req),
-    .fw_done(fw_done),
-    .fw_data(fw_data),
-    .fw_wr(fw_wr),
+    .fw_req(fw_req && !use_native_firmware),
+    .fw_done(generated_fw_done),
+    .fw_data(generated_fw_data),
+    .fw_wr(fw_wr && !use_native_firmware),
     .fw_wlane(fw_wlane),
-    .fw_wdata(fw_wdata)
+    .fw_wdata(fw_wdata),
+    .cfg_we(builtin_profile_we),.cfg_addr(builtin_profile_addr),
+    .cfg_data(builtin_profile_data),.cfg_be(builtin_profile_be)
+);
+nds_firmware_cache native_firmware_cache (
+    .clk(ddr_clk),.guest_clk(clk1x),.reset(media_reset),.enable(firmware_mounted),
+    .img_mounted(firmware_img_mounted),.img_readonly(firmware_img_readonly),.img_size(firmware_img_size),
+    .fw_addr,.fw_req(fw_req && use_native_firmware),
+    .fw_wr(fw_wr && use_native_firmware),.fw_wlane,.fw_wdata,
+    .fw_release(fw_release && use_native_firmware),
+    .fw_done(native_fw_done),.fw_data(native_fw_data),.fw_busy(native_fw_busy),
+    .flush_req(firmware_flush),.commit_ack(firmware_commit),.commit_sequence(firmware_commit_sequence),
+    .mounted(firmware_mounted),.clean(firmware_clean),.fault(firmware_cache_fault),
+    .persist_pending(firmware_persist_pending),.persist_sequence(firmware_persist_sequence),
+    .sd_lba(firmware_sd_lba),.sd_rd(firmware_sd_rd),.sd_wr(firmware_sd_wr),.sd_ack(firmware_sd_ack),
+    .sd_buff_addr(save_sd_buff_addr),.sd_buff_dout(save_sd_buff_dout),
+    .sd_buff_wr(save_sd_buff_wr && sector_payload_owner[1]),.sd_buff_din(firmware_sd_buff_din)
 );
 
 ////////////////////////////  SDRAM  ////////////////////////////////////
@@ -658,12 +870,16 @@ wire  [1:0] vsrv_bank_c;
 wire [14:0] vsrv_addr_c;
 wire  [3:0] vsrv_be_c;
 wire [31:0] vsrv_din_c;
+wire        vsrv_seq_c, vsrv_wide_c, vsrv_more_c;
+wire [31:0] vsrv_din_hi_c;
+wire  [3:0] vsrv_be_hi_c;
 wire        vrsrv_req_c;
 wire  [1:0] vrsrv_bank_c;
 wire [13:0] vrsrv_addr_c;
 wire        vrsrv_ready_c;
 
 reg  [31:0] vsrv_dout_r;
+reg  [31:0] vsrv_dout_hi_r; // the rest of the line, for nds_vram's RD_LINE_BUF
 reg  [63:0] vrsrv_dout_r;   // 64-bit A..D line, see nds_vram's rsrv_* port
 reg         vsrv_done_r,  vrsrv_done_r;
 
@@ -678,18 +894,30 @@ wire [63:0] sd_ch1_dout;
 wire        sd_ch1_accept;
 
 // ---- vsrv arbiter: park main RAM, run one ch2 op, hand ch2 back ----
+// A_HOLD keeps main RAM parked for a few cycles after an op when nds_vram says
+// more srv work is already waiting (vsrv_more). The next op then goes straight
+// to SDRAM: parking takes more than a clk1x period, which was as long as the
+// SDRAM write itself, and a DMA into banks A..D pays it for every word.
 localparam A_IDLE  = 2'd0;
 localparam A_DRAIN = 2'd1;
 localparam A_WAIT  = 2'd2;
+localparam A_HOLD  = 2'd3;
+// long enough for the next op to arrive when nds_vram goes through IDLE for it
+// (done, the clk1x edge that sees it, one more clk1x edge, seq detect, pend)
+localparam [3:0] HOLD_CYCLES = 4'd12;
 
 reg  [1:0] arb_state = A_IDLE;
-reg        vs_req_d = 0, vs_pend = 0, vs_fin = 0;
+reg        vs_seq_d = 0, vs_pend = 0, vs_fin = 0;
 reg        sd_vs_req = 0;
 reg [26:0] vs_adr;
 reg        vs_rnw;
 reg  [3:0] vs_be;
 reg [31:0] vs_din;
+reg        vs_wide;
+reg  [3:0] vs_be_hi;
+reg [31:0] vs_din_hi;
 reg  [2:0] drain_cnt;
+reg  [3:0] hold_cnt;
 
 wire vs_owns = (arb_state == A_WAIT);
 wire mr_done32 = sd_ch2_ready & ~vs_owns;
@@ -700,7 +928,9 @@ wire mr_done64 = sd_ch2_ready64 & ~vs_owns;
 always @(posedge clk_mem or posedge console_reset_mem) begin
 	if (console_reset_mem) begin
 		arb_state <= A_IDLE;
-		vs_req_d <= 0;
+		// tracks rather than clears: nds_vram's toggle is not reset with us,
+		// and a stale difference would start an op nobody asked for
+		vs_seq_d <= vsrv_seq_c;
 		vs_pend <= 0;
 		vs_fin <= 0;
 		sd_vs_req <= 0;
@@ -708,21 +938,32 @@ always @(posedge clk_mem or posedge console_reset_mem) begin
 		vs_rnw <= 0;
 		vs_be <= 0;
 		vs_din <= 0;
+		vs_wide <= 0;
+		vs_be_hi <= 0;
+		vs_din_hi <= 0;
 		drain_cnt <= 0;
+		hold_cnt <= 0;
 		mainram_allow <= 1;
 		vsrv_dout_r <= 0;
+		vsrv_dout_hi_r <= 0;
 		vsrv_done_r <= 0;
 	end else begin
-		vs_req_d  <= vsrv_req_c;
+		vs_seq_d  <= vsrv_seq_c;
 		sd_vs_req <= 0;
 
-	// vsrv_req is clk1x-registered (CLKMEM_RATIO clkMem cycles wide) - edge detect
-	if (vsrv_req_c & ~vs_req_d) begin
+	// A new op is a CHANGE of vsrv_seq, which is clk1x-registered and so stable
+	// for CLKMEM_RATIO clkMem cycles. It used to be a rising edge of vsrv_req;
+	// nds_vram now chains posted-write drains with vsrv_req held high, and an
+	// edge detect never sees those.
+	if (vsrv_seq_c != vs_seq_d) begin
 		vs_pend <= 1;
 		vs_adr  <= {8'd0, vsrv_bank_c, vsrv_addr_c, 2'b00};
 		vs_rnw  <= vsrv_rnw_c;
 		vs_be   <= vsrv_be_c;
 		vs_din  <= vsrv_din_c;
+		vs_wide <= vsrv_wide_c & ~vsrv_rnw_c;
+		vs_be_hi  <= vsrv_be_hi_c;
+		vs_din_hi <= vsrv_din_hi_c;
 	end
 
 	case (arb_state)
@@ -750,11 +991,31 @@ always @(posedge clk_mem or posedge console_reset_mem) begin
 		end
 
 		A_WAIT: begin
-			if (sd_ch2_ready) begin
-				vsrv_dout_r <= sd_ch2_dout;
+			// A read waits for the whole burst: nds_vram keeps the other word
+			// of the line (ch2_dout_hi, with ready64 two cycles after ready).
+			// That also keeps the burst's own ready64 from reaching main RAM
+			// as a done after ch2 has been handed back. ch2_dout holds.
+			if (vs_rnw ? sd_ch2_ready64 : sd_ch2_ready) begin
+				vsrv_dout_r    <= sd_ch2_dout;
+				vsrv_dout_hi_r <= sd_ch2_dout_hi;
 				vs_fin      <= 1;
-				arb_state   <= A_IDLE;
+				hold_cnt    <= 0;
+				arb_state   <= vsrv_more_c ? A_HOLD : A_IDLE;
 			end
+		end
+
+		A_HOLD: begin
+			// mainram_allow has stayed low since the drain that started this
+			// run of ops, so main RAM cannot have an op in flight: no drain
+			if (vs_pend) begin
+				sd_vs_req <= 1;
+				vs_pend   <= 0;
+				arb_state <= A_WAIT;
+			end
+			else if (hold_cnt == HOLD_CYCLES)
+				arb_state <= A_IDLE;
+			else
+				hold_cnt <= hold_cnt + 1'd1;
 		end
 
 		default: arb_state <= A_IDLE;
@@ -916,6 +1177,11 @@ sdram #(
 	.ch2_req   (sd_vs_req | mr_ena),
 	.ch2_cancel(1'b0),
 	.ch2_rnw   (vs_owns ? vs_rnw       : mr_rnw),
+	// 64-bit posted VRAM writes. The odd word is read live by sdram.sv while
+	// the burst runs, which is safe because vs_* only change on the next op.
+	.ch2_wide  (vs_owns & vs_wide),
+	.ch2_din_hi(vs_din_hi),
+	.ch2_be_hi (vs_be_hi),
 	.ch2_ready (sd_ch2_ready),
 	.ch2_ready16(),
 	.ch2_dout_hi(sd_ch2_dout_hi),
@@ -972,91 +1238,6 @@ wire [17:0] fb_pixb_d = pixel_fifo_read[68:51];
 wire [7:0] fb_pixb_y = pixel_fifo_read[50:43];
 wire [7:0] fb_pixb_x = pixel_fifo_read[42:35];
 
-// The production image keeps all telemetry off.  A temporary diagnostic image
-// can enable NDS_BOOT_DIAGNOSTIC together with the framebuffer's legacy debug
-// lane.  Snapshot the live clk1x signals slowly, then hold them across a normal
-// two-stage DDR-domain synchronizer so the twelve published pixels are coherent
-// enough to distinguish reset/loader state from a running CPU.  This cone is
-// absent when NDS_BOOT_DIAGNOSTIC is not defined.
-wire [31:0] dbg_pc9_diag, dbg_pc7_diag, dbg_r0_diag;
-wire [31:0] dbg_lr_diag, dbg_cpsr_diag, dbg_vfy_addr_unused;
-wire [17:0] dbg_vfy_bad_unused, dbg_hwstat_diag;
-wire [31:0] dbg_rsp_unused;
-wire dbg_rsp_stb_unused;
-`ifdef NDS_BOOT_DIAGNOSTIC
-logic [15:0] diag_sample_div9, diag_sample_div7;
-logic [31:0] diag_pc9_hold, diag_pc7_hold, diag_r0_hold;
-logic [31:0] diag_lr_hold;
-logic [17:0] diag_hwstat_hold;
-logic [17:0] diag_heartbeat;
-(* async_reg = "true" *) logic [31:0] diag_pc9_meta, diag_pc9_ddr;
-(* async_reg = "true" *) logic [31:0] diag_pc7_meta, diag_pc7_ddr;
-(* async_reg = "true" *) logic [31:0] diag_r0_meta, diag_r0_ddr;
-(* async_reg = "true" *) logic [31:0] diag_lr_meta, diag_lr_ddr;
-(* async_reg = "true" *) logic [17:0] diag_hwstat_meta, diag_hwstat_ddr;
-
-// ARM9 taps originate on clk2x. Latch the complete bundle in that source
-// domain before it enters the slow, held snapshot crossing.
-always_ff @(posedge clk2x or posedge console_reset_2x) begin
-    if (console_reset_2x) begin
-        diag_sample_div9 <= '0;
-        diag_pc9_hold <= '0;
-        diag_r0_hold <= '0;
-        diag_lr_hold <= '0;
-    end else begin
-        diag_sample_div9 <= diag_sample_div9 + 1'b1;
-        if (&diag_sample_div9) begin
-            diag_pc9_hold <= dbg_pc9_diag;
-            diag_r0_hold <= dbg_r0_diag;
-            diag_lr_hold <= dbg_lr_diag;
-        end
-    end
-end
-
-always_ff @(posedge clk1x or posedge console_reset_1x) begin
-    if (console_reset_1x) begin
-        diag_sample_div7 <= '0;
-        diag_pc7_hold <= '0;
-        diag_hwstat_hold <= '0;
-    end else begin
-        diag_sample_div7 <= diag_sample_div7 + 1'b1;
-        if (&diag_sample_div7) begin
-            diag_pc7_hold <= dbg_pc7_diag;
-            diag_hwstat_hold <= dbg_hwstat_diag;
-        end
-    end
-end
-
-// The diagnostic publisher and heartbeat intentionally use bridge_reset_ddr,
-// which stays released during CART_DOWNLOAD/CART_FLUSH. This makes a reset or
-// flush stall observable instead of silencing the diagnostic channel.
-always_ff @(posedge ddr_clk or posedge bridge_reset_ddr) begin
-    if (bridge_reset_ddr) begin
-        diag_heartbeat <= '0;
-        diag_pc9_meta <= '0; diag_pc9_ddr <= '0;
-        diag_pc7_meta <= '0; diag_pc7_ddr <= '0;
-        diag_r0_meta <= '0; diag_r0_ddr <= '0;
-        diag_lr_meta <= '0; diag_lr_ddr <= '0;
-        diag_hwstat_meta <= '0; diag_hwstat_ddr <= '0;
-    end else begin
-        diag_heartbeat <= diag_heartbeat + 1'b1;
-        diag_pc9_meta <= diag_pc9_hold; diag_pc9_ddr <= diag_pc9_meta;
-        diag_pc7_meta <= diag_pc7_hold; diag_pc7_ddr <= diag_pc7_meta;
-        diag_r0_meta <= diag_r0_hold; diag_r0_ddr <= diag_r0_meta;
-        diag_lr_meta <= diag_lr_hold; diag_lr_ddr <= diag_lr_meta;
-        diag_hwstat_meta <= diag_hwstat_hold;
-        diag_hwstat_ddr <= diag_hwstat_meta;
-    end
-end
-
-wire [17:0] diag_lifecycle = {
-    cart_state, flush_probe_count, flush_complete,
-    cart_download_raw, cart_download_ddr, cart_loaded_ddr,
-    cart_loaded_sync[1], nds_on, console_reset_request, console_reset_1x,
-    bridge_reset_ddr, pll_locked, enable, shell_reset, boot_done, boot_error
-};
-`endif
-
 localparam [27:1] FB_HW_BASE = 27'h7f00000;
 localparam [7:0] FB_BURST = 8'd128;
 wire [27:1] fb5_addr, fb6_addr;
@@ -1064,10 +1245,14 @@ wire [63:0] fb5_din, fb6_dout;
 wire fb5_req, fb5_next, fb5_ready;
 wire fb6_req, fb6_valid, fb6_ready;
 logic pf_tgl, pf_scr, pf_bank, pf_external;
+logic pf_slot, pf_ticket, split_frame_toggle;
+wire [3:0] pf_completed, lb_selected_slot;
+wire [3:0] lb_acquire, lb_hold;
 logic [1:0] pf_frame_bank;
 logic [7:0] pf_line;
 logic [8:0] lb_raddr;
 wire [35:0] lb_q;
+wire lb_valid;
 wire fb_published_frame_toggle;
 wire [1:0] fb_published_frame_bank;
 logic effective_3d_frame_toggle;
@@ -1075,6 +1260,9 @@ logic h3d_external_screen_toggle;
 wire [1:0] h3d_full_frame_bank;
 wire h3d_full_frame_screen;
 wire h3d_external_screen_adopted_toggle;
+wire h3d_external_video_enable;
+wire h3d_scanout_external_quiescent;
+wire h3d_fb_external_quiescent;
 wire [7:0] h3d_scanout_late_count;
 wire [9:0] h3d_fb_fault_flags;
 wire [27:0] h3d_fb_bank_diagnostic;
@@ -1091,9 +1279,17 @@ localparam logic [28:0] H3D_BANK1_WORD   = 29'h07fa8000;
 
 wire h3d_control_active, h3d_control_initialized, h3d_control_fault;
 wire h3d_control_release;
+// clk_video and ddr_clk are the same retained shell clk_sys. The pending OSD
+// bit never drives fetch gating; only the boundary-latched policy does.
+assign h3d_external_video_enable =
+`ifdef NDS_MATCHED_DISPLAY_TEST
+    // Both A-only and paired output live in ARM-owned full-frame banks.
+    // Disabling B pixels must not disable the shared DDR scanout path.
+    h3d_control_release && !bridge_reset_ddr;
+`else
+    h3d_engine_b_applied && h3d_control_release && !bridge_reset_ddr;
+`endif
 wire [31:0] h3d_active_session, h3d_control_fault_bits;
-wire [2:0] h3d_telemetry_index;
-wire h3d_diagnostic_hold_ddr;
 wire h3d_control_read, h3d_control_write;
 wire [7:0] h3d_control_burst;
 wire [28:0] h3d_control_addr;
@@ -1103,39 +1299,12 @@ wire h3d_control_busy, h3d_control_command_accepted;
 wire [63:0] h3d_control_dout;
 wire h3d_control_dout_ready;
 
-// The public crash hold is a bounded DDR-domain lease. Synchronize the level
-// independently into each CPU domain; release is guaranteed by the control
-// block even if the requesting HPS process disappears during capture.
-(* async_reg = "true" *) logic [1:0] h3d_hold_sync_1x;
-(* async_reg = "true" *) logic [1:0] h3d_hold_sync_2x;
-logic h3d_hold_previous_1x, h3d_hold_previous_2x;
-always_ff @(posedge clk1x or posedge bridge_reset_request) begin
-    if (bridge_reset_request) begin
-        h3d_hold_sync_1x <= 2'b00;
-        h3d_hold_previous_1x <= 1'b0;
-    end else begin
-        h3d_hold_sync_1x <= {
-            h3d_hold_sync_1x[0], h3d_diagnostic_hold_ddr
-        };
-        h3d_hold_previous_1x <= h3d_hold_sync_1x[1];
-    end
-end
-always_ff @(posedge clk2x or posedge bridge_reset_request) begin
-    if (bridge_reset_request) begin
-        h3d_hold_sync_2x <= 2'b00;
-        h3d_hold_previous_2x <= 1'b0;
-    end else begin
-        h3d_hold_sync_2x <= {
-            h3d_hold_sync_2x[0], h3d_diagnostic_hold_ddr
-        };
-        h3d_hold_previous_2x <= h3d_hold_sync_2x[1];
-    end
-end
-wire h3d_diagnostic_release_1x =
-    h3d_hold_previous_1x && !h3d_hold_sync_1x[1];
-wire h3d_diagnostic_release_2x =
-    h3d_hold_previous_2x && !h3d_hold_sync_2x[1];
-
+wire h3d_raw_record_valid, h3d_raw_record_ready;
+wire [127:0] h3d_raw_record;
+wire [31:0] h3d_raw_record_frame;
+wire h3d_raw_record_frame_end;
+wire h3d_raw_boundary_valid, h3d_raw_boundary_ready;
+wire [31:0] h3d_raw_boundary_frame;
 wire h3d_record_valid, h3d_record_ready;
 wire [127:0] h3d_record;
 wire [31:0] h3d_record_frame;
@@ -1146,7 +1315,11 @@ wire h3d_record_source_active, h3d_record_ddr_active;
 wire h3d_record_source_fault, h3d_record_ddr_fault;
 wire [3:0] h3d_record_source_fault_reason, h3d_record_ddr_fault_reason;
 wire [8:0] h3d_gx_fifo_level;
+wire h3d_gx_geometry_busy;
 wire h3d_gx_fifo_empty, h3d_gx_fifo_below_half, h3d_gx_fifo_full;
+wire h3d_lcd_vblank;
+wire [6:0] h3d_gx_stack_status;
+wire h3d_gx_stack_ack;
 
 wire h3d_packet_active, h3d_packet_full, h3d_packet_done;
 wire h3d_packet_fault;
@@ -1160,6 +1333,25 @@ wire [7:0] h3d_packet_be;
 wire h3d_packet_busy, h3d_packet_command_accepted;
 wire [63:0] h3d_packet_dout;
 wire h3d_packet_dout_ready;
+
+// One ordered GX-result request from the source owner. The reply RAM stays
+// in the reader; only its synchronous index/data port reaches the console.
+wire h3d_readback_request, h3d_readback_ready;
+wire [31:0] h3d_readback_id;
+wire h3d_readback_response;
+wire [31:0] h3d_readback_response_id, h3d_readback_status;
+wire [4:0] h3d_readback_index;
+wire [31:0] h3d_readback_data;
+wire h3d_readback_source_fault;
+wire h3d_readback_ddr_read, h3d_readback_ddr_busy;
+wire [7:0] h3d_readback_ddr_burst, h3d_readback_ch3_burst;
+wire h3d_readback_ch3_valid;
+wire [28:0] h3d_readback_ddr_address;
+wire h3d_readback_ddr_accepted, h3d_readback_ddr_data_ready;
+wire [63:0] h3d_readback_ddr_data;
+wire h3d_readback_ch3_request, h3d_readback_ch3_ready;
+wire [27:1] h3d_readback_ch3_address;
+wire [63:0] h3d_readback_ch3_data;
 
 wire h3d_plane_read, h3d_plane_write;
 wire [7:0] h3d_plane_burst;
@@ -1213,7 +1405,6 @@ assign h3d_console_release =
 // FPGA power-up value supplies exactly one synchronous reset edge when the
 // retained DDR clock first becomes live.  H3D clients reset independently and
 // ignore any drained response belonging to their old epoch.
-logic h3d_fabric_boot_reset = 1'b1;
 always_ff @(posedge ddr_clk) begin
     if (island_locked)
         h3d_fabric_boot_reset <= 1'b0;
@@ -1225,17 +1416,18 @@ wire h3d_gpu_write_valid, h3d_gpu_write_ready;
 wire [27:0] h3d_gpu_write_address;
 wire [1:0] h3d_gpu_write_access;
 wire [3:0] h3d_gpu_write_byte_enable;
-wire [31:0] h3d_gpu_write_data, h3d_gpu_write_frame;
+wire [31:0] h3d_gpu_write_data;
+wire [8:0] h3d_gpu_write_scanline;
 wire [63:0] h3d_gpu_write_timestamp;
 wire h3d_vram9_write_valid, h3d_vram9_write_ready;
 wire [31:0] h3d_vram9_write_address, h3d_vram9_write_data;
-wire [31:0] h3d_vram9_write_frame;
+wire [8:0] h3d_vram9_write_scanline;
 wire [1:0] h3d_vram9_write_access;
 wire [3:0] h3d_vram9_write_byte_enable;
 wire [63:0] h3d_vram9_write_timestamp;
 wire h3d_vram7_write_valid, h3d_vram7_write_ready;
 wire [31:0] h3d_vram7_write_address, h3d_vram7_write_data;
-wire [31:0] h3d_vram7_write_frame;
+wire [8:0] h3d_vram7_write_scanline;
 wire [1:0] h3d_vram7_write_access;
 wire [3:0] h3d_vram7_write_byte_enable;
 wire [63:0] h3d_vram7_write_timestamp;
@@ -1247,135 +1439,8 @@ wire h3d_frame_valid, h3d_frame_ready;
 wire [31:0] h3d_frame_number, h3d_current_frame;
 wire [63:0] h3d_frame_timestamp, h3d_timestamp_live;
 wire h3d_console_source_fault;
+wire [1:0] h3d_console_source_fault_reason;
 wire h3d_core_line_drop;
-wire [31:0] h3d_bg1_scroll_triplet;
-(* async_reg = "true" *) logic [31:0] h3d_bg1_scroll_meta_ddr;
-(* async_reg = "true" *) logic [31:0] h3d_bg1_scroll_ddr;
-
-logic [7:0] h3d_line_drop_count_1x;
-logic [7:0] h3d_plane_deadline_count_1x;
-(* async_reg = "true" *) logic [7:0] h3d_line_drop_meta_ddr;
-(* async_reg = "true" *) logic [7:0] h3d_line_drop_count_ddr;
-(* async_reg = "true" *) logic [7:0] h3d_plane_deadline_meta_ddr;
-(* async_reg = "true" *) logic [7:0] h3d_plane_deadline_count_ddr;
-(* async_reg = "true" *) logic [27:0] h3d_plane_frame_diagnostic_meta_ddr;
-(* async_reg = "true" *) logic [27:0] h3d_plane_frame_diagnostic_ddr;
-logic [7:0] h3d_plane_miss_count_ddr;
-
-always_ff @(posedge clk1x or posedge console_reset_1x) begin
-    if (console_reset_1x) begin
-        h3d_line_drop_count_1x <= 8'd0;
-        h3d_plane_deadline_count_1x <= 8'd0;
-    end else if (h3d_core_line_drop && h3d_line_drop_count_1x != 8'hff) begin
-        h3d_line_drop_count_1x <= h3d_line_drop_count_1x + 1'b1;
-    end else if (h3d_plane_pixel_line_missed &&
-                 h3d_plane_deadline_count_1x != 8'hff) begin
-        h3d_plane_deadline_count_1x <=
-            h3d_plane_deadline_count_1x + 1'b1;
-    end
-end
-
-always_ff @(posedge ddr_clk or posedge console_reset_ddr) begin
-    if (console_reset_ddr) begin
-        h3d_bg1_scroll_meta_ddr <= 32'd0;
-        h3d_bg1_scroll_ddr <= 32'd0;
-        h3d_line_drop_meta_ddr <= 8'd0;
-        h3d_line_drop_count_ddr <= 8'd0;
-        h3d_plane_deadline_meta_ddr <= 8'd0;
-        h3d_plane_deadline_count_ddr <= 8'd0;
-        h3d_plane_frame_diagnostic_meta_ddr <= 28'd0;
-        h3d_plane_frame_diagnostic_ddr <= 28'd0;
-        h3d_plane_miss_count_ddr <= 8'd0;
-    end else begin
-        h3d_bg1_scroll_meta_ddr <= h3d_bg1_scroll_triplet;
-        h3d_bg1_scroll_ddr <= h3d_bg1_scroll_meta_ddr;
-        h3d_line_drop_meta_ddr <= h3d_line_drop_count_1x;
-        h3d_line_drop_count_ddr <= h3d_line_drop_meta_ddr;
-        h3d_plane_deadline_meta_ddr <= h3d_plane_deadline_count_1x;
-        h3d_plane_deadline_count_ddr <= h3d_plane_deadline_meta_ddr;
-        h3d_plane_frame_diagnostic_meta_ddr <=
-            h3d_plane_frame_diagnostic;
-        h3d_plane_frame_diagnostic_ddr <=
-            h3d_plane_frame_diagnostic_meta_ddr;
-        if (h3d_plane_descriptor_valid && h3d_plane_line_missed &&
-            h3d_plane_miss_count_ddr != 8'hff)
-            h3d_plane_miss_count_ddr <= h3d_plane_miss_count_ddr + 1'b1;
-    end
-end
-
-// White-screen diagnostic: publish the live architectural ARM9 PC through
-// the already-polled FPGA heartbeat word. This changes no CPU, renderer,
-// packet, or display behavior and lets the read-only board monitor identify
-// the exact stuck control-flow location.
-// A running CPU publishes its architectural PC exactly as before.  If the PC
-// is still zero, use the same word as a compact boot-stall receipt instead of
-// losing every upstream state bit behind an indistinguishable zero.  The 0xd
-// signature cannot be a valid ARM9 PC in this core's mapped execution regions.
-wire [31:0] fb_runtime_heartbeat = dbg_pc9_diag != 0 ? dbg_pc9_diag : {
-    4'hd,
-    h3d_control_release, h3d_record_source_active, h3d_console_release,
-    console_reset_request, console_reset_1x, cart_loaded_ddr,
-    cart_loaded_sync[1], nds_on, bridge_reset_ddr, h3d_path_reset,
-    dbg_hwstat_diag
-};
-// Passive renderer line-30 receipt. F[27:0] carries the accepted BG1HOFS,
-// queued/direct identity, and register-shadow comparison. Normal samples retain
-// the final-pixel row hash; a no-BG1-write sample substitutes the DMA grant
-// blocker's actual accepted ARM9 membus state, age, and address. The
-// observational heartbeat does not alter rendering, DMA, framebuffer
-// publication, or display handshakes.
-`ifdef NDS_SEAM_DIAGNOSTIC
-// Sound bring-up diagnostic: Beta 78 proved the H3D transport, return plane,
-// and framebuffer were live while the console emitted empty frames. Publish
-// the existing architectural ARM9 PC tap so the next board run identifies the
-// exact upstream boot wait without changing any emulation behavior.
-wire [31:0] h3d_diagnostic_heartbeat = {4'h9, dbg_pc9_diag[27:0]};
-`else
-wire [31:0] h3d_diagnostic_heartbeat = fb_runtime_heartbeat;
-`endif
-
-// Slowly rotating, tagged public crash telemetry. The control block retains
-// each selection across 8192 complete header sweeps, allowing the HPS's low-
-// overhead 100 ms recorder to collect full CPU/subsystem context over time.
-// PC/address values use their architecturally meaningful low 28 bits. CPSR
-// keeps NZCV plus bits 23:0; ARMv5 bits 27:24 are unused/reserved here.
-logic [31:0] h3d_public_crash_telemetry;
-always_comb begin
-    case (h3d_telemetry_index)
-        3'd0: h3d_public_crash_telemetry =
-            {4'h1, dbg_pc7_diag[27:0]};
-        3'd1: h3d_public_crash_telemetry =
-            {4'h2, dbg_r0_diag[27:0]};
-        3'd2: h3d_public_crash_telemetry =
-            {4'h3, dbg_lr_diag[27:0]};
-        3'd3: h3d_public_crash_telemetry =
-            {4'h4, dbg_cpsr_diag[31:28], dbg_cpsr_diag[23:0]};
-        3'd4: h3d_public_crash_telemetry = {
-            4'h5, h3d_gx_fifo_full, h3d_gx_fifo_level,
-            dbg_hwstat_diag
-        };
-        3'd5: h3d_public_crash_telemetry = {
-            4'h6, 9'd0,
-            boundary_fault, h3d_fabric_protocol_error,
-            h3d_fabric_epoch_quiescent, h3d_control_fault,
-            h3d_control_release, h3d_record_source_active,
-            h3d_record_source_fault, h3d_record_ddr_active,
-            h3d_record_ddr_fault, h3d_packet_active,
-            h3d_packet_full, h3d_packet_fault,
-            h3d_plane_busy_state, h3d_plane_descriptor_busy,
-            h3d_plane_line_fetch_busy, h3d_plane_descriptor_valid,
-            h3d_pixel_descriptor_pending, h3d_diagnostic_hold_ddr,
-            cart_loaded_ddr
-        };
-        3'd6: h3d_public_crash_telemetry =
-            {4'h7, h3d_fabric_debug[27:0]};
-        default: h3d_public_crash_telemetry = {
-            4'h8, h3d_line_drop_count_ddr,
-            h3d_plane_deadline_count_ddr, h3d_plane_miss_count_ddr,
-            h3d_record_ddr_fault_reason
-        };
-    endcase
-end
 // The return plane is derived display data and may complete after its source
 // frame has advanced.  Once a current-session descriptor crosses, keep its
 // complete plane visible until a newer descriptor replaces it; the reader's
@@ -1388,27 +1453,38 @@ wire [31:0] h3d_plane_display_frame = h3d_pixel_descriptor_valid
 // dropped 2D render line is already represented by a transparent/old pixel
 // and can recover on a later line or frame.  Resetting both CPUs for such a
 // display miss turns recoverable backpressure into a permanent boot failure.
-(* async_reg = "true" *) logic [1:0] h3d_source_fault_sync_ddr;
+// Synchronize each sticky reason before publishing the aggregate fault and
+// its detail together. No clocks, queue capacities or backpressure change.
+(* async_reg = "true" *) logic [1:0] h3d_source_reason_meta_ddr;
+(* async_reg = "true" *) logic [1:0] h3d_source_reason_sync_ddr;
+(* async_reg = "true" *) logic [1:0] h3d_readback_fault_sync_ddr;
 always_ff @(posedge ddr_clk or posedge bridge_reset_ddr) begin
     if (bridge_reset_ddr) begin
-        h3d_source_fault_sync_ddr <= 2'b00;
+        h3d_source_reason_meta_ddr <= 2'b00;
+        h3d_source_reason_sync_ddr <= 2'b00;
+        h3d_readback_fault_sync_ddr <= 2'b00;
         h3d_external_fault_bits <= 32'd0;
     end else begin
-        h3d_source_fault_sync_ddr <= {
-            h3d_source_fault_sync_ddr[0], h3d_console_source_fault
-        };
-        if (cart_loaded_ddr && !h3d_cart_ready_d) begin
+        h3d_source_reason_meta_ddr <= h3d_console_source_fault_reason;
+        h3d_source_reason_sync_ddr <= h3d_source_reason_meta_ddr;
+        h3d_readback_fault_sync_ddr <= {h3d_readback_fault_sync_ddr[0], h3d_readback_source_fault};
+        if (h3d_cart_ready_rise) begin
             h3d_external_fault_bits <= 32'd0;
         end else begin
             h3d_external_fault_bits <= h3d_external_fault_bits |
-                (h3d_source_fault_sync_ddr[1] ? 32'h00000100 : 32'd0) |
+                ((|h3d_source_reason_sync_ddr) ?
+                    (32'h00000100 | {8'd0, h3d_source_reason_sync_ddr, 22'd0}) : 32'd0) |
                 (h3d_record_ddr_fault ?
                     (32'h00000200 |
                      {16'd0, h3d_record_ddr_fault_reason, 12'd0}) : 32'd0) |
                 (h3d_packet_fault ?
                     (32'h00000400 |
                      {11'd0, h3d_packet_fault_reason, 16'd0}) : 32'd0) |
-                (h3d_fabric_protocol_error ? 32'h00000800 : 32'd0);
+                (h3d_fabric_protocol_error ? 32'h00000800 : 32'd0) |
+                // Bits 12..15/16..20 hold record/packet fault reasons;
+                // bit 21 reports readback faults, bits 22/23 identify
+                // console HBlank/frame queue overflow respectively.
+                (h3d_readback_fault_sync_ddr[1] ? 32'h00200000 : 32'd0);
         end
     end
 end
@@ -1423,6 +1499,15 @@ wire [7:0] h3d_core_merge_x, h3d_core_merge_y;
 // asserted across several queued VBlanks and therefore has no per-frame edge.
 wire h3d_scanout_frame_boundary = h3d_core_line_end &&
     h3d_core_merge_y == 8'd191;
+wire h3d_lcd_phase_raw;
+wire [8:0] h3d_lcd_line_raw;
+wire h3d_descriptor_switch_window;
+nds_h3d_adoption_window h3d_adoption_window (
+    .clk(clk1x), .reset(console_reset_1x),
+    .lcd_phase(h3d_lcd_phase_raw), .lcd_line(h3d_lcd_line_raw),
+    .merge_start(h3d_core_line_start), .merge_end(h3d_core_line_end),
+    .merge_y(h3d_core_merge_y), .switch_allowed(h3d_descriptor_switch_window)
+);
 logic h3d_descriptor_request;
 logic [11:0] h3d_descriptor_retry;
 logic h3d_line_pending;
@@ -1447,26 +1532,31 @@ wire [7:0] h3d_line_prefetch_y = h3d_core_line_y == 8'd190 ? 8'd0 :
 // bank. The displayed bank is therefore already the exact content toggle;
 // wiring it directly adds no state or comparison logic to this full device.
 `ifdef NDS_HYBRID_3D
+`ifdef NDS_MATCHED_DISPLAY_TEST
+always_comb effective_3d_frame_toggle = fb_published_frame_toggle;
+`else
 always_comb effective_3d_frame_toggle = h3d_pixel_descriptor_bank;
+`endif
 `else
 always_comb effective_3d_frame_toggle = fb_published_frame_toggle;
 `endif
 
 nds_nitro_fb_ddr3 #(
     .FB_HW_BASE(FB_HW_BASE), .FB_BURST(FB_BURST),
-    // Keep the large per-pixel content-hash telemetry cone out of this nearly
-    // full device; the two compact counters above are the live diagnostic.
+    // Temporary per-pixel tracing is absent. The user-facing 3D FPS
+    // counter still uses effective_3d_frame_toggle in the scanout below.
     .RUNTIME_TELEMETRY(1'b0)
 ) framebuffer (
     .clk_sys(ddr_clk), .CLK_VIDEO(clk_video),
-`ifdef NDS_BOOT_DIAGNOSTIC
-    .reset_sys(bridge_reset_ddr),
+`ifdef NDS_HYBRID_3D
+    // Legacy channel 6 owns already-issued reads across CPU/session resets.
+    .reset_read(h3d_fabric_boot_reset),
 `else
+    .reset_read(console_reset_ddr),
+`endif
+    .external_enable(h3d_external_video_enable),
+    .external_quiescent(h3d_fb_external_quiescent),
     .reset_sys(console_reset_ddr), .reset_video(video_output_reset),
-`endif
-`ifdef NDS_BOOT_DIAGNOSTIC
-    .reset_video(video_output_reset),
-`endif
     .pix_x(fb_pix_x), .pix_y(fb_pix_y), .pix_d(fb_pix_d), .pix_we(fb_pix_we),
     .pixb_x(fb_pixb_x), .pixb_y(fb_pixb_y),
     .pixb_d(fb_pixb_d), .pixb_we(fb_pixb_we),
@@ -1474,36 +1564,45 @@ nds_nitro_fb_ddr3 #(
     .telemetry_session(32'd0),
     // Keep timing-sensitive 2D/BG/HDMA scanout in the FPGA. HPS publishes
     // only the completed 3D plane through the registered merge seam below.
+`ifdef NDS_MATCHED_DISPLAY_TEST
+    .external_frame_mode(1'b1),
+    .external_frame_publish(h3d_full_frame_publish),
+    .external_frame_bank(h3d_full_frame_bank),
+    .external_frame_adopted(h3d_full_frame_adopted),
+`else
     .external_frame_mode(1'b0), .external_frame_publish(1'b0),
     .external_frame_bank(2'd0), .external_frame_adopted(),
-`ifdef NDS_BOOT_DIAGNOSTIC
-    .dbg0(18'h2d15a),.dbg1(diag_heartbeat),.dbg2(diag_lifecycle),
-    .dbg3(diag_hwstat_ddr),
-    .dbg4(diag_pc9_ddr[17:0]),.dbg5({4'h9,diag_pc9_ddr[31:18]}),
-    .dbg6(diag_pc7_ddr[17:0]),.dbg7({4'h7,diag_pc7_ddr[31:18]}),
-    .dbg8(diag_r0_ddr[17:0]),.dbg9({4'h0,diag_r0_ddr[31:18]}),
-    .dbg10(diag_lr_ddr[17:0]),.dbg11({4'he,diag_lr_ddr[31:18]}),
-`else
+`endif
     .dbg0(18'd0),.dbg1(18'd0),.dbg2(18'd0),.dbg3(18'd0),
     .dbg4(18'd0),.dbg5(18'd0),.dbg6(18'd0),.dbg7(18'd0),
     .dbg8(18'd0),.dbg9(18'd0),.dbg10(18'd0),.dbg11(18'd0),
-`endif
     .pf_tgl,.pf_scr,.pf_line,.pf_bank,.pf_frame_bank,.pf_external,
+    .split_mode(video_split_active), .pf_slot, .pf_ticket, .split_frame_toggle, .pf_completed,
+    .lb_acquire, .lb_hold, .lb_selected_slot,
     .published_frame_toggle(fb_published_frame_toggle),
     .published_frame_bank(fb_published_frame_bank),
     .scanout_late_count(h3d_scanout_late_count),
     .runtime_fault_flags(h3d_fb_fault_flags),
     .bank_diagnostic(h3d_fb_bank_diagnostic),
-    .lb_raddr,.lb_q,
+    .lb_raddr,.lb_q,.lb_valid,
     .fb5_addr,.fb5_din,.fb5_req,.fb5_next,.fb5_ready,
     .fb6_addr,.fb6_req,.fb6_dout,.fb6_valid,.fb6_ready
 );
 nds_nitro_video_scanout scanout (
-    .clk_video,.reset(video_output_reset),.pf_tgl,.pf_scr,.pf_line,.pf_bank,
+    .clk_video,.reset(video_output_reset),.session_reset(video_session_reset),
+    .pf_tgl,.pf_scr,.pf_line,.pf_bank,
+    .external_enable(h3d_external_video_enable),
+    .external_quiescent(h3d_scanout_external_quiescent),
     .pf_frame_bank,.pf_external,
     .layout_select(video_layout_select),
     .screen_order_select(video_screen_order_select),
     .gap_select(video_gap_select),.fps_select(video_fps_select),
+    .crt_select(video_crt_select),.crt_active(video_crt_active),
+    .split_select(video_split_select), .split_active(video_split_active),
+    .analog_screen_select(video_analog_screen_select),
+    .analog_screen_active(video_analog_screen_active),
+    .pf_slot, .pf_ticket, .split_frame_toggle, .pf_completed, .lb_acquire, .lb_hold, .lb_selected_slot,
+    .analog_ce, .analog_de, .analog_hs, .analog_vs, .analog_r, .analog_g, .analog_b,
     .touch_pressed(joystick_sync[12]),.touch_x,.touch_y,
     .layout_active(video_layout_active),
     .screen_order_active(video_screen_order_active),
@@ -1515,7 +1614,7 @@ nds_nitro_video_scanout scanout (
     .external_screen_select(h3d_full_frame_screen),
     .external_screen_adopted_toggle(h3d_external_screen_adopted_toggle),
     .effective_3d_frame_toggle,
-    .lb_raddr,.lb_q,.ce_pixel(video_ce),.de(video_de),
+    .lb_raddr,.lb_q,.lb_valid,.ce_pixel(video_ce),.de(video_de),
     .hsync(video_hs),.vsync(video_vs),
     .red(video_r),.green(video_g),.blue(video_b)
 );
@@ -1525,6 +1624,10 @@ nds_nitro_video_scanout scanout (
 // to a stable cross-domain toggle, then return one DDR-domain adoption pulse
 // so the descriptor/DDR bank cannot be recycled early.
 `ifdef NDS_HYBRID_3D
+`ifdef NDS_MATCHED_DISPLAY_TEST
+// Both physical screens use the same complete frame bank. No independent B.
+assign h3d_external_screen_toggle = 1'b0;
+`else
 always_ff @(posedge ddr_clk) begin
     if (bridge_reset_ddr) begin
         h3d_external_screen_toggle <= 1'b0;
@@ -1543,8 +1646,10 @@ always_ff @(posedge ddr_clk) begin
             h3d_external_adopt_seen <= h3d_external_adopt_sync[1];
     end
 end
+`endif
 `else
 always_comb h3d_external_screen_toggle = 1'b0;
+assign h3d_external_video_enable = 1'b0;
 assign h3d_full_frame_bank = 2'd0;
 assign h3d_full_frame_screen = 1'b0;
 `endif
@@ -1553,17 +1658,44 @@ assign h3d_full_frame_screen = 1'b0;
 // -------------------------------------------------------------------------
 // Hybrid 3D session, ordered event stream, and clock-safe return plane.
 // -------------------------------------------------------------------------
+`ifdef NDS_ARM9_PC_PROFILE
+wire [31:0] profile_pc9, profile_cpsr9, profile_control9;
+wire [31:0] profile_pc_ddr, profile_metadata_ddr;
+// Synchronize reset release into the source domain. This observer does not
+// participate in any console hold, execution, bus or publication handshake.
+(* async_reg = "true" *) logic [1:0] profile_reset_sync = 2'b11;
+always_ff @(posedge clk2x) profile_reset_sync <= {profile_reset_sync[0], bridge_reset_ddr};
+nds_arm9_pc_sampler profile_sampler (
+    .cpu_clk(clk2x), .cpu_reset(profile_reset_sync[1]),
+    .architectural_pc(profile_pc9), .thumb(profile_cpsr9[5]),
+    .halted(profile_control9[8]), .dma_hold(profile_control9[6]),
+    .guest_reset(profile_control9[13]), .vblank_async(h3d_lcd_vblank),
+    .ddr_clk(ddr_clk), .ddr_reset(bridge_reset_ddr),
+    .pc(profile_pc_ddr), .metadata(profile_metadata_ddr)
+);
+`endif
 nds_h3d_control_init #(
     .BASE_WORD(H3D_CONTROL_WORD), .ENTRY_COUNT(16384),
-    .PACKET_MODE(1'b1)
+    .PACKET_MODE(1'b1), .SESSION_POLICY_ENABLE(1'b1)
+    , .DIAGNOSTIC_HOLD_ENABLE(1'b0)
+`ifdef NDS_MATCHED_DISPLAY_TEST
+    , .MATCHED_DISPLAY_TEST(1'b1), .MATCHED_ENGINE_B_OPTIONAL(1'b1)
+`endif
 ) h3d_control (
     .clk(ddr_clk), .reset(bridge_reset_ddr),
     .requested_session(h3d_session_trigger),
+    .engine_b_pixels_enable(h3d_engine_b_applied),
+    .video_quiescent(h3d_scanout_external_quiescent &&
+                     h3d_fb_external_quiescent),
     .external_fault_bits(h3d_external_fault_bits),
-    .fpga_heartbeat_value(h3d_diagnostic_heartbeat),
-    .fpga_telemetry_value(h3d_public_crash_telemetry),
-    .telemetry_index(h3d_telemetry_index),
-    .diagnostic_hold(h3d_diagnostic_hold_ddr),
+    // Retain the ABI and existing DDR write cadence, with zero in the
+    // temporary CPU/probe fields. Session, HPS liveness and faults stay live.
+`ifdef NDS_ARM9_PC_PROFILE
+    .fpga_heartbeat_value(profile_pc_ddr), .fpga_telemetry_value(profile_metadata_ddr),
+`else
+    .fpga_heartbeat_value(32'd0), .fpga_telemetry_value(32'd0),
+`endif
+    .telemetry_index(), .diagnostic_hold(),
     .active(h3d_control_active),
     .initialized(h3d_control_initialized),
     .console_release(h3d_control_release),
@@ -1584,17 +1716,29 @@ nds_h3d_control_init #(
 // order, and cross complete frame records and boundary tokens into DDR.
 nds_h3d_frame_record_cdc #(
     .ASYNC_LGDEPTH(4),
+`ifdef NDS_MATCHED_DISPLAY_TEST
+    .SPARSE_HBLANK(1'b0),
+`else
     .SPARSE_HBLANK(1'b1),
-    .SCANLINE_TAGS(1'b1)
+`endif
+    .SCANLINE_TAGS(1'b1),
+`ifdef NDS_GX_SWAP_RETIREMENT_EXPERIMENT
+    // Investigation only: the first hardware candidate stalled game menus.
+    .SWAP_VBLANK_RETIREMENT(1'b1)
+`else
+    .SWAP_VBLANK_RETIREMENT(1'b0)
+`endif
 ) h3d_record_cdc (
     .source_clk(clk1x), .ddr_clk(ddr_clk),
     .reset(bridge_reset_ddr), .session_flush(~h3d_control_release),
+    .lcd_vblank(h3d_lcd_vblank),
     .gpu_valid(h3d_gpu_write_valid), .gpu_ready(h3d_gpu_write_ready),
     .gpu_address(h3d_gpu_write_address),
     .gpu_access(h3d_gpu_write_access),
     .gpu_byte_enable(h3d_gpu_write_byte_enable),
     .gpu_data(h3d_gpu_write_data),
     .gpu_timestamp(h3d_gpu_write_timestamp),
+    .gpu_scanline(h3d_gpu_write_scanline),
     .arm9_vram_valid(h3d_vram9_write_valid),
     .arm9_vram_ready(h3d_vram9_write_ready),
     .arm9_vram_address(h3d_vram9_write_address[27:0]),
@@ -1602,6 +1746,7 @@ nds_h3d_frame_record_cdc #(
     .arm9_vram_byte_enable(h3d_vram9_write_byte_enable),
     .arm9_vram_data(h3d_vram9_write_data),
     .arm9_vram_timestamp(h3d_vram9_write_timestamp),
+    .arm9_vram_scanline(h3d_vram9_write_scanline),
     .arm7_vram_valid(h3d_vram7_write_valid),
     .arm7_vram_ready(h3d_vram7_write_ready),
     .arm7_vram_address(h3d_vram7_write_address[27:0]),
@@ -1609,6 +1754,7 @@ nds_h3d_frame_record_cdc #(
     .arm7_vram_byte_enable(h3d_vram7_write_byte_enable),
     .arm7_vram_data(h3d_vram7_write_data),
     .arm7_vram_timestamp(h3d_vram7_write_timestamp),
+    .arm7_vram_scanline(h3d_vram7_write_scanline),
     // Engine B needs LCD timing, but the former 263-record-per-frame stream
     // could overflow during an HPS stall. Sparse mode accepts the source on
     // every line, forwards only frame-start/visible-end markers through a
@@ -1629,20 +1775,49 @@ nds_h3d_frame_record_cdc #(
     .ddr_fault(h3d_record_ddr_fault),
     .ddr_fault_reason(h3d_record_ddr_fault_reason),
     .fifo_level(h3d_gx_fifo_level),
+    .gx_geometry_busy(h3d_gx_geometry_busy),
     .fifo_empty(h3d_gx_fifo_empty),
     .fifo_below_half(h3d_gx_fifo_below_half),
     .fifo_full(h3d_gx_fifo_full),
-    .record_valid(h3d_record_valid), .record_ready(h3d_record_ready),
-    .record(h3d_record), .record_frame(h3d_record_frame),
-    .record_frame_end(h3d_record_frame_end),
-    .boundary_valid(h3d_boundary_valid),
-    .boundary_ready(h3d_boundary_ready),
-    .boundary_frame(h3d_boundary_frame)
+    .gx_stack_ack(h3d_gx_stack_ack),
+    .gx_stack_status(h3d_gx_stack_status),
+    .record_valid(h3d_raw_record_valid), .record_ready(h3d_raw_record_ready),
+    .record(h3d_raw_record), .record_frame(h3d_raw_record_frame),
+    .record_frame_end(h3d_raw_record_frame_end),
+    .boundary_valid(h3d_raw_boundary_valid),
+    .boundary_ready(h3d_raw_boundary_ready),
+    .boundary_frame(h3d_raw_boundary_frame)
+);
+
+// Fold consecutive ARM9 VRAM writes (halfwords into words, words into pairs)
+// before the DDR writer; see the module header for why.
+nds_h3d_vram_record_packer h3d_vram_packer (
+    .clk(ddr_clk), .reset(bridge_reset_ddr | ~h3d_control_release),
+    .in_record_valid(h3d_raw_record_valid),
+    .in_record_ready(h3d_raw_record_ready),
+    .in_record(h3d_raw_record),
+    .in_record_frame(h3d_raw_record_frame),
+    .in_record_frame_end(h3d_raw_record_frame_end),
+    .in_boundary_valid(h3d_raw_boundary_valid),
+    .in_boundary_ready(h3d_raw_boundary_ready),
+    .in_boundary_frame(h3d_raw_boundary_frame),
+    .out_record_valid(h3d_record_valid), .out_record_ready(h3d_record_ready),
+    .out_record(h3d_record), .out_record_frame(h3d_record_frame),
+    .out_record_frame_end(h3d_record_frame_end),
+    .out_boundary_valid(h3d_boundary_valid),
+    .out_boundary_ready(h3d_boundary_ready),
+    .out_boundary_frame(h3d_boundary_frame)
 );
 
 nds_h3d_frame_packet_writer #(
     .CONTROL_BASE_WORD(H3D_CONTROL_WORD),
-    .SLOT_BASE_WORD(H3D_SLOT_WORD)
+    .SLOT_BASE_WORD(H3D_SLOT_WORD),
+    // QC1 private experiment: commit long command prefixes while the guest
+    // is still submitting them, rather than deferring all ARM validation and
+    // matrix work until a readback fence closes a 2000--3000-record packet.
+    // Continuation ordering/commit/ack semantics and the 64-KiB ABI slots stay
+    // unchanged. Extra packet overhead must be measured before adoption.
+    .MAX_RECORDS(1024)
 ) h3d_packet_writer (
     .clk(ddr_clk), .reset(bridge_reset_ddr),
     .session_flush(~h3d_control_release),
@@ -1668,6 +1843,46 @@ nds_h3d_frame_packet_writer #(
     .ddram_command_accepted(h3d_packet_command_accepted),
     .ddram_read_data(h3d_packet_dout),
     .ddram_read_data_ready(h3d_packet_dout_ready)
+);
+
+// The result reply lives at physical 0x3fc00200. Its dedicated, read-only
+// client borrows unused uncached legacy channel 3 rather than adding a fifth
+// outer-fabric client. The adapter removes the legacy 0x30000000 translation
+// and keeps old ownership alive through session/reset cancellation.
+nds_h3d_gx_readback_reply #(
+    .CONTROL_BASE_WORD(H3D_CONTROL_WORD), .BURST_FILL(H3D_READBACK_BURST)
+) h3d_readback_reply (
+    .source_clk(clk1x), .ddr_clk(ddr_clk),
+    .reset(bridge_reset_ddr), .session_flush(~h3d_control_release),
+    .session(h3d_session_sync_1x),
+    .request_valid(h3d_readback_request), .request_ready(h3d_readback_ready),
+    .request_id(h3d_readback_id),
+    .response_valid(h3d_readback_response),
+    .response_id(h3d_readback_response_id),
+    .response_status(h3d_readback_status),
+    .read_index(h3d_readback_index), .read_data(h3d_readback_data),
+    .source_fault(h3d_readback_source_fault),
+    .ddram_read(h3d_readback_ddr_read), .ddram_burst_count(h3d_readback_ddr_burst),
+    .ddram_address(h3d_readback_ddr_address),
+    .ddram_busy(h3d_readback_ddr_busy),
+    .ddram_command_accepted(h3d_readback_ddr_accepted),
+    .ddram_read_data(h3d_readback_ddr_data),
+    .ddram_read_data_ready(h3d_readback_ddr_data_ready)
+);
+
+nds_h3d_readback_legacy_adapter #(.BURST_ENABLE(H3D_READBACK_BURST)) h3d_readback_adapter (
+    .clk(ddr_clk), .boot_reset(h3d_fabric_boot_reset),
+    .cancel(h3d_path_reset),
+    .read(h3d_readback_ddr_read), .address(h3d_readback_ddr_address),
+    .burst_count(h3d_readback_ddr_burst),
+    .busy(h3d_readback_ddr_busy),
+    .command_accepted(h3d_readback_ddr_accepted),
+    .read_data(h3d_readback_ddr_data),
+    .read_data_ready(h3d_readback_ddr_data_ready),
+    .ch_request(h3d_readback_ch3_request),
+    .ch_address(h3d_readback_ch3_address),
+    .ch_burst(h3d_readback_ch3_burst), .ch_valid(h3d_readback_ch3_valid),
+    .ch_ready(h3d_readback_ch3_ready), .ch_data(h3d_readback_ch3_data)
 );
 
 // The active session is bundled stable while console_reset is asserted.  It
@@ -1757,7 +1972,10 @@ always_ff @(posedge clk1x or posedge console_reset_1x) begin
                 h3d_line_pending <= 1'b1;
                 h3d_line_pending_frame <= h3d_plane_display_frame;
                 h3d_line_pending_y <= h3d_line_prefetch_y;
-            end else begin
+            end else if (!h3d_engine_b_sync_1x[1]) begin
+                // Off preserves beta.11's newest-line policy. On holds the
+                // request so its birth-age metadata remains coherent while
+                // the composite descriptor waits for B scanout adoption.
                 h3d_line_pending_frame <= h3d_plane_display_frame;
                 h3d_line_pending_y <= h3d_line_prefetch_y;
             end
@@ -1767,9 +1985,11 @@ end
 
 nds_h3d_plane_reader #(
     .CONTROL_BASE_WORD(H3D_CONTROL_WORD),
-    .BANK0_BASE_WORD(H3D_BANK0_WORD), .BANK1_BASE_WORD(H3D_BANK1_WORD)
+    .BANK0_BASE_WORD(H3D_BANK0_WORD), .BANK1_BASE_WORD(H3D_BANK1_WORD),
+    .LATE_ADOPTION_WINDOW(1'b1)
 ) h3d_plane_reader (
     .ddr_clk(ddr_clk), .ddr_reset(h3d_path_reset),
+    .external_enable(h3d_external_video_enable),
     .pixel_clk(clk1x), .pixel_reset(console_reset_1x),
     .ddr_session(h3d_active_session),
     .pixel_session(h3d_session_sync_1x),
@@ -1779,6 +1999,7 @@ nds_h3d_plane_reader #(
     .line_request_ready(h3d_plane_line_request_ready),
     .line_frame(h3d_line_pending_frame), .line_y(h3d_line_pending_y),
     .frame_boundary(h3d_scanout_frame_boundary),
+    .descriptor_switch_window(h3d_descriptor_switch_window),
     .scanline_tick(h3d_core_line_request),
     .scanline_y(h3d_core_line_y),
     .line_start(h3d_core_line_start), .line_end(h3d_core_line_end),
@@ -1853,14 +2074,22 @@ always_comb begin
 `endif
 end
 
-ddram island_ddram (
+ddram #(.CART_WIDE_BANK(1), .CH3_READ_BURST(H3D_READBACK_BURST)) island_ddram (
     .*,
     .ch1_addr(27'd0),.ch1_dout(),.ch1_din(16'd0),
     .ch1_req(1'b0),.ch1_rnw(1'b1),.ch1_ready(),
-    .ch2_addr({1'b0,cd_addr,1'b0}),.ch2_dout(cd_dout),.ch2_din(32'd0),
+    .ch2_addr({cd_addr,1'b0}),.ch2_altbank(cd_altbank),.ch2_dout(cd_dout),.ch2_din(32'd0),
     .ch2_req(cd_req),.ch2_rnw(1'b1),.ch2_ready(cd_ready),
+`ifdef NDS_HYBRID_3D
+    .ch3_addr(h3d_readback_ch3_address),.ch3_dout(h3d_readback_ch3_data),
+    .ch3_din(64'd0),.ch3_req(h3d_readback_ch3_request),
+    .ch3_rnw(1'b1),.ch3_be(8'd0),.ch3_ready(h3d_readback_ch3_ready),
+    .ch3_burst(h3d_readback_ch3_burst),.ch3_valid(h3d_readback_ch3_valid),
+`else
     .ch3_addr(27'd0),.ch3_dout(),.ch3_din(64'd0),.ch3_req(1'b0),
     .ch3_rnw(1'b1),.ch3_be(8'd0),.ch3_ready(),
+    .ch3_burst(8'd1),.ch3_valid(),
+`endif
     .ch4_addr(27'd0),.ch4_dout(),.ch4_din(64'd0),.ch4_req(1'b0),
     .ch4_rnw(1'b1),.ch4_be(8'd0),.ch4_ready(),
     .ch5_addr(fb5_addr),.ch5_din(fb5_din),.ch5_req(fb5_req),
@@ -1919,8 +2148,13 @@ nds_h3d_ddr_fabric h3d_ddr_fabric (
 
 
 wire [15:0] sound_left, sound_right;
-assign audio_left = sound_left;
-assign audio_right = sound_right;
+wire signed [15:0] sound_headroom_left, sound_headroom_right;
+nds_audio_headroom #(.SHIFT(1)) sound_output_headroom (
+    .input_left(sound_left),.input_right(sound_right),
+    .output_left(sound_headroom_left),.output_right(sound_headroom_right)
+);
+assign audio_left = sound_headroom_left;
+assign audio_right = sound_headroom_right;
 wire [31:0] math_address;
 wire [31:0] math_write_data;
 wire [31:0] math_read_data;
@@ -1939,24 +2173,52 @@ nds_nitro_arm9_math_unit #(.COMBINATIONAL_READ(1'b1)) arm9_math (
 );
 
 nds_nitro_console_wrap #(
-    .CLKMEM_RATIO(CLKMEM_RATIO)
+`ifdef NDS_ARM_AREA
+    .GPU2D_A_ENABLE(0),.HOST_SAVE_PROFILE(1),
+`endif
+`ifdef NDS_HYBRID_3D
+    .H3D_GX_READBACK_ENABLE(1'b1),
+`ifdef NDS_HBLANK_RUN_QUEUE_EXPERIMENT
+    .H3D_COMPRESS_HBLANK(1'b1),
+`else
+    .H3D_COMPRESS_HBLANK(1'b0),
+`endif
+`endif
+`ifdef NDS_MATCHED_DISPLAY_TEST
+    .H3D_MATCHED_DISPLAY_TEST(1),
+`endif
+    .CLKMEM_RATIO(CLKMEM_RATIO),
+    .SOUND_STREAM_DIAGNOSTICS(0), .SOUND_DIAGNOSTICS(0)
 ) console (
     .clk1x(clk1x),.clk2x(clk2x),.clkMem(clk_mem),
     .clkMemIndex(clkMemIndex),
     .reset(console_reset_1x),.nds_on(nds_on),
-    .direct_boot(1'b1),.fw_boot(1'b0),
+    .direct_boot(!firmware_native_sync[1]),.fw_boot(firmware_native_sync[1]),
+    .cart_present(!firmware_native_sync[1]),
+    .host_save_valid(host_save_ready_sync[2]),.host_save_code(host_save_code),
+    .host_save_type(host_save_type),
+    .profile_valid(firmware_profile_sync[1]),.profile_addr(firmware_profile_addr),
+    .profile_data(firmware_profile_data),.profile_fw_offset(firmware_profile_offset),
+    .profile_fw_checksums(firmware_profile_checksums),
+    .rtc_seed(host_rtc[55:0]),.rtc_seed_toggle(host_rtc[64]),
+    .rtc_datetime(rtc_datetime),.rtc_date_written(rtc_date_written),
     .KeyA(joystick_sync[4]),.KeyB(joystick_sync[5]),
     .KeySelect(joystick_sync[10]),.KeyStart(joystick_sync[11]),
     .KeyRight(joystick_sync[0]),.KeyLeft(joystick_sync[1]),
     .KeyUp(joystick_sync[3]),.KeyDown(joystick_sync[2]),
     .KeyR(joystick_sync[9]),.KeyL(joystick_sync[8]),
-    .KeyX(joystick_sync[6]),.KeyY(joystick_sync[7]),.lid_closed(1'b0),
+    .KeyX(joystick_sync[6]),.KeyY(joystick_sync[7]),
+    .lid_closed(joystick_sync[13]),.mic_blow(joystick_sync[14]),
     .touch_active(joystick_sync[12]),
     .touch_x(touch_x),.touch_y(touch_y),
     .boot_done(boot_done),.boot_error(boot_error),
     .card_ena(card_ena),.card_addr(card_addr),
     .card_din(card_din),.card_done(card_done),
+    // These download flags stay stable before and throughout CPU execution.
+    // Match the existing DDR bank mask before the card's protected-area rule.
+    .card_address_mask({3'b000, cart_512_rom, cart_large_rom, 27'h7ffffff}),
     .backup_addr(backup_addr),
+    .backup_bank(backup_bank),
     .backup_write_data(backup_write_data),
     .backup_write_enable(backup_write_enable),
     .backup_read_data(backup_read_data),
@@ -1965,15 +2227,16 @@ nds_nitro_console_wrap #(
     .backup_save_type(backup_save_type),
     .backup_profile_valid(backup_profile_valid),
     .backup_access_active(backup_access_active),
-    .backup_cache_ready(backup_cache_ready_sync_1x),
-    .backup_run_ready(save_run_ready_sync_1x),
+    .backup_cache_ready(firmware_native_sync[1] || backup_cache_ready_sync_1x),
+    .backup_run_ready(firmware_native_sync[1] || save_run_ready_sync_1x),
     .fw_addr(fw_addr),.fw_req(fw_req),
     .fw_done(fw_done),.fw_data(fw_data),
     .fw_wr(fw_wr),.fw_wlane(fw_wlane),.fw_wdata(fw_wdata),
-    .bios7_load_addr(12'd0),.bios7_load_data(32'd0),
-    .bios7_load_be(4'd0),.bios7_load_we(1'b0),.bios7_load_done(1'b0),
-    .bios9_load_addr(10'd0),.bios9_load_data(32'd0),
-    .bios9_load_be(4'd0),.bios9_load_we(1'b0),.bios9_load_done(1'b0),
+    .fw_release(fw_release),.fw_busy(fw_busy),
+    .bios7_load_addr(bios7_load_addr),.bios7_load_data(bios7_load_data),
+    .bios7_load_be(bios7_load_be),.bios7_load_we(bios7_load_we),.bios7_load_done(bios7_ready_sync[1]),
+    .bios9_load_addr(bios9_load_addr),.bios9_load_data(bios9_load_data),
+    .bios9_load_be(bios9_load_be),.bios9_load_we(bios9_load_we),.bios9_load_done(bios9_ready_sync[1]),
     .mainram_allow(mainram_allow),.mainram_active(mainram_active),
     .mainram_busy(mainram_busy),
     .sdram_ena(mr_ena),.sdram_rnw(mr_rnw),.sdram_Adr(mr_adr),
@@ -1984,6 +2247,10 @@ nds_nitro_console_wrap #(
     .vsrv_bank(vsrv_bank_c),.vsrv_addr(vsrv_addr_c),
     .vsrv_be(vsrv_be_c),.vsrv_din(vsrv_din_c),
     .vsrv_dout(vsrv_dout_r),.vsrv_done(vsrv_done_r),
+    .vsrv_dout_hi(vsrv_dout_hi_r),
+    .vsrv_seq(vsrv_seq_c),.vsrv_wide(vsrv_wide_c),
+    .vsrv_din_hi(vsrv_din_hi_c),.vsrv_be_hi(vsrv_be_hi_c),
+    .vsrv_more(vsrv_more_c),
     .vrsrv_req(vrsrv_req_c),.vrsrv_bank(vrsrv_bank_c),
     .vrsrv_addr(vrsrv_addr_c),.vrsrv_dout(vrsrv_dout_r),
     .vrsrv_done(vrsrv_done_r),.vrsrv_ready(vrsrv_ready_c),
@@ -1994,7 +2261,14 @@ nds_nitro_console_wrap #(
     .pixel_out_x(pix_x),.pixel_out_y(pix_y),
     .pixel_out_data(pix_d),.pixel_out_we(pix_we),
     .pixelb_out_x(pixb_x),.pixelb_out_y(pixb_y),
-    .pixelb_out_data(pixb_d),.pixelb_out_we(pixb_we),.vblank_out(),
+    .pixelb_out_data(pixb_d),.pixelb_out_we(pixb_we),
+`ifdef NDS_HYBRID_3D
+    .vblank_out(h3d_lcd_vblank),
+`else
+    .vblank_out(),
+`endif
+    .sound_diagnostic(),
+    .sound_stream_diagnostic(),
     .sound_out_left(sound_left),.sound_out_right(sound_right),
 `ifdef NDS_HYBRID_3D
     .h3d_pixel_valid(h3d_plane_pixel_valid),
@@ -2006,19 +2280,47 @@ nds_nitro_console_wrap #(
     .h3d_merge_pixel_x(h3d_core_merge_x),
     .h3d_merge_pixel_y(h3d_core_merge_y),
     .h3d_line_drop(h3d_core_line_drop),
-    .h3d_bg1_scroll_triplet(h3d_bg1_scroll_triplet),
+    .h3d_bg1_scroll_triplet(),
+    .h3d_query_sample_toggle(),
     .h3d_service_ready(h3d_console_release),
+    .h3d_readback_request(h3d_readback_request),
+    .h3d_readback_ready(h3d_readback_ready),
+    .h3d_readback_id(h3d_readback_id),
+    .h3d_readback_response(h3d_readback_response),
+    .h3d_readback_response_id(h3d_readback_response_id),
+    .h3d_readback_status(h3d_readback_status),
+    .h3d_readback_index(h3d_readback_index),
+    .h3d_readback_data(h3d_readback_data),
+`ifdef NDS_MATCHED_DISPLAY_TEST
+    // Matched ARM output needs A/B registers, palette/OAM, all VRAM and LCD
+    // phases even when B pixels are disabled. The immutable H3P1 policy above
+    // retains the real menu selection; this legacy-named input controls the
+    // transport scope, not the renderer's pixel policy.
+    .h3d_engine_b_enable(1'b1),
+`elsif NDS_HYBRID_3D
+    .h3d_engine_b_enable(h3d_engine_b_sync_1x[1]),
+`else
+    .h3d_engine_b_enable(1'b0),
+`endif
     .h3d_gx_fifo_level(h3d_gx_fifo_level),
+`ifdef NDS_GX_BUSY_STATUS_EXPERIMENT
+    .h3d_gx_geometry_busy(h3d_gx_geometry_busy),
+`else
+    .h3d_gx_geometry_busy(1'b0),
+`endif
+    .h3d_gx_stack_status(h3d_gx_stack_status),
+    .h3d_gx_stack_ack(h3d_gx_stack_ack),
     .h3d_timestamp(h3d_timestamp_live),
     .h3d_current_frame(h3d_current_frame),
     .h3d_source_fault(h3d_console_source_fault),
+    .h3d_source_fault_reason(h3d_console_source_fault_reason),
     .h3d_gpu_write_valid(h3d_gpu_write_valid),
     .h3d_gpu_write_ready(h3d_gpu_write_ready),
     .h3d_gpu_write_address(h3d_gpu_write_address),
     .h3d_gpu_write_access(h3d_gpu_write_access),
     .h3d_gpu_write_byte_enable(h3d_gpu_write_byte_enable),
     .h3d_gpu_write_data(h3d_gpu_write_data),
-    .h3d_gpu_write_frame(h3d_gpu_write_frame),
+    .h3d_gpu_write_scanline(h3d_gpu_write_scanline),
     .h3d_gpu_write_timestamp(h3d_gpu_write_timestamp),
     .h3d_vram9_write_valid(h3d_vram9_write_valid),
     .h3d_vram9_write_ready(h3d_vram9_write_ready),
@@ -2026,7 +2328,7 @@ nds_nitro_console_wrap #(
     .h3d_vram9_write_access(h3d_vram9_write_access),
     .h3d_vram9_write_byte_enable(h3d_vram9_write_byte_enable),
     .h3d_vram9_write_data(h3d_vram9_write_data),
-    .h3d_vram9_write_frame(h3d_vram9_write_frame),
+    .h3d_vram9_write_scanline(h3d_vram9_write_scanline),
     .h3d_vram9_write_timestamp(h3d_vram9_write_timestamp),
     .h3d_vram7_write_valid(h3d_vram7_write_valid),
     .h3d_vram7_write_ready(h3d_vram7_write_ready),
@@ -2034,8 +2336,10 @@ nds_nitro_console_wrap #(
     .h3d_vram7_write_access(h3d_vram7_write_access),
     .h3d_vram7_write_byte_enable(h3d_vram7_write_byte_enable),
     .h3d_vram7_write_data(h3d_vram7_write_data),
-    .h3d_vram7_write_frame(h3d_vram7_write_frame),
+    .h3d_vram7_write_scanline(h3d_vram7_write_scanline),
     .h3d_vram7_write_timestamp(h3d_vram7_write_timestamp),
+    .h3d_lcd_phase_raw(h3d_lcd_phase_raw),
+    .h3d_lcd_line_raw(h3d_lcd_line_raw),
     .h3d_hblank_valid(h3d_hblank_valid),
     .h3d_hblank_ready(h3d_hblank_ready),
     .h3d_hblank_line(h3d_hblank_line),
@@ -2046,16 +2350,22 @@ nds_nitro_console_wrap #(
     .h3d_frame_number(h3d_frame_number),
     .h3d_frame_timestamp(h3d_frame_timestamp),
 `endif
-    .dbg_pc9(dbg_pc9_diag),.dbg_pc7(dbg_pc7_diag),
-    .dbg_r0_9(dbg_r0_diag),.dbg_lr9(dbg_lr_diag),
-    .dbg_cpsr9(dbg_cpsr_diag),.dbg_vfy_bad(dbg_vfy_bad_unused),
-    .diagnostic_hold9(h3d_hold_sync_2x[1]),
-    .diagnostic_hold7(h3d_hold_sync_1x[1]),
-    .diagnostic_release9(h3d_diagnostic_release_2x),
-    .diagnostic_release7(h3d_diagnostic_release_1x),
-    .dbg_vfy_addr(dbg_vfy_addr_unused),
+`ifdef NDS_ARM9_PC_PROFILE
+    .dbg_pc9(profile_pc9), .dbg_cpsr9(profile_cpsr9),
+    .dbg_cpu9_addr(profile_control9),
+`else
+    .dbg_pc9(), .dbg_cpsr9(), .dbg_cpu9_addr(),
+`endif
+    .dbg_pc7(), .dbg_mem_probe(),
+    .dbg_r0_9(),.dbg_lr9(),
+    .dbg_vfy_bad(),
+    .diagnostic_hold9(1'b0),
+    .diagnostic_hold7(1'b0),
+    .diagnostic_release9(1'b0),
+    .diagnostic_release7(1'b0),
+    .dbg_vfy_addr(),
     .dbg_cmd_stb(1'b0),.dbg_cmd_op(8'd0),.dbg_cmd_arg(32'd0),
-    .dbg_rsp_data(dbg_rsp_unused),.dbg_rsp_stb(dbg_rsp_stb_unused),
-    .dbg_hwstat(dbg_hwstat_diag)
+    .dbg_rsp_data(),.dbg_rsp_stb(),
+    .dbg_hwstat()
 );
 endmodule

@@ -99,6 +99,7 @@ GPU::~GPU() noexcept
 
 void GPU::ResetVRAMCache() noexcept
 {
+    ++BOBJCoherencyEpoch;
     for (int i = 0; i < 9; i++)
         VRAMDirty[i] = NonStupidBitField<128*1024/VRAMDirtyGranularity>();
 
@@ -127,6 +128,21 @@ void GPU::ResetVRAMCache() noexcept
 
 void GPU::Reset() noexcept
 {
+#ifdef NDS4MISTER_EXPERIMENTAL_FMV_PACKED_COLOR
+    FmvReceiverEnabled = false;
+    FmvPackedColor.Next.fill(0);
+    FmvPackedColor.Armed.fill(false);
+    FmvPackedColor.DirtyAll.fill(false);
+    FmvPackedColor.Conversions = 0;
+    FmvPackedColor.FilterConversions = 0;
+#ifdef NDS4MISTER_EXPERIMENTAL_FMV_VIDEO_DECODE
+    FmvPackedColor.Video.Clear();
+    FmvPackedColor.VideoDecodes = 0;
+    FmvPackedColor.VideoErrors = 0;
+    FmvPackedColor.CachedConversions = 0;
+#endif
+#endif
+    BOBJCoherencyEpoch = 0;
     ExternalRenderMemorySequence = 0;
     memset(ExternalRenderVRAMRevision, 0,
            sizeof(ExternalRenderVRAMRevision));
@@ -150,6 +166,7 @@ void GPU::Reset() noexcept
 
     memset(Palette, 0, 2*1024);
     memset(OAM, 0, 2*1024);
+    MarkSpriteOAMWritten(0, 2*1024);
 
     memset(VRAM_A, 0, 128*1024);
     memset(VRAM_B, 0, 128*1024);
@@ -250,6 +267,7 @@ void GPU::DoSavestate(Savestate* file) noexcept
 
     file->VarArray(Palette, 2*1024);
     file->VarArray(OAM, 2*1024);
+    if (!file->Saving) MarkSpriteOAMWritten(0, 2*1024);
 
     file->VarArray(VRAM_A, 128*1024);
     file->VarArray(VRAM_B, 128*1024);
@@ -651,6 +669,7 @@ void GPU::MapVRAM_AB(u32 bank, u8 cnt) noexcept
 
         case 3: // texture
             VRAMMap_Texture[ofs] |= bankmask;
+            VRAMDirty_Texture.InvalidateMapping(ofs);
             break;
         }
     }
@@ -731,6 +750,7 @@ void GPU::MapVRAM_CD(u32 bank, u8 cnt) noexcept
 
         case 3: // texture
             VRAMMap_Texture[ofs] |= bankmask;
+            VRAMDirty_Texture.InvalidateMapping(ofs);
             break;
 
         case 4: // BBG/BOBJ
@@ -810,6 +830,8 @@ void GPU::MapVRAM_E(u32 bank, u8 cnt) noexcept
 
         case 3: // texture palette
             MAP_RANGE(TexPal, 0, 4);
+            for (u32 slot = 0; slot < 4; ++slot)
+                VRAMDirty_TexPal.InvalidateMapping(slot);
             break;
 
         case 4: // ABG ext palette
@@ -913,6 +935,7 @@ void GPU::MapVRAM_FG(u32 bank, u8 cnt) noexcept
 
         case 3: // texture palette
             VRAMMap_TexPal[(ofs & 0x1) + ((ofs & 0x2) << 1)] |= bankmask;
+            VRAMDirty_TexPal.InvalidateMapping((ofs & 0x1) + ((ofs & 0x2) << 1));
             break;
 
         case 4: // ABG ext palette
@@ -1644,7 +1667,9 @@ bool GPU::MakeVRAMFlat_BOBJCoherent(NonStupidBitField<128*1024/VRAMDirtyGranular
 {
     if (NDS4MiSTer::Trace2DEnabled())
         for (u32 i=0;i<dirty.DataLength;i++) NDS4MiSTerTraceDirtyFlatBOBJ.Data[i]|=dirty.Data[i];
-    return CopyLinearVRAM<16*1024>(VRAMFlat_BOBJ, VRAMMap_BOBJ, dirty, &GPU::ReadVRAM_BOBJ<u64>);
+    const bool copied = CopyLinearVRAM<16*1024>(VRAMFlat_BOBJ, VRAMMap_BOBJ, dirty, &GPU::ReadVRAM_BOBJ<u64>);
+    if (copied) ++BOBJCoherencyEpoch;
+    return copied;
 }
 
 bool GPU::MakeVRAMFlat_ABGExtPalCoherent(NonStupidBitField<32*1024/VRAMDirtyGranularity>& dirty) noexcept

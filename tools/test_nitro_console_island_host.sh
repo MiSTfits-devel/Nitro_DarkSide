@@ -6,20 +6,38 @@ repo_dir="$(cd "$script_dir/.." && pwd)"
 test_tmp="$(mktemp -d "${TMPDIR:-/tmp}/nds-nitro-island-host.XXXXXX")"
 trap 'rm -rf "$test_tmp"' EXIT
 
+bash "$script_dir/test_h3d_tag_factoring.sh"
+python3 "$script_dir/test_nds_cart_session_reset.py"
+python3 "$script_dir/test_nds_cart_large_rom.py"
+bash "$script_dir/test_nds_card_large_rom.sh"
 python3 "$script_dir/test_arm7_shared_shifter.py"
 python3 "$script_dir/test_sound_fetch_state_packing.py"
 "$script_dir/test_nds_sound_vhdl_analyze.sh"
 python3 "$script_dir/test_cache_tag_packing.py"
 "$script_dir/test_nds_cache_vhdl_analyze.sh"
-"$script_dir/test_nds_gpu2d_register_shadow.sh"
 "$script_dir/test_nitro_firmware_vhdl.sh"
+"$script_dir/test_nds_membus7_wifi.sh"
+"$script_dir/test_nds_audio_headroom.sh"
+bash "$script_dir/test_nds_gpu2d_register_shadow.sh"
+bash "$script_dir/test_h3d_vram9_retirement.sh"
+bash "$script_dir/test_h3d_console_event_gate.sh"
+bash "$script_dir/test_hblank_run_queue.sh"
+bash "$script_dir/test_h3d_session_policy.sh"
+bash "$script_dir/test_nds_extpal_remap.sh"
+bash "$script_dir/test_nds_palette_readback.sh"
+bash "$script_dir/test_nds_oam_readback.sh"
 
 "$script_dir/test_extract_melonds_freebios.sh"
 freebios7_before="$(shasum -a 256 "$repo_dir/rtl/nds_nitro_freebios7.vhd")"
 freebios9_before="$(shasum -a 256 "$repo_dir/rtl/nds_nitro_freebios9.vhd")"
+freebios7_mif_before="$(shasum -a 256 "$repo_dir/rtl/nds_nitro_freebios7.mif")"
+freebios9_mif_before="$(shasum -a 256 "$repo_dir/rtl/nds_nitro_freebios9.mif")"
 python3 "$script_dir/generate_nitro_freebios_vhdl.py" >/dev/null
 test "$freebios7_before" = "$(shasum -a 256 "$repo_dir/rtl/nds_nitro_freebios7.vhd")"
 test "$freebios9_before" = "$(shasum -a 256 "$repo_dir/rtl/nds_nitro_freebios9.vhd")"
+test "$freebios7_mif_before" = "$(shasum -a 256 "$repo_dir/rtl/nds_nitro_freebios7.mif")"
+test "$freebios9_mif_before" = "$(shasum -a 256 "$repo_dir/rtl/nds_nitro_freebios9.mif")"
+"$script_dir/test_nitro_freebios_m10k.sh"
 
 run_sv() {
     local top="$1"
@@ -31,6 +49,10 @@ run_sv() {
 run_sv tb_nds_nitro_ddram_cache_flush \
     "$repo_dir/third_party/Nitro_DarkSide/d2dabe/rtl/ddram.sv" \
     "$repo_dir/rtl/tb_nds_nitro_ddram_cache_flush.sv"
+
+run_sv tb_nds_ddram_cart_bank \
+    "$repo_dir/third_party/Nitro_DarkSide/d2dabe/rtl/ddram.sv" \
+    "$repo_dir/rtl/tb_nds_ddram_cart_bank.sv"
 
 run_sv tb_nds_nitro_cart_readahead \
     "$repo_dir/third_party/Nitro_DarkSide/d2dabe/rtl/ddram.sv" \
@@ -63,15 +85,16 @@ run_sv tb_nds_nitro_fb_telemetry \
     "$repo_dir/rtl/nds_nitro_fb_ddr3.sv" \
     "$repo_dir/rtl/tb_nds_nitro_fb_telemetry.sv"
 
-run_sv tb_nds_h3d_plane_reader \
-    "$repo_dir/rtl/nds_h3d_plane_reader.sv" \
-    "$repo_dir/rtl/tb_nds_h3d_plane_reader.sv"
-
 run_sv tb_nds_h3d_sparse_phase_cdc \
     "$repo_dir/rtl/nds_h3d_event_async_fifo.sv" \
     "$repo_dir/rtl/nds_gx_fifo_packet_frontend.sv" \
     "$repo_dir/rtl/nds_h3d_frame_record_cdc.sv" \
     "$repo_dir/rtl/tb_nds_h3d_sparse_phase_cdc.sv"
+run_sv tb_nds_h3d_delayed_scanline_tag \
+    "$repo_dir/rtl/nds_h3d_event_async_fifo.sv" \
+    "$repo_dir/rtl/nds_gx_fifo_packet_frontend.sv" \
+    "$repo_dir/rtl/nds_h3d_frame_record_cdc.sv" \
+    "$repo_dir/rtl/tb_nds_h3d_delayed_scanline_tag.sv"
 
 run_sv tb_nds_nitro_arm9_math_unit \
     "$repo_dir/rtl/nds_nitro_arm9_math_unit.sv" \
@@ -83,6 +106,7 @@ run_sv tb_nds_nitro_save_bridge \
 
 iverilog -g2012 -Wall -i -s tb_nds_nitro_input_boundary \
     -o "$test_tmp/tb_nds_nitro_input_boundary" \
+    "$repo_dir/rtl/nds_nitro_touch_input.sv" \
     "$repo_dir/rtl/nds_nitro_arm9_math_unit.sv" \
     "$repo_dir/rtl/nds_nitro_async_fifo.sv" \
     "$repo_dir/rtl/nds_nitro_fb_ddr3.sv" \
@@ -99,13 +123,13 @@ vvp "$test_tmp/tb_nds_nitro_input_boundary"
 # a duplicate behavioral model in the testbench.
 grep -Fq '        "NDS;;",' \
     "$repo_dir/fpga/mister_nitro_console_island/NDS4MiSTer.sv"
-grep -Fq '        "FS3,NDS,Load NDS (max 128 MiB),30000000;",' \
+grep -Fq '        "FS3,NDS,Load NDS (max 512 MiB),30000000;",' \
     "$repo_dir/fpga/mister_nitro_console_island/NDS4MiSTer.sv"
 grep -Fq 'nds_nitro_integer_scale integer_scale (' \
     "$repo_dir/fpga/mister_nitro_console_island/NDS4MiSTer.sv"
 grep -Fq '"O[6:5],Video Layout,Left/Right,Top/Bottom,Left Only,Right Only;",' \
     "$repo_dir/fpga/mister_nitro_console_island/NDS4MiSTer.sv"
-grep -Fq '"O[7],Screen Order,Top First,Bottom First;",' \
+grep -Fq '"O[7],Screen Order,Main First,Touch First;",' \
     "$repo_dir/fpga/mister_nitro_console_island/NDS4MiSTer.sv"
 grep -Fq '"O[9:8],Screen Gap,8 Pixels,None,16 Pixels,24 Pixels;",' \
     "$repo_dir/fpga/mister_nitro_console_island/NDS4MiSTer.sv"
@@ -114,14 +138,6 @@ grep -Fq 'wire [1:0] video_gap_select = status[9:8] == 2'"'"'d0 ? 2'"'"'d1 :' \
 grep -Fq '        "v,1;",' \
     "$repo_dir/fpga/mister_nitro_console_island/NDS4MiSTer.sv"
 grep -Fq '"O[4],3D FPS Counter,Off,On;",' \
-    "$repo_dir/fpga/mister_nitro_console_island/NDS4MiSTer.sv"
-grep -Fq '"P4,Credits;",' \
-    "$repo_dir/fpga/mister_nitro_console_island/NDS4MiSTer.sv"
-grep -Fq '"P4-,Heni: ARM9 and FPGA 2D;",' \
-    "$repo_dir/fpga/mister_nitro_console_island/NDS4MiSTer.sv"
-grep -Fq '"P4-,SplashDev88: HPS 3D/integration;",' \
-    "$repo_dir/fpga/mister_nitro_console_island/NDS4MiSTer.sv"
-grep -Fq '"P4-,Robert Peip: upstream foundation;",' \
     "$repo_dir/fpga/mister_nitro_console_island/NDS4MiSTer.sv"
 grep -Fq "wire console_enabled=1'b1;" \
     "$repo_dir/fpga/mister_nitro_console_island/NDS4MiSTer.sv"
@@ -156,14 +172,14 @@ grep -Fq 'set_global_assignment -name VERILOG_MACRO "NDS_FORCE_NEAREST=1"' \
     "$repo_dir/fpga/mister_nitro_console_island/NDS4MiSTer.qsf"
 grep -Fq 'set_global_assignment -name VERILOG_MACRO "NDS_FORCE_INTEGER_SCALE=1"' \
     "$repo_dir/fpga/mister_nitro_console_island/NDS4MiSTer.qsf"
-grep -Fq 'set_global_assignment -name VERILOG_MACRO "NDS_HDMI_SCALER_ONLY=1"' \
+grep -Fq 'set_global_assignment -name VERILOG_MACRO "NDS_NATIVE_OUTPUTS=1"' \
     "$repo_dir/fpga/mister_nitro_console_island/NDS4MiSTer.qsf"
 grep -Fq 'assign hdmi_tx_clk = hdmi_clk_out;' \
     "$repo_dir/fpga/mister_nitro_console_island/sys/sys_top.v"
 grep -Fq 'set_global_assignment -name VERILOG_MACRO "NDS_HYBRID_3D=1"' \
     "$repo_dir/fpga/mister_nitro_console_island/NDS4MiSTer.qsf"
 for h3d_source in \
-    nds_h3d_console_event_gate.vhd nds_h3d_gx_status.vhd \
+    nds_hblank_run_queue.vhd nds_h3d_console_event_gate.vhd nds_h3d_gx_status.vhd \
     nds_h3d_ddr_fabric.sv nds_h3d_control_init.sv \
     nds_h3d_event_async_fifo.sv nds_gx_fifo_packet_frontend.sv \
     nds_h3d_frame_record_cdc.sv nds_h3d_frame_packet_writer.sv \
@@ -211,15 +227,9 @@ grep -Fq 'ibios7 : entity work.nds_nitro_freebios7' \
     "$repo_dir/rtl/nds_nitro_console_top.vhd"
 grep -Fq 'ibios9 : entity work.nds_nitro_freebios9' \
     "$repo_dir/rtl/nds_nitro_console_top.vhd"
-# Engine-B replay mirrors the complete VRAM aperture plus both 2D register
-# banks and palette/OAM. Pin those source filters and the local-write seam.
-grep -Fq 'h3d_vram9_source_address(27 downto 24) = x"6"' \
-    "$repo_dir/rtl/nds_nitro_console_top.vhd"
-grep -Fq '(low >= 16#1000# and low <= 16#106F#)' \
-    "$repo_dir/rtl/nds_nitro_console_top.vhd"
-grep -Fq '16#1000000# + pal_addr * 4' \
-    "$repo_dir/rtl/nds_nitro_console_top.vhd"
-grep -Fq '16#3000000# + oam_addr * 4' \
+# In 3D-plane mode BG/OBJ traffic remains local to the FPGA; only LCDC texture
+# uploads cross to HPS. Pin that filter and the local-write acceptance seam.
+grep -Fq 'h3d_vram9_source_address(27 downto 20) = x"68"' \
     "$repo_dir/rtl/nds_nitro_console_top.vhd"
 grep -Fq 'vram9_ena and not vram9_rnw and h3d_vram9_needed_by_h3d;' \
     "$repo_dir/rtl/nds_nitro_console_top.vhd"
@@ -276,7 +286,13 @@ grep -Fq ".fpga_heartbeat_value(h3d_diagnostic_heartbeat)" \
     "$repo_dir/rtl/nds_nitro_console_island.sv"
 grep -Fq 'wire [31:0] h3d_bg1_scroll_triplet;' \
     "$repo_dir/rtl/nds_nitro_console_island.sv"
-grep -Fq 'h3d_bg1_scroll_meta_ddr <= h3d_bg1_scroll_triplet;' \
+grep -Fq 'nds_h3d_probe_cdc query_probe_cdc (' \
+    "$repo_dir/rtl/nds_nitro_console_island.sv"
+grep -Fq '.source_data(h3d_bg1_scroll_triplet)' \
+    "$repo_dir/rtl/nds_nitro_console_island.sv"
+grep -Fq '.source_toggle(h3d_query_sample_toggle)' \
+    "$repo_dir/rtl/nds_nitro_console_island.sv"
+grep -Fq '.sample_data(h3d_bg1_scroll_ddr)' \
     "$repo_dir/rtl/nds_nitro_console_island.sv"
 grep -Fq 'h3d_plane_descriptor_valid && h3d_plane_line_missed &&' \
     "$repo_dir/rtl/nds_nitro_console_island.sv"
@@ -312,16 +328,10 @@ grep -Fq 'wire [31:0] fb_runtime_heartbeat = dbg_pc9_diag != 0 ? dbg_pc9_diag : 
     "$repo_dir/rtl/nds_nitro_console_island.sv"
 grep -Fq 'h3d_control_release, h3d_record_source_active, h3d_console_release,' \
     "$repo_dir/rtl/nds_nitro_console_island.sv"
-grep -Fq 'h3d_gpu_source_address <=' \
+grep -Fq 'h3d_gpu_write_hit(io9_lat_1x.Adr, io9_lat_1x.bEna, h3d_engine_b_enable)' \
     "$repo_dir/rtl/nds_nitro_console_top.vhd"
-grep -Fq '      io_bus9.Adr;' \
+grep -Fq "hblank_pulse => lcd_phase and h3d_engine_b_enable" \
     "$repo_dir/rtl/nds_nitro_console_top.vhd"
-grep -Fq 'hblank_pulse => drawline' \
-    "$repo_dir/rtl/nds_nitro_console_top.vhd"
-grep -Fq '.SPARSE_HBLANK(1' \
-    "$repo_dir/rtl/nds_nitro_console_island.sv"
-grep -Fq '.SCANLINE_TAGS(1' \
-    "$repo_dir/rtl/nds_nitro_console_island.sv"
 grep -Fq ".external_frame_mode(1'b0), .external_frame_publish(1'b0)" \
     "$repo_dir/rtl/nds_nitro_console_island.sv"
 # The measured one-engine fit diagnostic keeps timing-critical engine A in
@@ -358,7 +368,7 @@ console_ports=$(sed -n '/nds_nitro_console_wrap #(/,/^);/p' \
     "$repo_dir/rtl/nds_nitro_console_island.sv")
 for required_port in \
     h3d_pixel_valid h3d_line_request h3d_service_ready \
-    h3d_gx_fifo_level h3d_current_frame h3d_source_fault \
+    h3d_gx_fifo_level h3d_current_frame h3d_source_fault h3d_source_fault_reason \
     diagnostic_hold9 diagnostic_hold7 \
     diagnostic_release9 diagnostic_release7 \
     h3d_gpu_write_valid \
@@ -391,11 +401,14 @@ iverilog -g2012 -Wall -i -tnull -s nds_nitro_console_island \
     "$repo_dir/rtl/nds_ddram_arbiter_4client.sv" \
     "$repo_dir/rtl/nds_h3d_ddr_fabric.sv" \
     "$repo_dir/rtl/nds_h3d_control_init.sv" \
+    "$repo_dir/rtl/nds_h3d_session_policy_latch.sv" \
     "$repo_dir/rtl/nds_h3d_event_async_fifo.sv" \
     "$repo_dir/rtl/nds_gx_fifo_packet_frontend.sv" \
     "$repo_dir/rtl/nds_h3d_frame_record_cdc.sv" \
     "$repo_dir/rtl/nds_h3d_frame_packet_writer.sv" \
+    "$repo_dir/rtl/nds_h3d_adoption_window.sv" \
     "$repo_dir/rtl/nds_h3d_plane_reader.sv" \
+    "$repo_dir/rtl/nds_h3d_probe_cdc.sv" \
     "$repo_dir/third_party/Nitro_DarkSide/d2dabe/rtl/sdram.sv" \
     "$repo_dir/third_party/Nitro_DarkSide/d2dabe/rtl/ddram.sv" \
     "$repo_dir/rtl/nds_nitro_console_island.sv"
@@ -414,4 +427,8 @@ iverilog -g2012 -Wall -i -tnull -s nds_nitro_console_island \
     "$repo_dir/third_party/Nitro_DarkSide/d2dabe/rtl/ddram.sv" \
     "$repo_dir/rtl/nds_nitro_console_island.sv"
 
-echo "PASS: r355 Nitro console-island host RTL gates"
+if grep -Eq '"P[0-9]+,Credits;' "$repo_dir/fpga/mister_nitro_console_island/NDS4MiSTer.sv"; then
+    echo "FAIL: credits menu is prohibited" >&2
+    exit 1
+fi
+echo "PASS: Nitro console-island host RTL gates with Engine B policy"

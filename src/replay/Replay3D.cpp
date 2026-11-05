@@ -143,9 +143,9 @@ void map_vram(GPU& gpu, const u8* cnt) {
 
 void apply_delta(GPU& gpu, const Trace2DMemoryDeltaHeader& h, const std::vector<u8>& data) {
     if (h.Region == 0) { if (h.Offset + data.size() > 2048) throw std::runtime_error("palette delta out of bounds"); std::memcpy(gpu.Palette+h.Offset, data.data(), data.size()); return; }
-    if (h.Region == 1) { if (h.Offset + data.size() > 2048) throw std::runtime_error("OAM delta out of bounds"); std::memcpy(gpu.OAM+h.Offset, data.data(), data.size()); return; }
+    if (h.Region == 1) { if (h.Offset + data.size() > 2048) throw std::runtime_error("OAM delta out of bounds"); std::memcpy(gpu.OAM+h.Offset, data.data(), data.size()); gpu.MarkSpriteOAMWritten(h.Offset, static_cast<u32>(data.size())); return; }
     if (h.Region == 11) { if (h.Offset + data.size() > sizeof(gpu.VRAMFlat_AOBJ)) throw std::runtime_error("flat AOBJ delta out of bounds"); std::memcpy(gpu.VRAMFlat_AOBJ+h.Offset,data.data(),data.size()); return; }
-    if (h.Region == 12) { if (h.Offset + data.size() > sizeof(gpu.VRAMFlat_BOBJ)) throw std::runtime_error("flat BOBJ delta out of bounds"); std::memcpy(gpu.VRAMFlat_BOBJ+h.Offset,data.data(),data.size()); return; }
+    if (h.Region == 12) { if (h.Offset + data.size() > sizeof(gpu.VRAMFlat_BOBJ)) throw std::runtime_error("flat BOBJ delta out of bounds"); std::memcpy(gpu.VRAMFlat_BOBJ+h.Offset,data.data(),data.size()); ++gpu.BOBJCoherencyEpoch; return; }
     if (h.Region > 10) return;
     const u32 bank = h.Region - 2;
     if (h.Offset + data.size() > gpu.VRAMMask[bank] + 1) throw std::runtime_error("VRAM delta out of bounds");
@@ -236,6 +236,8 @@ int main(int argc, char** argv) {
             std::getenv("NDS_GPU_PACKED_OUTPUT") != nullptr;
         const bool threaded_3d =
             std::getenv("NDS_GPU_THREADED_3D") != nullptr;
+        const bool full_frame_3d =
+            std::getenv("NDS_GPU_FULL_FRAME_3D") != nullptr;
         const bool disable_engine_a =
             std::getenv("NDS_GPU_DISABLE_ENGINE_A") != nullptr;
         const bool disable_engine_b =
@@ -265,6 +267,11 @@ int main(int argc, char** argv) {
             ? static_cast<u32>(std::strtoul(
                 std::getenv("NDS_GPU_CACHE_DEBUG_LINE"),nullptr,10)) : ~0u;
         std::ofstream output_dump;
+        std::ofstream geometry_dump;
+        if (const char* path = std::getenv("NDS_GPU_3D_OUTPUT_DUMP")) {
+            geometry_dump.open(path, std::ios::binary);
+            if (!geometry_dump) throw std::runtime_error("cannot open 3D output dump");
+        }
         if(output_dump_path) {
             output_dump.open(output_dump_path,std::ios::binary);
             if(!output_dump) throw std::runtime_error("cannot open output dump");
@@ -313,6 +320,8 @@ int main(int argc, char** argv) {
         const auto replay_profile_start=std::chrono::steady_clock::now();
         auto replay_profile_checkpoint=replay_profile_start;
         nds->Reset();
+        if (const char* cache = std::getenv("NDS_GPU_SPRITE_PHASE_CACHE"))
+            nds->GPU.SetSpriteOAMWriteTracking(std::strcmp(cache, "1") == 0);
         nds->GPU.GPU3D.SetEnabled(true, true);
         nds->GPU.GPU3D.SetExternalCommandReplay(external_command_replay);
         nds->GPU.GPU2D_A.Enabled = !disable_engine_a;
@@ -320,7 +329,8 @@ int main(int argc, char** argv) {
         if (parallel_2d || packed_output || threaded_3d || profile) {
             melonDS::RendererSettings settings {
                 1, threaded_3d, false, false,
-                packed_output, parallel_2d, cache_apply, profile};
+                packed_output, parallel_2d, cache_apply, profile,
+                full_frame_3d};
             nds->GPU.GetRenderer().SetRenderSettings(settings);
             if (threaded_3d) {
                 // SetThreaded starts the reset-time placeholder render. Drain
@@ -762,6 +772,12 @@ int main(int argc, char** argv) {
                 nds->GPU.GPU3D.VBlank();
                 nds->GPU.GetRenderer().Start3DRendering(); nds->GPU.GetRenderer().Finish3DRendering();
                 dump_3d_frame(nds->GPU.GetRenderer(), p.Frame);
+                if (geometry_dump.is_open()) {
+                    for (u32 y = 0; y < 192; ++y)
+                        geometry_dump.write(reinterpret_cast<const char*>(
+                            nds->GPU.GetRenderer().Get3DScanline(y)), 256 * sizeof(u32));
+                    if (!geometry_dump) throw std::runtime_error("3D output dump failed");
+                }
                 if (analyze_geometry_delta) {
                     constexpr u32 BlockPixels = 16;
                     const auto bank = rendered & 1u;
@@ -902,6 +918,14 @@ int main(int argc, char** argv) {
                       << renderer_profile.ThreeDBandQueueAdvancedScanlines
                       << "\nrenderer_3d_band_queue_shadow_fallback_frames: "
                       << renderer_profile.ThreeDBandQueueShadowFallbackFrames
+                      << "\nrenderer_3d_x_partition_frames: "
+                      << renderer_profile.ThreeDXPartitionFrames
+                      << "\nrenderer_3d_x_partition_split_total: "
+                      << renderer_profile.ThreeDXPartitionSplitTotal
+                      << "\nrenderer_3d_x_partition_split_min: "
+                      << renderer_profile.ThreeDXPartitionSplitMin
+                      << "\nrenderer_3d_x_partition_split_max: "
+                      << renderer_profile.ThreeDXPartitionSplitMax
                       << "\n";
             std::cout<<"profile_total_ms: "<<std::chrono::duration<double,std::milli>(replay_profile_end-replay_profile_start).count()
             <<"\nprofile_sprite_ms: "<<sprite_profile_ns/1000000.0<<"\nprofile_scanline_ms: "<<scanline_profile_ns/1000000.0

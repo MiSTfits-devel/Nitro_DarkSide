@@ -798,13 +798,27 @@ begin
             end if;
             
             if (fetch_done = '1') then
-               fetch_data  <= gb_bus_din;
+               -- HALTCNT can stop decode while the next prefetch is still
+               -- in flight. Do not overwrite the buffered instruction that
+               -- decode must consume after wake (native BIOS: BX LR).
+               -- There is one outstanding fetch: fetch_PC already points
+               -- just past it, so replay the discarded response after wake.
+               -- The existing branch redirect below retains priority.
+               if (decode_halt = '1' and fetch_ready = '1') then
+                  if (thumbmode = '1') then
+                     fetch_PC <= fetch_PC - 2;
+                  else
+                     fetch_PC <= fetch_PC - 4;
+                  end if;
+               else
+                  fetch_data  <= gb_bus_din;
 -- synthesis translate_off
-               if (thumbmode = '1') then
-                  fetch_data(31 downto 16) <= (others => '0');
-               end if;
+                  if (thumbmode = '1') then
+                     fetch_data(31 downto 16) <= (others => '0');
+                  end if;
 -- synthesis translate_on
-               fetch_ready <= '1'; 
+                  fetch_ready <= '1';
+               end if;
             end if;
             
             if (execute_branch = '1') then
@@ -1151,6 +1165,11 @@ begin
                               decode_datacomb(11 downto  0)  := x"00" & '0' & decode_data(5 downto 3); -- RS -> 2nd OP -> no shift using op2 is default
                               decode_functions               := data_processing;
                               case (decode_data(9 downto 6)) is
+                                 -- H1 = H2 = 0: the ARM7TDMI (and melonDS) use the two low registers.
+                                 -- Without these arms both fell to `others` = opcode 0000 = AND
+                                 -- (see the matching fix and note in nds_cpu9.vhd).
+                                 when x"0" => decode_datacomb(24 downto 21) := x"4";                                                                                     -- 0000 ADD Rd, Rs (both low)
+                                 when x"4" => decode_datacomb(24 downto 21) := x"A";                                                                                     decode_datacomb(20) := '1'; -- 0100 CMP Rd, Rs (both low)
                                  when x"1" => decode_datacomb(24 downto 21) := x"4"; decode_datacomb( 3) := '1';                                                         -- 0001 ADD Rd, Hs ADD Rd, Rd, Hs Add a register in the range 8 - 15 to a register in the range 0 - 7.
                                  when x"2" => decode_datacomb(24 downto 21) := x"4"; decode_datacomb(19) := '1'; decode_datacomb(15) := '1';                             -- 0010 ADD Hd, Rs ADD Hd, Hd, Rs Add a register in the range 0 - 7 to a register in the range 8 - 15.
                                  when x"3" => decode_datacomb(24 downto 21) := x"4"; decode_datacomb( 3) := '1'; decode_datacomb(19) := '1'; decode_datacomb(15) := '1'; -- 0011 ADD Hd, Hs ADD Hd, Hd, Hs Add two registers in the range 8 - 15
@@ -1738,6 +1757,18 @@ begin
                   decode_rdest            <= x"E";
                   if (decode_unhalt = '1' or fetch_done = '1') then
                      decode_PC <= fetch_PC;
+                     -- A branch can retire as HALTCNT reaches decode. Its
+                     -- target then has only one prefetched instruction and
+                     -- no decoded instruction. Refill the missing PC bias
+                     -- for IRQ entry, or SUBS PC,LR,#4 returns one instruction
+                     -- before that target after wake.
+                     if (decode_unhalt = '1' and decode_ready = '0') then
+                        if (thumbmode = '1') then
+                           decode_PC <= fetch_PC + 2;
+                        else
+                           decode_PC <= fetch_PC + 4;
+                        end if;
+                     end if;
                   end if;
                end if;
             end if;
@@ -2130,7 +2161,11 @@ begin
             end case;
          end if;
          
-         if (execute_stall = '1' and decode_RM_op2 = decode_Rn_op1) then
+         -- STM with the base in the list and not first: ARMv4 stores the
+         -- written-back address, but only when writeback is actually enabled.
+         -- Without writeback the original base is stored (see nds_cpu9.vhd).
+         if (execute_stall = '1' and decode_RM_op2 = decode_Rn_op1 and
+             decode_datatransfer_writeback = '1') then
             execute_RW_data <= std_logic_vector(execute_blockRW_endaddr);
          end if;
          
@@ -3062,4 +3097,3 @@ begin
    
    
 end architecture;
-

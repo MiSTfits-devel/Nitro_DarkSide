@@ -106,7 +106,14 @@ entity nds_vram is
       -- nds_dma9 is, and that one is unconditional because it is what makes an
       -- access one cycle. If you are hunting the ~10-25 LABs, hunt there or
       -- outside this module; do not spend another fit on WQ_DEPTH.
-      POSTED_WRITES : boolean := true
+      POSTED_WRITES : boolean := true;
+      -- One-line read buffer for ARM9 reads of banks A..D. The backing channel
+      -- returns the whole 8-byte line a read lands in (srv_dout_hi is the other
+      -- word), so the next read of that line - a DMA or a copy loop walking
+      -- VRAM - is answered here instead of paying another SDRAM round trip.
+      -- A posted write into the line, any other write, and reset drop it.
+      -- Off by default because a backing model must drive srv_dout_hi for it.
+      RD_LINE_BUF   : boolean := false
    );
    port
    (
@@ -159,11 +166,32 @@ entity nds_vram is
       srv_din   : out std_logic_vector(31 downto 0) := (others => '0');
       srv_dout  : in  std_logic_vector(31 downto 0);
       srv_done  : in  std_logic;
+      -- Streaming extensions. A model that only watches srv_req/srv_done keeps
+      -- working (it just ignores srv_din_hi), but the real channel uses all of
+      -- them, because on hardware every srv op pays an SDRAM hand-over from
+      -- main RAM and three times its own SDRAM time went to that.
+      --   srv_seq  toggles once per op, so a new op can follow the last one
+      --            with srv_req still high: the posted-write drain chains
+      --            straight from one queue entry to the next.
+      --   srv_wide the op is a 64-bit write. srv_addr is the even word of the
+      --            8-byte line, srv_din/srv_be its data, and srv_din_hi/
+      --            srv_be_hi the odd word's.
+      --   srv_more more srv work is already waiting behind this op, so the
+      --            channel may keep SDRAM instead of handing it back.
+      --   srv_dout_hi the other word of the 8-byte line a read returned
+      --            (RD_LINE_BUF only)
+      srv_dout_hi : in std_logic_vector(31 downto 0) := (others => '0');
+      srv_seq    : out std_logic := '0';
+      srv_wide   : out std_logic := '0';
+      srv_din_hi : out std_logic_vector(31 downto 0) := (others => '0');
+      srv_be_hi  : out std_logic_vector(3 downto 0) := (others => '0');
+      srv_more   : out std_logic := '0';
 
       -- renderer line-server channels (read-only; see header). accept pulses
       -- the cycle the server takes the request - a client may present the
       -- next one immediately and have several outstanding, answered in order.
       rdr_bg_req     : in  std_logic := '0';
+      rdr_bg_lcdc    : in  std_logic := '0';
       rdr_bg_addr    : in  unsigned(18 downto 2) := (others => '0');
       rdr_bg_dout    : out std_logic_vector(31 downto 0) := (others => '0');
       rdr_bg_done    : out std_logic := '0';
@@ -322,6 +350,16 @@ architecture arch of nds_vram is
    -- cache tags against the write being presented.
    signal srv_bank_int : std_logic_vector(1 downto 0) := (others => '0');
    signal srv_addr_int : unsigned(16 downto 2) := (others => '0');
+   signal srv_seq_int  : std_logic := '0';
+   -- the drain op on the wire covers the queue head AND the entry after it
+   signal srv_pair     : std_logic := '0';
+
+   -- RD_LINE_BUF: the last A..D line an ARM9 read fetched, by physical bank
+   signal rb_valid : std_logic := '0';
+   signal rb_bank  : integer range BANK_A to BANK_D := BANK_A;
+   signal rb_line  : unsigned(16 downto 3) := (others => '0');
+   signal rb_data  : std_logic_vector(63 downto 0) := (others => '0');
+   signal rb_hit   : std_logic;   -- the latched cpu9 read is in it
 
    -- Lowest A..D bank at or above `from_idx` that this request hits, or 4 for
    -- none. This used to be a state of its own (SRVSCAN) evaluated once before
@@ -379,7 +417,11 @@ architecture arch of nds_vram is
    -- 3 is also not free the way 2 and 4 are - `mod 3` synthesises to comparators
    -- where a power of two is a dropped carry, which is why 4 -> 3 bought only 25
    -- ALMs of the ~130 its registers should have been worth.
-   constant WQ_DEPTH : integer := 3;
+   --
+   -- Back to 4 for paired drains: a pair on the wire holds two entries until
+   -- it retires, and with 3 only one more word fits behind it, so the next op
+   -- always went out alone - three ops per four words instead of two.
+   constant WQ_DEPTH : integer := 4;
 
    type t_wq_entry is record
       valid : std_logic;
@@ -535,13 +577,14 @@ architecture arch of nds_vram is
    type t_rq_entry is record
       valid    : std_logic;
       chan     : integer range 0 to 7;
+      lcdc     : std_logic;
       need_br  : std_logic;                           -- waiting on the BRAM stage
       ad_todo  : std_logic_vector(BANK_A to BANK_D);  -- A..D words not yet issued
       ad_owed  : integer range 0 to 4;                -- A..D words not yet returned
       acc      : std_logic_vector(31 downto 0);
    end record;
    constant RQ_INIT : t_rq_entry :=
-      ('0', 0, '0', (others => '0'), 0, (others => '0'));
+      ('0', 0, '0', '0', (others => '0'), 0, (others => '0'));
    type t_rq is array (0 to RQ_DEPTH-1) of t_rq_entry;
    signal rq       : t_rq := (others => RQ_INIT);
    signal rq_head  : integer range 0 to RQ_DEPTH-1 := 0;
@@ -568,12 +611,16 @@ architecture arch of nds_vram is
       line : unsigned(16 downto 3);
       -- Remains high only if no invalidating CPU/posted
       -- write raced this miss between issue and response. Completion is always
-      -- delivered; low suppresses only primary/victim insertion.
+      -- delivered; low suppresses primary/victim insertion and new read joins.
       cacheable : std_logic;
+      -- Direct-display neighbors may share this still-pending 64-bit read.
+      pair_valid : std_logic;
+      pair_slot  : integer range 0 to RQ_DEPTH-1;
+      pair_hi    : std_logic;
    end record;
    type t_adq is array (0 to AD_DEPTH-1) of t_adq_entry;
    signal adq       : t_adq :=
-      (others => (0, BANK_A, '0', 0, (others => '0'), '0'));
+      (others => (0, BANK_A, '0', 0, (others => '0'), '0', '0', 0, '0'));
    signal adq_head  : integer range 0 to AD_DEPTH-1 := 0;
    signal adq_tail  : integer range 0 to AD_DEPTH-1 := 0;
    signal adq_count : integer range 0 to AD_DEPTH := 0;
@@ -643,7 +690,8 @@ architecture arch of nds_vram is
    signal adhit_slot  : integer range 0 to RQ_DEPTH-1 := 0;
    signal adhit_word  : std_logic_vector(31 downto 0) := (others => '0');
 
-   -- Two-entry ownerless victim extension. Entry 0 is MRU and entry 1 is LRU.
+   -- Two-entry ownerless victim extension. The MRU selector orders two fixed
+   -- physical slots, so promotion does not copy a complete line between them.
    -- Tags are ownerless: any renderer channel may hit a line evicted by any
    -- other channel. The eight `adline` entries remain functional primaries.
    -- A victim hit installs the hit line in the requesting channel's primary and
@@ -651,6 +699,7 @@ architecture arch of nds_vram is
    -- installs in primary and inserts the displaced valid primary in the pair.
    type t_adglobal2 is array (0 to 1) of t_adline;
    signal adglobal2 : t_adglobal2 := (others => ADLINE_INIT);
+   signal adglobal2_mru : integer range 0 to 1 := 0;
 
    -- false: no cache, every word costs a memory access (the 64-bit channel still
    -- carries the line, only its low word is used). It was false for one build:
@@ -671,6 +720,40 @@ begin
 
    srv_bank <= srv_bank_int;
    srv_addr <= srv_addr_int;
+   srv_seq  <= srv_seq_int;
+   -- Something that will need srv as soon as this op finishes: queue entries
+   -- beyond the one or two on the wire, or a CPU/DMA access already latched.
+   -- A buffer hit needs the read to land in exactly one A..D bank and nowhere
+   -- else: a multi-bank read ORs banks the buffer does not hold.
+   rb_hit_p : process (all)
+      variable b : integer range 0 to 4;
+   begin
+      rb_hit <= '0';
+      b := ad_next(req9.hit, 0);
+      if (RD_LINE_BUF and rb_valid = '1' and req9.valid = '1' and req9.rnw = '1' and
+          b /= 4 and b = rb_bank and ad_next(req9.hit, b + 1) = 4 and
+          (req9.hit(BANK_E) or req9.hit(BANK_F) or req9.hit(BANK_G) or
+           req9.hit(BANK_H) or req9.hit(BANK_I)) = '0' and
+          req9.offs(b)(16 downto 3) = rb_line) then
+         rb_hit <= '1';
+      end if;
+   end process;
+
+   -- Registered: the island samples it on clkMem, and an op lasts several clk1x
+   -- cycles, so a hint one cycle old is as good and keeps this logic out of a
+   -- 134 MHz path.
+   process (clk)
+   begin
+      if rising_edge(clk) then
+         if ((state = WQ_WAIT and
+              ((srv_pair = '1' and wq_count > 2) or (srv_pair = '0' and wq_count > 1))) or
+             (req9.valid = '1' and rb_hit = '0') or req7.valid = '1') then
+            srv_more <= '1';
+         else
+            srv_more <= '0';
+         end if;
+      end if;
+   end process;
 
    idec9 : entity work.nds_vram_map
    port map ( vramcnt => vramcnt, addr => cpu9_addr & "00", is_arm7 => '0', hit => dec9_hit, offs => dec9_offs );
@@ -679,8 +762,11 @@ begin
    port map ( vramcnt => vramcnt, addr => cpu7_addr & "00", is_arm7 => '1', hit => dec7_hit, offs => dec7_offs );
 
    -- renderer BG/OBJ decode: flat renderer spaces are exactly the ARM9 view of
-   -- the main-BG (0x000000) and main-OBJ (0x400000) regions
-   rdec_bg_addr   <= "00000" & rdr_bg_addr & "00";
+   -- the main-BG (0x000000) and main-OBJ (0x400000) regions. Direct
+   -- display temporarily uses the BG channel at 0x06800000 + bank offset;
+   -- the same decoder enforces bank enable and the LCDC role.
+   rdec_bg_addr   <= "10000" & rdr_bg_addr & "00" when rdr_bg_lcdc='1' else
+                     "00000" & rdr_bg_addr & "00";
    rdec_obj_addr  <= "010000" & rdr_obj_addr & "00";
    rdec_bgb_addr  <= "0010000" & rdr_bgb_addr & "00";   -- 0x06200000 region
    rdec_objb_addr <= "0110000" & rdr_objb_addr & "00";  -- 0x06600000 region
@@ -824,10 +910,17 @@ begin
    begin
       idx := 0;
       got := '0';
-      for k in 0 to 7 loop
-         if (got = '0' and rreq_vec((rr_pri + k) mod 8) = '1') then
-            idx := (rr_pri + k) mod 8;
+      -- First find the lowest pending channel, then prefer the lowest at or
+      -- above rr_pri. This is the same circular order with static bit reads.
+      for i in 7 downto 0 loop
+         if rreq_vec(i) = '1' then
+            idx := i;
             got := '1';
+         end if;
+      end loop;
+      for i in 7 downto 0 loop
+         if i >= rr_pri and rreq_vec(i) = '1' then
+            idx := i;
          end if;
       end loop;
       rpick       <= idx;
@@ -888,9 +981,11 @@ begin
    -- ordered against the posted writes: a read cannot overtake a write that has
    -- not reached the store, and neither can a later non-posted write. The queue
    -- is only ever non-empty during a DMA burst, when both CPUs are paused.
+   -- (a req9 the line buffer answers is not dispatched; see rb_hit)
    dispatch   <= '1' when (state = IDLE and wq_count = 0 and
-                           (req9.valid = '1' or req7.valid = '1')) else '0';
-   chosen_is9 <= '1' when (req9.valid = '1' and (req7.valid = '0' or prefer9 = '1')) else '0';
+                           ((req9.valid = '1' and rb_hit = '0') or req7.valid = '1')) else '0';
+   chosen_is9 <= '1' when (req9.valid = '1' and rb_hit = '0' and
+                           (req7.valid = '0' or prefer9 = '1')) else '0';
    chosen     <= req9 when chosen_is9 = '1' else req7;
 
    -- E..I BRAM inputs are driven combinationally in the dispatch cycle so the
@@ -956,12 +1051,17 @@ begin
    begin
       idx   := 0;
       found := false;
-      for k in 0 to RQ_DEPTH-1 loop
-         if (not found) then
-            idx := (rq_head + k) mod RQ_DEPTH;
-            if (rq(idx).valid = '1' and rq(idx).ad_todo /= "0000") then
-               found := true;
-            end if;
+      -- Preserve head-first circular priority without rereading the entire
+      -- queue through a variable index for each possible offset.
+      for i in RQ_DEPTH-1 downto 0 loop
+         if rq(i).valid = '1' and rq(i).ad_todo /= "0000" then
+            idx := i;
+            found := true;
+         end if;
+      end loop;
+      for i in RQ_DEPTH-1 downto 0 loop
+         if i >= rq_head and rq(i).valid = '1' and rq(i).ad_todo /= "0000" then
+            idx := i;
          end if;
       end loop;
       if (found) then
@@ -983,6 +1083,7 @@ begin
       variable v_head  : integer range 0 to RQ_DEPTH-1;
       variable v_tail  : integer range 0 to RQ_DEPTH-1;
       variable v_acc   : std_logic_vector(31 downto 0);
+      variable v_br_word, v_rsp_word : std_logic_vector(31 downto 0);
       variable v_adcnt : integer range 0 to AD_DEPTH;
       variable v_adh   : integer range 0 to AD_DEPTH-1;
       variable v_adt   : integer range 0 to AD_DEPTH-1;
@@ -998,11 +1099,14 @@ begin
       variable v_line  : unsigned(16 downto 3);
       variable v_hi    : std_logic;
       variable v_g2    : t_adglobal2;
+      variable v_g2_mru: integer range 0 to 1;
       variable v_g2_hit: integer range -1 to 1;
       variable v_direct_hit : boolean;
       variable v_line_data  : std_logic_vector(63 downto 0);
       variable v_old_line   : t_adline;
       variable v_cacheable  : std_logic;
+      variable v_pair_index : integer range -1 to AD_DEPTH-1;
+      variable v_pair_returning : boolean;
 
       function same_tag(a : t_adline; b : t_adline) return boolean is
       begin
@@ -1010,34 +1114,41 @@ begin
                 a.bank = b.bank and a.line = b.line;
       end function;
 
+      -- idx is the logical order: 0 = MRU, 1 = LRU.
+      function victim_slot(mru : integer; idx : integer) return integer is
+      begin
+         if idx = 0 then return mru;
+         else return 1 - mru;
+         end if;
+      end function;
+
       procedure victim_remove(variable cache : inout t_adglobal2;
+                              variable mru : inout integer;
                               constant idx : in integer) is
       begin
          if idx = 0 then
-            cache(0) := cache(1);
-            cache(1) := ADLINE_INIT;
+            cache(mru) := ADLINE_INIT;
+            mru := 1 - mru;
          elsif idx = 1 then
-            cache(1) := ADLINE_INIT;
+            cache(1 - mru) := ADLINE_INIT;
          end if;
       end procedure;
 
       -- Insert or promote at MRU while maintaining unique valid tags inside
       -- the victim pair.
       procedure victim_insert(variable cache : inout t_adglobal2;
+                              variable mru : inout integer;
                               constant incoming : in t_adline) is
-         variable old_mru : t_adline;
       begin
          if incoming.valid = '0' then
             return;
-         elsif same_tag(cache(0), incoming) then
-            cache(0) := incoming;
-         elsif same_tag(cache(1), incoming) then
-            old_mru := cache(0);
-            cache(0) := incoming;
-            cache(1) := old_mru;
+         elsif same_tag(cache(mru), incoming) then
+            cache(mru) := incoming;
          else
-            cache(1) := cache(0);
-            cache(0) := incoming;
+            -- LRU promotion and new-tag insertion both keep the old MRU as
+            -- logical LRU, including when an invalid hole occupies either slot.
+            cache(1 - mru) := incoming;
+            mru := 1 - mru;
          end if;
       end procedure;
    begin
@@ -1061,11 +1172,12 @@ begin
             adq_head  <= 0;
             adq_tail  <= 0;
             adq_count <= 0;
-            adq       <= (others => (0, BANK_A, '0', 0, (others => '0'), '0'));
+            adq       <= (others => (0, BANK_A, '0', 0, (others => '0'), '0', '0', 0, '0'));
             rr_pri    <= 0;
             rsrv_req  <= '0';
             adline    <= (others => ADLINE_INIT);
             adglobal2 <= (others => ADLINE_INIT);
+            adglobal2_mru <= 0;
             rsp_valid <= '0';
             adhit_valid <= '0';
 
@@ -1081,6 +1193,9 @@ begin
             v_adq   := adq;
             v_adl   := adline;
             v_g2    := adglobal2;
+            v_g2_mru := adglobal2_mru;
+            adhit_valid <= '0';
+            v_pair_returning := false;
 
             -- ---- A..D line cache invalidation. The CPU reaches A..D through the
             -- srv channel, which HOLDS req for the whole write, so invalidating on
@@ -1156,19 +1271,44 @@ begin
                end loop;
             end if;
 
+            -- Collect the three return sources into each physical queue slot.
+            -- Static slot writes avoid cascaded variable-index read/modify/write
+            -- muxes across the entire accumulator array. OR is associative, so
+            -- simultaneous BRAM, SDRAM and cached returns retain their values.
+            -- Dispatch clears its slot last, matching the original S0 priority.
+            v_br_word := (others => '0');
+            for i in BANK_E to BANK_I loop
+               if br_hit(i) = '1' then
+                  v_br_word := v_br_word or bram_dout_b(i);
+               end if;
+            end loop;
+            v_rsp_word := rsp_data(31 downto 0);
+            if v_adq(v_adh).hi = '1' then
+               v_rsp_word := rsp_data(63 downto 32);
+            end if;
+            for i in 0 to RQ_DEPTH-1 loop
+               v_acc := rq(i).acc;
+               if br_valid = '1' and br_slot = i then
+                  v_acc := v_acc or v_br_word;
+               end if;
+               if rsp_valid = '1' and v_adcnt > 0 and v_adq(v_adh).slot = i then
+                  v_acc := v_acc or v_rsp_word;
+               end if;
+               if adhit_valid = '1' and adhit_slot = i then
+                  v_acc := v_acc or adhit_word;
+               end if;
+               if rdispatch = '1' and v_tail = i then
+                  v_acc := (others => '0');
+               end if;
+               v_rq(i).acc := v_acc;
+            end loop;
+
             -- ---- S1: the BRAM stage. port-B q is valid the cycle after the
             -- address was presented, so this collects the request issued last
             -- cycle. It runs before the new issue below, which re-drives the
             -- port for the NEXT request - the two do not conflict because the
             -- address register and q are one cycle apart.
             if (br_valid = '1') then
-               v_acc := v_rq(br_slot).acc;
-               for i in BANK_E to BANK_I loop
-                  if (br_hit(i) = '1') then
-                     v_acc := v_acc or bram_dout_b(i);
-                  end if;
-               end loop;
-               v_rq(br_slot).acc     := v_acc;
                v_rq(br_slot).need_br := '0';
             end if;
             br_valid <= '0';
@@ -1179,13 +1319,19 @@ begin
             -- channel, which is where the other half gets used for free.
             if (rsp_valid = '1' and v_adcnt > 0) then
                v_slot := v_adq(v_adh).slot;
-               if (v_adq(v_adh).hi = '1') then
-                  v_word := rsp_data(63 downto 32);
-               else
-                  v_word := rsp_data(31 downto 0);
-               end if;
-               v_rq(v_slot).acc     := v_rq(v_slot).acc or v_word;
                v_rq(v_slot).ad_owed := v_rq(v_slot).ad_owed - 1;
+               -- Keep the second word staged, like the ordinary cache-hit
+               -- response. Both clients still retire in their original order.
+               if v_adq(v_adh).pair_valid = '1' then
+                  v_pair_returning := true;
+                  adhit_valid <= '1';
+                  adhit_slot <= v_adq(v_adh).pair_slot;
+                  if v_adq(v_adh).pair_hi = '1' then
+                     adhit_word <= rsp_data(63 downto 32);
+                  else
+                     adhit_word <= rsp_data(31 downto 0);
+                  end if;
+               end if;
                if (AD_CACHE_EN and v_adq(v_adh).cacheable = '1') then
                   v_old_line := v_adl(v_adq(v_adh).chan);
                   v_line_data := rsp_data;
@@ -1195,15 +1341,15 @@ begin
                   -- channel primary.
                   v_g2_hit := -1;
                   for e in 0 to 1 loop
-                     if v_g2(e).valid = '1' and
-                        v_g2(e).bank = v_adq(v_adh).bank and
-                        v_g2(e).line = v_adq(v_adh).line then
+                     if v_g2(victim_slot(v_g2_mru, e)).valid = '1' and
+                        v_g2(victim_slot(v_g2_mru, e)).bank = v_adq(v_adh).bank and
+                        v_g2(victim_slot(v_g2_mru, e)).line = v_adq(v_adh).line then
                         v_g2_hit := e;
                         exit;
                      end if;
                   end loop;
                   if v_g2_hit >= 0 then
-                     victim_remove(v_g2, v_g2_hit);
+                     victim_remove(v_g2, v_g2_mru, v_g2_hit);
                   end if;
                   if v_old_line.valid = '1' and
                      v_old_line.bank = v_adq(v_adh).bank and
@@ -1212,7 +1358,7 @@ begin
                      -- must not evict that same tag into the victim pair.
                      null;
                   else
-                     victim_insert(v_g2, v_old_line);
+                     victim_insert(v_g2, v_g2_mru, v_old_line);
                   end if;
                   v_adl(v_adq(v_adh).chan) :=
                      ('1', v_adq(v_adh).bank, v_adq(v_adh).line, v_line_data);
@@ -1230,10 +1376,8 @@ begin
             -- Nothing can queue up behind it - the issue stage produces at most
             -- one hit per cycle and this consumes one per cycle.
             if (adhit_valid = '1') then
-               v_rq(adhit_slot).acc     := v_rq(adhit_slot).acc or adhit_word;
                v_rq(adhit_slot).ad_owed := v_rq(adhit_slot).ad_owed - 1;
             end if;
-            adhit_valid <= '0';
 
             -- ---- A..D issue: present the next op when the request wire is
             -- free - either nothing is on it, or what was on it is taken by
@@ -1242,7 +1386,13 @@ begin
             -- held until the channel takes it. Never gate presentation on
             -- rsrv_ready alone - that is the stale-ready wedge (see the port).
             if (rsrv_req = '0' or rsrv_ready = '1') then
-               if (ad_armed = '1' and v_adcnt < AD_DEPTH) then
+               if v_pair_returning then
+                  -- The shared hit-response stage is carrying the second
+                  -- LCDC word. Defer a new lookup for one cycle so a cache
+                  -- hit cannot replace that response. A held miss still
+                  -- transfers once; release its wire only after ready.
+                  rsrv_req <= '0';
+               elsif (ad_armed = '1' and v_adcnt < AD_DEPTH) then
                   v_bank := BANK_A;
                   for i in BANK_D downto BANK_A loop
                      if (ad_hit(i) = '1') then
@@ -1274,12 +1424,28 @@ begin
                   -- happened.
                   v_g2_hit := -1;
                   if (not v_direct_hit) then
-                     if v_g2(0).valid = '1' and v_g2(0).bank = v_bank and
-                        v_g2(0).line = v_line then
+                     if v_g2(v_g2_mru).valid = '1' and v_g2(v_g2_mru).bank = v_bank and
+                        v_g2(v_g2_mru).line = v_line then
                         v_g2_hit := 0;
-                     elsif v_g2(1).valid = '1' and v_g2(1).bank = v_bank and
-                           v_g2(1).line = v_line then
+                     elsif v_g2(1 - v_g2_mru).valid = '1' and v_g2(1 - v_g2_mru).bank = v_bank and
+                           v_g2(1 - v_g2_mru).line = v_line then
                         v_g2_hit := 1;
+                     end if;
+                  end if;
+                  -- Only the direct LCDC stream may join a pending read.
+                  -- A write since issue makes cacheable low before this scan,
+                  -- and pending writes are excluded by wq_touches above.
+                  v_pair_index := -1;
+                  if v_rq(ad_scan).lcdc = '1' then
+                     -- The LCDC words arrive in order. Joining only the
+                     -- newest pending burst covers consecutive halves without
+                     -- a four-entry associative search in this full device.
+                     v_qidx := (v_adt + AD_DEPTH - 1) mod AD_DEPTH;
+                     if v_adcnt > 0 and v_adq(v_qidx).chan = 0 and
+                        v_rq(v_adq(v_qidx).slot).lcdc = '1' and
+                        v_adq(v_qidx).bank = v_bank and v_adq(v_qidx).line = v_line and
+                        v_adq(v_qidx).cacheable = '1' and v_adq(v_qidx).pair_valid = '0' then
+                        v_pair_index := v_qidx;
                      end if;
                   end if;
                   if (AD_CACHE_EN and (v_direct_hit or v_g2_hit >= 0)) then
@@ -1293,12 +1459,12 @@ begin
                         -- Primary miss + victim hit: remove/promote the hit line
                         -- into this channel's primary, and send the displaced
                         -- valid primary into the ownerless victim MRU position.
-                        v_line_data := v_g2(v_g2_hit).data;
+                        v_line_data := v_g2(victim_slot(v_g2_mru, v_g2_hit)).data;
                         v_word := v_line_data(31 downto 0);
                         if (v_hi = '1') then v_word := v_line_data(63 downto 32); end if;
                         v_old_line := v_adl(v_chan);
-                        victim_remove(v_g2, v_g2_hit);
-                        victim_insert(v_g2, v_old_line);
+                        victim_remove(v_g2, v_g2_mru, v_g2_hit);
+                        victim_insert(v_g2, v_g2_mru, v_old_line);
                         v_adl(v_chan) := ('1', v_bank, v_line, v_line_data);
                      end if;
                      -- staged, NOT applied here: this branch is gated on
@@ -1314,6 +1480,12 @@ begin
                      -- the wire was free when we got here, so it must be released:
                      -- leaving it asserted would re-present the request that was
                      -- just taken and fetch the same line twice
+                     rsrv_req <= '0';
+                  elsif v_pair_index >= 0 then
+                     v_adq(v_pair_index).pair_valid := '1';
+                     v_adq(v_pair_index).pair_slot := ad_scan;
+                     v_adq(v_pair_index).pair_hi := v_hi;
+                     v_rq(ad_scan).ad_todo(v_bank) := '0';
                      rsrv_req <= '0';
                   else
                      rsrv_req  <= '1';
@@ -1333,7 +1505,7 @@ begin
                         v_cacheable := '0';
                      end if;
                      v_adq(v_adt) :=
-                        (ad_scan, v_bank, v_hi, v_chan, v_line, v_cacheable);
+                        (ad_scan, v_bank, v_hi, v_chan, v_line, v_cacheable, '0', 0, '0');
                      v_adt   := (v_adt + 1) mod AD_DEPTH;
                      v_adcnt := v_adcnt + 1;
                   end if;
@@ -1355,7 +1527,8 @@ begin
 
                v_rq(v_tail).valid   := '1';
                v_rq(v_tail).chan    := rpick;
-               v_rq(v_tail).acc     := (others => '0');
+               v_rq(v_tail).lcdc    := '0';
+               if rpick = 0 then v_rq(v_tail).lcdc := rdr_bg_lcdc; end if;
                v_rq(v_tail).ad_owed := v_nad;
                for i in BANK_A to BANK_D loop
                   v_rq(v_tail).ad_todo(i) := rchosen_hit(i);
@@ -1413,6 +1586,7 @@ begin
                report "victim pair contains duplicate valid tags"
                severity failure;
             adglobal2 <= v_g2;
+            adglobal2_mru <= v_g2_mru;
 
          end if;
       end if;
@@ -1430,11 +1604,15 @@ begin
       variable v_wcnt  : integer range 0 to WQ_DEPTH;
       variable v_wprev : integer range 0 to WQ_DEPTH-1;
       variable v_wbusy : boolean;
+      variable v_wpair : boolean;   -- and the entry after the head is on it too
+      variable v_wh1   : integer range 0 to WQ_DEPTH-1;
 
       -- Hand bank `nxt` of request `r` to the srv_* channel and wait on it.
       procedure issue_srv (r : t_req; nxt : integer) is
       begin
          srv_req  <= '1';
+         srv_seq_int <= not srv_seq_int;
+         srv_wide <= '0';
          srv_rnw  <= r.rnw;
          srv_bank_int <= std_logic_vector(to_unsigned(nxt, 2));
          srv_addr_int <= r.offs(nxt)(16 downto 2);
@@ -1442,6 +1620,40 @@ begin
          srv_din  <= r.din;
          srv_idx  <= nxt + 1;
          state    <= SRVWAIT;
+      end procedure;
+
+      -- Put queue entry h on the wire. When the entry after it is the odd word
+      -- of the same 8-byte line, it goes too, as one 64-bit write: SDRAM takes
+      -- the second word for two more cycles of a burst it has already opened,
+      -- where on its own it would pay a whole hand-over and row cycle again.
+      -- Only the ascending order pairs - that is what a DMA or a copy loop
+      -- produces, and the other order would need a second data mux.
+      procedure issue_drain (q : t_wq; h : integer; n : integer; pair : out boolean) is
+         variable h1 : integer range 0 to WQ_DEPTH-1;
+         variable p  : boolean;
+      begin
+         if (h = WQ_DEPTH - 1) then h1 := 0; else h1 := h + 1; end if;
+         p := n >= 2 and q(h1).valid = '1' and q(h1).bank = q(h).bank and
+              q(h).addr(2) = '0' and q(h1).addr(2) = '1' and
+              q(h1).addr(16 downto 3) = q(h).addr(16 downto 3);
+         pair := p;
+         srv_req      <= '1';
+         srv_seq_int  <= not srv_seq_int;
+         srv_rnw      <= '0';
+         srv_bank_int <= std_logic_vector(to_unsigned(q(h).bank, 2));
+         srv_addr_int <= q(h).addr;
+         srv_be       <= q(h).be;
+         srv_din      <= q(h).din;
+         srv_be_hi    <= q(h1).be;
+         srv_din_hi   <= q(h1).din;
+         if (p) then
+            srv_wide <= '1';
+            srv_pair <= '1';
+         else
+            srv_wide <= '0';
+            srv_pair <= '0';
+         end if;
+         state <= WQ_WAIT;
       end procedure;
 
       -- Drive the requester's result and pulse its done. `is9` is passed in
@@ -1470,6 +1682,7 @@ begin
          v_wt    := wq_tail;
          v_wcnt  := wq_count;
          v_wbusy := (state = WQ_WAIT);   -- the head is on the wire right now
+         v_wpair := (state = WQ_WAIT and srv_pair = '1');
 
          -- request latching (ena is a single-cycle pulse). A posted write never
          -- reaches req9: cpu9_wok already acknowledged it, and pushing it here
@@ -1499,6 +1712,9 @@ begin
             req9.valid <= '0';
             req7.valid <= '0';
             srv_req    <= '0';
+            srv_wide   <= '0';
+            srv_pair   <= '0';
+            rb_valid   <= '0';
             prefer9    <= '1';
             v_wq       := (others => WQ_INIT);
             v_wh       := 0;
@@ -1507,25 +1723,38 @@ begin
 
          else
 
+            -- A read answered from the line buffer needs neither the FSM nor
+            -- srv, so it is answered in whatever state the FSM is in - most
+            -- usefully while it drains the write the DMA posted just before.
+            -- It may pass queued writes: one into this line would have dropped
+            -- the buffer when it was accepted. `dispatch` leaves such a req9
+            -- alone, and no other ARM9 op can be in flight while it waits.
+            if (rb_hit = '1') then
+               req9.valid <= '0';
+               cpu9_done  <= '1';
+               if (req9.offs(rb_bank)(2) = '1') then
+                  cpu9_dout <= rb_data(63 downto 32);
+               else
+                  cpu9_dout <= rb_data(31 downto 0);
+               end if;
+            end if;
+
             case state is
 
                when IDLE =>
                   -- draining outranks dispatch, and `dispatch` is gated on the
                   -- queue being empty so the two can never both fire
                   if (v_wcnt > 0) then
-                     srv_req  <= '1';
-                     srv_rnw  <= '0';
-                     srv_bank_int <= std_logic_vector(to_unsigned(v_wq(v_wh).bank, 2));
-                     srv_addr_int <= v_wq(v_wh).addr;
-                     srv_be   <= v_wq(v_wh).be;
-                     srv_din  <= v_wq(v_wh).din;
-                     state    <= WQ_WAIT;
+                     issue_drain(v_wq, v_wh, v_wcnt, v_wpair);
                      v_wbusy  := true;   -- blocks a merge into it on this edge
                   elsif (dispatch = '1') then
                      cur     <= chosen;
                      cur_is9 <= chosen_is9;
                      acc     <= (others => '0');
                      srv_idx <= 0;
+                     if (chosen.rnw = '0') then
+                        rb_valid <= '0';   -- any write the queue did not take
+                     end if;
                      if (chosen_is9 = '1') then
                         req9.valid <= '0';
                         prefer9    <= '0';   -- fairness toggle
@@ -1587,6 +1816,22 @@ begin
                         v_acc := v_acc or srv_dout;
                         acc   <= v_acc;
                      end if;
+                     -- keep the whole line of a single-bank ARM9 read. The queue
+                     -- is empty (a read only dispatches then), so it is current.
+                     if (RD_LINE_BUF and cur.rnw = '1' and cur_is9 = '1' and
+                         ad_next(cur.hit, 0) = to_integer(unsigned(srv_bank_int)) and
+                         ad_next(cur.hit, srv_idx) = 4 and
+                         (cur.hit(BANK_E) or cur.hit(BANK_F) or cur.hit(BANK_G) or
+                          cur.hit(BANK_H) or cur.hit(BANK_I)) = '0') then
+                        rb_valid <= '1';
+                        rb_bank  <= to_integer(unsigned(srv_bank_int));
+                        rb_line  <= srv_addr_int(16 downto 3);
+                        if (srv_addr_int(2) = '1') then
+                           rb_data <= srv_dout & srv_dout_hi;
+                        else
+                           rb_data <= srv_dout_hi & srv_dout;
+                        end if;
+                     end if;
                      srv_req <= '0';
                      if (ad_next(cur.hit, srv_idx) = 4) then
                         retire(cur_is9, v_acc);
@@ -1599,16 +1844,30 @@ begin
                   -- a posted write has no result and nobody is waiting on it, so
                   -- retiring it is just a pop
                   if (srv_done = '1') then
-                     srv_req          <= '0';
-                     v_wq(v_wh).valid := '0';
-                     if (v_wh = WQ_DEPTH - 1) then
-                        v_wh := 0;
+                     for k in 0 to 1 loop
+                        if (k = 0 or v_wpair) then
+                           v_wq(v_wh).valid := '0';
+                           if (v_wh = WQ_DEPTH - 1) then
+                              v_wh := 0;
+                           else
+                              v_wh := v_wh + 1;
+                           end if;
+                           v_wcnt := v_wcnt - 1;
+                        end if;
+                     end loop;
+                     v_wbusy := false;
+                     v_wpair := false;
+                     if (v_wcnt > 0) then
+                        -- chain: srv_req stays high and srv_seq marks the
+                        -- new op, so the next entry costs no idle cycle
+                        issue_drain(v_wq, v_wh, v_wcnt, v_wpair);
+                        v_wbusy := true;
                      else
-                        v_wh := v_wh + 1;
+                        srv_req  <= '0';
+                        srv_wide <= '0';
+                        srv_pair <= '0';
+                        state    <= IDLE;
                      end if;
-                     v_wcnt           := v_wcnt - 1;
-                     v_wbusy          := false;
-                     state            <= IDLE;
                   end if;
 
                -- ===================== reset clear pass =====================
@@ -1627,6 +1886,8 @@ begin
 
                when CLR_SRV =>
                   srv_req  <= '1';
+                  srv_seq_int <= not srv_seq_int;
+                  srv_wide <= '0';
                   srv_rnw  <= '0';
                   srv_bank_int <= std_logic_vector(to_unsigned(clr_bank, 2));
                   srv_addr_int <= clr_addr;
@@ -1670,10 +1931,17 @@ begin
                else
                   v_wprev := v_wt - 1;
                end if;
+               -- an entry already on the wire - the head, and the one after
+               -- it when the two went out as a pair - can no longer take data
+               if (v_wh = WQ_DEPTH - 1) then
+                  v_wh1 := 0;
+               else
+                  v_wh1 := v_wh + 1;
+               end if;
                if (v_wcnt > 0 and v_wq(v_wprev).valid = '1' and
                    v_wq(v_wprev).bank = wq_bank_now and
                    v_wq(v_wprev).addr = dec9_offs(wq_bank_now)(16 downto 2) and
-                   not (v_wprev = v_wh and v_wbusy)) then
+                   not (v_wbusy and (v_wprev = v_wh or (v_wpair and v_wprev = v_wh1)))) then
                   for j in 0 to 3 loop
                      if (cpu9_be(j) = '1') then
                         v_wq(v_wprev).din(j*8 + 7 downto j*8) := cpu9_din(j*8 + 7 downto j*8);
@@ -1689,6 +1957,10 @@ begin
                      v_wt := v_wt + 1;
                   end if;
                   v_wcnt := v_wcnt + 1;
+               end if;
+               -- the buffered line is about to change
+               if (wq_bank_now = rb_bank and wq_push_line = rb_line) then
+                  rb_valid <= '0';
                end if;
             end if;
 

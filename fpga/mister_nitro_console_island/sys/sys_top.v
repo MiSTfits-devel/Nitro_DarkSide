@@ -236,6 +236,12 @@ wire [31:0] gp_out;
 
 wire  [1:0] io_ver = 1; // 0 - obsolete. 1 - optimized HPS I/O. 2,3 - reserved for future.
 wire        io_wait;
+wire        nds_osd_wait;
+`ifdef MISTER_HDMI_ONLY
+assign nds_osd_wait = 1'b0;
+`elsif NDS_HDMI_SCALER_ONLY
+assign nds_osd_wait = 1'b0;
+`endif
 wire        io_wide;
 wire [15:0] io_dout;
 wire [15:0] io_din = gp_outr[15:0];
@@ -256,7 +262,7 @@ reg  rack;
 wire io_strobe = ~rack & io_clk;
 
 always @(posedge clk_sys) begin
-	if(~(io_wait | vs_wait) | io_strobe) begin
+	if(~(io_wait | vs_wait | nds_osd_wait) | io_strobe) begin
 		rack <= io_clk;
 		io_ack <= rack;
 	end
@@ -304,6 +310,25 @@ reg        cfg_set      = 0;
 
 wire       audio_96k    = cfg[6];
 wire       csync_en     = cfg[3];
+`ifdef MISTER_HDMI_ONLY
+wire nds_dv1_native_osd = 1'b0;
+`elsif NDS_HDMI_SCALER_ONLY
+wire nds_dv1_native_osd = 1'b0;
+`else
+// CONF_DVI and CONF_DIRECT_VIDEO2 must retain the legacy menu sampling.
+wire nds_dv1_native_osd = direct_video && !cfg[7] && !cfg[13] &&
+                          !vga_fb && (nds_split_active || vga_scaler);
+`endif
+`ifdef MISTER_HDMI_ONLY
+wire nds_dv1_side_native_menu = 1'b0;
+`elsif NDS_HDMI_SCALER_ONLY
+wire nds_dv1_side_native_menu = 1'b0;
+`elsif NDS_TATE
+wire nds_dv1_side_native_menu = nds_dv1_native_osd &&
+    tate_source_width > 10'd320 && tate_source_height <= 10'd240 && !nds_dv1_present;
+`else
+wire nds_dv1_side_native_menu = 1'b0;
+`endif
 `ifndef MISTER_DUAL_SDRAM
 	`ifdef NDS_HDMI_SCALER_ONLY
 	wire sog = 1'b0;
@@ -422,6 +447,11 @@ always@(posedge clk_sys) begin
 `endif
 			if(io_din[7:0] == 'h42) io_dout_sys <= {1'b1, frame_cnt};
 			if(io_din[7:0] == 'h44) io_dout_sys <= 1;
+`ifdef NDS_NATIVE_OUTPUTS
+			// Read-only standalone display handoff: use the actual Main-loaded
+			// flags, including alternate INI selection and per-core overrides.
+			if(io_din[7:0] == 'h46) io_dout_sys <= 16'h4456;
+`endif
 		end
 		else begin
 			cnt <= cnt + 1'd1;
@@ -486,6 +516,14 @@ always@(posedge clk_sys) begin
 					9: LFB_STRIDE      <= io_din[13:0];
 				endcase
 			end
+`ifdef NDS_NATIVE_OUTPUTS
+			if(cmd == 'h46 && cnt == 0) io_dout_sys <= cfg;
+            if(cmd == 'h46 && cnt == 1) io_dout_sys <= 16'h5350; // split-output ABI v1
+            // Only horizontal side-by-side uses game-pixel menu sampling.
+            // Use the exact raster gate so opening the menu cannot change
+            // receiver decimation. All other modes retain the fine grid.
+            if(cmd == 'h46 && cnt == 2) io_dout_sys <= nds_dv1_side_native_menu ? 16'h4e51 : 16'h4e50;
+`endif
 			if(cmd == 'h25) {led_overtake, led_state} <= io_din;
 			if(cmd == 'h26) vol_att <= io_din[4:0];
 			if(cmd == 'h27) VSET <= io_din[11:0];
@@ -744,6 +782,94 @@ wire  [23:0] hdmi_data;
 wire         hdmi_vs, hdmi_hs, hdmi_de, hdmi_vbl, hdmi_brd;
 wire         freeze;
 wire         bob_deint;
+wire nds_dv1_rotated, nds_dv1_ce, nds_dv1_de, nds_dv1_hs, nds_dv1_vs;
+wire [23:0] nds_dv1_rgb;
+wire [1:0] nds_dv1_rotation;
+wire nds_dv1_present = nds_dv1_native_osd && nds_dv1_rotated;
+
+`ifdef NDS_TATE
+wire [1:0] tate_rotation, tate_applied;
+wire [9:0] tate_source_width, tate_source_height;
+wire tate_fb_enable;
+wire [9:0] tate_fb_width, tate_fb_height;
+wire [31:0] tate_fb_base;
+wire [13:0] tate_fb_stride;
+wire [27:0] tate_address, scaler_address;
+wire [127:0] tate_writedata, scaler_writedata;
+wire tate_write, tate_ready, scaler_waitrequest, scaler_read, scaler_write;
+wire [7:0] scaler_burstcount;
+wire [15:0] scaler_byteenable;
+wire scaler_readdatavalid;
+wire [27:0] shared_address;
+wire [7:0] shared_burstcount;
+wire [127:0] shared_writedata;
+wire [15:0] shared_byteenable;
+wire shared_read, shared_write, shared_waitrequest;
+wire native_fb_enable, native_boundary;
+wire [1:0] native_applied;
+wire [9:0] native_fb_width, native_fb_height;
+wire [31:0] native_fb_base;
+wire [13:0] native_fb_stride;
+wire native_read, native_waitrequest, native_readdatavalid;
+wire [27:0] native_address;
+wire [7:0] native_burstcount;
+// This port already carries the scaler's frame capture and readback. Rotation
+// replaces the normal capture while active; the console DDR port is untouched.
+localparam integer TATE_TILE_ROWS = 4;
+nds_tate_video #(.TILE_ROWS(TATE_TILE_ROWS),.CCW_ONLY(0),.NATIVE_READER(1)) tate_video (
+    .reset(reset_req), .i_clk(clk_ihdmi), .i_ce(ce_hpix),
+    .i_de(hde_emu), .i_vs(hvs_fix), .i_rgb({hr_out,hg_out,hb_out}),
+    .rotation(tate_rotation), .source_width(tate_source_width),
+    .source_height(tate_source_height), .avl_clk(clk_100m),
+    .o_clk(hdmi_clk_out), .o_vbl(hdmi_vbl),
+    .n_clk(clk_vid), .n_vbl(native_boundary), .n_enable(nds_dv1_native_osd),
+    .n_fb_enable(native_fb_enable), .n_rotation_applied(native_applied),
+    .n_fb_width(native_fb_width), .n_fb_height(native_fb_height),
+    .n_fb_base(native_fb_base), .n_fb_stride(native_fb_stride),
+    .fb_enable(tate_fb_enable), .rotation_applied(tate_applied),
+    .fb_width(tate_fb_width), .fb_height(tate_fb_height),
+    .fb_base(tate_fb_base), .fb_stride(tate_fb_stride),
+    .wr_address(tate_address), .wr_data(tate_writedata),
+    .wr_valid(tate_write), .wr_ready(tate_ready), .overflow()
+);
+nds_tate_scaler_arbiter #(.TATE_BEATS(TATE_TILE_ROWS/4)) tate_arbiter (
+    .clk(clk_100m), .reset(reset_req),
+    .s_read(scaler_read), .s_write(scaler_write), .s_address(scaler_address),
+    .s_burstcount(scaler_burstcount), .s_writedata(scaler_writedata),
+    .s_byteenable(scaler_byteenable), .s_waitrequest(scaler_waitrequest),
+    .t_write(tate_write), .t_address(tate_address), .t_writedata(tate_writedata),
+    .t_ready(tate_ready), .m_read(shared_read), .m_write(shared_write),
+    .m_address(shared_address), .m_burstcount(shared_burstcount),
+    .m_writedata(shared_writedata), .m_byteenable(shared_byteenable),
+    .m_waitrequest(shared_waitrequest)
+);
+nds_dv1_read_arbiter native_read_arbiter (
+    .clk(clk_100m), .reset(reset_req),
+    .s_read(shared_read), .s_write(shared_write), .s_address(shared_address),
+    .s_burstcount(shared_burstcount), .s_writedata(shared_writedata),
+    .s_byteenable(shared_byteenable), .s_waitrequest(shared_waitrequest),
+    .s_readdatavalid(scaler_readdatavalid),
+    .n_read(native_read), .n_address(native_address), .n_burstcount(native_burstcount),
+    .n_waitrequest(native_waitrequest), .n_readdatavalid(native_readdatavalid),
+    .m_read(vbuf_read), .m_write(vbuf_write), .m_address(vbuf_address),
+    .m_burstcount(vbuf_burstcount), .m_writedata(vbuf_writedata),
+    .m_byteenable(vbuf_byteenable), .m_waitrequest(vbuf_waitrequest),
+    .m_readdatavalid(vbuf_readdatavalid)
+);
+nds_dv1_rotate_read native_rotation_reader (
+    .reset(reset_req), .clk(clk_vid), .avl_clk(clk_100m),
+    .enable(nds_dv1_native_osd), .fb_enable(native_fb_enable),
+    .fb_width(native_fb_width), .fb_height(native_fb_height),
+    .fb_base(native_fb_base), .fb_stride(native_fb_stride), .fb_rotation(native_applied),
+    .frame_boundary(native_boundary), .active(nds_dv1_rotated), .rotation(nds_dv1_rotation),
+    .ce(nds_dv1_ce), .de(nds_dv1_de), .hs(nds_dv1_hs), .vs(nds_dv1_vs), .rgb(nds_dv1_rgb),
+    .underrun(), .rd(native_read), .rd_address(native_address), .rd_count(native_burstcount),
+    .rd_wait(native_waitrequest), .rd_valid(native_readdatavalid), .rd_data(vbuf_readdata)
+);
+`else
+assign nds_dv1_rotated = 0;
+assign {nds_dv1_ce,nds_dv1_de,nds_dv1_hs,nds_dv1_vs,nds_dv1_rgb,nds_dv1_rotation} = 0;
+`endif
 
 `ifndef MISTER_DEBUG_NOHDMI
 	wire clk_hdmi  = hdmi_clk_out;
@@ -751,6 +877,16 @@ wire         bob_deint;
 	ascal 
 	#(
 		.RAMBASE(32'h20000000),
+	`ifdef NDS_FORCE_NEAREST
+		// mode is already fixed to nearest below; preserve scaler features
+		// while replacing its nearest-only coefficient products with shifts.
+		.NEAREST_ONLY("true"),
+	`endif
+`ifdef NDS_NATIVE_OUTPUTS
+		// A shallow 32x128 burst buffer is efficient in MLABs. This frees
+		// four M10Ks for the much deeper native-output menu bitmap.
+		.INPUT_BURST_RAM_STYLE("MLAB, no_rw_check"),
+`endif
 	`ifdef MISTER_SMALL_VBUF
 		.RAMSIZE(32'h00200000),
 	`else
@@ -784,6 +920,9 @@ wire         bob_deint;
 		.bob_deint  (bob_deint),
 
 		.i_clk    (clk_ihdmi),
+`ifdef NDS_TATE
+        .i_capture_disable (tate_rotation == 1 || tate_rotation == 2),
+`endif
 		.i_ce     (ce_hpix),
 		.i_r      (hr_out),
 		.i_g      (hg_out),
@@ -861,15 +1000,26 @@ wire         bob_deint;
 		.o_fb_stride      (FB_STRIDE),
 
 		.avl_clk          (clk_100m),
-		.avl_waitrequest  (vbuf_waitrequest),
 		.avl_readdata     (vbuf_readdata),
+`ifdef NDS_TATE
+        .avl_readdatavalid(scaler_readdatavalid),
+        .avl_waitrequest  (scaler_waitrequest),
+        .avl_burstcount   (scaler_burstcount),
+        .avl_writedata    (scaler_writedata),
+        .avl_address      (scaler_address),
+        .avl_write        (scaler_write),
+        .avl_read         (scaler_read),
+        .avl_byteenable   (scaler_byteenable)
+`else
 		.avl_readdatavalid(vbuf_readdatavalid),
+		.avl_waitrequest  (vbuf_waitrequest),
 		.avl_burstcount   (vbuf_burstcount),
 		.avl_writedata    (vbuf_writedata),
 		.avl_address      (vbuf_address),
 		.avl_write        (vbuf_write),
 		.avl_read         (vbuf_read),
 		.avl_byteenable   (vbuf_byteenable)
+`endif
 	);
 `endif
 
@@ -893,7 +1043,11 @@ reg [31:0] FB_BASE   = 0;
 reg [13:0] FB_STRIDE = 0;
 
 always @(posedge clk_sys) begin
+`ifdef NDS_TATE
+    FB_EN <= LFB_EN | fb_en | tate_fb_enable;
+`else
 	FB_EN <= LFB_EN | fb_en;
+`endif
 	if(LFB_EN) begin
 		FB_FMT    <= LFB_FMT;
 		FB_WIDTH  <= LFB_WIDTH;
@@ -901,6 +1055,15 @@ always @(posedge clk_sys) begin
 		FB_BASE   <= LFB_BASE;
 		FB_STRIDE <= LFB_STRIDE;
 	end
+`ifdef NDS_TATE
+    else if(tate_fb_enable) begin
+        FB_FMT <= 6'b000110;
+        FB_WIDTH <= {2'd0,tate_fb_width};
+        FB_HEIGHT <= {2'd0,tate_fb_height};
+        FB_BASE <= tate_fb_base;
+        FB_STRIDE <= tate_fb_stride;
+    end
+`endif
 	else begin
 		FB_FMT    <= fb_fmt;
 		FB_WIDTH  <= fb_width;
@@ -1275,20 +1438,21 @@ cyclonev_hps_interface_peripheral_i2c hdmi_i2c
 
 `ifndef MISTER_HDMI_ONLY
 `ifndef NDS_HDMI_SCALER_ONLY
-reg [23:0] dv_data;
-reg        dv_hs, dv_vs, dv_de;
+// These three-cycle delays need registers, not scarce M10K RAM blocks.
+(* altera_attribute = "-name AUTO_SHIFT_REGISTER_RECOGNITION OFF" *) reg [23:0] dv_data;
+(* altera_attribute = "-name AUTO_SHIFT_REGISTER_RECOGNITION OFF" *) reg        dv_hs, dv_vs, dv_de;
 wire [23:0] dv_data_osd;
 wire dv_hs_osd, dv_vs_osd, dv_cs_osd;
 
 always @(posedge clk_vid) begin
-	reg [23:0] dv_d1, dv_d2;
-	reg        dv_de1, dv_de2, dv_hs1, dv_hs2, dv_vs1, dv_vs2;
+	(* altera_attribute = "-name AUTO_SHIFT_REGISTER_RECOGNITION OFF" *) reg [23:0] dv_d1, dv_d2;
+	(* altera_attribute = "-name AUTO_SHIFT_REGISTER_RECOGNITION OFF" *) reg        dv_de1, dv_de2, dv_hs1, dv_hs2, dv_vs1, dv_vs2;
 	reg [12:0] vsz, vcnt, vcnt_l, vcnt_ll;
 	reg        old_hs, old_vs;
 	reg        vde;
 	reg  [3:0] hss;
 
-	if(ce_pix) begin
+	if(nds_dv1_present ? nds_dv1_ce : ce_pix) begin
 		hss <= (hss << 1) | dv_hs_osd;
 
 		old_hs <= dv_hs_osd;
@@ -1325,7 +1489,7 @@ always @(posedge clk_vid) begin
 end
 
 `ifndef MISTER_DISABLE_YC
-	assign {dv_data_osd, dv_hs_osd, dv_vs_osd, dv_cs_osd } = ~yc_en ? {vga_data_osd, vga_hs_osd, vga_vs_osd, vga_cs_osd } : {yc_o, yc_hs, yc_vs, yc_cs };
+	assign {dv_data_osd, dv_hs_osd, dv_vs_osd, dv_cs_osd } = (nds_split_active || ~yc_en) ? {vga_data_osd, vga_hs_osd, vga_vs_osd, vga_cs_osd } : {yc_o, yc_hs, yc_vs, yc_cs };
 `else
 	assign {dv_data_osd, dv_hs_osd, dv_vs_osd, dv_cs_osd } = {vga_data_osd, vga_hs_osd, vga_vs_osd, vga_cs_osd };
 `endif
@@ -1481,6 +1645,9 @@ assign HDMI_TX_D  = hdmi_out_d;
 	`endif
 `endif
 
+wire nds_split_active;
+wire [23:0] nds_analog_data;
+wire nds_analog_hs, nds_analog_vs, nds_analog_de, nds_analog_ce;
 wire [23:0] vga_data_sl;
 wire        vga_de_sl, vga_ce_sl, vga_vs_sl, vga_hs_sl;
 scanlines #(0) VGA_scanlines
@@ -1501,11 +1668,52 @@ scanlines #(0) VGA_scanlines
 	.ce_out(vga_ce_sl)
 );
 
+// Keep scaler capture and independent analog on the original DS raster.
+// Only DV1 presentation and its measured crop metadata select this reader.
+wire [23:0] native_digital_rgb = nds_dv1_present ? nds_dv1_rgb : vga_data_sl;
+wire native_digital_ce = nds_dv1_present ? nds_dv1_ce : vga_ce_sl;
+wire native_digital_de = nds_dv1_present ? nds_dv1_de : vga_de_sl;
+wire native_digital_hs = nds_dv1_present ? nds_dv1_hs : vga_hs_sl;
+wire native_digital_vs = nds_dv1_present ? nds_dv1_vs : vga_vs_sl;
+
 `ifndef MISTER_HDMI_ONLY
 `ifndef NDS_HDMI_SCALER_ONLY
 wire [23:0] vga_data_osd;
 wire        vga_vs_osd, vga_hs_osd, vga_de_osd;
-osd vga_osd
+wire nds_osd_write, nds_osd_digital_read, nds_osd_analog_read, nds_osd_analog_scheduled;
+wire [12:0] nds_osd_write_address, nds_osd_digital_address, nds_osd_analog_address;
+wire [7:0] nds_osd_write_data, nds_osd_digital_q, nds_osd_digital_pair_q, nds_osd_analog_q;
+// NDS drives both HPS_BUS[36] (clk_sys) and CLK_VIDEO (clk_vid) from the
+// same60MHz source. One true-dual-port bitmap can therefore serve both
+// native menus, with a short synchronous write queue. The HDMI OSD keeps
+// its own bitmap/clock. Busy delays HPS acknowledgement after acceptance;
+// it never drops or repeats a received bitmap word.
+nds_native_osd_memory nds_osd_memory (
+    .clk(clk_vid), .write_enable(nds_osd_write), .write_address(nds_osd_write_address),
+    .write_data(nds_osd_write_data), .busy(nds_osd_wait),
+    .digital_read(nds_osd_digital_read), .digital_address(nds_osd_digital_address),
+    .digital_q(nds_osd_digital_q), .digital_pair_q(nds_osd_digital_pair_q),
+    .analog_read(nds_split_active && nds_osd_analog_scheduled && nds_osd_analog_read),
+    .analog_address(nds_osd_analog_address), .analog_q(nds_osd_analog_q)
+);
+// Preserve the full16-row menu. Native DS modes use at most3200 clock
+// ticks of active video per line;14-bit counters cover their raster and
+// blanking with ample headroom. The tallest source is414 active lines
+// (stacked screens,24-pixel gap,FPS row), so larger multiscan modes are
+// unreachable. HDMI keeps the generic22-bit counters and all geometries.
+// Adjust only unrotated dual-screen DV1: widen the narrow Top/Bottom
+// menu and halve the broad Side-by-side menu. Use the applied video path,
+// preserving Main, Touch, CRT and rotated modes.
+`ifdef NDS_TATE
+wire nds_dv1_dual_menu = nds_dv1_native_osd &&
+                       tate_source_height > 10'd240 && !nds_dv1_present;
+wire nds_dv1_side_menu = nds_dv1_native_osd &&
+                       tate_source_width > 10'd320 && tate_source_height <= 10'd240 && !nds_dv1_present;
+`else
+wire nds_dv1_dual_menu = 1'b0;
+wire nds_dv1_side_menu = 1'b0;
+`endif
+osd #(.OSD_COUNTER_BITS(14), .OSD_MAX_LINES(512), .OSD_EXTERNAL_BUFFER(1), .OSD_NATIVE_PIXELS(1), .OSD_NATIVE_COMPACT(1), .OSD_DOUBLE_WIDTH(1), .OSD_HALF_WIDTH(1)) vga_osd
 (
 	.clk_sys(clk_sys),
 
@@ -1515,19 +1723,57 @@ osd vga_osd
 	.osd_status(osd_status),
 
 	.clk_video(clk_vid),
-	.din(vga_data_sl),
-	.hs_in(vga_hs_sl),
-	.vs_in(vga_vs_sl),
-	.de_in(vga_de_sl),
+	.din(native_digital_rgb),
+	.hs_in(native_digital_hs),
+	.vs_in(native_digital_vs),
+	.de_in(native_digital_de),
 
 	.dout(vga_data_osd),
 	.hs_out(vga_hs_osd),
 	.vs_out(vga_vs_osd),
-	.de_out(vga_de_osd)
+	.de_out(vga_de_osd),
+    .buffer_we(nds_osd_write), .buffer_waddr(nds_osd_write_address), .buffer_wdata(nds_osd_write_data),
+    .buffer_re(nds_osd_digital_read), .buffer_raddr(nds_osd_digital_address),
+    .buffer_q(nds_osd_digital_q), .buffer_pair_q(nds_osd_digital_pair_q), .buffer_scheduled(),
+    .native_pixel_enable(nds_dv1_side_native_menu), .native_pixel_ce(native_digital_ce),
+    .native_rotation(nds_dv1_rotation), .double_width(nds_dv1_dual_menu),
+    .half_width(nds_dv1_side_menu)
 );
 
 wire vga_cs_osd;
 csync csync_vga(clk_vid, vga_hs_osd, vga_vs_osd, vga_cs_osd);
+
+wire [23:0] nds_analog_data_sl, nds_analog_data_osd;
+wire nds_analog_hs_sl, nds_analog_vs_sl, nds_analog_de_sl;
+wire nds_analog_hs_osd, nds_analog_vs_osd, nds_analog_de_osd, nds_analog_cs_osd;
+scanlines #(0) nds_analog_scanlines (
+    .clk(clk_vid), .scanlines(scanlines),
+    .din(nds_analog_de ? nds_analog_data : 24'd0),
+    .hs_in(~nds_analog_hs), .vs_in(~nds_analog_vs), .de_in(nds_analog_de),
+    .ce_in(nds_analog_ce), .dout(nds_analog_data_sl),
+    .hs_out(nds_analog_hs_sl), .vs_out(nds_analog_vs_sl),
+    .de_out(nds_analog_de_sl), .ce_out()
+);
+// This independent raster is always upright320x240. Twelve bits retain all
+// SPI position values and the3200-clock active line; the14-bit gap counter
+// still covers its22-line vertical blank. HDMI TATE uses hdmi_osd unchanged.
+osd #(.OSD_COUNTER_BITS(12), .OSD_FIXED_UPRIGHT(1), .OSD_MAX_LINES(240), .OSD_EXTERNAL_BUFFER(1)) nds_analog_osd (
+    .clk_sys(clk_sys), .io_osd(io_osd_vga), .io_strobe(io_strobe), .io_din(io_din),
+    .osd_status(), .clk_video(clk_vid), .din(nds_analog_data_sl),
+    .hs_in(nds_analog_hs_sl), .vs_in(nds_analog_vs_sl), .de_in(nds_analog_de_sl),
+    .dout(nds_analog_data_osd), .hs_out(nds_analog_hs_osd),
+    .vs_out(nds_analog_vs_osd), .de_out(nds_analog_de_osd),
+    .buffer_we(), .buffer_waddr(), .buffer_wdata(),
+    .buffer_re(nds_osd_analog_read), .buffer_raddr(nds_osd_analog_address),
+    .buffer_q(nds_osd_analog_q), .buffer_scheduled(nds_osd_analog_scheduled)
+);
+csync nds_analog_csync(clk_vid, nds_analog_hs_osd, nds_analog_vs_osd, nds_analog_cs_osd);
+wire [23:0] native_analog_data = nds_split_active ? nds_analog_data_osd : vga_data_osd;
+wire native_analog_hs = nds_split_active ? nds_analog_hs_osd : vga_hs_osd;
+wire native_analog_vs = nds_split_active ? nds_analog_vs_osd : vga_vs_osd;
+wire native_analog_de = nds_split_active ? nds_analog_de_osd : vga_de_osd;
+wire native_analog_cs = nds_split_active ? nds_analog_cs_osd : vga_cs_osd;
+
 
 `ifndef MISTER_DISABLE_YC
 	reg         pal_en;
@@ -1544,12 +1790,12 @@ csync csync_vga(clk_vid, vga_hs_osd, vga_vs_osd, vga_cs_osd);
 		.CVBS(cvbs),
 		.PHASE_INC(PhaseInc),
 		.COLORBURST_RANGE(ColorBurst_Range),
-		.hsync(vga_hs_osd),
-		.vsync(vga_vs_osd),
-		.csync(vga_cs_osd),
-		.de(vga_de_osd),
+		.hsync(native_analog_hs),
+		.vsync(native_analog_vs),
+		.csync(native_analog_cs),
+		.de(native_analog_de),
 		.dout(yc_o),
-		.din(vga_data_osd),
+		.din(native_analog_data),
 		.hsync_o(yc_hs),
 		.vsync_o(yc_vs),
 		.csync_o(yc_cs),
@@ -1631,12 +1877,12 @@ reg  [39:0] PhaseInc;
 	(
 		.clk(clk_vid),
 		.ypbpr_en(ypbpr_en),
-		.hsync(vga_hs_osd),
-		.vsync(vga_vs_osd),
-		.csync(vga_cs_osd),
-		.de(vga_de_osd),
+		.hsync(native_analog_hs),
+		.vsync(native_analog_vs),
+		.csync(native_analog_cs),
+		.de(native_analog_de),
 		.dout(vga_o_t),
-		.din(vga_data_osd),
+		.din(native_analog_data),
 		.hsync_o(vga_hs_t),
 		.vsync_o(vga_vs_t),
 		.csync_o(vga_cs_t),
@@ -1913,9 +2159,24 @@ emu emu
 	.NDS_F2H_IRQ(nds_f2h_irq),
 	.HPS_BUS({f1, HDMI_TX_VS, 
 				 clk_100m, clk_ihdmi,
-				 ce_hpix, hde_emu, hhs_fix, hvs_fix, 
+				 native_digital_ce, native_digital_de, native_digital_hs, native_digital_vs,
 				 io_wait, clk_sys, io_fpga, io_uio, io_strobe, io_wide, io_din, io_dout}),
 
+`ifdef MISTER_DUAL_SDRAM
+    .NDS_NATIVE_OUTPUT_ALLOWED(1'b0),
+`elsif MISTER_HDMI_ONLY
+    .NDS_NATIVE_OUTPUT_ALLOWED(1'b0),
+`elsif NDS_HDMI_SCALER_ONLY
+    .NDS_NATIVE_OUTPUT_ALLOWED(1'b0),
+`else
+    .NDS_NATIVE_OUTPUT_ALLOWED(~vga_fb & ~vga_scaler),
+`endif
+    .NDS_SPLIT_ACTIVE(nds_split_active),
+    .NDS_ANALOG_R(nds_analog_data[23:16]),
+    .NDS_ANALOG_G(nds_analog_data[15:8]),
+    .NDS_ANALOG_B(nds_analog_data[7:0]),
+    .NDS_ANALOG_HS(nds_analog_hs), .NDS_ANALOG_VS(nds_analog_vs),
+    .NDS_ANALOG_DE(nds_analog_de), .NDS_ANALOG_CE(nds_analog_ce),
 	.VGA_R(r_out),
 	.VGA_G(g_out),
 	.VGA_B(b_out),
@@ -1940,6 +2201,12 @@ emu emu
 	.VGA_SL(scanlines),
 	.VIDEO_ARX(ARX),
 	.VIDEO_ARY(ARY),
+`ifdef NDS_TATE
+    .VIDEO_ROTATION(tate_rotation),
+    .VIDEO_ROTATION_APPLIED(tate_applied),
+    .VIDEO_SOURCE_WIDTH(tate_source_width),
+    .VIDEO_SOURCE_HEIGHT(tate_source_height),
+`endif
 
 `ifdef MISTER_FB
 	.FB_EN(fb_en),

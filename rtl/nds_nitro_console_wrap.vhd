@@ -27,7 +27,14 @@ entity nds_nitro_console_wrap is
       -- product currently keeps GPU_FAST off, but carrying the exact ratio
       -- through the mixed-language boundary prevents a future fast-engine
       -- build from silently using the 3x phase gate under a 4x PLL.
-      CLKMEM_RATIO     : integer := 3
+      CLKMEM_RATIO     : integer := 3;
+      H3D_GX_READBACK_ENABLE : std_logic := '0';
+      H3D_COMPRESS_HBLANK : std_logic := '0';
+      GPU2D_A_ENABLE : integer := 1;
+      HOST_SAVE_PROFILE : integer := 0;
+      H3D_MATCHED_DISPLAY_TEST : integer := 0;
+      SOUND_DIAGNOSTICS : integer := 0;
+      SOUND_STREAM_DIAGNOSTICS : integer := 0
    );
    port
    (
@@ -41,6 +48,22 @@ entity nds_nitro_console_wrap is
       -- '1' = boot the real firmware from the retail BIOSes' reset vectors
       -- instead of HLE direct boot. See the header note on ARCHITECTURE.md.
       fw_boot          : in  std_logic;
+      cart_present     : in  std_logic := '1';
+      -- Immutable per-cartridge host metadata; validity is synchronized outside.
+      host_save_valid : in std_logic := '0';
+      host_save_code : in std_logic_vector(31 downto 0) := (others => '0');
+      host_save_type : in std_logic_vector(3 downto 0) := (others => '0');
+      -- Selected effective firmware user settings, 28 little-endian words.
+      -- profile_data may have one clk1x cycle of latency.
+      profile_valid    : in  std_logic := '0';
+      profile_addr     : out std_logic_vector(4 downto 0);
+      profile_data     : in  std_logic_vector(31 downto 0) := (others => '0');
+      profile_fw_offset : in std_logic_vector(31 downto 0) := x"0007FE00";
+      profile_fw_checksums : in std_logic_vector(31 downto 0) := x"0000FFFF";
+      rtc_seed         : in std_logic_vector(55 downto 0) := (others => '0');
+      rtc_seed_toggle  : in std_logic := '0';
+      rtc_datetime     : out std_logic_vector(55 downto 0);
+      rtc_date_written : out std_logic;
       -- keys (active high)
       KeyA             : in  std_logic;
       KeyB             : in  std_logic;
@@ -67,14 +90,16 @@ entity nds_nitro_console_wrap is
 
       -- card image read port (word addressed into the staged .nds)
       card_ena         : out std_logic;
-      card_addr        : out std_logic_vector(24 downto 0);  -- word address (byte addr 26:2)
+      card_addr        : out std_logic_vector(26 downto 0);  -- word address (byte addr 28:2)
       card_din         : in  std_logic_vector(31 downto 0);
       card_done        : in  std_logic;
+      card_address_mask : in std_logic_vector(31 downto 0) := x"FFFFFFFF";
 
       -- Cartridge backup-memory byte port.  The island terminates this on one
       -- side of a mixed-width M10K; MiSTer's mounted .sav channel owns the
       -- other side.
       backup_addr         : out std_logic_vector(19 downto 0);
+      backup_bank         : out std_logic_vector(3 downto 0) := (others => '0');
       backup_write_data   : out std_logic_vector(7 downto 0);
       backup_write_enable : out std_logic;
       backup_read_data    : in  std_logic_vector(7 downto 0);
@@ -86,7 +111,7 @@ entity nds_nitro_console_wrap is
       backup_cache_ready  : in  std_logic := '1';
       backup_run_ready    : in  std_logic := '1';
 
-      -- SPI firmware flash image read port (128 KB, word addressed)
+      -- SPI firmware flash image port (256 KiB aperture, word addressed)
       fw_addr          : out std_logic_vector(15 downto 0);  -- word address (byte addr 17:2)
       fw_req           : out std_logic;
       fw_done          : in  std_logic;
@@ -97,6 +122,8 @@ entity nds_nitro_console_wrap is
       fw_wr            : out std_logic;
       fw_wlane         : out std_logic_vector(1 downto 0);
       fw_wdata         : out std_logic_vector(7 downto 0);
+      fw_busy          : in std_logic := '0';
+      fw_release       : out std_logic; -- completed SPI program chip-select
 
       -- hot-loadable ARM7/ARM9 BIOS RAM write ports
       bios7_load_addr  : in std_logic_vector(13 downto 2);
@@ -135,6 +162,12 @@ entity nds_nitro_console_wrap is
       vsrv_din         : out std_logic_vector(31 downto 0);
       vsrv_dout        : in  std_logic_vector(31 downto 0);
       vsrv_done        : in  std_logic;
+      vsrv_dout_hi     : in  std_logic_vector(31 downto 0);
+      vsrv_seq         : out std_logic;
+      vsrv_wide        : out std_logic;
+      vsrv_din_hi      : out std_logic_vector(31 downto 0);
+      vsrv_be_hi       : out std_logic_vector(3 downto 0);
+      vsrv_more        : out std_logic;
       vrsrv_req        : out std_logic;
       vrsrv_bank       : out std_logic_vector(1 downto 0);
       vrsrv_addr       : out std_logic_vector(13 downto 0);
@@ -163,13 +196,27 @@ entity nds_nitro_console_wrap is
       h3d_merge_pixel_y    : out std_logic_vector(7 downto 0);
       h3d_line_drop        : out std_logic;
       h3d_bg1_scroll_triplet : out std_logic_vector(31 downto 0);
+      h3d_query_sample_toggle : out std_logic := '0';
 
       -- Lossless raw H3D event streams, all in the clk1x domain.
       h3d_service_ready       : in  std_logic := '0';
+      h3d_readback_request    : out std_logic := '0';
+      h3d_readback_ready      : in  std_logic := '0';
+      h3d_readback_id         : out std_logic_vector(31 downto 0) := (others => '0');
+      h3d_readback_response   : in  std_logic := '0';
+      h3d_readback_response_id: in  std_logic_vector(31 downto 0) := (others => '0');
+      h3d_readback_status     : in  std_logic_vector(31 downto 0) := (others => '0');
+      h3d_readback_index      : out std_logic_vector(4 downto 0) := (others => '0');
+      h3d_readback_data       : in  std_logic_vector(31 downto 0) := (others => '0');
+      h3d_engine_b_enable     : in  std_logic := '0';
       h3d_gx_fifo_level       : in  std_logic_vector(8 downto 0) := (others => '0');
+      h3d_gx_geometry_busy    : in  std_logic := '0';
+      h3d_gx_stack_status     : in  std_logic_vector(6 downto 0) := (others => '0');
+      h3d_gx_stack_ack        : out std_logic;
       h3d_timestamp           : out std_logic_vector(63 downto 0);
       h3d_current_frame       : out std_logic_vector(31 downto 0);
       h3d_source_fault        : out std_logic;
+      h3d_source_fault_reason : out std_logic_vector(1 downto 0) := "00";
 
       h3d_gpu_write_valid       : out std_logic;
       h3d_gpu_write_ready       : in  std_logic := '1';
@@ -177,7 +224,7 @@ entity nds_nitro_console_wrap is
       h3d_gpu_write_access      : out std_logic_vector(1 downto 0);
       h3d_gpu_write_byte_enable : out std_logic_vector(3 downto 0);
       h3d_gpu_write_data        : out std_logic_vector(31 downto 0);
-      h3d_gpu_write_frame       : out std_logic_vector(31 downto 0);
+      h3d_gpu_write_scanline    : out std_logic_vector(8 downto 0);
       h3d_gpu_write_timestamp   : out std_logic_vector(63 downto 0);
 
       h3d_vram9_write_valid       : out std_logic;
@@ -186,7 +233,7 @@ entity nds_nitro_console_wrap is
       h3d_vram9_write_access      : out std_logic_vector(1 downto 0);
       h3d_vram9_write_byte_enable : out std_logic_vector(3 downto 0);
       h3d_vram9_write_data        : out std_logic_vector(31 downto 0);
-      h3d_vram9_write_frame       : out std_logic_vector(31 downto 0);
+      h3d_vram9_write_scanline    : out std_logic_vector(8 downto 0);
       h3d_vram9_write_timestamp   : out std_logic_vector(63 downto 0);
 
       h3d_vram7_write_valid       : out std_logic;
@@ -195,9 +242,12 @@ entity nds_nitro_console_wrap is
       h3d_vram7_write_access      : out std_logic_vector(1 downto 0);
       h3d_vram7_write_byte_enable : out std_logic_vector(3 downto 0);
       h3d_vram7_write_data        : out std_logic_vector(31 downto 0);
-      h3d_vram7_write_frame       : out std_logic_vector(31 downto 0);
+      h3d_vram7_write_scanline    : out std_logic_vector(8 downto 0);
       h3d_vram7_write_timestamp   : out std_logic_vector(63 downto 0);
 
+      -- Raw physical LCD timing for safe late 3D adoption; never queued.
+      h3d_lcd_phase_raw      : out std_logic := '0';
+      h3d_lcd_line_raw       : out std_logic_vector(8 downto 0) := (others => '0');
       h3d_hblank_valid       : out std_logic;
       h3d_hblank_ready       : in  std_logic := '1';
       h3d_hblank_line        : out std_logic_vector(8 downto 0);
@@ -221,6 +271,8 @@ entity nds_nitro_console_wrap is
       vblank_out       : out std_logic;
 
       -- sound
+      sound_diagnostic : out std_logic_vector(127 downto 0) := (others => '0');
+      sound_stream_diagnostic : out std_logic_vector(63 downto 0) := (others => '0');
       sound_out_left   : out std_logic_vector(15 downto 0);
       sound_out_right  : out std_logic_vector(15 downto 0);
 
@@ -230,6 +282,8 @@ entity nds_nitro_console_wrap is
       dbg_r0_9          : out std_logic_vector(31 downto 0);
       dbg_lr9           : out std_logic_vector(31 downto 0);
       dbg_cpsr9         : out std_logic_vector(31 downto 0);
+      dbg_mem_probe     : out std_logic_vector(31 downto 0) := (others => '0');
+      dbg_cpu9_addr     : out std_logic_vector(31 downto 0) := (others => '0');
       diagnostic_hold9  : in  std_logic := '0';
       diagnostic_hold7  : in  std_logic := '0';
       diagnostic_release9 : in std_logic := '0';
@@ -244,7 +298,9 @@ entity nds_nitro_console_wrap is
       dbg_rsp_data      : out std_logic_vector(31 downto 0);
       dbg_rsp_stb       : out std_logic;
 
-      dbg_hwstat        : out std_logic_vector(17 downto 0)
+      dbg_hwstat        : out std_logic_vector(17 downto 0);
+      -- Optional synthetic microphone input; defaults to silence for old callers.
+      mic_blow         : in std_logic := '0'
    );
 end entity;
 
@@ -323,8 +379,13 @@ begin
    -- whole of nds_sound, and it stays the reference the daemon is judged
    -- against until 1-4 in that document are proved.
    generic map (
+      GPU2D_A_ENABLE => GPU2D_A_ENABLE, HOST_SAVE_PROFILE => HOST_SAVE_PROFILE,
       GPU_FAST => 0, GPU2D_B_ENABLE => 0,
-      SOUND_ENABLE => 1, DEBUG_ENABLE => 0,
+      H3D_MATCHED_DISPLAY_TEST => H3D_MATCHED_DISPLAY_TEST,
+      SOUND_ENABLE => 1, SOUND_DIAGNOSTICS => SOUND_DIAGNOSTICS,
+      SOUND_STREAM_DIAGNOSTICS => SOUND_STREAM_DIAGNOSTICS, DEBUG_ENABLE => 0,
+      H3D_GX_READBACK_ENABLE => H3D_GX_READBACK_ENABLE = '1',
+      H3D_COMPRESS_HBLANK => H3D_COMPRESS_HBLANK = '1',
       CLKMEM_RATIO => CLKMEM_RATIO
    )
    port map
@@ -337,6 +398,18 @@ begin
       nds_on           => nds_on,
       direct_boot      => direct_boot,
       fw_boot          => fw_boot,
+      cart_present     => cart_present,
+      host_save_valid => host_save_valid, host_save_code => host_save_code,
+      host_save_type => host_save_type,
+      profile_valid    => profile_valid,
+      profile_addr     => profile_addr,
+      profile_data     => profile_data,
+      profile_fw_offset => profile_fw_offset,
+      profile_fw_checksums => profile_fw_checksums,
+      rtc_seed         => rtc_seed,
+      rtc_seed_toggle  => rtc_seed_toggle,
+      rtc_datetime     => rtc_datetime,
+      rtc_date_written => rtc_date_written,
 
       KeyA             => KeyA,
       KeyB             => KeyB,
@@ -351,6 +424,7 @@ begin
       KeyX             => KeyX,
       KeyY             => KeyY,
       lid_closed       => lid_closed,
+      mic_blow         => mic_blow,
 
       touch_active     => touch_active,
       touch_x          => touch_x,
@@ -363,8 +437,10 @@ begin
       card_addr        => card_addr,
       card_din         => card_din,
       card_done        => card_done,
+      card_address_mask => card_address_mask,
 
       backup_addr         => backup_addr,
+      backup_bank => backup_bank,
       backup_write_data   => backup_write_data,
       backup_write_enable => backup_write_enable,
       backup_read_data    => backup_read_data,
@@ -380,6 +456,8 @@ begin
       fw_wr            => fw_wr,
       fw_wlane         => fw_wlane_u,
       fw_wdata         => fw_wdata,
+      fw_busy          => fw_busy,
+      fw_release       => fw_release,
       fw_req           => fw_req,
       fw_done          => fw_done,
       fw_data          => fw_data,
@@ -416,6 +494,12 @@ begin
       vsrv_din         => vsrv_din,
       vsrv_dout        => vsrv_dout,
       vsrv_done        => vsrv_done,
+      vsrv_dout_hi     => vsrv_dout_hi,
+      vsrv_seq         => vsrv_seq,
+      vsrv_wide        => vsrv_wide,
+      vsrv_din_hi      => vsrv_din_hi,
+      vsrv_be_hi       => vsrv_be_hi,
+      vsrv_more        => vsrv_more,
       vrsrv_req        => vrsrv_req,
       vrsrv_bank       => vrsrv_bank,
       vrsrv_addr       => vrsrv_addr_u,
@@ -441,17 +525,30 @@ begin
       h3d_merge_pixel_y    => h3d_merge_y_i,
 
       h3d_service_ready       => h3d_service_ready,
+      h3d_readback_request    => h3d_readback_request,
+      h3d_readback_ready      => h3d_readback_ready,
+      h3d_readback_id         => h3d_readback_id,
+      h3d_readback_response   => h3d_readback_response,
+      h3d_readback_response_id=> h3d_readback_response_id,
+      h3d_readback_status     => h3d_readback_status,
+      h3d_readback_index      => h3d_readback_index,
+      h3d_readback_data       => h3d_readback_data,
+      h3d_engine_b_enable     => h3d_engine_b_enable,
       h3d_gx_fifo_level       => h3d_gx_fifo_level,
+      h3d_gx_geometry_busy    => h3d_gx_geometry_busy,
+      h3d_gx_stack_status     => h3d_gx_stack_status,
+      h3d_gx_stack_ack        => h3d_gx_stack_ack,
       h3d_timestamp           => h3d_timestamp,
       h3d_current_frame       => h3d_current_frame,
       h3d_source_fault        => h3d_source_fault,
+      h3d_source_fault_reason => h3d_source_fault_reason,
       h3d_gpu_write_valid       => h3d_gpu_write_valid,
       h3d_gpu_write_ready       => h3d_gpu_write_ready,
       h3d_gpu_write_address     => h3d_gpu_write_address,
       h3d_gpu_write_access      => h3d_gpu_write_access,
       h3d_gpu_write_byte_enable => h3d_gpu_write_byte_enable,
       h3d_gpu_write_data        => h3d_gpu_write_data,
-      h3d_gpu_write_frame       => h3d_gpu_write_frame,
+      h3d_gpu_write_scanline    => h3d_gpu_write_scanline,
       h3d_gpu_write_timestamp   => h3d_gpu_write_timestamp,
       h3d_vram9_write_valid       => h3d_vram9_write_valid,
       h3d_vram9_write_ready       => h3d_vram9_write_ready,
@@ -459,7 +556,7 @@ begin
       h3d_vram9_write_access      => h3d_vram9_write_access,
       h3d_vram9_write_byte_enable => h3d_vram9_write_byte_enable,
       h3d_vram9_write_data        => h3d_vram9_write_data,
-      h3d_vram9_write_frame       => h3d_vram9_write_frame,
+      h3d_vram9_write_scanline    => h3d_vram9_write_scanline,
       h3d_vram9_write_timestamp   => h3d_vram9_write_timestamp,
       h3d_vram7_write_valid       => h3d_vram7_write_valid,
       h3d_vram7_write_ready       => h3d_vram7_write_ready,
@@ -467,8 +564,10 @@ begin
       h3d_vram7_write_access      => h3d_vram7_write_access,
       h3d_vram7_write_byte_enable => h3d_vram7_write_byte_enable,
       h3d_vram7_write_data        => h3d_vram7_write_data,
-      h3d_vram7_write_frame       => h3d_vram7_write_frame,
+      h3d_vram7_write_scanline    => h3d_vram7_write_scanline,
       h3d_vram7_write_timestamp   => h3d_vram7_write_timestamp,
+      h3d_lcd_phase_raw      => h3d_lcd_phase_raw,
+      h3d_lcd_line_raw       => h3d_lcd_line_raw,
       h3d_hblank_valid       => h3d_hblank_valid,
       h3d_hblank_ready       => h3d_hblank_ready,
       h3d_hblank_line        => h3d_hblank_line,
@@ -489,6 +588,8 @@ begin
       pixelb_out_we    => pixelb_out_we,
       vblank_out       => vblank_out,
 
+      sound_diagnostic => sound_diagnostic,
+      sound_stream_diagnostic => sound_stream_diagnostic,
       sound_out_left   => sound_out_left,
       sound_out_right  => sound_out_right,
 
@@ -506,6 +607,7 @@ begin
       dbg_line_drop_b  => open,
       dbg_line_busy    => open,
       dbg_bg1_scroll_triplet => h3d_bg1_scroll_triplet,
+      dbg_query_sample_toggle => h3d_query_sample_toggle,
       dbg_cpu_err9     => open,
       dbg_cpu_err7     => open,
       dbg_pc9          => dbg_pc9,
@@ -513,6 +615,8 @@ begin
       dbg_r0_9         => dbg_r0_9,
       dbg_lr9          => dbg_lr9,
       dbg_cpsr9        => dbg_cpsr9,
+      dbg_mem_probe    => dbg_mem_probe,
+      dbg_cpu9_addr    => dbg_cpu9_addr,
       diagnostic_hold9 => diagnostic_hold9,
       diagnostic_hold7 => diagnostic_hold7,
       diagnostic_release9 => diagnostic_release9,

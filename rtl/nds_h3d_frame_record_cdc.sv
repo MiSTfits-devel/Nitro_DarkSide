@@ -3,7 +3,7 @@
 // Ordered clk1x record normalizer and CDC transport for H3B1 frame packets.
 // One source is accepted per source-clock edge. Raw GPU geometry writes pass
 // through the exact standalone GX normalizer; other GPU and VRAM writes are
-// converted directly to the shared 128-bit record ABI. A 162-bit asynchronous
+// converted directly to the shared 128-bit record ABI. A 172-bit asynchronous
 // FIFO transports {boundary, frame_end, logical_frame, record} to DDR.
 module nds_h3d_frame_record_cdc #(
     parameter integer ASYNC_LGDEPTH = 4,
@@ -13,12 +13,14 @@ module nds_h3d_frame_record_cdc #(
     // best-effort basis; per-record scanline tags recover exact ordering once
     // transport resumes, so timing pulses never backpressure the console.
     parameter bit SPARSE_HBLANK = 0,
-    parameter bit SCANLINE_TAGS = 0
+    parameter bit SCANLINE_TAGS = 0,
+    parameter bit SWAP_VBLANK_RETIREMENT = 0
 ) (
     input  logic         source_clk,
     input  logic         ddr_clk,
     input  logic         reset,
     input  logic         session_flush,
+    input  logic         lcd_vblank,
 
     input  logic         gpu_valid,
     output logic         gpu_ready,
@@ -27,6 +29,7 @@ module nds_h3d_frame_record_cdc #(
     input  logic [3:0]   gpu_byte_enable,
     input  logic [31:0]  gpu_data,
     input  logic [63:0]  gpu_timestamp,
+    input  logic [8:0]   gpu_scanline,
 
     input  logic         arm9_vram_valid,
     output logic         arm9_vram_ready,
@@ -35,6 +38,7 @@ module nds_h3d_frame_record_cdc #(
     input  logic [3:0]   arm9_vram_byte_enable,
     input  logic [31:0]  arm9_vram_data,
     input  logic [63:0]  arm9_vram_timestamp,
+    input  logic [8:0]   arm9_vram_scanline,
 
     input  logic         arm7_vram_valid,
     output logic         arm7_vram_ready,
@@ -43,6 +47,7 @@ module nds_h3d_frame_record_cdc #(
     input  logic [3:0]   arm7_vram_byte_enable,
     input  logic [31:0]  arm7_vram_data,
     input  logic [63:0]  arm7_vram_timestamp,
+    input  logic [8:0]   arm7_vram_scanline,
 
     input  logic         hblank_valid,
     output logic         hblank_ready,
@@ -65,6 +70,12 @@ module nds_h3d_frame_record_cdc #(
     output logic         fifo_empty,
     output logic         fifo_below_half,
     output logic         fifo_full,
+    // This is a source-clock status signal, like fifo_level; it does not
+    // cross through the DDR transport or depend on record consumption.
+    output logic         gx_geometry_busy,
+    // GXSTAT matrix stacks: {error, projection level, position level[4:0]}.
+    input  logic         gx_stack_ack,
+    output logic [6:0]   gx_stack_status,
 
     output logic         record_valid,
     input  logic         record_ready,
@@ -88,6 +99,7 @@ module nds_h3d_frame_record_cdc #(
     localparam logic [7:0] KIND_OAM_WRITE = 8'd7;
     localparam logic [7:0] KIND_HBLANK = 8'd8;
     localparam logic [7:0] KIND_GX_PACKED = 8'd9;
+    localparam logic [7:0] KIND_GX_READBACK_FENCE = 8'd10;
 
     function automatic logic [1:0] address_low(
         input logic [3:0] byte_enable
@@ -143,6 +155,9 @@ module nds_h3d_frame_record_cdc #(
         gpu_arch_address <= 28'h00005cb;
     wire gpu_gxstat = gpu_arch_address >= 28'h0000600 &&
         gpu_arch_address <= 28'h0000613;
+    // Internal ordered-source sentinel, never an architectural MMIO write.
+    wire gpu_readback_fence = gpu_address == 28'h00007f0 &&
+        gpu_access == 2'b11 && gpu_byte_enable == 4'b0000;
     wire gpu_qualified = gpu_2d || gpu_palette || gpu_oam || gpu_disp3d ||
         gpu_vramcnt || gpu_powcnt1 || gpu_renderer || gpu_geometry ||
         gpu_gxstat;
@@ -227,12 +242,27 @@ module nds_h3d_frame_record_cdc #(
     logic gx_swap_pending;
     logic [63:0] gx_oldest_swap_timestamp;
     logic gx_packed_active;
+    logic gx_normalization_pending;
     logic gx_protocol_error;
     logic [31:0] logical_frame;
 
-    nds_gx_fifo_packet_frontend gx_frontend (
+    // POWCNT1 low byte, in the same accepted source order as GX commands.
+    // Writes while geometry is disabled must not create phantom SWAP waits.
+    logic geometry_enabled;
+    always_ff @(posedge source_clk) begin
+        // Match the direct-boot renderer and matrix-prefix initial state.
+        if (source_reset_local) geometry_enabled <= 1;
+        else if (gpu_valid && gpu_ready && gpu_powcnt1 && gpu_byte_enable[0])
+            geometry_enabled <= gpu_data[3];
+    end
+
+    nds_gx_fifo_packet_frontend #(
+        .SWAP_VBLANK_RETIREMENT(SWAP_VBLANK_RETIREMENT)
+    ) gx_frontend (
         .clk(source_clk),
         .reset(source_reset_local),
+        .lcd_vblank(lcd_vblank),
+        .geometry_enabled(geometry_enabled),
         .write_valid(gx_write_valid),
         .write_ready(gx_write_ready),
         .write_is_dma(1'b0),
@@ -251,11 +281,17 @@ module nds_h3d_frame_record_cdc #(
         .swap_pending(gx_swap_pending),
         .oldest_swap_timestamp(gx_oldest_swap_timestamp),
         .fifo_level(fifo_level),
+        .geometry_busy(gx_geometry_busy),
         .fifo_empty(fifo_empty),
         .fifo_below_half(fifo_below_half),
         .fifo_full(fifo_full),
         .packed_active(gx_packed_active),
-        .protocol_error(gx_protocol_error)
+        .normalization_pending(gx_normalization_pending),
+        .protocol_error(gx_protocol_error),
+        .stack_ack(gx_stack_ack),
+        .pos_stack_level(gx_stack_status[4:0]),
+        .proj_stack_level(gx_stack_status[5]),
+        .stack_error(gx_stack_status[6])
     );
 
     logic async_write_valid;
@@ -278,6 +314,7 @@ module nds_h3d_frame_record_cdc #(
     logic sparse_phase_pending;
     logic sparse_phase_visible_end;
     logic [31:0] sparse_phase_frame;
+    logic [63:0] sparse_phase_timestamp;
     wire phase_valid = SPARSE_HBLANK ?
         (sparse_phase_pending || phase_input_valid) : phase_input_valid;
     wire [8:0] phase_line =
@@ -286,10 +323,9 @@ module nds_h3d_frame_record_cdc #(
     wire [31:0] phase_frame =
         SPARSE_HBLANK && sparse_phase_pending ?
             sparse_phase_frame : hblank_frame;
-    // Sparse markers are only two fixed lines and always win arbitration.
-    // Their timestamp therefore needs no retained 64-bit payload; this keeps
-    // the full FPGA cost to one line bit plus the display-frame number.
-    wire [63:0] phase_timestamp = hblank_timestamp;
+    wire [63:0] phase_timestamp =
+        SPARSE_HBLANK && sparse_phase_pending ?
+            sparse_phase_timestamp : hblank_timestamp;
     wire [127:0] hblank_record = pack_record(
         KIND_HBLANK, 8'd0, 4'd0, {23'd0, phase_line}, phase_frame);
 
@@ -302,62 +338,19 @@ module nds_h3d_frame_record_cdc #(
     logic promised_swap_boundary;
     logic [63:0] selected_raw_timestamp;
     logic selected_raw_valid;
-    // Timestamp ordering is done on the low TS_CMP_W bits, modularly, not on
-    // all 64. The stored and transported timestamp stays 64 bits wide: it is
-    // an ABI, split into timestamp_low/timestamp_high in the DDR record slot
-    // that Hybrid3DAbi.h parses, and narrowing it would change what the HPS
-    // shadow reads. Only the arbitration below is narrowed, and that is where
-    // the whole cost was.
-    //
-    // Nine 64-bit magnitude comparators in one combinational block put ~11 ns
-    // into a 27.393 ns path, about 40% of it, and that path is not local: this
-    // block's gpu_ready becomes dma_gx_write_ready in nds_nitro_console_top,
-    // which gates ARM9 register writes in the same cycle. Diagnostic
-    // arbitration was therefore setting the console's clk2x ceiling.
-    //
-    // Modular comparison is exact as long as any two timestamps compared here
-    // differ by less than 2**(TS_CMP_W-1) counts. These are snapshots held in
-    // the source skid slots and the 256-entry GX FIFO, so the true separation
-    // is bounded by how long a held source can wait for acceptance. At 32 bits
-    // that budget is 2**31 clk1x counts, over 60 seconds at any cadence this
-    // core runs -- orders of magnitude beyond any stall the service loop can
-    // survive. Raise TS_CMP_W rather than reasoning around a wrap if that ever
-    // stops being true.
-    localparam int TS_CMP_W = 32;
-
-    function automatic logic ts_le(input logic [63:0] a, input logic [63:0] b);
-        logic signed [TS_CMP_W-1:0] d;
-        d = a[TS_CMP_W-1:0] - b[TS_CMP_W-1:0];
-        ts_le = (d <= 0);
-    endfunction
-
-    function automatic logic ts_lt(input logic [63:0] a, input logic [63:0] b);
-        logic signed [TS_CMP_W-1:0] d;
-        d = a[TS_CMP_W-1:0] - b[TS_CMP_W-1:0];
-        ts_lt = (d < 0);
-    endfunction
-
-    function automatic logic ts_eq(input logic [63:0] a, input logic [63:0] b);
-        ts_eq = (a[TS_CMP_W-1:0] == b[TS_CMP_W-1:0]);
-    endfunction
-
     wire gpu_fire = gpu_valid && gpu_ready;
     wire arm9_fire = arm9_vram_valid && arm9_vram_ready;
     wire arm7_fire = arm7_vram_valid && arm7_vram_ready;
     wire frame_fire = frame_valid && frame_ready;
     wire gx_record_fire = gx_record_valid && gx_record_ready;
-    // Sparse phase markers use their retained timestamp and therefore can
-    // precede a same-edge HDMA write exactly like the full diagnostic mode.
-    // Selecting them here costs no wide comparator: the boundary is only two
-    // records per display frame and the held marker simply arbitrates before
-    // raw state until accepted. The state sources already provide lossless
-    // backpressure.
-    wire phase_precedes_raw = SPARSE_HBLANK ?
-        1'b1 :
-        ((!gpu_valid || ts_le(phase_timestamp, gpu_timestamp)) &&
-         (!arm9_vram_valid || ts_le(phase_timestamp, arm9_vram_timestamp)) &&
-         (!arm7_vram_valid || ts_le(phase_timestamp, arm7_vram_timestamp)) &&
-         (!frame_valid || ts_le(phase_timestamp, frame_timestamp)));
+    // HBlank wins only an equal timestamp. An older delayed GPU/VRAM write
+    // (for example, line 262 still draining when line 0 arrives) must remain
+    // ahead of the next frame's marker.
+    wire phase_precedes_raw =
+        ((!gpu_valid || phase_timestamp <= gpu_timestamp) &&
+         (!arm9_vram_valid || phase_timestamp <= arm9_vram_timestamp) &&
+         (!arm7_vram_valid || phase_timestamp <= arm7_vram_timestamp) &&
+         (!frame_valid || phase_timestamp <= frame_timestamp));
 
     always_comb begin
         select_gpu = 0;
@@ -377,25 +370,25 @@ module nds_h3d_frame_record_cdc #(
             selected_raw_timestamp = phase_timestamp;
         end else if (gpu_valid &&
             (!arm9_vram_valid ||
-             ts_le(gpu_timestamp, arm9_vram_timestamp)) &&
+             gpu_timestamp <= arm9_vram_timestamp) &&
             (!arm7_vram_valid ||
-             ts_le(gpu_timestamp, arm7_vram_timestamp)) &&
+             gpu_timestamp <= arm7_vram_timestamp) &&
             (!frame_valid ||
-             ts_le(gpu_timestamp, frame_timestamp))) begin
+             gpu_timestamp <= frame_timestamp)) begin
             select_gpu = 1;
             selected_raw_valid = 1;
             selected_raw_timestamp = gpu_timestamp;
         end else if (arm9_vram_valid &&
                      (!arm7_vram_valid ||
-                      ts_le(arm9_vram_timestamp, arm7_vram_timestamp)) &&
+                      arm9_vram_timestamp <= arm7_vram_timestamp) &&
                      (!frame_valid ||
-                      ts_le(arm9_vram_timestamp, frame_timestamp))) begin
+                      arm9_vram_timestamp <= frame_timestamp)) begin
             select_arm9 = 1;
             selected_raw_valid = 1;
             selected_raw_timestamp = arm9_vram_timestamp;
         end else if (arm7_vram_valid &&
                      (!frame_valid ||
-                      ts_le(arm7_vram_timestamp, frame_timestamp))) begin
+                      arm7_vram_timestamp <= frame_timestamp)) begin
             select_arm7 = 1;
             selected_raw_valid = 1;
             selected_raw_timestamp = arm7_vram_timestamp;
@@ -409,10 +402,10 @@ module nds_h3d_frame_record_cdc #(
         // its original source timestamp. GX wins ties. A geometry raw write
         // may simultaneously enter the independent 256-entry GX FIFO.
         select_gx_head = gx_record_valid &&
-            !(SPARSE_HBLANK && select_hblank) &&
-            (!selected_raw_valid ||
-             ts_lt(gx_record_timestamp, selected_raw_timestamp) ||
-             (ts_eq(gx_record_timestamp, selected_raw_timestamp) &&
+            ((select_gpu && gpu_readback_fence) ||
+             !selected_raw_valid ||
+             gx_record_timestamp < selected_raw_timestamp ||
+             (gx_record_timestamp == selected_raw_timestamp &&
               !select_hblank));
         // The oldest fully normalized SWAP ordered at or before this boundary
         // is a promise that the equal/current frame will close. It may be
@@ -424,7 +417,7 @@ module nds_h3d_frame_record_cdc #(
         promised_swap_boundary = frame_valid &&
             frame_number == logical_frame &&
             ((gx_swap_pending &&
-              ts_le(gx_oldest_swap_timestamp, frame_timestamp)) ||
+              gx_oldest_swap_timestamp <= frame_timestamp) ||
              (select_gx_head && gx_record[15:8] == 8'h50));
 
         gpu_ready = 0;
@@ -475,13 +468,29 @@ module nds_h3d_frame_record_cdc #(
                         if (!SPARSE_HBLANK)
                             hblank_ready = async_write_ready;
                     end else if (select_gpu) begin
-                        if (!gpu_qualified) begin
+                        if (gpu_readback_fence) begin
+                            // Drain every previously accepted GX parameter,
+                            // including packed zero-param expansion not yet
+                            // in the FIFO. A partial command awaiting future
+                            // input must NOT block the executed-prefix query.
+                            // This fences delivered records, not geometry retirement.
+                            // Waiting for the SWAP barrier here could block the
+                            // LCD events required to finish an ordered query.
+                            if (!gx_record_valid && !gx_normalization_pending) begin
+                                gpu_ready = gpu_data == 0 || async_write_ready;
+                                async_write_valid = gpu_valid && gpu_data != 0;
+                                async_write_data = {
+                                    1'b0, 1'b0, logical_frame, 10'd0,
+                                    64'd0, gpu_data, 24'd0,
+                                    KIND_GX_READBACK_FENCE};
+                            end
+                        end else if (!gpu_qualified) begin
                             gpu_ready = 1;
                         end else begin
                             async_write_valid = gpu_valid;
                             async_write_data = {
                                 1'b0, 1'b0, logical_frame,
-                                SCANLINE_TAGS, hblank_line,
+                                SCANLINE_TAGS, gpu_scanline,
                                 gpu_direct_record};
                             gpu_ready = async_write_ready;
                         end
@@ -492,14 +501,14 @@ module nds_h3d_frame_record_cdc #(
                             async_write_valid = arm9_vram_valid;
                             async_write_data = {
                                 1'b0, 1'b0, logical_frame,
-                                SCANLINE_TAGS, hblank_line, arm9_record};
+                                SCANLINE_TAGS, arm9_vram_scanline, arm9_record};
                             arm9_vram_ready = async_write_ready;
                         end
                     end else if (select_arm7) begin
                         async_write_valid = arm7_vram_valid;
                         async_write_data = {
                             1'b0, 1'b0, logical_frame,
-                            SCANLINE_TAGS, hblank_line, arm7_record};
+                            SCANLINE_TAGS, arm7_vram_scanline, arm7_record};
                         arm7_vram_ready = async_write_ready;
                     end else if (select_frame) begin
                         async_write_valid = frame_valid;
@@ -513,12 +522,14 @@ module nds_h3d_frame_record_cdc #(
     end
 
     wire sparse_phase_fire = SPARSE_HBLANK && select_hblank &&
+        !select_gx_head &&
         async_write_valid && async_write_ready;
     always_ff @(posedge source_clk or posedge source_reset_local) begin
         if (source_reset_local) begin
             sparse_phase_pending <= 1'b0;
             sparse_phase_visible_end <= 1'b0;
             sparse_phase_frame <= '0;
+            sparse_phase_timestamp <= '0;
         end else if (SPARSE_HBLANK) begin
             if (sparse_phase_pending) begin
                 if (sparse_phase_fire) begin
@@ -526,6 +537,7 @@ module nds_h3d_frame_record_cdc #(
                         sparse_phase_pending <= 1'b1;
                         sparse_phase_visible_end <= hblank_line == 9'd192;
                         sparse_phase_frame <= hblank_frame;
+                        sparse_phase_timestamp <= hblank_timestamp;
                     end else begin
                         sparse_phase_pending <= 1'b0;
                     end
@@ -534,6 +546,7 @@ module nds_h3d_frame_record_cdc #(
                 sparse_phase_pending <= 1'b1;
                 sparse_phase_visible_end <= hblank_line == 9'd192;
                 sparse_phase_frame <= hblank_frame;
+                sparse_phase_timestamp <= hblank_timestamp;
             end
         end else begin
             sparse_phase_pending <= 1'b0;
@@ -545,18 +558,21 @@ module nds_h3d_frame_record_cdc #(
     logic arm7_stalled;
     logic hblank_stalled;
     logic frame_stalled;
-    logic [129:0] gpu_stalled_payload;
-    logic [129:0] arm9_stalled_payload;
-    logic [129:0] arm7_stalled_payload;
+    logic [138:0] gpu_stalled_payload;
+    logic [138:0] arm9_stalled_payload;
+    logic [138:0] arm7_stalled_payload;
     logic [104:0] hblank_stalled_payload;
     logic [95:0] frame_stalled_payload;
-    wire [129:0] gpu_source_payload = {
-        gpu_timestamp, gpu_data, gpu_byte_enable, gpu_access, gpu_address};
-    wire [129:0] arm9_source_payload = {
-        arm9_vram_timestamp, arm9_vram_data, arm9_vram_byte_enable,
+    wire [138:0] gpu_source_payload = {
+        gpu_scanline, gpu_timestamp, gpu_data, gpu_byte_enable, gpu_access,
+        gpu_address};
+    wire [138:0] arm9_source_payload = {
+        arm9_vram_scanline, arm9_vram_timestamp, arm9_vram_data,
+        arm9_vram_byte_enable,
         arm9_vram_access, arm9_vram_address};
-    wire [129:0] arm7_source_payload = {
-        arm7_vram_timestamp, arm7_vram_data, arm7_vram_byte_enable,
+    wire [138:0] arm7_source_payload = {
+        arm7_vram_scanline, arm7_vram_timestamp, arm7_vram_data,
+        arm7_vram_byte_enable,
         arm7_vram_access, arm7_vram_address};
     wire [104:0] hblank_source_payload = {
         hblank_timestamp, hblank_frame, hblank_line};
@@ -597,6 +613,8 @@ module nds_h3d_frame_record_cdc #(
             source_fault_reason_now = 4'd6;
         else if (frame_stability_fault)
             source_fault_reason_now = 4'd7;
+        else if (gpu_fire && gpu_readback_fence && gpu_data == 0)
+            source_fault_reason_now = 4'd8;
     end
 
     always_ff @(posedge source_clk or posedge source_reset_local) begin

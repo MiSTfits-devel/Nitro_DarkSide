@@ -1,0 +1,1046 @@
+{
+  "schema_version": 1,
+  "game_code": "CPUE",
+  "revision": 1,
+  "title": "Pok\u00e9mon Platinum Version (USA) (Rev 1)",
+  "header_sha1": "5b5bc6e7e15499337acf5662e3e7652c7fc3b665",
+  "header_bytes": 352,
+  "rom_sha256": "fbce4c4def0c7797f8dd238a3d7a5e48b4a7e3abd86890ac65f6321cef781bdb",
+  "arm9_sha256": "df6b2a565733621064a2dd2ea5eb69f87a949124434721d450acc566e902e5a5",
+  "baseline": "Exact rc12 with cumulative accepted FFTA2 Beta2 changes; prior Platinum character and furniture fixes retained",
+  "budget": "Approved terrain private beta retained. User20261028 permits timing/RNG trajectory differences provided gameplay functions. New candidates require functional/save/audio screening, measured native benefit and review video when worthwhile; exact mismatches retained.",
+  "status": "terrain_accepted_user_directed_private_beta",
+  "patches": [
+    {
+      "cpu": "arm9",
+      "mode": "arm",
+      "target": "arm9.bin/main_loaded",
+      "addr": "0x20c4b90",
+      "expect": "02c080e00c0050e1000000ba000000ea0400b0e8000000ba000000ea002081e5f7ffffba1eff2fe1",
+      "scratch_bytes": 0,
+      "overlay": null,
+      "hook": null,
+      "enabled": false,
+      "id": "fifo-word-stream-predication",
+      "pattern": "branch-heavy-fixed-destination-word-stream",
+      "replace": "02c080e00c0050e10400b0b8002081b5fbffffba1eff2fe10000a0e10000a0e10000a0e10000a0e1",
+      "status": "rejected_audio_and_transient_RAM_mismatch",
+      "validated": {
+        "fb": "All6000 top/bottom screen pairs bit-exact",
+        "ram": "All5 declared checkpoint sets and retainedframe2600dump match outside40 patch bytes; per-frame mainRAM247,DTCM348,ARM7WRAM107 hashes differ",
+        "audio": "Failed:175017 of4813950 stereo samples differ; maximum signed16 delta2146; no audibility judgment",
+        "save": "All6000 per-frame save hashes and finalsave bit-exact",
+        "native": "User-authorized isolated perceptual screening completed; staged bytes/save/ownership/capture checks passed. No native bit-exact or full lifecycle qualification. Menu: 14.6755 control versus 14.6280 patched; Bag: 30.2040 versus 30.0440 screen publications/s. Bag-opening near-black mean: 0.4333s control versus 0.4417s patched. No native gain demonstrated."
+      },
+      "gain": {
+        "reference_arm9_entries_4200_5999": {
+          "before": 248802085,
+          "after": 245648794,
+          "reduction_percent": 1.2673892986065611,
+          "first_frame": 4200,
+          "end_frame_exclusive": 6000,
+          "scope": "Software executed instructions; not native cycles or speed"
+        },
+        "native_cycles": null,
+        "native_frame_time": null,
+        "qualified": false,
+        "native_screening": "Menu: 14.6755 control versus 14.6280 patched; Bag: 30.2040 versus 30.0440 screen publications/s. Bag-opening near-black mean: 0.4333s control versus 0.4417s patched. No native gain demonstrated."
+      },
+      "notes": "Rejected and disabled. Same40-byte initial ARM9 code extent; no scratch/hook/overlay.1680 synthetic cases preserve registers/CPSR/ordered accesses. Full reference has identical screens/save/fixed RAM checkpoints but changed audio and transient RAM. Do not assume harmless timing, extrapolate FFT video approval, retry unchanged or run natively under the current budget. On 2026-10-28 the user explicitly authorized isolated perceptual trials and review videos, superseding the earlier no-native-trial restriction for this experiment only. Trials show no worthwhile gain in screened scenes; retain disabled regardless of visual review. No combined-patch or lifecycle acceptance.",
+      "synthetic_validation": {
+        "cases": 1680,
+        "receipt": "FIFO_WORD_STREAM_SYNTHETIC_V1.json",
+        "receipt_sha256": "9a8aadaf1f1e6551bbdba52d01c32be334dc6c47b6f01678bb9ee2a9ec484eb5"
+      },
+      "replay_rejection": {
+        "receipt": "FIFO_WORD_STREAM_COMPARISON_V1.json",
+        "receipt_sha256": "35dfacf2159523c2d10014d77f33cb17910e56a805bf38470ca25ac120422007",
+        "input_manifest": "FIFO_WORD_STREAM_INPUT_MANIFEST_V1.json",
+        "input_manifest_sha256": "6b8951fe98bd5a995c67df3fea5abcb266340df1dbb755e85e54ed54cc2dc44b",
+        "status_receipt": "FIFO_WORD_STREAM_CANDIDATE_V1_STATUS.json",
+        "status_sha256": "b4880cb2efd1e52f818365b3b063aa1035464d20975652de9e64b6e9bf5a1e92"
+      },
+      "native_perceptual_screening": {
+        "accepted": false,
+        "default_enabled": false,
+        "scope": "Stock1GHz, unchanged rc12 FPGA and accepted Beta2 renderer; real-time inputs and same disposable qualified seed. Publication counts are not unique gameplay FPS or cycles.",
+        "trial": "Q1",
+        "matched_control_trials": [
+          "C6"
+        ],
+        "receipt": "NATIVE_PERCEPTUAL_RESULTS_V1.json",
+        "receipt_sha256": "6ddbeae9b819127aebc73c8c3c7b3d20f64ed2df3c4f12a3c6cde5c9894d8749",
+        "result": "no_qualified_gain_in_screened_scenes",
+        "reference_review": "Platinum_FIFO_Review.mov",
+        "review_receipt": "Platinum_FIFO_Review.json",
+        "review_receipt_sha256": "d4a6a98f8b65b516313e0c4c6f08fc2ba5bbfd29a5b4d36df9ec6be1683f3947",
+        "native_battle_measured": false,
+        "user_perceptual_approval": false
+      }
+    },
+    {
+      "id": "overlay5-empty-tail-exit",
+      "pattern": "repeated-empty-tail-compaction",
+      "cpu": "arm9",
+      "target": "arm9.overlay",
+      "overlay": 5,
+      "overlay_ram": "0x21d0d80",
+      "overlay_file_id": 5,
+      "overlay_sha256": "6e2095b04c6db198d2c16f81964732d5b2119fa66edb907bec3b3774f41d43f9",
+      "addr": "0x21ee0a0",
+      "mode": "thumb",
+      "expect": "17d1721c824214da11017b18d96800290bd010013b189c462a1c03cb03c203cb03c200216046c16003e0521c10338242ecdb0020205e",
+      "replace": "18d1721c824215da11017b18d96800290bd010013b189c462a1c03cb03c203cb03c200216046c16004e0521c10338242ecdb461e2088",
+      "hook": null,
+      "scratch_bytes": 0,
+      "enabled": false,
+      "notes": "Disabled scratch-free Thumb empty-tail exit. Six byte values change across five instructions in a guarded54-byte overlay extent. Signed entry count must remain immutable during the call; no queue/IRQ writes are removed. 1338 synthetic cases and bounded pre/post-reset writer contracts pass. Audio alone fails the current budget. Do not rerun unchanged, trial natively, or transfer FFT perceptual approval. On 2026-10-28 the user explicitly authorized isolated perceptual trials and review videos, superseding the earlier no-native-trial restriction for this experiment only. Trials show no worthwhile gain in screened scenes; retain disabled regardless of visual review. No combined-patch or lifecycle acceptance.",
+      "status": "rejected_audio_mismatch",
+      "validated": {
+        "fb": "All 6000 top/bottom screen pairs bit-exact",
+        "ram": "All five fixed checkpoint sets and retained frame2600 RAM exact outside full-body-qualified patch bytes; transient per-frame mainRAM246/DTCM250/ARM7WRAM19 hashes differ",
+        "audio": "Failed:1660 of4813950 stereo samples differ; max signed16 delta312; RMS0.148479; no audibility judgment",
+        "save": "All6000 save hashes and final save bit-exact",
+        "native": "User-authorized isolated perceptual screening completed; staged bytes/save/ownership/capture checks passed. No native bit-exact or full lifecycle qualification. Walking: 16.70\u201316.80 control versus 16.65 patched screen publications/s; menu: 14.89\u201315.13 control versus 14.74 patched. No native gain demonstrated."
+      },
+      "gain": {
+        "reference_arm9_entries_4200_5999": {
+          "before": 248802085,
+          "after": 237158299,
+          "reduction_percent": 4.679939076877109,
+          "first_frame": 4200,
+          "end_frame_exclusive": 6000,
+          "scope": "Software executed instructions; not native cycles or speed"
+        },
+        "native_cycles": null,
+        "native_frame_time": null,
+        "qualified": false,
+        "native_screening": "Walking: 16.70\u201316.80 control versus 16.65 patched screen publications/s; menu: 14.89\u201315.13 control versus 14.74 patched. No native gain demonstrated."
+      },
+      "synthetic_validation": {
+        "cases": 1338,
+        "receipt": "EMPTY_TAIL_SYNTHETIC_V1.json",
+        "receipt_sha256": "fd8d90ad20c07ebdee517b19a9f58c7171967990ebb9a24524b1e88da6751ebe"
+      },
+      "replay_rejection": {
+        "receipt": "EMPTY_TAIL_COMPARISON_V1.json",
+        "receipt_sha256": "e0d26ddc9381c72ea9e234b09b3c235c642a52f9832b32dcdee38f98cd79d772",
+        "input_manifest": "EMPTY_TAIL_INPUT_MANIFEST_V1.json",
+        "input_manifest_sha256": "86d047ce9b6cf2113f8facc2d7ae26b391195a265b4a05b318b95874cc6855e8",
+        "status_receipt": "EMPTY_TAIL_CANDIDATE_V1_STATUS.json",
+        "status_sha256": "1a54b57e86827452898591e71c67ba9708df4b885992e3ef3a5c9a6f6d5badaa"
+      },
+      "native_perceptual_screening": {
+        "accepted": false,
+        "default_enabled": false,
+        "scope": "Stock1GHz, unchanged rc12 FPGA and accepted Beta2 renderer; real-time inputs and same disposable qualified seed. Publication counts are not unique gameplay FPS or cycles.",
+        "trial": "E2",
+        "matched_control_trials": [
+          "C4",
+          "C5"
+        ],
+        "receipt": "NATIVE_PERCEPTUAL_RESULTS_V1.json",
+        "receipt_sha256": "6ddbeae9b819127aebc73c8c3c7b3d20f64ed2df3c4f12a3c6cde5c9894d8749",
+        "result": "no_qualified_gain_in_screened_scenes",
+        "reference_review": "Platinum_Overlay_Review.mov",
+        "review_receipt": "Platinum_Overlay_Review.json",
+        "review_receipt_sha256": "1e9b49e00266e7a7ba2598113a34ba1b3185a194aec41e32e063dcb46a37b50f",
+        "native_battle_measured": false,
+        "user_perceptual_approval": false
+      }
+    },
+    {
+      "id": "irq-mask-sparse-bitwalk",
+      "pattern": "fixed-width-sparse-bitmask-traversal",
+      "cpu": "arm9",
+      "target": "arm9.bin/main_loaded",
+      "addr": "0x20c144c",
+      "mode": "arm",
+      "expect": "f8432de90080a0e30c20a0e36c409fe56c609fe50870a0e108e0a0e101c0a0e30230a0e1010010e30f00000a0790a0e1080058e3030000ba0b0058e3085048d2956329d0060000da030058e3030000ba060058e3015088d2956229d0000000da081184e7000059e302508918018088e2160058e3a000a0e1e9ffffbaf883bde8",
+      "replace": "f8432de90c20a0e370409fe570609fe500e0a0e301c0a0e3207ba0e1ff04c0e30305c0e30f5ca0e3785085e3000050e30f00000a009060e2009009e0198f6fe11f8068e20900c0e11c0815e10500000a080058e30190883208904822926929e0025089e8000000ea081184e7000050e3efffff1a0700a0e1020052e1f883bde8",
+      "hook": null,
+      "scratch_bytes": 0,
+      "enabled": false,
+      "data_guards": [
+        {
+          "addr": "0x20c14cc",
+          "expect": "00007e02f8cb1c02"
+        }
+      ],
+      "notes": "Functional-budget reassessment retains exact differences but admits isolated native trial. Unchanged128-byte patch plus accepted terrain completes23400referenceframes and first battle victory. Five atomic fallback checks pass;82new battle table contracts pass, including oneIRQ-enabled single-bit call. Fresh native walking/menu screen finds no useful gain. Keep disabled; no unchanged repeat without a different CPU-limited workload.",
+      "status": "parked_native_gain_insufficient",
+      "validated": {
+        "fb": "Current terrain combination:7top hash differences across23400frames;bottomexact. Selected interior/story/battle/victory pairs reviewed.",
+        "ram": "Six complete code/literal checkpoint identities pass; raw game RAM differs and remains unmasked outside exact patch bytes.",
+        "audio": "8744151of18774412stereo samples differ;maxdelta29784,RMS201.409466. No listening/inaudibility claim.",
+        "save": "Current23400frame finalsave matches terrain control; native isolated seed unchanged after both clean stops.",
+        "native": "Fresh same-boot terrain control/IRQ candidate: cold load, paired outdoor traversals and menu open/close function; no useful publication-throughput improvement. No native save-write/reset/full-game qualification."
+      },
+      "gain": {
+        "reference_arm9_entries_15000_16799": {
+          "before": 292331250,
+          "after": 285962200,
+          "reduction_percent": 2.1787099394950076,
+          "first_frame": 15000,
+          "end_frame_exclusive": 16800,
+          "scope": "Software executed instructions; not native cycles or speed"
+        },
+        "native_cycles": null,
+        "native_frame_time": null,
+        "qualified": false,
+        "current_reference_arm9_entries": [
+          {
+            "first_frame": 0,
+            "end_exclusive": 18000,
+            "control": {
+              "arm9_insn": 2729727044,
+              "arm7_insn": 522918408
+            },
+            "candidate": {
+              "arm9_insn": 2699997893,
+              "arm7_insn": 522913820
+            },
+            "arm9_entry_reduction_percent": 1.0890887814349548
+          },
+          {
+            "first_frame": 18000,
+            "end_exclusive": 23400,
+            "control": {
+              "arm9_insn": 264018986,
+              "arm7_insn": 205172678
+            },
+            "candidate": {
+              "arm9_insn": 263927471,
+              "arm7_insn": 205170447
+            },
+            "arm9_entry_reduction_percent": 0.03466227993164095
+          },
+          {
+            "first_frame": 0,
+            "end_exclusive": 23400,
+            "control": {
+              "arm9_insn": 2993746030,
+              "arm7_insn": 728091086
+            },
+            "candidate": {
+              "arm9_insn": 2963925364,
+              "arm7_insn": 728084267
+            },
+            "arm9_entry_reduction_percent": 0.9960987238453178
+          }
+        ],
+        "current_native_screen": [
+          {
+            "scene": "walking",
+            "control_trials": 1,
+            "candidate_trials": 1,
+            "control_mean": 18.91943725097915,
+            "candidate_mean": 18.84082173149513,
+            "change_percent": -0.41552778997141493,
+            "control_range": [
+              18.91943725097915,
+              18.91943725097915
+            ]
+          },
+          {
+            "scene": "menu",
+            "control_trials": 1,
+            "candidate_trials": 1,
+            "control_mean": 16.59444824931414,
+            "candidate_mean": 16.508847555098715,
+            "change_percent": -0.5158393513864712,
+            "control_range": [
+              16.59444824931414,
+              16.59444824931414
+            ]
+          }
+        ]
+      },
+      "synthetic_validation": {
+        "cases": 12262,
+        "receipt": "IRQ_SPARSE_SYNTHETIC_V2.json",
+        "receipt_sha256": "ed43eb715c4bc7de04306de8a6e0df039ff3d6b1facbfe6e1bce7ff8fb9eeb2f"
+      },
+      "replay_rejection": {
+        "receipt": "IRQ_SPARSE_COMPARISON_V2.json",
+        "receipt_sha256": "3a22bd19b323d0f9b214999bdacb38bbcb3924bd1f3466dd11879bacc9276a1b",
+        "input_manifest": "IRQ_SPARSE_INPUT_MANIFEST_V2.json",
+        "input_manifest_sha256": "88a80f1b30af340dae733083a853403d4047c2c4f403bb1a124fafed6e2d3664",
+        "status_receipt": "IRQ_SPARSE_CANDIDATE_V2_STATUS.json",
+        "status_sha256": "aeac47b90c98658533e4b45c50569972745f3875040ce9a1bf3c6ac2dc8be92f"
+      },
+      "functional_reassessment": {
+        "receipt": "IRQ_FUNCTIONAL_NATIVE_FINDINGS_V1.json",
+        "receipt_sha256": "7594a4ba982c2f62f80444096401c8e832908b85997837f12289acf7c788f976",
+        "reference_receipt": "IRQ_FUNCTIONAL_BATTLE_ANALYSIS_V1.json",
+        "reference_receipt_sha256": "609e81bfe40fddbdc8cad7b4ccdf903d2dc7ea44d1b1688d753fd34bea3f3699",
+        "review": "IRQ_FUNCTIONAL_NATIVE_REVIEW_V1.json",
+        "review_sha256": "4564306b525885b04a4b963a0d311aadf9db4bdb2bf387946f69ea074532d4fc",
+        "scope": "Current functional budget supersedes old exact-only prohibition; patch remains off for no useful native gain."
+      }
+    },
+    {
+      "id": "arm7-pitch-zero-carry-mla",
+      "pattern": "zero-multiplicand-predication",
+      "cpu": "arm7",
+      "target": "arm7.bin/autoload:2",
+      "section_base": "0x37f8000",
+      "section_sha256": "f3290680c123083725ad475baa5220242ed4e9cdd36a9efa8871823f954a0284",
+      "addr": "0x037fbde4",
+      "mode": "arm",
+      "expect": "013890e2c50fa0e1932581e000c0a0e3931021e00030ace2100044e2931521e0000050e3",
+      "replace": "013890e2c50fa0e1932581e000c0a0e3931021e00030ace2100044e293152120000050e3",
+      "hook": null,
+      "scratch_bytes": 0,
+      "enabled": false,
+      "precondition": "Full36-byte preceding arithmetic sequence authenticates R3=ADDS carry and unchangedC flag before MLA. All32-bit entry inputs supported;no BIOS table-value assumption.",
+      "notes": "Functional-budget reassessment: old exact RAM/audio rejection is historical. Keep disabled because shipped-core source gives only3 removable local ARM7 beats per observed call,173481beats over1800frames (about5.18ms total at33.513982MHz). Native benefit unmeasured; reopen with substantially higher call frequency or an ARM7 pacing bottleneck.",
+      "status": "parked_negligible_prospective_cost_budget",
+      "validated": {
+        "synthetic": "6800 exact cases",
+        "fb": "All16800 screen pairs exact",
+        "ram": "10of11 fixed checkpoint sets exact;frame14300 mainRAM49 words andDTCM3 words differ. Retainedframe2600 exact; transient RAM differences retained.",
+        "audio": "73833of13479065 stereo samples differ;maxdelta2974,RMS8.593533;no audibility judgment",
+        "save": "All16800 per-frame and final save hashes exact",
+        "native": "Not run; source-derived opportunity too small at observed frequency. Not rejected solely for timing/RNG/hash drift."
+      },
+      "gain": {
+        "reference_ARM9_entries": {
+          "before": 292331250,
+          "after": 292330960
+        },
+        "reference_ARM7_entries": {
+          "before": 45944604,
+          "after": 45944758
+        },
+        "scope": "Software instruction entries;not native cycles or speed",
+        "native_cycles": null,
+        "native_frame_time": null,
+        "qualified": false
+      },
+      "synthetic_validation": {
+        "cases": 6800,
+        "receipt": "ARM7_PITCH_CARRY_SYNTHETIC_V1.json",
+        "receipt_sha256": "3023fcebe093878c2fd86870e94bb7a7338ccc03e45b36e2040da36c839e955e"
+      },
+      "decision": {
+        "receipt": "ARM7_PITCH_CARRY_DECISION_V1.json",
+        "receipt_sha256": "ddc621391aa6c0656c1194d5a6e8fc67c75ee73a385960f930dc20e796647864"
+      },
+      "section_bss_bytes": 16952,
+      "delivery_validation": {
+        "receipt": "ARM7_AUTOLOAD_DECISION_V1.json",
+        "receipt_sha256": "7587e8ce0221fe47cb69e0972fcbef0f5b74280191b1240fad61327157cdfa2c",
+        "long_replay_files": 241,
+        "boot_replay_files": 83,
+        "original_copy_stores": 40316,
+        "candidate_executed": false
+      },
+      "replay_rejection": {
+        "receipt": "ARM7_PITCH_CARRY_REPLAY_DECISION_V1.json",
+        "receipt_sha256": "187501917c2d2fa338ccfc5a76f217949f90f100ca793c91270a864c824256f5",
+        "comparison": "ARM7_PITCH_CARRY_PAIR_COMPARISON_V1.json",
+        "comparison_sha256": "0776ac07c5915305d3ccd74636ea2ac72df2660c629f5d316e355948966b2b6d"
+      },
+      "functional_cost_screen": {
+        "receipt": "ARM7_PITCH_FUNCTIONAL_COST_V1.json",
+        "receipt_sha256": "84036196786432b25ad7b1e17db6d2e5c5cfd462f114c822051e921884cf3505",
+        "observed_calls": 57827,
+        "local_extra_clock_beats_per_call": 3,
+        "local_extra_clock_beats_total": 173481,
+        "frames": 1800,
+        "local_seconds_at_shipped_clock": 0.005176376832809661,
+        "native_speedup": null,
+        "scope": "Source-derived local cost screen weighted by reference calls; not a global native speed bound."
+      }
+    },
+    {
+      "id": "font-table-last-colors-reuse",
+      "pattern": "repeated-small-lookup-table-construction",
+      "cpu": "arm9",
+      "mode": "thumb",
+      "target": "arm9.bin/main_loaded",
+      "addr": "0x0201d9fc",
+      "expect": "f8b58cb0254b0025089509900a920b91d980588008a89a800595029084468646069000200490069801900298006807900020039070460090019800680701009800230068644606022068391c00033043014307985b1c021c0a43690010486d1c241d4252042befdb0098001d00900398401c03900428e2db0198001d01900498401c04900428d3db0298001d02900598401c05900428c4db0cb0f8bdd8041c0200051c02",
+      "replace": "f8b58cb0254b0025089509900a920b915c8884421ed1dc888c421bd19c88944218d10b9a079213001b011a4313001b021a430ca8009001900290042003900490059008a906918c468e46ff21490004280cb0f8bdd98058809a8008ab104c012636020327a80980001858290939408900595809010843a90839408900595809020843290039408900595809030843208002340135b542e5d1c3e7c046d8041c0200051c02",
+      "hook": null,
+      "overlay": null,
+      "scratch_bytes": 0,
+      "enabled": false,
+      "status": "parked_no_worthwhile_native_menu_bag_battle_gain",
+      "notes": "Disabled same164-byte ARM9 Thumb function/literal replacement. Compare stored16bit colors with full32bit args; regenerate onmiss. No scratch ornewservice.8672 synthetic cases and1338 observedbattlecall contracts pass;23400-frame fullreplay changes5topscreenframes and61453stereosamples. All6fixedRAMsets/saveexact. No nativequalification,unchangedrepeat,combination orFFTapprovaltransfer. On 2026-10-28 the user explicitly authorized isolated perceptual trials and review videos, superseding the earlier no-native-trial restriction for this experiment only. Trials show no worthwhile gain in screened scenes; retain disabled regardless of visual review. No combined-patch or lifecycle acceptance. Later user functional-budget direction admits individually adding this unchanged patch to accepted terrain for screening. Full-route cache contract and native first-turn screen completed; no useful native gain. Historical strict mismatch evidence retained; candidate still disabled and no new lifecycle acceptance.",
+      "assembly_source_sha256": "300d9925c68cbe1d59304cc815d72eec6f29af9b753d5f8997058366991d3068",
+      "replacement_sha256": "2cc8b108b591ab7a07edc24182a9c447f67707a72bdc90de6645c3648865211c",
+      "validated": {
+        "fb": "Failed:5upper-screenframes differ at18131,19457,20891,22807,22819; all23400bottom frames exact",
+        "ram": "All6fixedcheckpoint sets andretainedframe2600 mainRAM exact afteronly164-byte code normalization; perframemainRAM200,DTCM607,ARM7WRAM75 hashesdiffer",
+        "audio": "Failed:61453 of18774412 stereo samples differ;maxsigned16delta2870;RMS15.590998;no audibilityjudgment",
+        "save": "All23400 perframe savehashes andfinalsave bit-exact",
+        "native": "User-authorized isolated perceptual screening completed; staged bytes/save/ownership/capture checks passed. No native bit-exact or full lifecycle qualification. Menu: 14.6755 control versus 14.6349 patched; Bag: 30.2040 versus 30.0610 screen publications/s. Bag-opening near-black mean: 0.4333s control versus 0.4500s patched. No native gain demonstrated."
+      },
+      "gain": {
+        "reference_arm9_entries_18000_23399": {
+          "before": 294410989,
+          "after": 287746374,
+          "reduction_percent": 2.2637113589533846,
+          "first_frame": 18000,
+          "end_frame_exclusive": 23400,
+          "scope": "Software executed instructions; not native cycles or speed"
+        },
+        "native_cycles": null,
+        "native_frame_time": null,
+        "qualified": false,
+        "native_screening": "Menu: 14.6755 control versus 14.6349 patched; Bag: 30.2040 versus 30.0610 screen publications/s. Bag-opening near-black mean: 0.4333s control versus 0.4500s patched. No native gain demonstrated.",
+        "native_battle_screening": "Menu publications -0.026%; first-turn observation +0.030%. Identical text 1.2333s control versus1.2667s candidate. No useful speedup; software ARM9 entries -2.369% is not native cycles."
+      },
+      "synthetic_validation": {
+        "cases": 8672,
+        "receipt": "LOOKUP_TABLE_REUSE_SYNTHETIC_SUITE_V1.json",
+        "receipt_sha256": "beab7fff096381887be2e7d0ed8edaa9c7850fa78f8b1fd1a8f7299c4fb0a1b1",
+        "precondition": "Existing last-color metadata andtable mustbe coherent; deliberately incoherentfixture rejects"
+      },
+      "replay_rejection": {
+        "receipt": "LOOKUP_TABLE_REUSE_REPLAY_DECISION_V1.json",
+        "receipt_sha256": "bdf8cfa9a0825786d41bc0ed32477db4bf3828b5f5eb36d0948890d586727a17",
+        "input_manifest": "LOOKUP_TABLE_REUSE_INPUT_MANIFEST_V1.json",
+        "input_manifest_sha256": "7aa69d9c5e0a0dd3f3e626a8e582373545f504835db8051e82afa27c48fdd75d",
+        "status_receipt": "LOOKUP_TABLE_REUSE_CANDIDATE_V1_STATUS.json",
+        "status_sha256": "1818f224856b3ec3d87f6af1143c416de0e9bd5303d6d09ee31ded34d233c76c"
+      },
+      "execution_audit": {
+        "receipt": "LOOKUP_TABLE_REUSE_EXECUTION_AUDIT_V1.json",
+        "receipt_sha256": "8522db721a309a77029cc02e6ecde19ed170ccb0da95f276c4a8a7df3b3b79ed",
+        "calls": 1338,
+        "reuse_hits": 1281,
+        "generation_misses": 57
+      },
+      "native_perceptual_screening": {
+        "accepted": false,
+        "default_enabled": false,
+        "scope": "Stock1GHz, unchanged rc12 FPGA and accepted Beta2 renderer; real-time inputs and same disposable qualified seed. Publication counts are not unique gameplay FPS or cycles.",
+        "trial": "F1",
+        "matched_control_trials": [
+          "C6"
+        ],
+        "receipt": "NATIVE_PERCEPTUAL_RESULTS_V1.json",
+        "receipt_sha256": "6ddbeae9b819127aebc73c8c3c7b3d20f64ed2df3c4f12a3c6cde5c9894d8749",
+        "result": "no_qualified_gain_in_screened_scenes",
+        "reference_review": "Platinum_Font_Review.mov",
+        "review_receipt": "Platinum_Font_Review.json",
+        "review_receipt_sha256": "169895005d8379e3b536c10a68052876da55b37cae7670bcfab18edda93769bf",
+        "native_battle_measured": false,
+        "user_perceptual_approval": false
+      },
+      "native_battle_screening": {
+        "receipt": "NATIVE_FONT_BATTLE_FINDINGS_V1.json",
+        "receipt_sha256": "995269af0e1965ddf1d1a08bf977d574ba4ce7964c50cb91dfda1047879edb51",
+        "accepted": false,
+        "default_enabled": false,
+        "baseline": "accepted terrain only",
+        "reference_contract": "FONT_TERRAIN_CONTRACT_V1.json",
+        "key_write_contract": "FONT_TERRAIN_METADATA_KEY_WRITES_V1.json",
+        "comparison": [
+          {
+            "scene": "command_menu",
+            "control_publications_per_second": 59.649124882508836,
+            "candidate_publications_per_second": 59.633612633310435,
+            "publication_change_percent": -0.026005828633623995,
+            "control_renderer_cpu_percent": 91.82168470188546,
+            "candidate_renderer_cpu_percent": 93.39602648600545
+          },
+          {
+            "scene": "first_turn",
+            "control_publications_per_second": 59.61911299950796,
+            "candidate_publications_per_second": 59.63703769423135,
+            "publication_change_percent": 0.030065349552477194,
+            "control_renderer_cpu_percent": 88.02978528363103,
+            "candidate_renderer_cpu_percent": 88.32278599296498
+          }
+        ],
+        "text_timing": {
+          "semantic_text": "TURTWIG used Tackle!",
+          "control": {
+            "lower": 1.2166666666666686,
+            "upper": 1.25,
+            "first_present_delta": 1.2333333333333343
+          },
+          "candidate": {
+            "lower": 1.25,
+            "upper": 1.2833333333333314,
+            "first_present_delta": 1.2666666666666657
+          },
+          "point_duration_change_percent": 2.702702702702542,
+          "interpretation": "No shortening observed. One observation per arm; not an estimated regression or statistically qualified speed difference. Intervals only bound capture transition timing, not run-to-run variability."
+        },
+        "native_battle_measured": true,
+        "result": "no_worthwhile_native_gain",
+        "qualification": "Single initial screen with prior control; candidate native victory/save-write/reset not qualified."
+      }
+    },
+    {
+      "id": "overlay5-terrain-visibility",
+      "pattern": "coarse-offscreen-model-culling",
+      "cpu": "arm9",
+      "target": "arm9.overlay",
+      "overlay": 5,
+      "overlay_ram": "0x21d0d80",
+      "overlay_file_id": 5,
+      "overlay_sha256": "6e2095b04c6db198d2c16f81964732d5b2119fa66edb907bec3b3774f41d43f9",
+      "addr": "0x21e8a2a",
+      "mode": "thumb",
+      "expect": "194b0baa03cb03c21868174b106002aa042703cb03c27f1efbd118680bab10600220a159800208180ea902aa34f60df8",
+      "replace": "a05902218902471878680ea9174a154b34f64dfa00280bd038000ea9134a114b34f613f8c046c046c046c046c046c046",
+      "hook": null,
+      "scratch_bytes": 0,
+      "enabled": true,
+      "notes": "User reviewed video/audio and explicitly requested promotion on2026-10-28. Exact tested48-byte terrain visibility patch; no new scratch. Known framebuffer/audio/RAM differences remain documented; bounded native gain and save/reset/reload/rollback checks passed. Full-game and complete RAM-liveness qualification are not claimed.",
+      "status": "accepted_user_directed_private_beta",
+      "validated": {
+        "fb": "15,600 frames: six top-screen differences at 14357,14359,14479,14481,14483,14485; all bottom screens exact. All 600 target-window screen pairs exact.",
+        "ram": "Strict failure retained. Main-RAM writers classify projection/model/graphics-transfer state; full replay transfer bookkeeping is consistent. DTCM liveness and complete reader equivalence remain unqualified. Only exact48-byte code normalized.",
+        "audio": "239,992 of 12,516,274 stereo samples differ; maximum channel delta 1,215 and RMS 9.153. Audibility unjudged. User approved the presented control/candidate review on2026-10-28.",
+        "save": "Original reference save exact. Native candidate ordinary Save, soft-reset Continue, patched cold session reload and unpatched control reload passed; all loaded scene PNGs identical and generated save unchanged across resets/reloads. Bounded Twinleaf Town coverage.",
+        "native": "Two alternating control/candidate outdoor trials, same boundary route, stock1GHz, rc12 FPGA and accepted Beta2 renderer. Controls16.7726/17.2525; candidates19.1382/19.3653 complete screen-buffer publications/s. Saves preserved and OBS added no drops. Indoor idle59.7131 versus59.6371. Three further sessions passed native save/reset/cold-load and house entry/exit, including unpatched rollback save compatibility. No physical power-cycle or instruction-cache readback claim. Reference reset comparison completed; full RAM liveness and broader scene coverage remain unqualified.",
+        "user_review": "Everything looks good, followed by explicit just promote it,. works great. Accepted as a perceptual private beta.",
+        "reset_reference": "12000 frames: both screens, final save and all7 full RAM checkpoints exact outside authenticated48 codebytes; transient state/audio differences retained. Audio184514/9627902 stereo samples differ, max4058,RMS40.630. This reset comparison was not in the previously reviewed video."
+      },
+      "gain": {
+        "reference_arm9_entries_15000_15599": {
+          "before": 98783080,
+          "after": 97162803,
+          "reduction_percent": 1.6402373766843503,
+          "scope": "Executed instructions in software replay, not native cycles or speed."
+        },
+        "terrain_draw_calls": {
+          "before": 1200,
+          "after": 590,
+          "new_box_tests": 1200
+        },
+        "native_cycles": null,
+        "native_frame_time": null,
+        "qualified": true,
+        "native_publication_throughput": {
+          "control_mean": 17.012519283317772,
+          "candidate_mean": 19.251761807913674,
+          "increase_percent": 13.16232174262204,
+          "control_range_percent": 2.82089939355885,
+          "unit": "complete screen-buffer publications per second",
+          "scope": "Two matched 40-second boundary traversal trials per mode; not unique animation FPS, game-clock speed or whole-game gain."
+        },
+        "qualification_scope": "Bounded native publication-throughput benefit accepted for private beta, not full-game speed."
+      },
+      "evidence": [
+        "TERRAIN_CONTRACT_QUALIFICATION_V1.json",
+        "TERRAIN_CONTRACT_FINDINGS_V1.json",
+        "TERRAIN_CULL_BUILD_V1.json",
+        "TERRAIN_CULL_REFERENCE_FINDINGS_V1.json",
+        "TERRAIN_CULL_RAM_DIFF_V1.json",
+        "TERRAIN_NATIVE_FINDINGS_V1.json",
+        "TERRAIN_NATIVE_INTERIOR_FINDINGS_V1.json",
+        "TERRAIN_NATIVE_METRIC_AUDIT_V1.json",
+        "TERRAIN_RAM_WRITER_REPEAT_V1.json",
+        "TERRAIN_RAM_CLASSIFICATION_V1.json",
+        "TERRAIN_TRANSFER_LIFECYCLE_V1.json",
+        "TERRAIN_USER_REVIEW_APPROVAL_V1.json",
+        "TERRAIN_NATIVE_LIFECYCLE_V1.json",
+        "NATIVE_TERRAIN_LIFECYCLE_PRESERVATION_V1.json",
+        "TERRAIN_RESET_FINDINGS_V1.json",
+        "TERRAIN_PROMOTION_AUTHORIZATION_V1.json"
+      ]
+    },
+    {
+      "id": "oam-six-byte-inline",
+      "pattern": "fixed-size-strided-upload",
+      "cpu": "arm9",
+      "target": "arm9.bin/main_loaded",
+      "addr": "0x020a7ed4",
+      "mode": "arm",
+      "expect": "0680a0e30600a0e10410a0e10820a0e139ff2fe1082084e201008ae20018a0e10208a0e1210855e12048a0e1086086e221a8a0e1f2ffff8a",
+      "replace": "0015a0e1071481e2041081e006c0a0e304e04fe2b230d6e0b230c1e0b230d6e0b230c1e0b430d6e0b430c1e0015055e2f7ffff1a0000a0e1",
+      "hook": null,
+      "scratch_bytes": 0,
+      "enabled": false,
+      "notes": "Same56-byte extent. Valid manager engine0/1 and OAM range0..127; preserves ordered three16-bit reads/writes and untouched affine halfword. Original zero-length branch and full-copy/affine paths remain. Synthetic cases pass; bounded reference/native screening complete, broader lifecycle unqualified; not a generic memcpy rewrite. Native walking/menu and first-battle screens found no worthwhile publication-throughput gain. Keep disabled; only new target-scene evidence warrants further work.",
+      "validation": {
+        "synthetic": "92 complete-function cases: registers, CPSR, memory and ordered data effects match; immutable callback literals excluded",
+        "reference": "23400-frame run completed; coherent reviewed battle progression, unchanged save; timing/frame/RAM/audio differences retained",
+        "native": "Walking/menu pair and first-battle route/turn complete coherently with unchanged disposable save, clean captures/stops. Battle opponent move/rolled stats differ under functional budget. No worthwhile publication-throughput gain demonstrated; unique guest cadence and native candidate battle victory/save-write/reset unqualified."
+      },
+      "gain": {
+        "native_walking_publication_percent": 0.38681611066622157,
+        "native_menu_publication_percent": -0.24547073528020658,
+        "qualified_game_FPS": null,
+        "source": "OAM_NATIVE_FINDINGS_V1.json",
+        "native_battle_menu_publication_percent": -0.0608475590555102,
+        "native_battle_turn_publication_percent": 0.008253804967561784,
+        "battle_source": "NATIVE_BATTLE_OAM_FINDINGS_V1.json",
+        "qualified_whole_turn_speedup": null
+      }
+    },
+    {
+      "id": "font-resident-glyph-mode",
+      "pattern": "existing-resident-asset-mode",
+      "cpu": "arm9",
+      "mode": "thumb",
+      "target": "arm9.bin/main_loaded",
+      "addr": "0x2002bc8",
+      "expect": "0e20012220f088fb",
+      "replace": "0e20002220f088fb",
+      "hook": null,
+      "overlay": null,
+      "scratch_bytes": 0,
+      "enabled": false,
+      "status": "rejected_functional_heap_failure",
+      "notes": "Select existing immediate font mode at02002bca. Eight-byte guard includes unchanged adjacent instructions to meet existing loader minimum; only one Thumb immediate changes. Existing game allocator and free path own glyph buffers; no new scratch or service. Accepted terrain is the sole baseline patch. Native performance and broader heap lifetime unqualified. Rejected after a real allocation/ARM9 fault during field setup. Initial successful allocation and battle-baseline checkpoint headroom did not cover an earlier child-heap demand. Do not enable this blanket variant.",
+      "validated": {
+        "functional": "Fails field setup at frame1318: Heap_Alloc on heap8 sees null handle; ARM9 remains in abort mode at PCffff0108 in all checkpoints1320 onward.",
+        "buffers": "Three startup buffers each32576bytes exactly match the owned font archive at frames60 and1200.",
+        "native": "Not deployed; no native result."
+      },
+      "gain": {
+        "qualified": false,
+        "native_speedup": null
+      },
+      "evidence": [
+        "FONT_RESIDENT_MODE_PROPOSAL_V1.json",
+        "FONT_RESIDENT_CONTROL_FINDINGS_V1.json",
+        "FONT_RESIDENT_CONTROL_QUALIFICATION_V1.json",
+        "FONT_RESIDENT_ALL_FAILURE_V2.json",
+        "FONT_RESIDENT_ALL_BEFORE_AFTER_V2.csv"
+      ]
+    },
+    {
+      "id": "font-resident-system-message",
+      "pattern": "existing-resident-asset-mode",
+      "cpu": "arm9",
+      "mode": "thumb",
+      "target": "arm9.bin/main_loaded",
+      "addr": "0x2002bc8",
+      "expect": "0e20012220f088fb",
+      "replace": "0e204a0820f088fb",
+      "data_guards": [
+        {
+          "addr": "0x020e4cd4",
+          "expect": "00000000010000000200000003000000"
+        }
+      ],
+      "hook": null,
+      "overlay": null,
+      "scratch_bytes": 0,
+      "enabled": false,
+      "status": "superseded_for_larger_heap_margin",
+      "notes": "Mode equals owned archive member >>1: system0/message1 use immediate0, subscreen2/Unown3 retain lazy1. Exact16-byte four-entry member table is guarded. One Thumb instruction changes, within the existing eight-byte loader guard. Two existing allocations total65152 glyph bytes, excluding overhead; no new scratch/service. This reduced footprint follows a fault in the all-font experiment. Native benefit and broader lifetime unqualified. Completed replay but only3892 application-heap bytes remain at field checkpoints. Superseded by a separately tested message-only candidate to recover margin before native screening.",
+      "validated": {
+        "functional": "23400-frame first-battle replay completes,7290 observed allocations nonnull. Both resident buffers exact in28 checkpoint comparisons. Four inspected battle pairs show coherent text/combat with different timing/HP/turn trajectory. Broader lifecycle unqualified.",
+        "ram": "Only3892 free application-heap bytes at field checkpoints; checkpoint minimum, not full-route minimum. Strict RAM differences retained.",
+        "fb": "12683 top and991 bottom frames differ.",
+        "audio": "11365490 of18774412 stereo samples differ;max61454,RMS5058.548. Different timing/trajectory; no audibility claim.",
+        "save": "Final save exact.",
+        "native": "Not tested; prefer message-only trial with32608 additional allocator bytes free."
+      },
+      "gain": {
+        "qualified": false,
+        "reference_battle_ARM9_entries_before": 264018986,
+        "reference_battle_ARM9_entries_after": 249954154,
+        "reference_battle_PIO_blocks_before": 10232,
+        "reference_battle_PIO_blocks_after": 8274,
+        "scope": "Observed fixed-input replay workload with divergent timing/HP/turns; not an equivalent-work or native speed measurement."
+      },
+      "evidence": [
+        "FONT_RESIDENT_CONTROL_FINDINGS_V1.json",
+        "FONT_RESIDENT_V1_OBSERVER_FAILURE_V1.json",
+        "FONT_RESIDENT_SELECTIVE_FINDINGS_V3.json",
+        "FONT_RESIDENT_SELECTIVE_BEFORE_AFTER_V3.csv",
+        "FONT_RESIDENT_SELECTIVE_CONTACT_V3.png"
+      ]
+    },
+    {
+      "id": "font-resident-message-only",
+      "pattern": "existing-resident-asset-mode",
+      "cpu": "arm9",
+      "mode": "thumb",
+      "target": "arm9.bin/main_loaded",
+      "addr": "0x2002bb8",
+      "expect": "18b581b0009184000749084b095b1b5b0e20012220f088fb0549096809199431086001b018bdc046d44c0e02d64c0e02481d1002",
+      "replace": "1ab584000849094b095b1b5b0e200122012900d1002220f087fb0549096809199431086001b018bdd44c0e02d64c0e02481d1002",
+      "data_guards": [
+        {
+          "addr": "0x020e4cd4",
+          "expect": "00000000010000000200000003000000"
+        }
+      ],
+      "hook": null,
+      "overlay": null,
+      "scratch_bytes": 0,
+      "enabled": false,
+      "status": "parked_native_gain_insufficient",
+      "notes": "Same52-byte constructor including unchanged12-byte literal pool. Equivalent stack setup frees instruction space for member1-only immediate mode; other three fonts remain lazy. Existing game alloc/free owns32576 glyph bytes. Exact constructor arguments except intended mode and pre-call flags; exact stack bytes and post-call ABI checked. No trampoline, unused memory or new service.",
+      "validated": {
+        "synthetic": "384 constructor/stack/return contract cases; four atomic-original fallback cases pass.",
+        "functional": "23400-frame replay reaches first battle and returns to outdoor dialogue;7659 observed allocations nonnull. Message glyph buffer exact at14 checkpoints. Four screenshot pairs reviewed. Broader save/reset/lifetime and audio review remain pending.",
+        "ram": "Minimum sampled application-heap free space36500bytes, not full-route/full-game minimum. Strict RAM differences retained.",
+        "fb": "11414 top and1339 bottom frames differ; timing/HP/turn trajectory changes documented.",
+        "audio": "16430574 of18774412 stereo samples differ;max56430,RMS5139.997. Different trajectory/timing, no audibility conclusion.",
+        "save": "Final save exact; replay does not qualify a new save write.",
+        "native": "One cold control/candidate at stock1GHz using identical accepted host/renderer/rc12 FPGA and private seed. Same second dialogue line: control1.9667/1.9833s, candidate1.9333/1.9167s; no publication-throughput gain. Bounded navigation/sign/dialogue pass, save unchanged; broader lifecycle/audio qualification not performed."
+      },
+      "gain": {
+        "qualified": false,
+        "full_route_font_PIO_blocks_before": 10779,
+        "full_route_font_PIO_blocks_after": 1225,
+        "battle_ARM9_entries_before": 264018986,
+        "battle_ARM9_entries_after": 323410873,
+        "scope": "Different fixed-input trajectory ends candidate battle earlier and adds outdoor work. Neither aggregate instruction count nor total battle duration is an equal-work speed measurement.",
+        "native_speedup": null,
+        "native_line_seconds_control": 1.9750000000000005,
+        "native_line_seconds_candidate": 1.924999999999999,
+        "native_line_elapsed_reduction_screening_percent": 2.5316455696203333,
+        "native_scope": "Single cold session per arm, two within-session repetitions of identical second line. About50ms less line time is insufficient to justify32608bytes extra heap and lifecycle cost; no general gameplay speedup."
+      },
+      "evidence": [
+        "FONT_RESIDENT_MESSAGE_BUILD_V4.json",
+        "FONT_RESIDENT_ALL_FAILURE_V2.json",
+        "FONT_RESIDENT_MESSAGE_FINDINGS_V4.json",
+        "FONT_RESIDENT_MESSAGE_BEFORE_AFTER_V4.csv",
+        "FONT_RESIDENT_MESSAGE_GUARD_TESTS_V4.json",
+        "FONT_RESIDENT_MESSAGE_VISUAL_REVIEW_V4.json",
+        "NATIVE_MESSAGE_FONT_FINDINGS_V1.json",
+        "NATIVE_MESSAGE_FONT_VISUAL_REVIEW_V1.json",
+        "MESSAGE_FONT_NATIVE_BEFORE_AFTER_V32.csv"
+      ]
+    },
+    {
+      "id": "narc-size-dead-position-work",
+      "pattern": "unused-archive-metadata-work",
+      "cpu": "arm9",
+      "mode": "thumb",
+      "target": "arm9.bin/main_loaded",
+      "addr": "0x2006bbe",
+      "expect": "03980022261804a8311dc1f00ceb04a803a90422c1f000eb0c34e90004a861180022039fc1f000eb04a802a90422c1f0f2ea04a801a90422c1f0eeeaf21902990832511804a80022c1f0eeea",
+      "replace": "0ae00022261804a8311dc1f00ceb04a803a90422c1f000eb0c34e90004a861180022039fc1f000eb04a802a90422c1f0f2ea04a801a90422c1f0eeea06e002990832511804a80022c1f0eeea",
+      "hook": null,
+      "overlay": null,
+      "scratch_bytes": 0,
+      "enabled": false,
+      "status": "parked_native_gain_insufficient",
+      "notes": "Two in-function Thumb branches skip BTNF-size seek/read and final payload-position seek in the size-only routine. Return still derives from unchanged BTAF member offsets. No new memory, allocator, trampoline or service. FS_SeekFile writes only local file position; removed FS_Read may alter global cartridge-cache/timing state, requiring full replay/native qualification. Existing missing file close is not changed.",
+      "validated": {
+        "synthetic_valid_members": 808,
+        "synthetic_empty_member_assertions": 1,
+        "reference_frames": 23400,
+        "reference_member_size_returns": 426,
+        "fb": "Sparse paired screens show coherent Continue, rival battle and outdoor return.9560 top and1329 bottom frame hashes differ; different battle trajectory.",
+        "ram": "Strict comparison retained:23246 mainRAM,16566DTCM,22783ARM7WRAM frame hashes differ. No sampled ARM9 abort/undefined mode.",
+        "audio": "5888533 of18774412 stereo samples differ; no listening qualification. Different late battle trajectory.",
+        "save": "All replay save hashes and final save match; no save-write or reset qualification for this patch.",
+        "native": "One cold control/candidate at stock1GHz, unchanged accepted runtime and copied save. Four Bag open/close cycles per arm have identical mean combined near-black time1.7583s and effectively identical publication throughput. Coherent reviewed transitions and exact save on clean exit; broader lifecycle/audio unqualified."
+      },
+      "gain": {
+        "qualified": false,
+        "per_call_FS_reads_before": 6,
+        "per_call_FS_reads_after": 5,
+        "per_call_FS_seeks_before": 5,
+        "per_call_FS_seeks_after": 3,
+        "native_speedup": null,
+        "reference_boot_0_1200": {
+          "arm9_entries_before": 58302294,
+          "arm9_entries_after": 58084099,
+          "PIO_blocks_before": 3651,
+          "PIO_blocks_after": 3621,
+          "size_queries_each": 53
+        },
+        "scope": "Observed software replay workload only; native loading screen pending.",
+        "native_Bag_open_mean_seconds_control": 0.44166666666666665,
+        "native_Bag_open_mean_seconds_candidate": 0.45,
+        "native_Bag_close_mean_seconds_control": 1.3166666666666667,
+        "native_Bag_close_mean_seconds_candidate": 1.3083333333333333,
+        "native_scope": "Single cold session per arm, four within-session cycles. No measurable useful improvement in the screened transition; no universal slowdown/no-benefit claim."
+      },
+      "evidence": [
+        "ARCHIVE_SIZE_SKIP_BUILD_V1.json",
+        "ARCHIVE_SIZE_SKIP_DISASSEMBLY_V1.txt",
+        "ARCHIVE_METADATA_FINDINGS_V4.json",
+        "ARCHIVE_SIZE_SKIP_GUARD_TESTS_V1.json",
+        "ARCHIVE_SIZE_SKIP_FINDINGS_V1.json",
+        "ARCHIVE_SIZE_SKIP_VISUAL_REVIEW_V1.json",
+        "NATIVE_ARCHIVE_SIZE_FINDINGS_V1.json",
+        "NATIVE_ARCHIVE_SIZE_VISUAL_REVIEW_V1.json",
+        "ARCHIVE_SIZE_NATIVE_BEFORE_AFTER_V33.csv",
+        "ARCHIVE_SIZE_CANONICAL_SELECTION_V1.json"
+      ]
+    },
+    {
+      "id": "narc-read-fixed-metadata",
+      "pattern": "immutable-archive-metadata-precompute",
+      "cpu": "arm9",
+      "mode": "thumb",
+      "target": "arm9.bin/main_loaded",
+      "addr": "0x20068ee",
+      "expect": "06a80c210022c1f076ec06a805a90222c1f06aec059c06a8211d0022c1f06cec06a805a90422c1f05eec06a802a90222c1f05aec02a80088a84201dc1cf023f805980022261806a8311dc1f054ec06a805a90422c1f048ec",
+      "replace": "102408e00022c1f076ec06a805a90222c1f06aec059c06a8211d0022c1f06cec06a805a90422c1f05eec06a802a90222c1f05aec02a80088a84201dc1cf023f80598002226181020059005e054ec06a805a90422c1f048ec",
+      "hook": null,
+      "overlay": null,
+      "scratch_bytes": 0,
+      "enabled": false,
+      "status": "parked_native_gain_insufficient",
+      "notes": "Same-function Thumb constants replace header-size and BTNF-size seek/read pairs. All 215 owned NARCs have both values 16. Full ROM/revision/ARM9/original-byte guards are mandatory; not a general NARC assumption. Member bounds/nonzero assertions, offset/count behavior, payload reads and close remain. No allocator, new storage or service. Global FS/cache/IRQ effects require full replay/native screening.",
+      "validated": {
+        "synthetic_payload_cases": 1644,
+        "synthetic_empty_assertions": 3,
+        "synthetic_invalid_member_or_open_failure_cases": 430,
+        "reference_frames": 23400,
+        "reference_read_ranges_and_lengths": 735,
+        "fb": "Coherent Continue, rival battle, post-battle field and home transition in sampled frames. 10,528 top/1,467 bottom hashes differ; later battle trajectory changes.",
+        "ram": "All 735 observed read arguments, member offsets/lengths and final FSFile positions match owned archives. Live destination bytes not independently sampled. No checkpoint ARM9 abort/undefined mode. Strict RAM differences retained.",
+        "audio": "6,982,861 of 18,774,412 stereo samples differ; no listening-equivalence claim. Later battle trajectory differs.",
+        "save": "All per-frame save hashes and final save match; no new save-write/reset qualification.",
+        "native": "Single cold control/candidate at stock 1GHz, identical accepted runtime and ordinary copied save. Same challenge/full-health battle/menu screens and supplemental first attack work. Both clean exits preserve seed. No new listening/save-write/reset/broad lifecycle qualification."
+      },
+      "gain": {
+        "qualified": false,
+        "per_call_FS_reads_before": 7,
+        "per_call_FS_reads_after": 5,
+        "per_call_FS_seeks_before": 5,
+        "per_call_FS_seeks_after": 3,
+        "native_speedup": null,
+        "reference_matched_call_prefix": {
+          "calls": 448,
+          "associated_PIO_blocks_before": 2086,
+          "associated_PIO_blocks_after": 1759,
+          "scope": "Same ordered archive/member/offset/requested prefix; other scheduler/cache state not held constant"
+        },
+        "reference_prebattle": {
+          "arm9_entries_before": 2729727044,
+          "arm9_entries_after": 2728653519,
+          "PIO_blocks_before": 26144,
+          "PIO_blocks_after": 26017
+        },
+        "scope": "Reference request reduction is real in bounded traces; native visible first-battle transition improves only 50ms/about 0.31% in one pair. Insufficient benefit for promotion; not a universal no-benefit claim.",
+        "native_transition_seconds_before": 16.133333333333333,
+        "native_transition_seconds_after": 16.083333333333336,
+        "native_near_black_total_seconds_before": 1.2333333333333334,
+        "native_near_black_total_seconds_after": 1.2000000000000002
+      },
+      "evidence": [
+        "ARCHIVE_READ_FIXED_BUILD_V1.json",
+        "ARCHIVE_READ_FIXED_OWNED_DISASSEMBLY_V1.txt",
+        "ARCHIVE_READ_FIXED_REPLACEMENT_DISASSEMBLY_V1.txt",
+        "ARCHIVE_FIXED_METADATA_ADMISSION_V1.json",
+        "ARCHIVE_READ_CALL_QUALIFICATION_V1.json",
+        "ARCHIVE_READ_CALL_CONTRACT_V1.json",
+        "ARCHIVE_READ_FIXED_GUARD_TESTS_V1.json",
+        "ARCHIVE_READ_FIXED_FINDINGS_V1.json",
+        "ARCHIVE_READ_FIXED_VISUAL_REVIEW_V1.json",
+        "NATIVE_ARCHIVE_READ_FIXED_FINDINGS_V1.json",
+        "NATIVE_ARCHIVE_READ_FIXED_VISUAL_REVIEW_V1.json",
+        "ARCHIVE_READ_FIXED_NATIVE_BEFORE_AFTER_V34.csv",
+        "ARCHIVE_READ_FIXED_CANONICAL_SELECTION_V1.json",
+        "ARCHIVE_METADATA_PATTERN_SCAN_V1.json"
+      ]
+    },
+    {
+      "id": "overlay16-battle-queue-early-exit",
+      "pattern": "unsigned-sum-zero-predicate",
+      "cpu": "arm9",
+      "mode": "thumb",
+      "target": "arm9.overlay",
+      "overlay": 16,
+      "overlay_ram": "0x223b140",
+      "overlay_file_id": 16,
+      "overlay_sha256": "cdee3e91570eca14296be7164b03926d729d914a293d4db5098aeed4bb7f1950",
+      "addr": "0x2251fc8",
+      "expect": "f8b50022222486469446071c161c240200203b1c311c5d182d5d491c52191029f9db401c10330428f4db6046401c403784460428ecdb002a03d10549002370464350002a01d10120f8bd0020f8bdc04648310000",
+      "replace": "f8b5864622242402031901252d0204218c4610211a78002a17d10133013df9d109e0c046c046c046c046c046c046c046c046c046c046002a03d10549002370464350002a01d10120f8bd0020f8bdc04648310000",
+      "hook": null,
+      "scratch_bytes": 0,
+      "enabled": false,
+      "status": "parked_native_gain_insufficient",
+      "notes": "Scan the existing256-byte unsigned command queue in the original order and return false on the first nonzero byte. Keep original empty-queue timeout reset and return blocks; no cache or extra storage. R2 changes from full sum to first nonzero byte on nonempty calls; five owned callers consume BooleanR0 only. Other return registers, flags, stack and writes match synthetic cases. Timing/interruption and functional native qualification required. Native first-turn screen shows no worthwhile pacing or throughput gain; keep disabled. Do not repeat this scene unchanged.",
+      "validated": {
+        "synthetic_cases": 940,
+        "observer_byte_equal_files": 254,
+        "reference_frames": 23400,
+        "reference_live_predicate_calls": 3754,
+        "reference_save": "exact",
+        "reference_screens": "one top-frame difference; bottom exact",
+        "reference_audio": "293543/18774412 stereo samples differ; audibility unqualified",
+        "native": "Cold boot and first-turn progression screened; clean capture/stop and unchanged copied save. Tackle text1.2333s control versus1.2500s candidate with overlapping bounds. Different night backdrop/stats; no whole-turn or broader lifecycle qualification."
+      },
+      "gain": {
+        "qualified": false,
+        "modeled_observed_function_instructions_before": 6239380,
+        "modeled_observed_function_instructions_after": 363678,
+        "modeled_reduction_percent": 94.17124778423496,
+        "reference_battle_arm9_entry_reduction_percent": 2.2217958976632035,
+        "native_publications_per_second_control": 59.61911299950796,
+        "native_publications_per_second_candidate": 59.608815949164466,
+        "native_text_seconds_control": 1.2333333333333343,
+        "native_text_seconds_candidate": 1.25
+      },
+      "evidence": [
+        "BATTLE_PENDING_STATIC_IDENTITY_V1.json",
+        "BATTLE_PENDING_CONTRACT_V2.json",
+        "BATTLE_PENDING_BUILD_V1.json",
+        "BATTLE_PENDING_OWNED_DISASSEMBLY_V1.txt",
+        "BATTLE_PENDING_REPLACEMENT_DISASSEMBLY_V1.txt",
+        "BATTLE_PENDING_CANDIDATE_ANALYSIS_V1.json",
+        "BATTLE_PENDING_VISUAL_REVIEW_V1.json",
+        "BATTLE_PENDING_MATCHED_WORKLOAD_V1.json",
+        "NATIVE_BATTLE_PENDING_FINDINGS_V1.json",
+        "NATIVE_BATTLE_PENDING_VISUAL_REVIEW_V1.json",
+        "BATTLE_PENDING_NATIVE_BEFORE_AFTER_V35.csv"
+      ]
+    }
+  ],
+  "arm9_crc32": "4d104949",
+  "latest_research": {
+    "classification": "THRESHOLD_CLASSIFICATION_V1.json",
+    "guarded_observations": "OVERLAY5_GUARDED_FINDINGS_V1.json",
+    "delivery_proposal": "OVERLAY5_PATCH_DELIVERY_PROPOSAL_V1.json",
+    "overlay_id": 5,
+    "decoded_overlay_sha256": "6e2095b04c6db198d2c16f81964732d5b2119fa66edb907bec3b3774f41d43f9",
+    "implemented": true,
+    "delivery_control": "OVERLAY_DELIVERY_CONTROL_V1_STATUS.json",
+    "reset_control": "OVERLAY_DELIVERY_RESET_FINDINGS_V1.json",
+    "delivery_implemented": true,
+    "optimization_implemented": true,
+    "native_qualified": true,
+    "optimization_enabled": true,
+    "overlay_comparison_control": "EMPTY_TAIL_CONTROL_V2_STATUS.json",
+    "overlay_reset_comparison_control": "EMPTY_TAIL_RESET_CONTROL_V1_STATUS.json",
+    "latest_decision": "TERRAIN_PROMOTION_AUTHORIZATION_V1.json",
+    "hblank_screen": "HBLANK_COST_SCREEN_V1.json",
+    "hblank_synthetic_screen": "HBLANK_SYNTHETIC_SCREEN_V1.json",
+    "hblank_patch_implemented": false,
+    "route_coordinate_findings": "ROUTE_COORDINATE_FINDINGS_V1.json",
+    "town_route": "room-route-v9.tsv",
+    "town_repeat": "ROOM_ROUTE_V9_REPEAT_COMPARISON.json",
+    "town_profile": "TOWN_PROFILE_SCREEN_V1.json",
+    "coverage": "REPLAY_SCENE_REVIEW_V6.json",
+    "next_proposal": "ARCHIVE_FIXED_METADATA_ADMISSION_V1.json",
+    "irq_mask_census": "IRQ_MASK_CENSUS_EFFECT_AUDIT_V1.json",
+    "irq_mask_cost_screen": "IRQ_MASK_COST_SCREEN_V1.json",
+    "irq_mask_replay": "IRQ_SPARSE_COMPARISON_V2.json",
+    "irq_mask_synthetic": "IRQ_SPARSE_SYNTHETIC_V2.json",
+    "irq_mask_detector": "IRQ_SPARSE_PATTERN_SCAN_V1.json",
+    "irq_mask_enabled": false,
+    "arm7_sound_identity": "ARM7_SOUND_WATCH_IDENTITY_V1.json",
+    "arm7_sound_qualification": "ARM7_SOUND_CENSUS_QUALIFICATION_V1.json",
+    "arm7_sound_recurrence": "ARM7_SOUND_RECURRENCE_V1.json",
+    "arm7_sound_call_contract": "ARM7_SOUND_CALL_CONTRACT_V1.json",
+    "arm7_guest_patch_implemented": true,
+    "arm7_carry_qualification": "ARM7_PITCH_CARRY_CENSUS_QUALIFICATION_V1.json",
+    "arm7_carry_contract": "ARM7_PITCH_CARRY_CALL_CONTRACT_V1.json",
+    "arm7_carry_synthetic": "ARM7_PITCH_CARRY_SYNTHETIC_V1.json",
+    "arm7_carry_detector": "ARM7_PITCH_CARRY_PATTERN_SCAN_V1.json",
+    "arm7_patch_manifest_present": true,
+    "arm7_delivery_implemented": true,
+    "arm7_delivery_control": "ARM7_AUTOLOAD_CONTROL_V1_STATUS.json",
+    "arm7_boot_copy_mapping": "ARM7_AUTOLOAD_BOOT_MAPPING_V1.json",
+    "arm7_candidate_virtual_stream_preflight": true,
+    "arm7_candidate_runtime_executed": true,
+    "arm7_comparison_qualified": true,
+    "arm7_carry_replay": "ARM7_PITCH_CARRY_PAIR_COMPARISON_V1.json",
+    "arm7_carry_enabled": false,
+    "outdoor_route": "outdoor-route-v2.tsv",
+    "outdoor_repeat": "OUTDOOR_ROUTE_V2_REPEAT_COMPARISON.json",
+    "outdoor_profile": "OUTDOOR_PROFILE_SCREEN_V1.json",
+    "outdoor_pattern_screen": "OUTDOOR_PATTERN_SCREEN_V1.json",
+    "input_preflight": "OUTDOOR_ROUTE_V2_INPUT_VALIDATION.json",
+    "story_route": "story-save-v2.tsv",
+    "story_save_repeat": "STORY_SAVE_V2_REPEAT_COMPARISON.json",
+    "story_cold_load_repeat": "STORY_COLD_LOAD_V1_REPEAT_COMPARISON.json",
+    "story_seed_admission": "STORY_SAVE_SEED_ADMISSION_V1.json",
+    "story_navigation_profile": "STORY_NAVIGATION_PROFILE_SCREEN_V1.json",
+    "battle_route": "first-battle-profile-v1.tsv",
+    "battle_repeat": "FIRST_BATTLE_REPEAT_COMPARISON_V1.json",
+    "battle_profile": "FIRST_BATTLE_PROFILE_SCREEN_V1.json",
+    "battle_pattern_screen": "FIRST_BATTLE_PATTERN_SCREEN_V1.json",
+    "battle_overlay_identity": "FIRST_BATTLE_OVERLAY_IDENTITY_V1.json",
+    "preview_format_review": "FIRST_BATTLE_PREVIEW_FORMAT_REVIEW_V1.json",
+    "native_preparation": "NATIVE_BASELINE_PREPARATION_FINDINGS_V1.json",
+    "lookup_table_identity": "LOOKUP_TABLE_IDENTITY_V1.json",
+    "lookup_table_census": "LOOKUP_TABLE_CENSUS_QUALIFICATION_V1.json",
+    "lookup_table_recurrence": "LOOKUP_TABLE_RECURRENCE_V1.json",
+    "lookup_table_entry_reuse": "LOOKUP_TABLE_ENTRY_REUSE_V1.json",
+    "lookup_table_writer_contract": "LOOKUP_TABLE_WRITE_CONTRACT_V1.json",
+    "lookup_table_original_effects": "LOOKUP_TABLE_ORIGINAL_EFFECT_MODEL_V1.json",
+    "lookup_table_proposal": "LOOKUP_TABLE_REUSE_PROPOSAL_V1.json",
+    "lookup_table_patch_implemented": true,
+    "lookup_table_enabled": false,
+    "lookup_table_synthetic": "LOOKUP_TABLE_REUSE_SYNTHETIC_SUITE_V1.json",
+    "lookup_table_control": "LOOKUP_TABLE_REUSE_CONTROL_V2_STATUS.json",
+    "lookup_table_replay": "LOOKUP_TABLE_REUSE_PAIR_COMPARISON_V1.json",
+    "lookup_table_execution": "LOOKUP_TABLE_REUSE_EXECUTION_AUDIT_V1.json",
+    "lookup_table_decision": "LOOKUP_TABLE_REUSE_REPLAY_DECISION_V1.json",
+    "native_perceptual_authorization": "PERCEPTUAL_TRIAL_USER_DIRECTION_V1.json",
+    "native_perceptual_review": "PERCEPTUAL_REVIEW_V1.md",
+    "native_HPS_profile": "PLATINUM_HPS_BASELINE_ANALYSIS_V1.json",
+    "geometry_observer_build": "GEOMETRY_BUILD_V12.json",
+    "geometry_observer_qualification": "GEOMETRY_OUTDOOR_QUALIFICATION_V1.json",
+    "geometry_census": "GEOMETRY_OUTDOOR_CENSUS_V1.json",
+    "prop_culling_census": "BOXTEST_REGISTER_FINDINGS_V2.json",
+    "terrain_visibility_experiment": {
+      "receipt": "TERRAIN_NATIVE_FINDINGS_V1.json",
+      "state": "Accepted by explicit user direction; enabled for private beta."
+    },
+    "terrain_ram_classification": "TERRAIN_RAM_CLASSIFICATION_V1.json",
+    "oam_inline_experiment": {
+      "state": "disabled_no_worthwhile_native_walking_menu_gain",
+      "synthetic": "OAM_INLINE_FULL_FUNCTION_PROOF_V1.json",
+      "reference": "OAM_INLINE_BATTLE_CANDIDATE_V1_STATUS.json",
+      "functional_review": "OAM_INLINE_BATTLE_VISUAL_REVIEW_V1.json",
+      "user_budget": "FUNCTIONAL_BUDGET_STEERING_20261028.json",
+      "native": "OAM_NATIVE_FINDINGS_V1.json"
+    },
+    "font_battle_experiment": {
+      "state": "parked_no_worthwhile_native_menu_bag_battle_gain",
+      "receipt": "NATIVE_FONT_BATTLE_FINDINGS_V1.json",
+      "reference": "FONT_TERRAIN_BATTLE_CANDIDATE_V1_STATUS.json",
+      "enabled": false
+    },
+    "visibility_input_census": {
+      "state": "accepted_terrain_visibility_input_census_complete",
+      "qualification": "VISIBILITY_INPUT_QUALIFICATION_V1.json",
+      "findings": "VISIBILITY_INPUT_FINDINGS_V1.json",
+      "dependencies": "VISIBILITY_INPUT_DEPENDENCY_AUDIT_V1.json",
+      "proposal": "VISIBILITY_REUSE_PROPOSAL_V1.json",
+      "patch_implemented": false,
+      "enabled": false
+    },
+    "cartridge_request_census": {
+      "state": "accepted_terrain_PIO_cartridge_recurrence_census_complete",
+      "qualification": "CART_REQUEST_QUALIFICATION_V1.json",
+      "findings": "CART_REQUEST_FINDINGS_V1.json",
+      "file_mapping": "CART_REQUEST_FILE_MAPPING_V1.json",
+      "overlay_mapping": "CART_REQUEST_OVERLAY_MAPPING_V1.json",
+      "font_resident_proposal": "FONT_RESIDENT_MODE_PROPOSAL_V1.json",
+      "patch_implemented": false,
+      "enabled": false
+    },
+    "archive_size_experiment": {
+      "candidate": "narc-size-dead-position-work",
+      "status": "parked_native_gain_insufficient",
+      "reference": "ARCHIVE_SIZE_SKIP_FINDINGS_V1.json",
+      "native": "NATIVE_ARCHIVE_SIZE_FINDINGS_V1.json",
+      "enabled": false,
+      "accepted_beta": "Platinum Beta1 R2 unchanged; terrain only"
+    },
+    "fixed_archive_metadata_admission": {
+      "state": "parked_archive_read_fixed_native_gain_insufficient",
+      "receipt": "ARCHIVE_FIXED_METADATA_ADMISSION_V1.json",
+      "implemented": true,
+      "enabled": false,
+      "reference": "ARCHIVE_READ_FIXED_FINDINGS_V1.json",
+      "native": "NATIVE_ARCHIVE_READ_FIXED_FINDINGS_V1.json"
+    },
+    "archive_metadata_detector": {
+      "receipt": "ARCHIVE_METADATA_PATTERN_SCAN_V1.json",
+      "scanner_commit": "4467f74557df5bc37e42b4139b656507e40cdde7",
+      "mode": "Opt-in Thumb structural scan; no profile supplied"
+    }
+  },
+  "arm7_sha256": "77146657cd179d1cb4053d291e4da1c8bc33e611814131dc4c04bba70eb65a81",
+  "arm7_crc32": "67db0960",
+  "arm7_code_settings_offset": "0x1d0"
+}

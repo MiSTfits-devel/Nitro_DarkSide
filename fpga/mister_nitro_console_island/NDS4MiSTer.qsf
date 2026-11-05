@@ -1,4 +1,7 @@
+set_global_assignment -name VERILOG_MACRO "NDS_ARM_AREA=1"
 set_global_assignment -name TOP_LEVEL_ENTITY sys_top
+# Isolated paired-display experiment, not a production default.
+set_global_assignment -name VERILOG_MACRO "NDS_MATCHED_DISPLAY_TEST=1"
 set_global_assignment -name LAST_QUARTUS_VERSION "17.0.2 Lite Edition"
 set_global_assignment -name GENERATE_RBF_FILE ON
 set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files
@@ -17,20 +20,17 @@ set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_DUPLICATION OFF
 set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_RETIMING OFF
 set_global_assignment -name PLACEMENT_EFFORT_MULTIPLIER 2.0
 set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
-# At this density Quartus's automatic hold repair inserted roughly 3000 ns of
-# delay and exhausted routing after successful placement, so seed 2 was built
-# with hold repair off and shipped with hold red across every island domain.
-# That repair was failing because it was fighting a 14.784 ns setup deficit for
-# space; NDS_PLL_BRINGUP removes the deficit, so hold repair is back on and is
-# expected to converge. Turn this off again only if the bring-up fit runs out
-# of routing.
-set_global_assignment -name OPTIMIZE_HOLD_TIMING "ALL PATHS"
-# Match the fitter policy of the earlier successfully routed Engine-B image.
-# The newer redundant-logic/router overrides repeatedly placed but terminated
-# after more than forty minutes of hold-delay congestion. The sparse timing
-# transport already removes the obsolete 512-line queue, so those overrides
-# are neither needed for capacity nor worth the routing regression here.
-set_global_assignment -name SEED 2
+# Remove equivalent redundant logic before placement. Keep normal setup and
+# default hold repair, as in the working rc.7 build. Mux
+# restructuring and pre-mapping resynthesis were tested together and rejected
+# because they enlarged this design.
+set_global_assignment -name REMOVE_REDUNDANT_LOGIC_CELLS ON
+set_global_assignment -name ROUTER_TIMING_OPTIMIZATION_LEVEL NORMAL
+# The hold-repair-disabled experiment routed, but NSMB remained black even
+# with the rc.7 host and split mode disabled. Restore the previous default
+# All Paths repair; use the measured global-reset assignments below to ease
+# routing pressure. Timing reports remain diagnostic; test the image on hardware.
+set_global_assignment -name SEED 7
 set_global_assignment -name VHDL_INPUT_VERSION VHDL_2008
 
 # The FPGA console sound engine drives the normal MiSTer audio cone. Keep the
@@ -38,40 +38,28 @@ set_global_assignment -name VHDL_INPUT_VERSION VHDL_2008
 set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ALSA=1"
 set_global_assignment -name VERILOG_MACRO "NDS_NO_AUDIO_FILTER=1"
 
-# Use the standard scaled HDMI path because the native NDS raster is not a
-# display-compatible HDMI mode. Keep analog/direct-video presentation out of
-# the first alpha while retaining the OSD and controller-driven ROM picker.
+# Standard HDMI continues through the scaler. The experimental native path
+# is for analog displays and Direct Video receivers such as RetroTINK-4K.
 set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_SHADOWMASK=1"
-# Keep the compact scaler-only shell and its standard MiSTer scaler/OSD path.
-# Like MiSTer's HDMI-only topology, the dedicated sys_top branch wires the
-# selected HDMI PLL clock directly to the transmitter because direct video is
-# fixed off. This removes an unused clock selector from the timing-critical
-# HDMI domain. Sound remains on.
-set_global_assignment -name VERILOG_MACRO "NDS_HDMI_SCALER_ONLY=1"
+# Experimental native analog and Direct Video paths. The standard scaler
+# remains available for ordinary HDMI and VGA monitors (vga_scaler=1).
+set_global_assignment -name VERILOG_MACRO "NDS_NATIVE_OUTPUTS=1"
+set_global_assignment -name VERILOG_MACRO "NDS_TATE=1"
 set_global_assignment -name VERILOG_MACRO "NDS_DISABLE_HDMI_LOW_LATENCY=1"
 
-# Composite/S-video and adaptive/downscale filters are not first-alpha
-# requirements.
-set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_YC=1"
+# Keep the standard YC encoder for composite/S-Video hardware such as the
+# SuperStation One in FPGA encoder mode. Main selects it from vga_mode.
+# Adaptive/downscale filters remain outside this experiment.
 set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ADAPTIVE=1"
 set_global_assignment -name VERILOG_MACRO "MISTER_DOWNSCALE_NN=1"
 set_global_assignment -name VERILOG_MACRO "NDS_FORCE_NEAREST=1"
 set_global_assignment -name VERILOG_MACRO "NDS_FORCE_INTEGER_SCALE=1"
 set_global_assignment -name VERILOG_MACRO "NDS_HYBRID_3D=1"
-set_global_assignment -name VERILOG_MACRO "NDS_SEAM_DIAGNOSTIC=1"
 
 # Native-cadence 134.055928/67.027964/33.513982 MHz Nitro clock family. The
 # whole family moves together to preserve the exact 4:2:1 phase relationship.
 # HDMI remains on its independent shell clock.
 set_global_assignment -name VERILOG_MACRO "NDS_CLKMEM_4X=1"
-
-# Bring-up cadence: 80/40/20 MHz, the same 4:2:1 family scaled to sit under the
-# Fmax seed 2 actually measured (126.77 / 43.67 / 25.06 MHz). The console runs
-# at 59.7% of native speed, which is the price of an image whose timing is
-# clean enough to tell us whether the RTL executes at all. Remove this macro
-# once the island domains close at the native cadence; NDS_CLKMEM_4X above then
-# takes effect again unchanged.
-set_global_assignment -name VERILOG_MACRO "NDS_PLL_BRINGUP=1"
 
 # Run-time and legacy framebuffer telemetry are both absent from the product.
 # Frame-rate validation uses the external read-only DDR sampler.
@@ -80,6 +68,13 @@ source sys/sys_analog.tcl
 source files.qip
 set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_id Top
 
+# Keep the related Nitro clocks on global networks, as in the working rc.5
+# build. Native video adds clock users and otherwise lets the fitter move
+# clk2x onto a regional network. Frequencies and PLL phase settings are unchanged.
+set_instance_assignment -name GLOBAL_SIGNAL "GLOBAL CLOCK" -to "emu:emu|nitro_pll:island_pll|nitro_pll_0002:pll_inst|altera_pll:altera_pll_i|outclk_wire[0]"
+set_instance_assignment -name GLOBAL_SIGNAL "GLOBAL CLOCK" -to "emu:emu|nitro_pll:island_pll|nitro_pll_0002:pll_inst|altera_pll:altera_pll_i|outclk_wire[1]"
+set_instance_assignment -name GLOBAL_SIGNAL "GLOBAL CLOCK" -to "emu:emu|nitro_pll:island_pll|nitro_pll_0002:pll_inst|altera_pll:altera_pll_i|outclk_wire[2]"
+
 # The release is globally area-optimized so the 98% design remains routable.
 # The two small, measured 148.5 MHz display blocks are the exception: give
 # synthesis permission to favor their HDMI timing without bloating the console
@@ -87,11 +82,34 @@ set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_
 set_instance_assignment -name OPTIMIZATION_TECHNIQUE SPEED -to hdmi_osd
 set_instance_assignment -name OPTIMIZATION_TECHNIQUE SPEED -to ascal
 
-# The alpha prioritizes a routable RBF over final timing closure. Keep the
-# measured high-fanout CPU reset on a global network. Two additional reset
-# assignments in the supplied snapshot were invalid no-ops; activating them
-# displaced FPGA_CLK2_50 onto non-dedicated routing, so omit them.
+# The extra analog menu uses the remaining four M10Ks. Keep its short RGB
+# and sync delay chains in registers rather than inferring tiny shift RAMs.
+# This changes storage implementation only; all pipeline cycles are retained.
+set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to "*nds_analog_scanlines*"
+set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to "*nds_analog_csync*"
+
+# The alpha prioritizes a routable RBF over final timing closure. Use three
+# spare global networks for the measured high-fanout reset controls.
 set_instance_assignment -name GLOBAL_SIGNAL "GLOBAL CLOCK" -to "*|nds_nitro_console_top:inds|resetCpu"
+set_instance_assignment -name GLOBAL_SIGNAL "GLOBAL CLOCK" -to "emu:emu|nds_nitro_console_island:island|console_reset_sync_1x[1]"
+set_instance_assignment -name GLOBAL_SIGNAL "GLOBAL CLOCK" -to {*|nds_nitro_console_island:island|console_reset_sync_ddr[1]}
+
+# Private split experiment: the prior fit used 13/16 global networks. These
+# existing registered resets drove 935 and 663 non-global loads respectively.
+# Promote them to spare global networks to reduce general routing demand;
+# no reset logic, clocks, or gameplay/display functionality changes.
+set_instance_assignment -name GLOBAL_SIGNAL "GLOBAL CLOCK" -to "emu:emu|nds_nitro_console_island:island|nds_h3d_frame_record_cdc:h3d_record_cdc|source_reset_pipe[2]"
+set_instance_assignment -name GLOBAL_SIGNAL "GLOBAL CLOCK" -to "emu:emu|nds_nitro_console_island:island|console_reset_sync_2x[1]"
+
+# Prepared alternative for the last global network: the post-map netlist
+# verifies this synthesized control has 1,304 loads (1,010 in the plane
+# reader). Its inputs are the DDR bridge reset and H3D session-release cone;
+# it is shared reset/load control, despite the packet-buffer-generated name.
+# Cyclone V global networks support internally generated clear/load controls.
+# Replace the smaller 584-load reset promotion; retain all reset logic/cycles.
+# This synthesized name is tied to the frozen RTL. Require an explicit
+# applied-assignment message from the fitter before accepting a build.
+set_instance_assignment -name GLOBAL_SIGNAL "GLOBAL CLOCK" -to "emu:emu|nds_nitro_console_island:island|nds_h3d_frame_packet_writer:h3d_packet_writer|buf_record~640"
 
 set_global_assignment -name PRE_FLOW_SCRIPT_FILE "quartus_sh:sys/build_id.tcl"
 set_location_assignment PIN_U9 -to ADC_CONVST
@@ -336,6 +354,7 @@ set_global_assignment -name VHDL_FILE ../../third_party/Nitro_DarkSide/d2dabe/rt
 set_global_assignment -name VHDL_FILE ../../third_party/Nitro_DarkSide/d2dabe/rtl/nds_cpu9.vhd
 set_global_assignment -name VHDL_FILE ../../third_party/Nitro_DarkSide/d2dabe/rtl/nds_cache9.vhd
 set_global_assignment -name VHDL_FILE ../../rtl/nds_nitro_membus9.vhd
+set_global_assignment -name VHDL_FILE ../../rtl/nds_palette_readback.vhd
 set_global_assignment -name VHDL_FILE ../../third_party/Nitro_DarkSide/d2dabe/rtl/nds_syscnt.vhd
 set_global_assignment -name VHDL_FILE ../../third_party/Nitro_DarkSide/d2dabe/rtl/nds_loader.vhd
 set_global_assignment -name VHDL_FILE ../../third_party/Nitro_DarkSide/d2dabe/rtl/nds_debug.vhd
@@ -349,32 +368,47 @@ set_global_assignment -name VHDL_FILE ../../third_party/Nitro_DarkSide/d2dabe/rt
 set_global_assignment -name VHDL_FILE ../../third_party/Nitro_DarkSide/d2dabe/rtl/nds_drawer_affext.vhd
 set_global_assignment -name VHDL_FILE ../../third_party/Nitro_DarkSide/d2dabe/rtl/nds_drawer_obj.vhd
 set_global_assignment -name VHDL_FILE ../../third_party/Nitro_DarkSide/d2dabe/rtl/nds_drawer_merge.vhd
+set_global_assignment -name VHDL_FILE ../../rtl/nds_lcdc_line.vhd
 set_global_assignment -name VHDL_FILE ../../rtl/nds_nitro_gpu2d.vhd
-set_global_assignment -name VHDL_FILE ../../third_party/Nitro_DarkSide/d2dabe/rtl/nds_gpu2d_fast.vhd
 set_global_assignment -name VHDL_FILE ../../rtl/nds_gpu2d_register_shadow.vhd
+set_global_assignment -name VHDL_FILE ../../third_party/Nitro_DarkSide/d2dabe/rtl/nds_gpu2d_fast.vhd
 set_global_assignment -name VHDL_FILE ../../third_party/Nitro_DarkSide/d2dabe/rtl/nds_gpu_timing.vhd
 set_global_assignment -name VHDL_FILE ../../third_party/Nitro_DarkSide/d2dabe/rtl/nds_dma9.vhd
 set_global_assignment -name VHDL_FILE ../../third_party/Nitro_DarkSide/d2dabe/rtl/nds_dma7.vhd
 set_global_assignment -name VHDL_FILE ../../rtl/nds_h3d_gx_status.vhd
+set_global_assignment -name VHDL_FILE ../../rtl/nds_hblank_run_queue.vhd
 set_global_assignment -name VHDL_FILE ../../rtl/nds_h3d_console_event_gate.vhd
 set_global_assignment -name VHDL_FILE ../../rtl/nds_nitro_freebios7.vhd
 set_global_assignment -name VHDL_FILE ../../rtl/nds_nitro_freebios9.vhd
+set_global_assignment -name VHDL_FILE ../../rtl/nds_nitro_bootbios7.vhd
+set_global_assignment -name VHDL_FILE ../../rtl/nds_nitro_bootbios9.vhd
+set_global_assignment -name MIF_FILE ../../rtl/nds_nitro_bootbios7.mif
+set_global_assignment -name MIF_FILE ../../rtl/nds_nitro_bootbios9.mif
+set_global_assignment -name VHDL_FILE ../../rtl/nds_nitro_rtc.vhd
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_rtc_host_bridge.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_firmware_control.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_firmware_cache.sv
+set_global_assignment -name MIF_FILE ../../rtl/nds_nitro_freebios7.mif
+set_global_assignment -name MIF_FILE ../../rtl/nds_nitro_freebios9.mif
 set_global_assignment -name VHDL_FILE ../../rtl/nds_nitro_console_top.vhd
 set_global_assignment -name VHDL_FILE ../../rtl/nds_nitro_console_wrap.vhd
 set_global_assignment -name SYSTEMVERILOG_FILE ../../third_party/Nitro_DarkSide/d2dabe/rtl/sdram.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../third_party/Nitro_DarkSide/d2dabe/rtl/ddram.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_nitro_arm9_math_unit.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_arm9_pc_sampler.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_nitro_async_fifo.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_nitro_fb_ddr3.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_nitro_touch_input.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_nitro_video_scanout.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_ddram_arbiter_4client.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_h3d_ddr_fabric.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_h3d_session_policy_latch.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_h3d_control_init.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_h3d_event_async_fifo.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_gx_fifo_packet_frontend.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_h3d_frame_record_cdc.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_h3d_frame_packet_writer.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_h3d_vram_record_packer.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_h3d_plane_reader.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_nitro_console_island.sv
 set_global_assignment -name SYSTEMVERILOG_FILE NDS4MiSTer.sv
@@ -393,3 +427,29 @@ set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_nitro_save_profile.
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_nitro_save_bridge.sv
 set_global_assignment -name MISC_FILE nds_save_profile_prefix.hex
 set_global_assignment -name MISC_FILE nds_save_profile_entries.hex
+
+set_global_assignment -name VHDL_FILE ../../rtl/nds_nitro_firmware.vhd
+set_global_assignment -name MIF_FILE ../../rtl/nds_nitro_firmware.mif
+set_global_assignment -name VHDL_FILE ../../rtl/nds_nitro_spi.vhd
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_audio_headroom.sv
+
+set_global_assignment -name VHDL_FILE ../../rtl/nds_sound_stream_watch.vhd
+
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_tate_video.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_tate_controls.sv
+
+set_global_assignment -name VHDL_FILE ../../rtl/nds_h3d_gx_readback_owner.vhd
+set_global_assignment -name VHDL_FILE ../../rtl/nds_h3d_gx_dma_completion.vhd
+
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_h3d_gx_readback_reply.sv
+
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_h3d_readback_legacy_adapter.sv
+
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_h3d_adoption_window.sv
+
+# Temporary CPU/query/sound/render probes are removed at the product boundary.
+# Keep 3D FPS, TATE/menu rotation, YC encoding, microphone and lid controls.
+
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_native_osd_memory.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_dv1_osd_raster.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/nds_dv1_rotate_read.sv

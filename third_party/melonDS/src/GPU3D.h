@@ -20,7 +20,9 @@
 #define GPU3D_H
 
 #include <array>
+#include <deque>
 #include <memory>
+#include <vector>
 
 #include "Savestate.h"
 #include "FIFO.h"
@@ -139,6 +141,27 @@ public:
         return ExternalGeometryDiscardActive ||
             ExternalGeometryDiscardTainted;
     }
+    // Host raster policy, selected before starting this instance's workers.
+    // It is not guest state and is never restored from a GPU savestate.
+    void SetIntegralTextureSpansEnabled(bool enabled) noexcept
+    {
+        UseIntegralTextureSpans = enabled;
+    }
+    bool IntegralTextureSpansEnabled() const noexcept
+    {
+        return UseIntegralTextureSpans;
+    }
+    // Keep Portrait's admitted raster and scheduling choices separate from
+    // Dawn's texture history and other replay policies.
+    void SetSpriteRasterSpansEnabled(bool enabled) noexcept
+    {
+        UseSpriteRasterSpans = enabled;
+    }
+    bool SpriteRasterSpansEnabled() const noexcept
+    {
+        return UseIntegralTextureSpans || UseSpriteRasterSpans;
+    }
+
     // Native-resolution software rendering consumes FinalPosition only.
     // OpenGL/compute renderers additionally consume HiresPosition.
     void SetHighResolutionCoordinatesEnabled(bool enabled) noexcept
@@ -192,6 +215,7 @@ private:
     void UpdateClipMatrix() noexcept;
     void ResetRenderingState() noexcept;
     void AddCycles(s32 num) noexcept;
+    [[gnu::noinline]] void AdvancePipelines(s32 num) noexcept;
     void NextVertexSlot() noexcept;
     void StallPolygonPipeline(s32 delay, s32 nonstalldelay) noexcept;
     void SubmitPolygon() noexcept;
@@ -242,11 +266,13 @@ private:
     // and advances it in bounded 256-command runs.  Keep that run contiguous
     // instead of paying the emulated four-entry pipe plus 256-entry FIFO
     // write/refill/read machinery for commands no emulated CPU can observe.
-    // The extra room is a fail-safe for a future caller that exceeds the
-    // service's current run boundary; overflow retains exact order in the
-    // ordinary FIFO behind this batch.
+    // SWAP_BUFFERS can suspend execution across several such runs. The FPGA
+    // keeps producing while the replay waits for its recorded VBlank, so this
+    // host-only queue must retain the entire burst instead of spilling into a
+    // finite emulated CPU stall queue. Retain capacity across frames/resets.
     static constexpr u32 ExternalBatchCapacity = 512;
-    CmdFIFOEntry ExternalBatch[ExternalBatchCapacity] {};
+    std::vector<CmdFIFOEntry> ExternalBatch =
+        std::vector<CmdFIFOEntry>(ExternalBatchCapacity);
     u32 ExternalBatchRead = 0;
     u32 ExternalBatchCount = 0;
 
@@ -319,6 +345,8 @@ public:
     bool ExternalGeometryDiscardActive = false;
     bool ExternalGeometryDiscardTainted = false;
     bool HighResolutionCoordinatesEnabled = true;
+    bool UseIntegralTextureSpans = false;
+    bool UseSpriteRasterSpans = false;
 
     u32 DispCnt = 0;
     u8 AlphaRefVal = 0;
@@ -349,6 +377,9 @@ public:
     u32 RenderClearAttr2 = 0;
 
     bool RenderFrameIdentical = false; // not part of the hardware state, don't serialize
+    // Monotonic identity of the latched raster inputs. Unlike the adjacent
+    // VBlank hint, this retains invalidations across omitted render attempts.
+    u64 RenderStateRevision = 0; // replay-thread owned, not serialized/reset
 
     u16 RenderXPos = 0;
 
@@ -406,6 +437,19 @@ public:
     u32 FlushRequest = 0;
     u32 FlushAttributes = 0;
     u64 ExternalDiscardedVertices = 0;
+
+    // Cold overflow storage belongs after the established geometry state.
+    // Inserting it beside CmdStallQueue shifts matrices, vertex data and
+    // polygon buffers even for games that never overflow.
+    // External replay only: commands behind a full stall queue. Need for Speed
+    // Carbon submits 25k-42k commands per frame, so a SWAP_BUFFERS waiting for
+    // VBlank can hold back more than the FIFOs and stall queue together. The
+    // stream is authoritative and must never be dropped: a lost MTX_POP or
+    // G3X_ResetMtxStack header leaves the matrix stack permanently unbalanced.
+    // Entries drain strictly behind the stall queue, preserving order.
+    std::deque<CmdFIFOEntry> ExternalOverflow {};
+    static constexpr std::size_t ExternalOverflowLimit = 1u << 22; // 32 MiB
+    std::size_t ExternalOverflowPeak = 0;
 };
 
 class Renderer3D

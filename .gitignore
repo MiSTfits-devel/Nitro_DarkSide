@@ -83,3 +83,11 @@ work/
 
 # Locally built helper executable.
 /nds_slot_dump
+
+# Local standalone frontend build and Python bytecode.
+/tools/standalone_host/nds_standalone_host
+__pycache__/
+*.pyc
+
+# Reproducible project-owned movie hooks; source and build script are tracked.
+/tools/standalone_host/fmv/guest/*.bin

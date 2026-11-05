@@ -1,6 +1,7 @@
 module tb_nds_h3d_control_init #(
     parameter integer ENTRY_COUNT = 8,
-    parameter bit PACKET_MODE = 1'b0
+    parameter bit PACKET_MODE = 1'b0,
+    parameter bit DIAGNOSTIC_HOLD_ENABLE = 1'b1
 );
     localparam logic [28:0] BASE = 29'h00370000;
     localparam integer HEADER_WORDS64 = 16;
@@ -24,11 +25,16 @@ module tb_nds_h3d_control_init #(
     logic clk = 0;
     logic reset = 1;
     logic [31:0] requested_session = 0;
+    logic engine_b_pixels_enable = 0;
+    logic video_quiescent = 1;
     logic [31:0] external_fault_bits = 0;
     logic [31:0] fpga_heartbeat_value = 32'h12345678;
     logic [31:0] fpga_telemetry_value = 32'h89abcdef;
     logic [2:0] telemetry_index;
     logic diagnostic_hold;
+    always @(posedge clk)
+        if (!reset && !DIAGNOSTIC_HOLD_ENABLE && diagnostic_hold)
+            $fatal(1, "disabled diagnostic path halted the CPUs");
 
     logic active;
     logic initialized;
@@ -105,7 +111,8 @@ module tb_nds_h3d_control_init #(
         .PACKET_MODE(PACKET_MODE),
         .HEADER_WORDS64(HEADER_WORDS64),
         .HPS_HEARTBEAT_TIMEOUT_CYCLES(512),
-        .DIAGNOSTIC_HOLD_CYCLES(32)
+        .DIAGNOSTIC_HOLD_CYCLES(32),
+        .DIAGNOSTIC_HOLD_ENABLE(DIAGNOSTIC_HOLD_ENABLE)
     ) dut (
         .*
     );
@@ -646,10 +653,16 @@ module tb_nds_h3d_control_init #(
         // hold. It is diagnostic data, not a malformed counter reserve.
         @(negedge clk);
         memory[13][63:32] = 32'h00000042;
-        wait (diagnostic_hold);
-        if (fault || !console_release)
-            $fatal(1, "diagnostic hold token faulted the active session");
-        wait (!diagnostic_hold);
+        if (DIAGNOSTIC_HOLD_ENABLE) begin
+            wait (diagnostic_hold);
+            if (fault || !console_release)
+                $fatal(1, "diagnostic hold token faulted the active session");
+            wait (!diagnostic_hold);
+        end else begin
+            repeat (160) @(posedge clk);
+            if (fault || !console_release)
+                $fatal(1, "ignored diagnostic token disturbed the active session");
+        end
         repeat (40) @(posedge clk);
         if (diagnostic_hold)
             $fatal(1, "diagnostic hold did not release itself");
@@ -679,10 +692,11 @@ module tb_nds_h3d_control_init #(
         memory[5] = {active8, 32'd2};
         wait_for_release();
         @(negedge clk);
-        external_fault_bits = 32'h00000100;
+        // Preserve both queue-reason bits together with the legacy summary.
+        external_fault_bits = 32'h00c00100;
         wait_for_fault();
-        if ((fault_bits & 32'h00000100) == 0 ||
-            (memory[4][31:0] & 32'h00000100) == 0)
+        if ((fault_bits & 32'h00c00100) != 32'h00c00100 ||
+            (memory[4][31:0] & 32'h00c00100) != 32'h00c00100)
             $fatal(1, "external product fault was not published");
         external_fault_bits = 32'd0;
         wait (dut.state == STATE_FAULT_HOLD);

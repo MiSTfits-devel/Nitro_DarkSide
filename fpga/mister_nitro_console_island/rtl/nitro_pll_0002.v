@@ -33,54 +33,23 @@ module nitro_pll_0002(
 		//   3x = 100.541946 MHz (default)
 		//   fast = 134.055928/67.027964/33.513982 MHz (NDS_CLKMEM_4X;
 		//          native DS cadence with a 4x SDRAM clock).
-		//   bring-up = 68/34/17 MHz (NDS_PLL_BRINGUP; see below).
 		// The whole clock family moves together to preserve its exact 4:2:1
 		// phase relationship; changing clkMem alone is not a legal PLL setup.
-		//
-		// NDS_PLL_BRINGUP builds the console below its measured Fmax so the
-		// image is timing-clean and can answer one question on hardware: does
-		// the RTL work at all? Seed 2 was constrained at the native cadence and
-		// closed at 126.77 / 43.67 / 25.06 MHz -- the ARM9 domain reaching 65%
-		// of its required frequency across TNS -35,389 ns -- so that image
-		// could not execute regardless of what it showed on screen.
-		//
-		// 80/40/20 was tried first, from seed 2's same-clock Fmax, and left
-		// clk2x at -3.344 ns / TNS -1075 ns. Same-clock Fmax was the wrong
-		// number to size this from: every one of the 50 worst paths is a
-		// clk1x -> clk2x crossing, and Fmax by construction ignores those. The
-		// binding family runs from six counter bits in
-		// nds_h3d_console_event_gate (frame_pending_count, gpu_pending_count)
-		// into nds_nitro_arm9_math_unit's div_pending_quotient through 33
-		// levels of logic, for a 27.393 ns data delay against a 25.000 ns
-		// setup relationship. Size the cadence to that delay instead: clk2x at
-		// 34 MHz gives a 29.412 ns relationship, 2.0 ns of room.
-		//
-		// The console then runs at 34/67.027964 = 50.7% of native speed. Note
-		// the emulated RTC counts nds_rtc.vhd's CYCLES_PER_SEC = 33513982
-		// clk1x cycles per second and will therefore run ~1.97x fast in this
-		// configuration; that constant is deliberately left alone so the build
-		// differs from a shipping one by clock frequency only.
-`ifdef NDS_PLL_BRINGUP
-		.output_clock_frequency0("68.0 MHz"),
-`elsif NDS_CLKMEM_4X
+`ifdef NDS_CLKMEM_4X
 		.output_clock_frequency0("134.055928 MHz"),
 `else
 		.output_clock_frequency0("100.541946 MHz"),
 `endif
 		.phase_shift0("0 ps"),
 		.duty_cycle0(50),
-`ifdef NDS_PLL_BRINGUP
-		.output_clock_frequency1("34.0 MHz"),
-`elsif NDS_CLKMEM_4X
+`ifdef NDS_CLKMEM_4X
 		.output_clock_frequency1("67.027964 MHz"),
 `else
 		.output_clock_frequency1("67.027964 MHz"),
 `endif
 		.phase_shift1("0 ps"),
 		.duty_cycle1(50),
-`ifdef NDS_PLL_BRINGUP
-		.output_clock_frequency2("17.0 MHz"),
-`elsif NDS_CLKMEM_4X
+`ifdef NDS_CLKMEM_4X
 		.output_clock_frequency2("33.513982 MHz"),
 `else
 		.output_clock_frequency2("33.513982 MHz"),

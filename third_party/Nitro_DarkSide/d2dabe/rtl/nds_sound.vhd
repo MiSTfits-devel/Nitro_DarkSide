@@ -42,7 +42,8 @@ entity nds_sound is
       --     produces. Kept buildable on purpose - it is the reference the RAM
       --     path is judged against, and the fallback if the approximation ever
       --     turns out to matter.
-      ADPCM_TABLE_RAM : integer := 1
+      ADPCM_TABLE_RAM : integer := 1;
+      DIAGNOSTICS : integer := 0
    );
    port
    (
@@ -72,7 +73,8 @@ entity nds_sound is
 
       -- debug/verification tap: master enable + any-channel-active
       snd_enable  : out std_logic;
-      snd_active  : out std_logic_vector(15 downto 0)
+      snd_active  : out std_logic_vector(15 downto 0);
+      diagnostic : out std_logic_vector(127 downto 0) := (others => '0')
    );
 end entity;
 
@@ -160,8 +162,16 @@ architecture arch of nds_sound is
    signal fetchstate_b_din  : std_logic_vector(48 downto 0);
    signal fetchstate_b_dout : std_logic_vector(48 downto 0);
 
+   -- NDS4MiSTer enters games through direct boot rather than running the
+   -- firmware. Firmware/direct-boot setup leaves SOUNDBIAS at its 0x200
+   -- midpoint before game code starts; many games never write it themselves.
+   -- Without this preset the final mixer adds -32768 and clips before the
+   -- signed MiSTer output stage can remove the DC offset.
+   constant SOUNDBIAS_DIRECT_BOOT_VALUE : std_logic_vector(9 downto 0) :=
+      "1000000000";
    signal soundcnt  : std_logic_vector(15 downto 0) := (others => '0');
-   signal soundbias : std_logic_vector(9 downto 0)  := (others => '0');
+   signal soundbias : std_logic_vector(9 downto 0)  :=
+      SOUNDBIAS_DIRECT_BOOT_VALUE;
 
    type t_cap is record
       cnt : std_logic_vector(7 downto 0);
@@ -298,6 +308,79 @@ architecture arch of nds_sound is
 
 begin
 
+   -- Passive follow-up telemetry. This generate observes the actual decoder
+   -- and fetch states; it cannot pause, supply, skip or modify any sample.
+   gdiag_full : if DIAGNOSTICS = 1 generate
+      signal underrun_mask : std_logic_vector(15 downto 0) := (others => '0');
+      signal underrun_cycles : unsigned(11 downto 0) := (others => '0');
+      signal grant_age, grant_max, memory_age, memory_max : unsigned(13 downto 0) := (others => '0');
+   begin
+      diagnostic(127 downto 64) <= x"A" & std_logic_vector(underrun_cycles) & underrun_mask &
+                    x"B" & std_logic_vector(grant_max) & std_logic_vector(memory_max);
+      process(clk)
+         variable missing : std_logic_vector(15 downto 0);
+      begin
+         if rising_edge(clk) then
+            if reset = '1' then
+               underrun_mask <= (others => '0'); underrun_cycles <= (others => '0');
+               grant_age <= (others => '0'); grant_max <= (others => '0');
+               memory_age <= (others => '0'); memory_max <= (others => '0');
+            elsif ce = '1' then
+               missing := (others => '0');
+               if tick2 = '1' and soundcnt(15) = '1' then
+                  for i in 0 to 15 loop
+                     if chan(i).busy = '1' and chan(i).format /= "11" and
+                        chan(i).timer(15 downto 0) = x"FFFF" and
+                        chan(i).startdel = 0 and chan(i).curv = '0' then
+                        missing(i) := '1';
+                     end if;
+                  end loop;
+               end if;
+               underrun_mask <= underrun_mask or missing;
+               if missing /= x"0000" and underrun_cycles /= x"FFF" then
+                  underrun_cycles <= underrun_cycles + 1;
+               end if;
+               if fstate = FGRANT then
+                  if grant_age /= 16383 then grant_age <= grant_age + 1; end if;
+               else grant_age <= (others => '0'); end if;
+               if grant_age > grant_max then grant_max <= grant_age; end if;
+               if fstate = FWAITDONE then
+                  if memory_age /= 16383 then memory_age <= memory_age + 1; end if;
+               else memory_age <= (others => '0'); end if;
+               if memory_age > memory_max then memory_max <= memory_age; end if;
+            end if;
+         end if;
+      end process;
+   end generate;
+   -- Mode 2 keeps only consumption/address counters. The previous hardware
+   -- run observed no sample-fetch starvation; remove its channel-wide
+   -- underrun detection and dwell maxima from this smaller private diagnostic.
+   gdiag_slim : if DIAGNOSTICS = 2 generate
+      diagnostic(127 downto 64) <= (others => '0');
+   end generate;
+   gdiag_fetch : if DIAGNOSTICS /= 0 generate
+      signal fetch_count : unsigned(27 downto 0) := (others => '0');
+      signal last_fetch : std_logic_vector(27 downto 0) := (others => '0');
+   begin
+      diagnostic(63 downto 0) <= x"C" & std_logic_vector(fetch_count) & x"D" & last_fetch;
+      process(clk)
+      begin
+         if rising_edge(clk) then
+            if reset = '1' then
+               fetch_count <= (others => '0'); last_fetch <= (others => '0');
+            elsif ce = '1' then
+               if fstate = FWAITDONE and mb_done = '1' then
+                  fetch_count <= fetch_count + 1;
+                  last_fetch <= std_logic_vector(to_unsigned(fch,4)) & fptr_b_dout(21 downto 0) & "00";
+               end if;
+            end if;
+         end if;
+      end process;
+   end generate;
+   gnodiag : if DIAGNOSTICS = 0 generate
+      diagnostic <= (others => '0');
+   end generate;
+
    -- ADPCM step table: ONE write port (the init sweep) and ONE read port
    -- (round-robin over the 16 channels). That shape is what Quartus can turn
    -- into a simple dual-port M10K.
@@ -427,37 +510,56 @@ begin
    -- ================= read data =================
    process (all)
       variable n : integer;
+      variable channel_select : std_logic_vector(15 downto 0);
+      variable control_select : std_logic_vector(7 downto 0);
+      variable read_value, channel_value : std_logic_vector(31 downto 0);
    begin
-      wired_out7  <= (others => '0');
+      channel_select := (others => '0');
+      control_select := (others => '0');
+      read_value := (others => '0');
       wired_done7 <= '0';
 
       if (bus7.Adr(27 downto 9) = "0000000000000000010") then  -- 0x400-0x5FF
          wired_done7 <= '1';
          if (bus7.Adr(8) = '0') then
-            -- 0x400-0x4FF: channel registers
+            -- Retain numeric_std's channel-index conversion, including its
+            -- simulation behavior for an address containing a metavalue.
             n := to_integer(unsigned(bus7.Adr(7 downto 4)));
             case bus7.Adr(3 downto 2) is
-               when "00" =>
-                  wired_out7 <= chan(n).busy & chan(n).format & chan(n).repeatm & chan(n).duty &
-                                '0' & chan(n).pan & '0' & chan(n).hold & "0000" &
-                                chan(n).voldiv & '0' & chan(n).volmul;
-               when others =>
-                  wired_out7 <= (others => '0');  -- SAD/TMR/PNT/LEN write-only
+               when "00" => channel_select(n) := '1';
+               when others => null;  -- SAD/TMR/PNT/LEN write-only
             end case;
          else
-            -- 0x500-0x51F: control/bias/capture
+            -- Keep the existing aliases: bits 7:5 do not select these words.
             case bus7.Adr(4 downto 2) is
-               when "000"  => wired_out7 <= x"0000" & soundcnt;
-               when "001"  => wired_out7 <= x"00000" & "00" & soundbias;
-               when "010"  => wired_out7 <= x"0000" & cap(1).cnt & cap(0).cnt;
-               when "100"  => wired_out7 <= "00000" & cap(0).dad;
-               when "101"  => wired_out7 <= x"0000" & cap(0).len;
-               when "110"  => wired_out7 <= "00000" & cap(1).dad;
-               when "111"  => wired_out7 <= x"0000" & cap(1).len;
-               when others => wired_out7 <= (others => '0');
+               when "000"  => control_select(0) := '1';
+               when "001"  => control_select(1) := '1';
+               when "010"  => control_select(2) := '1';
+               when "100"  => control_select(4) := '1';
+               when "101"  => control_select(5) := '1';
+               when "110"  => control_select(6) := '1';
+               when "111"  => control_select(7) := '1';
+               when others => null;
             end case;
          end if;
       end if;
+
+      -- Share address decoding across output bits. Exactly one source can be
+      -- selected; all register state and the address-only response stay live.
+      for i in 0 to 15 loop
+         channel_value := chan(i).busy & chan(i).format & chan(i).repeatm & chan(i).duty &
+                          '0' & chan(i).pan & '0' & chan(i).hold & "0000" &
+                          chan(i).voldiv & '0' & chan(i).volmul;
+         read_value := read_value or (channel_value and (31 downto 0 => channel_select(i)));
+      end loop;
+      read_value := read_value or ((x"0000" & soundcnt) and (31 downto 0 => control_select(0)));
+      read_value := read_value or ((x"00000" & "00" & soundbias) and (31 downto 0 => control_select(1)));
+      read_value := read_value or ((x"0000" & cap(1).cnt & cap(0).cnt) and (31 downto 0 => control_select(2)));
+      read_value := read_value or (("00000" & cap(0).dad) and (31 downto 0 => control_select(4)));
+      read_value := read_value or ((x"0000" & cap(0).len) and (31 downto 0 => control_select(5)));
+      read_value := read_value or (("00000" & cap(1).dad) and (31 downto 0 => control_select(6)));
+      read_value := read_value or ((x"0000" & cap(1).len) and (31 downto 0 => control_select(7)));
+      wired_out7 <= read_value;
    end process;
 
    -- ================= state: registers, decode, fetch =================
@@ -479,7 +581,7 @@ begin
          if (reset = '1') then
 
             soundcnt  <= (others => '0');
-            soundbias <= (others => '0');
+            soundbias <= SOUNDBIAS_DIRECT_BOOT_VALUE;
             -- zero everything: the read mux ORs into the shared IO bus, a
             -- single 'U' field would poison every ARM7 IO read
             for i in 0 to 15 loop

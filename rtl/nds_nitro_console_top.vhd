@@ -35,9 +35,9 @@
 --   * ARM7 SPI bus (nds_spi): PMIC + firmware flash + TSC; the flash serves
 --     the fw_* image port (melonDS default firmware in sim; touch/mic not
 --     wired into the TSC yet)
---   * Redistributable melonDS FreeBIOS for ARM7 and ARM9. The registered
---     product ROMs provide the direct-boot SWIs used by the initial game
---     target without Nintendo BIOS data or a run-time BIOS loader.
+--   * Reloadable ARM7/ARM9 BIOS RAMs initialize to redistributable melonDS
+--     FreeBIOS. Private native BIOS images may be uploaded while held in reset;
+--     direct-boot sessions restore the same public FreeBIOS contents.
 --   * both 2D engines render (engine B via the 0x1000 register window,
 --     palette/OAM upper halves and the C/D/H/I VRAM roles); POWCNT routes
 --     the screens (swap bit; B-off shows white, palette/OAM writes gated
@@ -62,6 +62,10 @@ entity nds_nitro_console_top is
       -- the renderer 6390 cycles per scanline instead of 2130. A rendered line
       -- measures 5829 cycles, so it only fits the former. See nds_gpu2d_fast.
       GPU_FAST                 : integer   := 0;
+      GPU2D_A_ENABLE : integer := 1;
+      HOST_SAVE_PROFILE : integer := 0;
+      H3D_MATCHED_DISPLAY_TEST  : integer   := 0;
+      H3D_COMPRESS_HBLANK       : boolean   := false;
       -- Diagnostic area split: 0 removes engine B and mirrors engine A onto
       -- both physical screens.  This keeps NSMB's main-screen BG2/HDMA and
       -- the ARM 3D merge in FPGA while measuring whether one 2D engine fits.
@@ -79,6 +83,8 @@ entity nds_nitro_console_top is
       -- (see FITTING.md; the fitter is short by ~470 ALMs). Diagnostic images
       -- only - there is no audio at all with this off.
       SOUND_ENABLE             : integer   := 1;
+      SOUND_DIAGNOSTICS : integer := 0;
+      SOUND_STREAM_DIAGNOSTICS : integer := 0;
       -- DEBUG_ENABLE = 0 compiles nds_debug (the IS-NITRO-style halt/step/peek
       -- unit) out: 474 ALMs, ~47 LABs. That is enough to close the 27-LAB gap
       -- that SOUND_ENABLE=1 opens, which is the only reason to turn it off.
@@ -90,6 +96,7 @@ entity nds_nitro_console_top is
       -- a staged card image with nobody at the OSD. Other mailbox ops stop
       -- answering and fall to NDS.sv's outer timeout rather than hanging.
       DEBUG_ENABLE             : integer   := 1;
+      H3D_GX_READBACK_ENABLE    : boolean   := false;
       -- simulation only: the testbench has staged the ARM9/ARM7 main-RAM sections
       -- itself, so nds_loader may skip copying them (see nds_loader.skip_copy)
       skip_copy                : std_logic := '0'
@@ -136,6 +143,22 @@ entity nds_nitro_console_top is
       -- WRAM were each fixed by hand-reimplementing one thing the firmware does.
       -- Booting the firmware addresses the cause rather than the symptoms.
       fw_boot          : in  std_logic := '0';
+      cart_present     : in  std_logic := '1';
+      -- Immutable per-cartridge host metadata; validity is synchronized outside.
+      host_save_valid : in std_logic := '0';
+      host_save_code : in std_logic_vector(31 downto 0) := (others => '0');
+      host_save_type : in std_logic_vector(3 downto 0) := (others => '0');
+      -- Selected effective firmware user settings, 28 little-endian words.
+      -- profile_data may have one clk1x cycle of latency.
+      profile_valid    : in  std_logic := '0';
+      profile_addr     : out std_logic_vector(4 downto 0);
+      profile_data     : in  std_logic_vector(31 downto 0) := (others => '0');
+      profile_fw_offset : in std_logic_vector(31 downto 0) := x"0001FE00";
+      profile_fw_checksums : in std_logic_vector(31 downto 0) := x"00000000";
+      rtc_seed         : in std_logic_vector(55 downto 0) := (others => '0');
+      rtc_seed_toggle  : in std_logic := '0';
+      rtc_datetime     : out std_logic_vector(55 downto 0);
+      rtc_date_written : out std_logic;
       -- keys (active high) — X/Y/lid are NDS additions routed via ARM7 side
       KeyA             : in  std_logic;
       KeyB             : in  std_logic;
@@ -162,14 +185,16 @@ entity nds_nitro_console_top is
 
       -- card image read port (word addressed into the staged .nds, via nds_wrap)
       card_ena         : out std_logic;
-      card_addr        : out std_logic_vector(26 downto 2);
+      card_addr        : out std_logic_vector(28 downto 2);
       card_din         : in  std_logic_vector(31 downto 0);
       card_done        : in  std_logic;
+      card_address_mask : in std_logic_vector(31 downto 0) := x"FFFFFFFF";
 
       -- Cartridge backup-memory byte port.  Storage is instantiated in the
       -- SystemVerilog island so its second port can connect directly to the
       -- MiSTer mounted-save interface.
       backup_addr         : out std_logic_vector(19 downto 0);
+      backup_bank         : out std_logic_vector(3 downto 0) := (others => '0');
       backup_write_data   : out std_logic_vector(7 downto 0);
       backup_write_enable : out std_logic;
       backup_read_data    : in  std_logic_vector(7 downto 0);
@@ -197,10 +222,12 @@ entity nds_nitro_console_top is
       fw_wr            : out std_logic;
       fw_wlane         : out unsigned(1 downto 0);
       fw_wdata         : out std_logic_vector(7 downto 0);
+      fw_busy          : in std_logic := '0';
+      fw_release       : out std_logic; -- completed SPI program chip-select
 
-      -- Legacy hot-BIOS boundary retained for entity compatibility. The
-      -- compact product instantiates built-in FreeBIOS ROMs and ignores these
-      -- ports; donor and simulation variants can still use this interface.
+      -- Reloadable BIOS RAM, initialized to public FreeBIOS at configuration.
+      -- Upload writes are accepted only while reset is asserted. Native mode
+      -- also requires both load_done levels before the boot FSM can start.
       bios7_load_addr  : in unsigned(13 downto 2) := (others => '0');
       bios7_load_data  : in std_logic_vector(31 downto 0) := (others => '0');
       bios7_load_be    : in std_logic_vector(3 downto 0) := (others => '0');
@@ -238,6 +265,14 @@ entity nds_nitro_console_top is
       vsrv_din         : out std_logic_vector(31 downto 0);
       vsrv_dout        : in  std_logic_vector(31 downto 0);
       vsrv_done        : in  std_logic;
+      -- streaming extensions, see nds_vram's srv_seq/srv_wide/srv_more and
+      -- RD_LINE_BUF (vsrv_dout_hi: the other word of the 8-byte line read)
+      vsrv_dout_hi     : in  std_logic_vector(31 downto 0) := (others => '0');
+      vsrv_seq         : out std_logic;
+      vsrv_wide        : out std_logic;
+      vsrv_din_hi      : out std_logic_vector(31 downto 0);
+      vsrv_be_hi       : out std_logic_vector(3 downto 0);
+      vsrv_more        : out std_logic;
       vrsrv_req        : out std_logic;
       vrsrv_bank       : out std_logic_vector(1 downto 0);
       vrsrv_addr       : out unsigned(16 downto 3);
@@ -281,10 +316,24 @@ entity nds_nitro_console_top is
       -- addresses in the 0x06xxxxxx aperture.  All timestamps use the single
       -- ARM7-rate DS system clock, including ARM9-originated events.
       h3d_service_ready       : in  std_logic := '0';
+      h3d_readback_request    : out std_logic := '0';
+      h3d_readback_ready      : in  std_logic := '0';
+      h3d_readback_id         : out std_logic_vector(31 downto 0) := (others => '0');
+      h3d_readback_response   : in  std_logic := '0';
+      h3d_readback_response_id: in  std_logic_vector(31 downto 0) := (others => '0');
+      h3d_readback_status     : in  std_logic_vector(31 downto 0) := (others => '0');
+      h3d_readback_index      : out std_logic_vector(4 downto 0) := (others => '0');
+      h3d_readback_data       : in  std_logic_vector(31 downto 0) := (others => '0');
+      h3d_engine_b_enable     : in  std_logic := '0';
       h3d_gx_fifo_level       : in  std_logic_vector(8 downto 0) := (others => '0');
+      h3d_gx_geometry_busy    : in  std_logic := '0';
+      -- {error, projection level, position level[4:0]} from the GX frontend.
+      h3d_gx_stack_status     : in  std_logic_vector(6 downto 0) := (others => '0');
+      h3d_gx_stack_ack        : out std_logic := '0';
       h3d_timestamp           : out std_logic_vector(63 downto 0) := (others => '0');
       h3d_current_frame       : out std_logic_vector(31 downto 0) := (others => '0');
       h3d_source_fault        : out std_logic := '0';
+      h3d_source_fault_reason : out std_logic_vector(1 downto 0) := "00";
 
       h3d_gpu_write_valid       : out std_logic := '0';
       h3d_gpu_write_ready       : in  std_logic := '1';
@@ -292,7 +341,7 @@ entity nds_nitro_console_top is
       h3d_gpu_write_access      : out std_logic_vector(1 downto 0) := (others => '0');
       h3d_gpu_write_byte_enable : out std_logic_vector(3 downto 0) := (others => '0');
       h3d_gpu_write_data        : out std_logic_vector(31 downto 0) := (others => '0');
-      h3d_gpu_write_frame       : out std_logic_vector(31 downto 0) := (others => '0');
+      h3d_gpu_write_scanline    : out std_logic_vector(8 downto 0) := (others => '0');
       h3d_gpu_write_timestamp   : out std_logic_vector(63 downto 0) := (others => '0');
 
       h3d_vram9_write_valid       : out std_logic := '0';
@@ -301,7 +350,7 @@ entity nds_nitro_console_top is
       h3d_vram9_write_access      : out std_logic_vector(1 downto 0) := (others => '0');
       h3d_vram9_write_byte_enable : out std_logic_vector(3 downto 0) := (others => '0');
       h3d_vram9_write_data        : out std_logic_vector(31 downto 0) := (others => '0');
-      h3d_vram9_write_frame       : out std_logic_vector(31 downto 0) := (others => '0');
+      h3d_vram9_write_scanline    : out std_logic_vector(8 downto 0) := (others => '0');
       h3d_vram9_write_timestamp   : out std_logic_vector(63 downto 0) := (others => '0');
 
       h3d_vram7_write_valid       : out std_logic := '0';
@@ -310,9 +359,12 @@ entity nds_nitro_console_top is
       h3d_vram7_write_access      : out std_logic_vector(1 downto 0) := (others => '0');
       h3d_vram7_write_byte_enable : out std_logic_vector(3 downto 0) := (others => '0');
       h3d_vram7_write_data        : out std_logic_vector(31 downto 0) := (others => '0');
-      h3d_vram7_write_frame       : out std_logic_vector(31 downto 0) := (others => '0');
+      h3d_vram7_write_scanline    : out std_logic_vector(8 downto 0) := (others => '0');
       h3d_vram7_write_timestamp   : out std_logic_vector(63 downto 0) := (others => '0');
 
+      -- Raw physical LCD timing for safe late 3D adoption; never queued.
+      h3d_lcd_phase_raw      : out std_logic := '0';
+      h3d_lcd_line_raw       : out std_logic_vector(8 downto 0) := (others => '0');
       h3d_hblank_valid       : out std_logic := '0';
       h3d_hblank_ready       : in  std_logic := '1';
       h3d_hblank_line        : out std_logic_vector(8 downto 0) := (others => '0');
@@ -337,6 +389,8 @@ entity nds_nitro_console_top is
       vblank_out       : out std_logic;
 
       -- sound
+      sound_diagnostic : out std_logic_vector(127 downto 0) := (others => '0');
+      sound_stream_diagnostic : out std_logic_vector(63 downto 0) := (others => '0');
       sound_out_left   : out std_logic_vector(15 downto 0);
       sound_out_right  : out std_logic_vector(15 downto 0);
 
@@ -355,6 +409,7 @@ entity nds_nitro_console_top is
       dbg_line_drop_b  : out std_logic;   -- ... engine B specifically
       dbg_line_busy    : out std_logic;
       dbg_bg1_scroll_triplet : out std_logic_vector(31 downto 0);
+      dbg_query_sample_toggle : out std_logic := '0';
       dbg_cpu_err9     : out std_logic;
       dbg_cpu_err7     : out std_logic;
       dbg_pc9          : out std_logic_vector(31 downto 0);
@@ -362,6 +417,9 @@ entity nds_nitro_console_top is
       dbg_r0_9         : out std_logic_vector(31 downto 0);
       dbg_lr9          : out std_logic_vector(31 downto 0);
       dbg_cpsr9        : out std_logic_vector(31 downto 0);
+      -- Evidence-only native memory diagnostic. Observation wires only.
+      dbg_mem_probe    : out std_logic_vector(31 downto 0) := (others => '0');
+      dbg_cpu9_addr    : out std_logic_vector(31 downto 0) := (others => '0');
       -- Public crash capture: a bounded external hold from the H3D control
       -- block. This remains available when the 474-ALM nds_debug unit is off.
       diagnostic_hold9 : in  std_logic := '0';
@@ -377,21 +435,13 @@ entity nds_nitro_console_top is
       dbg_cmd_arg      : in  std_logic_vector(31 downto 0) := (others => '0');
       dbg_rsp_data     : out std_logic_vector(31 downto 0);
       dbg_rsp_stb      : out std_logic;
-      dbg_hwstat       : out std_logic_vector(17 downto 0)
+      dbg_hwstat       : out std_logic_vector(17 downto 0);
+      -- Optional synthetic microphone input; defaults to silence for old callers.
+      mic_blow         : in std_logic := '0'
    );
 end entity;
 
 architecture arch of nds_nitro_console_top is
-
-   -- Hardware boot-bisect for the combined Engine-B + writable-firmware
-   -- candidate.  Pearl and Animal Crossing boot with the writable-firmware
-   -- reference RBF, but remain in the BIOS wait loop when palette/OAM writes
-   -- are made lossless H3D transactions in the 99%-full Engine-B fit.  Keep
-   -- every other Engine-B path active while restoring the legacy immediate
-   -- palette/OAM completion.  This constant is intentionally local and must
-   -- be removed (or proven true-safe) after the hardware A/B identifies the
-   -- failing path.
-   constant H3D_PALETTE_OAM_REPLAY : boolean := false;
 
    component nds_nitro_save_profile is
       generic
@@ -519,7 +569,8 @@ architecture arch of nds_nitro_console_top is
    -- the SystemVerilog capture remains the event-format authority.
    function h3d_gpu_write_hit(
       address : std_logic_vector(27 downto 0);
-      be      : std_logic_vector(3 downto 0)) return boolean is
+      be      : std_logic_vector(3 downto 0);
+      engine_b : std_logic) return boolean is
       variable low, lane : integer;
    begin
       if (address(27 downto 13) /= "000000000000000") then
@@ -532,10 +583,11 @@ architecture arch of nds_nitro_console_top is
          when others          => lane := 0;
       end case;
       low := to_integer(unsigned(address(12 downto 2))) * 4 + lane;
-      return (low >= 16#000# and low <= 16#05F#) or
+      return (engine_b = '1' and
+              ((low >= 16#000# and low <= 16#05F#) or
+               (low >= 16#064# and low <= 16#06F#) or
+               (low >= 16#1000# and low <= 16#106F#))) or
              (low >= 16#060# and low <= 16#063#) or
-             (low >= 16#064# and low <= 16#06F#) or
-             (low >= 16#1000# and low <= 16#106F#) or
              (low >= 16#240# and low <= 16#249#) or
              (low >= 16#304# and low <= 16#307#) or
              (low >= 16#320# and low <= 16#3BF#) or
@@ -543,13 +595,16 @@ architecture arch of nds_nitro_console_top is
              (low >= 16#600# and low <= 16#613#);
    end function;
 
+   signal ld_nand_base : std_logic_vector(31 downto 0);
    signal ld_cartid  : std_logic_vector(31 downto 0);  -- header-size chip ID -> nds_card B8
    signal ld_save_is_64k : std_logic;
    signal ld_save_gamecode : std_logic_vector(31 downto 0);
    signal ld_save_gamecode_valid : std_logic;
+   signal save_profile_error : std_logic := '0';
    signal save_profile_busy : std_logic;
    signal save_profile_valid_s : std_logic;
    signal save_profile_type_s : std_logic_vector(3 downto 0);
+   signal save_ir_enable_s : std_logic := '0';
    -- on-FPGA debug unit (nds_debug): CPU hold/release, register read-back and
    -- a main-RAM peek muxed onto the ARM9 channel the same way the loader is
    signal pc9_s, pc7_s         : std_logic_vector(31 downto 0);
@@ -583,6 +638,11 @@ architecture arch of nds_nitro_console_top is
    signal vclr_busy   : std_logic;
    signal pclr_busy_a : std_logic;
    signal pclr_busy_b : std_logic;
+   signal pal_read_data : std_logic_vector(31 downto 0);
+   signal oam_read_data : std_logic_vector(31 downto 0);
+   signal oam_read_busy : std_logic;
+   signal pal_read_busy : std_logic;
+   signal pal_read_busy_meta, pal_read_busy_1x : std_logic := '1';
 
    -- ARM9 clk2x island <-> clk1x world bridge (see the process block below)
    signal cdc_req_wsh, cdc_req_vram, cdc_req_mr   : std_logic := '0';
@@ -604,6 +664,7 @@ architecture arch of nds_nitro_console_top is
    signal io9_lat_1x : proc_bus_gb_type;
    -- island-side capture of the main-RAM request's SWP lock bit (see mr9_lock)
    signal mr9_lock  : std_logic := '0';
+   signal i9_mr_lock : std_logic := '0';
    signal io9_ena   : std_logic := '0';   -- stretched io_bus9.ena, clk1x domain
    signal cdc_dmab_ena_d, dmab_ena_i9   : std_logic := '0';
    signal cdc_cpudone_tgl, cdc_cpudone_tgl_d, cpu9_done_1x : std_logic := '0';
@@ -637,7 +698,8 @@ architecture arch of nds_nitro_console_top is
    signal cp15_dtcm_ena, cp15_dtcm_load : std_logic;
    signal cp15_dtcm_base : std_logic_vector(31 downto 12);
    signal cp15_dtcm_size, cp15_itcm_size : std_logic_vector(4 downto 0);
-   signal bus_cacheable_i, bus_cacheable_d : std_logic;
+   signal bus_cacheable_i, bus_cacheable_d, bus_bufferable_d : std_logic;
+   signal bus_wdenied_d : std_logic;
    signal cache_op_ena, cache_op_busy : std_logic;
    signal cache_op      : std_logic_vector(3 downto 0);
    signal cache_op_addr : std_logic_vector(31 downto 0);
@@ -694,10 +756,27 @@ architecture arch of nds_nitro_console_top is
    signal h3d_gpu_source_access : std_logic_vector(1 downto 0);
    signal h3d_gpu_source_be : std_logic_vector(3 downto 0);
    signal h3d_gpu_source_data : std_logic_vector(31 downto 0);
+   signal gx_readback_enabled, gx_readback_selected, gx_readback_busy : std_logic;
+   signal gx_readback_complete, gx_readback_fence, gx_readback_geometry_write : std_logic;
+   signal gx_readback_request_i : std_logic;
+   signal gx_readback_cpu_read : std_logic;
+   signal gx_readback_cpu_complete, dma_io_read_wait_grant : std_logic;
+   signal gx_test_write : std_logic;
+   signal gx_test_status : std_logic_vector(1 downto 0);
+   signal gx_readback_value, gx_readback_wired : std_logic_vector(31 downto 0);
    signal dma_gx_write_valid, dma_gx_write_ready : std_logic;
+   signal dma_io_capture : std_logic;
+   -- nds_dma9's main-RAM fast lane (see the mem9 mux)
+   signal dma_mr_ok, dma_mr_sel, dma_mr_act : std_logic := '0';
+   signal dma_mr_bus_d, dma_mr_idle1, dma_mr_idle2 : std_logic := '0';
+   signal dma_mr_ena, dma_mr_rnw, dma_mr_pair, dma_mr_done : std_logic;
+   signal dma_mr_addr : std_logic_vector(21 downto 2);
+   signal dma_mr_be : std_logic_vector(3 downto 0);
+   signal dma_mr_wdata : std_logic_vector(31 downto 0);
    signal h3d_vram9_source_valid, h3d_vram9_source_ready : std_logic;
    signal h3d_vram9_needed_by_h3d : std_logic;
    signal h3d_vram9_issue : std_logic;
+   signal h3d_vram9_unposted_pending : std_logic := '0';
    signal h3d_vram9_source_address : std_logic_vector(31 downto 0);
    signal h3d_vram9_source_access : std_logic_vector(1 downto 0);
    signal h3d_vram9_source_be : std_logic_vector(3 downto 0);
@@ -776,6 +855,7 @@ architecture arch of nds_nitro_console_top is
    -- RTC
    signal rtc_wired_out7  : std_logic_vector(31 downto 0);
    signal rtc_wired_done7 : std_logic;
+   signal rtc_native_out7 : std_logic_vector(31 downto 0);
 
    -- sound
    signal snd_wired_out7  : std_logic_vector(31 downto 0);
@@ -807,9 +887,12 @@ architecture arch of nds_nitro_console_top is
    signal dma9_card_trig, dma7_card_trig     : std_logic;
    signal exmem_card7_s                      : std_logic;
    signal cardm_ena                          : std_logic;
-   signal cardm_addr                         : std_logic_vector(26 downto 2);
+   signal cardm_empty_done                   : std_logic := '0';
+   signal cardm_done                         : std_logic;
+   signal cardm_data                         : std_logic_vector(31 downto 0);
+   signal cardm_addr                         : std_logic_vector(28 downto 2);
    signal ld_card_ena                        : std_logic;
-   signal ld_card_addr                       : std_logic_vector(26 downto 2);
+   signal ld_card_addr                       : std_logic_vector(28 downto 2);
    signal irq9_vblank, irq9_hblank, irq9_vcount : std_logic;
    signal dbg_vbl_ena9 : std_logic;
 
@@ -835,6 +918,8 @@ architecture arch of nds_nitro_console_top is
    signal error_cpu7    : std_logic;
    signal cpu7_irq, cpu7_unhalt : std_logic;
    signal cpu7_newhalt : std_logic;
+   signal console_sleep : std_logic := '0';
+   signal sleep9_meta, sleep9 : std_logic := '0';
 
    signal bios_addr  : unsigned(13 downto 2);
    signal bios7_data : std_logic_vector(31 downto 0);
@@ -874,7 +959,7 @@ architecture arch of nds_nitro_console_top is
    signal io_wired_done7, irq_wired_done7, timer_wired_done7 : std_logic;
    signal spi_wired_out7 : std_logic_vector(31 downto 0);
    signal spi_wired_done7 : std_logic;
-   signal irq7_spi : std_logic;
+   signal irq7_spi, irq7_lid : std_logic;
    signal ipc_wired_out7, sys_wired_out7 : std_logic_vector(31 downto 0);
    signal ipc_wired_done7, sys_wired_done7 : std_logic;
    signal tim_wired_out7 : std_logic_vector(31 downto 0);
@@ -923,6 +1008,7 @@ architecture arch of nds_nitro_console_top is
    signal r_objep_dout              : std_logic_vector(31 downto 0);
 
    signal g_bg_addr    : integer range 0 to 131071;
+   signal g_bg_lcdc    : std_logic := '0';
    signal g_obj_addr   : integer range 0 to 65535;
    signal g_bgep_addr  : integer range 0 to 8191;
    signal g_objep_addr : integer range 0 to 2047;
@@ -949,6 +1035,7 @@ architecture arch of nds_nitro_console_top is
    signal linecounter     : integer range 0 to 191;
    signal linecounter_obj : integer range 0 to 191;
    signal drawline, drawObj, line_trigger, hblank_trigger, lcd_phase, gpu_vblank, refpoint_update : std_logic;
+   signal lcd_phase_line : unsigned(8 downto 0);
    signal h3d_frame_pending_level : std_logic_vector(8 downto 0);
    -- Exact renderer-side receipt for the NSMB BG1 parallax problem row.
    signal bg1_scroll_renderer_diag : std_logic_vector(31 downto 0) := (others => '0');
@@ -1011,28 +1098,29 @@ begin
    -- even while DMA owns that bus, so they require the completion toggle.
    h3d_gpu_source_is_cpu <= '0'
       when dma_bus_on = '1' and dma_gx_write_valid = '1' else '1';
-   h3d_gpu_source_valid <= dma_gx_write_valid when dma_bus_on = '1' and
+   h3d_gpu_source_valid <= '1' when gx_readback_fence = '1' else
+      dma_gx_write_valid when dma_bus_on = '1' and
                                                   dma_gx_write_valid = '1' else
-      pal_we when H3D_PALETTE_OAM_REPLAY and pal_we = '1' else
-      oam_we when H3D_PALETTE_OAM_REPLAY and oam_we = '1' else
+      pal_we when (h3d_engine_b_enable = '1') and pal_we = '1' else
+      oam_we when (h3d_engine_b_enable = '1') and oam_we = '1' else
       '1' when (io9_ena = '1' and io9_lat_1x.rnw = '0' and
-                h3d_gpu_write_hit(io9_lat_1x.Adr, io9_lat_1x.bEna)) else '0';
-   h3d_gpu_source_address <=
+                h3d_gpu_write_hit(io9_lat_1x.Adr, io9_lat_1x.bEna, h3d_engine_b_enable)) else '0';
+   h3d_gpu_source_address <= x"00007f0" when gx_readback_fence = '1' else
       std_logic_vector(to_unsigned(16#1000000# + pal_addr * 4, 28))
-         when H3D_PALETTE_OAM_REPLAY and pal_we = '1' else
+         when (h3d_engine_b_enable = '1') and pal_we = '1' else
       std_logic_vector(to_unsigned(16#3000000# + oam_addr * 4, 28))
-         when H3D_PALETTE_OAM_REPLAY and oam_we = '1' else
+         when (h3d_engine_b_enable = '1') and oam_we = '1' else
       io_bus9.Adr;
-   h3d_gpu_source_access <= h3d_access_from_be(pal_be)
-      when H3D_PALETTE_OAM_REPLAY and pal_we = '1' else
+   h3d_gpu_source_access <= "11" when gx_readback_fence = '1' else h3d_access_from_be(pal_be)
+      when (h3d_engine_b_enable = '1') and pal_we = '1' else
       h3d_access_from_be(oam_be)
-         when H3D_PALETTE_OAM_REPLAY and oam_we = '1' else io_bus9.acc;
-   h3d_gpu_source_be <= pal_be
-      when H3D_PALETTE_OAM_REPLAY and pal_we = '1' else
-      oam_be when H3D_PALETTE_OAM_REPLAY and oam_we = '1' else io_bus9.bEna;
-   h3d_gpu_source_data <= pal_din
-      when H3D_PALETTE_OAM_REPLAY and pal_we = '1' else
-      oam_din when H3D_PALETTE_OAM_REPLAY and oam_we = '1' else io_bus9.Din;
+         when (h3d_engine_b_enable = '1') and oam_we = '1' else io_bus9.acc;
+   h3d_gpu_source_be <= "0000" when gx_readback_fence = '1' else pal_be
+      when (h3d_engine_b_enable = '1') and pal_we = '1' else
+      oam_be when (h3d_engine_b_enable = '1') and oam_we = '1' else io_bus9.bEna;
+   h3d_gpu_source_data <= h3d_readback_id when gx_readback_fence = '1' else pal_din
+      when (h3d_engine_b_enable = '1') and pal_we = '1' else
+      oam_din when (h3d_engine_b_enable = '1') and oam_we = '1' else io_bus9.Din;
 
    h3d_vram9_source_address <=
       x"06" & std_logic_vector(dma_vr_addr) & "00" when dma_bus_on = '1' else
@@ -1045,16 +1133,37 @@ begin
    -- held/accepted write as the local VRAM path so the two mirrors cannot
    -- diverge under backpressure.
    h3d_vram9_needed_by_h3d <= '1'
-      when h3d_vram9_source_address(27 downto 24) = x"6" else '0';
+      when h3d_vram9_source_address(27 downto 20) = x"68" or
+           (h3d_engine_b_enable = '1' and
+            h3d_vram9_source_address(27 downto 24) = x"6") else '0';
    -- A posted DMA write becomes an event source only when nds_vram can accept
    -- it on the same edge.  `vram_write_valid` remains held independently, so
    -- a full local write queue cannot deadlock valid behind event ready; wok is
    -- local architectural credit and does not depend on the H3D queue.
    h3d_vram9_source_valid <=
+      '1' when h3d_vram9_unposted_pending = '1' else
       dma_vram_write_valid and ((not vr9_welig) or vr9_wok) and
          h3d_vram9_needed_by_h3d
          when dma_bus_on = '1' else
       vram9_ena and not vram9_rnw and h3d_vram9_needed_by_h3d;
+
+   -- CPU and non-postable DMA requests are pulses, unlike posted DMA valid.
+   -- Their source fields stay held until local VRAM returns done. Retain only
+   -- the request when the event skid is full; accept the local write and the
+   -- event copy together once it has room. No second payload copy is needed.
+   p_vram9_unposted_hold : process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         if reset_boot = '1' or h3d_service_ready = '0' then
+            h3d_vram9_unposted_pending <= '0';
+         elsif h3d_vram9_source_ready = '1' then
+            h3d_vram9_unposted_pending <= '0';
+         elsif vr9_src_ena = '1' and vr9_rnw = '0' and
+               h3d_vram9_needed_by_h3d = '1' then
+            h3d_vram9_unposted_pending <= '1';
+         end if;
+      end if;
+   end process;
 
    h3d_vram7_source_address <= x"06" & std_logic_vector(vram7_addr) & "00";
    h3d_vram7_source_access <= h3d_access_from_be(vram7_be);
@@ -1066,7 +1175,11 @@ begin
    ih3d_events : entity work.nds_h3d_console_event_gate
    generic map
    (
-      SPARSE_HBLANK => true
+      SPARSE_HBLANK => H3D_MATCHED_DISPLAY_TEST = 0,
+      -- Preserve beta.11's 32-entry posting window and empty-queue bypass.
+      -- Engine B On admits additional writes through the same lossless gate.
+      GPU_QUEUE_ADDRESS_BITS => 5,
+      COMPRESS_HBLANK => H3D_COMPRESS_HBLANK
    )
    port map
    (
@@ -1076,6 +1189,7 @@ begin
       timestamp => h3d_timestamp,
       current_frame => h3d_current_frame,
       source_fault => h3d_source_fault,
+      source_fault_reason => h3d_source_fault_reason,
 
       gpu_source_valid => h3d_gpu_source_valid,
       gpu_source_is_cpu => h3d_gpu_source_is_cpu,
@@ -1091,7 +1205,7 @@ begin
       gpu_event_access => h3d_gpu_write_access,
       gpu_event_be => h3d_gpu_write_byte_enable,
       gpu_event_data => h3d_gpu_write_data,
-      gpu_event_frame => h3d_gpu_write_frame,
+      gpu_event_scanline => h3d_gpu_write_scanline,
       gpu_event_timestamp => h3d_gpu_write_timestamp,
 
       vram9_source_valid => h3d_vram9_source_valid,
@@ -1107,7 +1221,7 @@ begin
       vram9_event_access => h3d_vram9_write_access,
       vram9_event_be => h3d_vram9_write_byte_enable,
       vram9_event_data => h3d_vram9_write_data,
-      vram9_event_frame => h3d_vram9_write_frame,
+      vram9_event_scanline => h3d_vram9_write_scanline,
       vram9_event_timestamp => h3d_vram9_write_timestamp,
 
       vram7_source_valid => h3d_vram7_source_valid,
@@ -1123,14 +1237,15 @@ begin
       vram7_event_access => h3d_vram7_write_access,
       vram7_event_be => h3d_vram7_write_byte_enable,
       vram7_event_data => h3d_vram7_write_data,
-      vram7_event_frame => h3d_vram7_write_frame,
+      vram7_event_scanline => h3d_vram7_write_scanline,
       vram7_event_timestamp => h3d_vram7_write_timestamp,
 
       -- Engine A still consumes HBlank locally. The hybrid transport takes a
-      -- sparse, nonblocking timing copy from the same pre-HDMA drawline edge
-      -- so the ARM can reconstruct only the missing Engine B screen.
-      hblank_pulse => drawline,
-      hblank_line => std_logic_vector(vcount_out),
+      -- sparse, nonblocking timing copy from the full LCD phase cadence so it
+      -- includes visible-end and frame-wrap lifecycle points needed by the
+      -- ARM reconstruction of the missing Engine B screen.
+      hblank_pulse => lcd_phase and h3d_engine_b_enable,
+      hblank_line => std_logic_vector(lcd_phase_line),
       hblank_event_valid => h3d_hblank_valid,
       hblank_event_ready => h3d_hblank_ready,
       hblank_event_line => h3d_hblank_line,
@@ -1170,7 +1285,8 @@ begin
                when B_RESET =>
                   resetCpu <= '1';
                   boot_cnt <= 0;
-                  if (nds_on = '1') then
+                  if nds_on = '1' and (fw_boot = '0' or
+                     (bios7_load_done = '1' and bios9_load_done = '1')) then
                      boot_state <= B_SETTLE;
                   end if;
 
@@ -1186,11 +1302,12 @@ begin
                   boot_state <= B_LDWAIT;
 
                when B_LDWAIT =>
-                  if (ld_error = '1') then
+                  if (ld_error = '1' or save_profile_error = '1') then
                      boot_state <= B_ERROR;
                   elsif (ld_done = '1' and ld_busy = '0' and
                          vclr_busy = '0' and pclr_busy_a = '0' and pclr_busy_b = '0' and
-                         backup_run_ready = '1') then
+                         pal_read_busy_1x = '0' and
+                         (backup_run_ready = '1' or cart_present = '0')) then
                      boot_state  <= B_S9RST;
                      boot_cnt    <= 0;
                      ss_bus9.rst <= '1';
@@ -1287,7 +1404,7 @@ begin
                   -- to 0x037F8000 mirror into WRAM7 over the ARM7 stack)
                   if (boot_cnt = 0) then
                      boot_cnt      <= 1;
-                     preset_direct <= direct_boot;
+                     preset_direct <= direct_boot and not fw_boot;
                   end if;
 
                when B_ERROR =>
@@ -1307,8 +1424,12 @@ begin
    (
       clk => clk1x, reset => reset_boot,
       start => ld_start, direct => direct_boot, fw_boot => fw_boot,
+      cart_present => cart_present,
+      profile_valid => profile_valid, profile_addr => profile_addr,
+      profile_data => profile_data, profile_fw_offset => profile_fw_offset,
+      profile_fw_checksums => profile_fw_checksums,
       busy => ld_busy, done => ld_done, load_error => ld_error,
-      arm9_entry => arm9_entry, arm7_entry => arm7_entry, cart_id => ld_cartid,
+      arm9_entry => arm9_entry, arm7_entry => arm7_entry, cart_id => ld_cartid, nand_base => ld_nand_base,
       save_is_64k => ld_save_is_64k,
       save_gamecode => ld_save_gamecode,
       save_gamecode_valid => ld_save_gamecode_valid,
@@ -1320,28 +1441,53 @@ begin
       vfy_bad => dbg_vfy_bad, vfy_addr => dbg_vfy_addr
    );
 
-   isaveprofile : nds_nitro_save_profile
-   generic map
-   (
-      PREFIX_COUNT => 368
-   )
-   port map
-   (
-      clk => clk1x,
-      reset => reset_boot,
-      start => ld_save_gamecode_valid,
-      game_code => ld_save_gamecode,
-      busy => save_profile_busy,
-      valid => save_profile_valid_s,
-      save_type => save_profile_type_s
-   );
+   g_fpga_save_profile : if HOST_SAVE_PROFILE = 0 generate
+   begin
+      save_profile_error <= '0';
+      isaveprofile : nds_nitro_save_profile
+      generic map
+      (
+         PREFIX_COUNT => 368
+      )
+      port map
+      (
+         clk => clk1x,
+         reset => reset_boot,
+         start => ld_save_gamecode_valid,
+         game_code => ld_save_gamecode,
+         busy => save_profile_busy,
+         valid => save_profile_valid_s,
+         save_type => save_profile_type_s
+      );
+
+   end generate;
+   g_host_save_profile : if HOST_SAVE_PROFILE /= 0 generate
+   begin
+      profile : entity work.nds_host_save_profile
+         port map(clk => clk1x, reset => reset_boot, start => ld_save_gamecode_valid,
+                  game_code => ld_save_gamecode, host_valid => host_save_valid,
+                  host_code => host_save_code, host_type => host_save_type,
+                  busy => save_profile_busy, valid => save_profile_valid_s,
+                  save_type => save_profile_type_s, fault => save_profile_error);
+   end generate;
 
    arm9_entry_eff <= x"FFFF0000" when (fw_boot = '1') else arm9_entry;
    arm7_entry_eff <= x"00000000" when (fw_boot = '1') else arm7_entry;
 
    -- card image port: the loader owns it during boot, the slot module after
    -- (the CPUs are in reset while ld_busy, so no ROMCTRL transfer can overlap)
-   card_ena  <= ld_card_ena  when ld_busy = '1' else cardm_ena;
+   card_ena <= '0' when cart_present = '0' else
+               ld_card_ena when ld_busy = '1' else cardm_ena;
+   -- An empty slot completes requested reads with the pulled-up bus value.
+   -- It neither accesses stale staged ROM bytes nor creates external traffic.
+   process(clk1x)
+   begin
+      if rising_edge(clk1x) then
+         cardm_empty_done <= cardm_ena and not cart_present and not resetCpu;
+      end if;
+   end process;
+   cardm_done <= card_done when cart_present = '1' else cardm_empty_done;
+   cardm_data <= card_din when cart_present = '1' else (others => '1');
    card_addr <= ld_card_addr when ld_busy = '1' else cardm_addr;
 
    icard : entity work.nds_card
@@ -1356,23 +1502,45 @@ begin
       clk => clk1x, ce => '1', reset => resetCpu,
       card7 => exmem_card7_s,
       fw_boot => fw_boot,
-      chipid => ld_cartid,
+      chipid => ld_cartid, nand_base => ld_nand_base,
+      rom_addr_mask => card_address_mask,
       bus9 => io_bus9, wired_out9 => card_wired_out9, wired_done9 => card_wired_done9,
       bus7 => io_bus7, wired_out7 => card_wired_out7, wired_done7 => card_wired_done7,
       irq9_xfer => irq9_card, irq7_xfer => irq7_card,
       dma9_card => dma9_card_trig, dma7_card => dma7_card_trig,
       dbg_card => dbg_card_s,
       backup_addr => backup_addr,
+      backup_bank => backup_bank,
       backup_write_data => backup_write_data,
       backup_write_enable => backup_write_enable,
       backup_read_data => backup_read_data,
       backup_write_toggle => backup_write_toggle,
       backup_save_type => save_profile_type_s,
+      backup_ir_enable => save_ir_enable_s,
       backup_access_active => backup_access_active,
       backup_cache_ready => backup_cache_ready,
       card_ena => cardm_ena, card_addr => cardm_addr,
-      card_din => card_din, card_done => card_done
+      card_din => cardm_data, card_done => cardm_done
    );
+
+   -- Cartridge IR transceiver: present when the game code's first character
+   -- is 'I' (melonDS NDSCart.cpp -- (gamecode & 0xFF) == 'I' selects
+   -- CartRetailIR).  ld_save_gamecode is little-endian, so that character is
+   -- bits 7..0.  Latched because ld_save_gamecode_valid is a single pulse.
+   process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         if (reset_boot = '1') then
+            save_ir_enable_s <= '0';
+         elsif (ld_save_gamecode_valid = '1') then
+            if (ld_save_gamecode(7 downto 0) = x"49") then
+               save_ir_enable_s <= '1';
+            else
+               save_ir_enable_s <= '0';
+            end if;
+         end if;
+      end if;
+   end process;
 
    backup_is_64k <= '1' when save_profile_type_s = "0011" else '0';
    backup_save_type <= save_profile_type_s;
@@ -1401,21 +1569,59 @@ begin
    end process;
    dbg_pk_sel <= dbg_pk_ena or dbg_pk_act;
 
+   -- nds_dma9's main-RAM fast lane is the fourth owner, below the loader. It
+   -- may only take the port once the DMA holds the bus AND the ARM9 cache is
+   -- idle: the cache retires a posted write, and releases the CPU at a line
+   -- fill's critical word, before it has finished with nds_mainram, so "CPU
+   -- bus idle" alone does not mean this port is free. With the CPU paused
+   -- nothing can wake the cache again until the DMA lets go. Two samples of
+   -- each, on top of the related-clock crossing, keep a request the cache
+   -- accepted just before the grant from slipping between them.
+   process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         dma_mr_bus_d <= dma_bus_on;
+         if (dbg_cache9(3 downto 0) = "0000") then
+            dma_mr_idle1 <= '1';
+         else
+            dma_mr_idle1 <= '0';
+         end if;
+         dma_mr_idle2 <= dma_mr_idle1;
+         dma_mr_ok    <= dma_bus_on and dma_mr_bus_d and dma_mr_idle1 and
+                         dma_mr_idle2 and not ld_busy and not dbg_pk_sel;
+         if (reset_boot = '1') then
+            dma_mr_act <= '0';
+         elsif (dma_mr_sel = '1' and dma_mr_ena = '1') then
+            dma_mr_act <= '1';
+         elsif (mem9_done = '1') then
+            dma_mr_act <= '0';
+         end if;
+      end if;
+   end process;
+   dma_mr_sel  <= dma_mr_ok and dma_bus_on;
+   dma_mr_done <= mem9_done and dma_mr_act;
+
    mem9_ena       <= (ld_wr_ena and ld_to_main) when ld_busy = '1' else
-                     dbg_pk_ena                 when dbg_pk_sel = '1' else mr9_ena;
+                     dbg_pk_ena                 when dbg_pk_sel = '1' else
+                     dma_mr_ena                 when dma_mr_sel = '1' else mr9_ena;
    mem9_rnw       <= ld_wr_rnw                  when ld_busy = '1' else
-                     '1'                        when dbg_pk_sel = '1' else mr9_rnw;
+                     '1'                        when dbg_pk_sel = '1' else
+                     dma_mr_rnw                 when dma_mr_sel = '1' else mr9_rnw;
    mem9_addr      <= ld_wr_addr(21 downto 2)    when ld_busy = '1' else
-                     dbg_pk_addr_s(21 downto 2) when dbg_pk_sel = '1' else mr9_addr;
+                     dbg_pk_addr_s(21 downto 2) when dbg_pk_sel = '1' else
+                     dma_mr_addr                when dma_mr_sel = '1' else mr9_addr;
    mem9_be        <= "1111"                     when ld_busy = '1' else
-                     "1111"                     when dbg_pk_sel = '1' else mr9_be;
-   mem9_writedata <= ld_wr_data                 when ld_busy = '1' else mr9_writedata;
-   -- Pair mode belongs to the cache alone. The loader writes and the debugger's
-   -- peek both borrow this port, and neither wants two words back - forcing it
-   -- low here means a peek issued mid-fill cannot make nds_mainram wait on a
-   -- done64 that its 32-bit op will never produce.
-   mem9_pair_s    <= mr9_pair when (ld_busy = '0' and dbg_pk_sel = '0') else '0';
-   mr9_done       <= mem9_done and not ld_busy and not dbg_pk_sel;
+                     "1111"                     when dbg_pk_sel = '1' else
+                     dma_mr_be                  when dma_mr_sel = '1' else mr9_be;
+   mem9_writedata <= ld_wr_data                 when ld_busy = '1' else
+                     dma_mr_wdata               when dma_mr_sel = '1' else mr9_writedata;
+   -- Pair mode belongs to the cache and the DMA lane. The loader writes and the
+   -- debugger's peek both borrow this port, and neither wants two words back -
+   -- forcing it low here means a peek issued mid-fill cannot make nds_mainram
+   -- wait on a done64 that its 32-bit op will never produce.
+   mem9_pair_s    <= '0'         when (ld_busy = '1' or dbg_pk_sel = '1') else
+                     dma_mr_pair when dma_mr_sel = '1' else mr9_pair;
+   mr9_done       <= mem9_done and not ld_busy and not dbg_pk_sel and not dma_mr_act;
    mr9_readdata   <= mem9_readdata;
    mr9_readdata_hi <= mem9_readdata_hi_s;
    dbg_pk_done_s  <= mem9_done and dbg_pk_sel;
@@ -1541,21 +1747,15 @@ begin
                acc  => io9_lat_1x.acc,  bEna => io9_lat_1x.bEna,
                rst  => i9_io_bus.rst);
 
-   -- Main-RAM SWP lock, island -> clk1x. Same payload-latch reasoning as io9_lat
-   -- above, but this one was a *timing* bug rather than a functional one, and it
-   -- was the whole worst-path family: `cpu9_lock and not bus_cacheable_d` was
-   -- wired live into nds_mainram's mem9_lock, so nds_mainram's clk1x req9_lock
-   -- flop closed a combinational path that started at the ARM9's register file
-   -- and ran through the shifter, the ALU, the writeback mux, the address mux
-   -- and the CP15 PU region compare - 18.48 ns into a 14.915 ns clk2x->clk1x
-   -- relationship. All 50 paths in the global -npaths 50 report ended here.
+   -- Main-RAM SWP lock, island -> clk1x. The cache supplies the lock belonging
+   -- to this memory request. Sampling the live CPU flags here is incorrect:
+   -- critical-word-first can release the CPU into a SWP while the cache still
+   -- issues background pair fills. A spurious lock makes mainram suppress the
+   -- high half of a pair and corrupts the unfinished cache line.
    --
-   -- Nothing about that was necessary. req9_lock only samples mem9_lock in the
-   -- clk1x cycle where mem9_ena is high, and mem9_ena is mr9_ena - the toggle
-   -- edge-detect above, which cannot fire until at least one clk1x edge AFTER
-   -- the island raised i9_mr_ena. Latching the term in the island at the instant
-   -- the request is launched therefore delivers the identical value with a full
-   -- clk1x period of settling, and turns the crossing into flop -> flop.
+   -- Keep the existing payload latch and settling time across the toggle
+   -- bridge. This adds no request cycles and keeps the CPU/PU combinational
+   -- path out of the clk1x request latch.
    --
    -- dma_bus_on / ld_busy stay live at the port: both are clk1x registers that
    -- hold for the whole burst, so they cost one LUT and no cross-domain cone.
@@ -1565,7 +1765,7 @@ begin
          if (resetCpu = '1') then
             mr9_lock <= '0';
          elsif (i9_mr_ena = '1') then
-            mr9_lock <= cpu9_lock and not bus_cacheable_d;
+            mr9_lock <= i9_mr_lock;
          end if;
       end if;
    end process;
@@ -1638,21 +1838,26 @@ begin
    begin
       if rising_edge(clk1x) then
          if (pal_we = '1' or oam_we = '1') then
-            if (not H3D_PALETTE_OAM_REPLAY or
+            if (not (h3d_engine_b_enable = '1') or
                 h3d_service_ready = '0' or
                 h3d_gpu_cpu_complete = '1') then
                cdc_io_cpl <= not cdc_io_cpl;
             end if;
          elsif (io9_ena = '1') then
-            if (h3d_service_ready = '1' and io9_lat_1x.rnw = '0' and
-                h3d_gpu_write_hit(io9_lat_1x.Adr, io9_lat_1x.bEna)) then
+            if (gx_readback_selected = '1' and io9_lat_1x.rnw = '1') then
+               -- Posting a fence does not retire its waiting CPU read.
+               null;
+            elsif (h3d_service_ready = '1' and io9_lat_1x.rnw = '0' and
+                h3d_gpu_write_hit(io9_lat_1x.Adr, io9_lat_1x.bEna, h3d_engine_b_enable)) then
                if (h3d_gpu_cpu_complete = '1') then
                   cdc_io_cpl <= not cdc_io_cpl;
                end if;
             else
                cdc_io_cpl <= not cdc_io_cpl;
             end if;
-         elsif (h3d_gpu_cpu_complete = '1') then
+         elsif (gx_readback_cpu_complete = '1') then
+            cdc_io_cpl <= not cdc_io_cpl;
+         elsif (h3d_gpu_cpu_complete = '1' and gx_readback_busy = '0') then
             cdc_io_cpl <= not cdc_io_cpl;
          end if;
       end if;
@@ -1700,6 +1905,18 @@ begin
    -- out ports are write-only in VHDL-93; nds_debug reads the internals
    dbg_pc9 <= pc9_s;
    dbg_pc7 <= pc7_s;
+   dbg_mem_probe <= dbg_probe;
+   -- CP15-lite diagnostic snapshot only: reuse the existing address-named
+   -- observation port for packed control. No live CPU9 bus address is exported.
+   -- [14]=fw_boot, [13]=resetCpu, [12]=cpu9_ena, [11]=cpu9_done,
+   -- [10]=cpu9_irq, [9]=cpu9_retire (existing CPU done, not a count),
+   -- [8]=cpu9_halt, [7]=cpu9_bus_idle, [6]=dma_on (CPU HOLD),
+   -- [5:2]=cache_op, [1]=cache_op_busy, [0]=cache_op_ena; [31:15]=0.
+   -- Source domains remain asynchronous; pulse-low samples prove no absence.
+   dbg_cpu9_addr <= "00000000000000000" & fw_boot & resetCpu &
+                    cpu9_ena & cpu9_done & cpu9_irq & cpu9_retire &
+                    cpu9_halt & cpu9_bus_idle & dma_on & cache_op &
+                    cache_op_busy & cache_op_ena;
 
    -- PROBE word (mailbox op 0x0A). Byte 3 is the top-level mux state, which is
    -- what decides whether a cache request ever reaches nds_mainram at all.
@@ -1823,9 +2040,10 @@ begin
    -- The product uses redistributable melonDS FreeBIOS. It provides CpuSet,
    -- CpuFastSet, wait, decompression, and other direct-boot SWIs without
    -- Nintendo BIOS data. It is not a claim of full retail-BIOS equivalence.
-   -- Quartus may infer block memory or logic for this registered constant ROM;
-   -- the fit report, not the source form, is the resource authority.
-   ibios9 : entity work.nds_nitro_freebios9
+   -- Full-size M10K RAM retains the exact one-cycle ROM read contract and can
+   -- receive a private BIOS under reset. Host reloads FreeBIOS for direct boot.
+   ibios9 : entity work.nds_nitro_bootbios9
+   generic map (is_simu => is_simu)
    port map
    (
       -- clk2x, NOT clk1x. The membus presents the accepted BIOS address and
@@ -1833,8 +2051,24 @@ begin
       -- the same one-cycle read contract as the previous registered BIOS RAM.
       clk       => clk2x,
       brom_addr => brom_addr,
-      brom_data => brom_data
+      brom_data => brom_data,
+      reset => reset,
+      load_addr => bios9_load_addr, load_data => bios9_load_data,
+      load_be => bios9_load_be, load_we => bios9_load_we
    );
+
+   -- Sleep stops both CPUs on the DS. NitroSDK's ARM9 sleep call relies on
+   -- that stop during a delay loop; leaving ARM9 running times out its power
+   -- management exchange while ARM7 is asleep. Use the CPU's existing DMA
+   -- pause path so in-flight memory responses are consumed and retained.
+   -- Keep the bus fabric, input and IRQ owners running to deliver lid wake.
+   process(clk2x)
+   begin
+      if rising_edge(clk2x) then
+         if resetCpu = '1' then sleep9_meta <= '0'; sleep9 <= '0';
+         else sleep9_meta <= console_sleep; sleep9 <= sleep9_meta; end if;
+      end if;
+   end process;
 
    icpu9 : entity work.nds_cpu9
    generic map ( is_simu => is_simu )
@@ -1843,6 +2077,7 @@ begin
       clk             => clk2x,
       ce              => '1',
       reset           => resetCpu,
+      cold_boot       => fw_boot,
 -- synthesis translate_off
       cpu_export_done => dbg_export9_done,
       cpu_export      => dbg_export9,
@@ -1868,7 +2103,7 @@ begin
       gb_bus_done     => cpu9_done,
       gb_bus_lock     => cpu9_lock,
       bus_lowbits     => cpu9_lowbits,
-      dma_on          => dma_on,
+      dma_on          => dma_on or sleep9,
       done            => cpu9_retire,
       CPU_bus_idle    => cpu9_bus_idle,
       PC_in_BIOS      => open,
@@ -1891,6 +2126,8 @@ begin
       cp15_itcm_size  => cp15_itcm_size,
       bus_cacheable_i => bus_cacheable_i,
       bus_cacheable_d => bus_cacheable_d,
+      bus_bufferable_d => bus_bufferable_d,
+      bus_wdenied_d   => bus_wdenied_d,
       cache_op_ena    => cache_op_ena,
       cache_op        => cache_op,
       cache_op_addr   => cache_op_addr,
@@ -1901,8 +2138,10 @@ begin
    generic map ( is_simu => is_simu )
    port map
    (
-      clk => clk2x, reset => resetCpu,
+      clk => clk2x, reset => resetCpu, native_mode => fw_boot,
       bus_cacheable_i => bus_cacheable_i, bus_cacheable_d => bus_cacheable_d,
+      bus_bufferable_d => bus_bufferable_d,
+      bus_wdenied_d => bus_wdenied_d,
       cache_op_ena => cache_op_ena, cache_op => cache_op,
       cache_op_addr => cache_op_addr, cache_op_busy => cache_op_busy,
       itcm_ena => cp15_itcm_ena, itcm_load => cp15_itcm_load, itcm_size => cp15_itcm_size,
@@ -1910,6 +2149,7 @@ begin
       dtcm_base => cp15_dtcm_base, dtcm_size => cp15_dtcm_size,
       dma_bus => dma_bus_on,
       cpu_adr => mbus_adr, cpu_rnw => mbus_rnw, cpu_ena => mbus_ena, cpu_code => mbus_code,
+      cpu_lock => cpu9_lock,
       cpu_acc => mbus_acc, cpu_dout => mbus_dout, cpu_lowbits => mbus_low,
       -- cpu_done stays island-native: membus9 and icpu9 are both on clk2x, so the
       -- CPU's own handshake needs no crossing. The clk1x stretch below is only for
@@ -1926,17 +2166,35 @@ begin
       vram_ena => i9_vram_ena, vram_rnw => vram9_rnw, vram_addr => vram9_addr, vram_be => vram9_be,
       vram_din => vram9_din, vram_dout => vram9_dout, vram_done => i9_vram_done,
       pal_we => i9_pal_we, pal_addr => pal_addr, pal_din => pal_din, pal_be => pal_be,
+      pal_readdata => pal_read_data,
       oam_we => i9_oam_we, oam_addr => oam_addr, oam_din => oam_din, oam_be => oam_be,
+      oam_readdata => oam_read_data,
       mr_ena => i9_mr_ena, mr_rnw => mr9_rnw, mr_addr => mr9_addr, mr_be => mr9_be,
       mr_writedata => mr9_writedata, mr_done => i9_mr_done, mr_readdata => mr9_readdata,
       mr_pair => mr9_pair, mr_readdata_hi => mr9_readdata_hi,
+      mr_lock => i9_mr_lock,
       io_ce_next => '1',
       io_bus => i9_io_bus, io_wired_out => io_wired_out9, io_wired_done => i9_io_done,
       dbg_mb => dbg_mb9, dbg_cache => dbg_cache9
    );
 
+   -- A GPU read can wait hundreds of microseconds for the ARM renderer.
+   -- A one-unit HBlank DMA may use independent RAM/IO lanes during that wait;
+   -- the DMA itself qualifies its addresses/count and forbids membus fallback.
+   -- The CPU remains paused and its true response is deferred until the IO
+   -- mux returns. Cache/write-buffer ownership and SWP locks stay respected.
+   dma_io_read_wait_grant <= gx_readback_busy and not gx_readback_fence and
+      not h3d_readback_request and
+      dma_mr_idle1 and dma_mr_idle2 and not ld_busy and not dbg_pk_sel and
+      not cpu9_lock;
+   igx_dma_completion : entity work.nds_h3d_gx_dma_completion
+      port map(clk => clk1x, reset => resetCpu,
+         gx_complete => gx_readback_complete, dma_bus_on => dma_bus_on,
+         cpu_complete => gx_readback_cpu_complete);
+
    -- ARM9 bus mux: the DMA owns the membus while dma_bus_on (CPU paused
-   -- via dma_on and drained via CPU_bus_idle before the grant)
+   -- via dma_on and normally drained via CPU_bus_idle before the grant;
+   -- a qualified GX-wait overlap never asserts dmab_ena)
    mbus_adr  <= dmab_adr  when dma_bus_on = '1' else cpu9_adr;
    mbus_rnw  <= dmab_rnw  when dma_bus_on = '1' else cpu9_rnw;
    mbus_ena  <= dmab_ena_i9 when dma_bus_on = '1' else cpu9_ena;
@@ -1968,7 +2226,9 @@ begin
       trig_gx      => gx_trig,
       gx_write_ready => dma_gx_write_ready,
       gx_write_valid => dma_gx_write_valid,
+      io_write_capture => dma_io_capture,
       cpu_bus_idle => cpu9_bus_idle,
+      io_read_wait_grant => dma_io_read_wait_grant,
       dma_on       => dma_on,
       dma_bus_on   => dma_bus_on,
       dbg_active_channel => dma9_dbg_active_channel,
@@ -2006,6 +2266,16 @@ begin
       vram_fast_welig => vr9_welig,
       vram_fast_wok   => dma_vr_wok_safe,
       vram_write_valid => dma_vram_write_valid,
+      mr_fast_ok       => dma_mr_ok,
+      mr_fast_ena      => dma_mr_ena,
+      mr_fast_rnw      => dma_mr_rnw,
+      mr_fast_addr     => dma_mr_addr,
+      mr_fast_be       => dma_mr_be,
+      mr_fast_wdata    => dma_mr_wdata,
+      mr_fast_pair     => dma_mr_pair,
+      mr_fast_done     => dma_mr_done,
+      mr_fast_rdata    => mem9_readdata,
+      mr_fast_rdata_hi => mem9_readdata_hi_s,
       irq_dma      => irq_dma9
    );
 
@@ -2118,23 +2388,28 @@ begin
       new_halt        => cpu7_newhalt or dbg_hold7 or diagnostic_hold7
    );
 
-   ibios7 : entity work.nds_nitro_freebios7
+   ibios7 : entity work.nds_nitro_bootbios7
+   generic map (is_simu => is_simu)
    port map
    (
       clk       => clk1x,
       bios_addr => bios_addr,
-      bios_data => bios7_data
+      bios_data => bios7_data,
+      reset => reset,
+      load_addr => bios7_load_addr, load_data => bios7_load_data,
+      load_be => bios7_load_be, load_we => bios7_load_we
    );
 
    -- ARM7 bus mux: the DMA owns the membus while dma7_bus_on (CPU paused
    -- via cpu7_pause and drained via cpu7_bus_idle before the grant); the
-   -- sound fetch unit is a second, lower-priority guest - it pauses the
-   -- CPU the same way (snd_bus_req -> cpu7_pause) but only gets the bus
-   -- when DMA7 neither holds nor wants it, and DMA7's grant is held off
-   -- while a sound word is in flight (dma7_idle_ok)
+   -- sound fetch unit pauses the CPU the same way (snd_bus_req ->
+   -- cpu7_pause). A pending refill wins the next free bus grant, and a
+   -- running DMA yields only after a complete read/write unit. This keeps
+   -- long transfers from starving the SPU without splitting a DMA word;
+   -- the CPU remains paused for the whole transfer and any sound refill.
    cpu7_pause   <= dma7_on or snd_bus_req;
-   dma7_idle_ok <= cpu7_bus_idle and not snd_bus_own;
-   snd_bus_ok   <= cpu7_bus_idle and not dma7_on and not dma7_bus_on;
+   dma7_idle_ok <= cpu7_bus_idle and not snd_bus_own and not snd_bus_req;
+   snd_bus_ok   <= cpu7_bus_idle and not dma7_bus_on;
 
    mbus7_adr  <= dmab7_adr  when dma7_bus_on = '1' else
                  sndb7_adr  when snd_bus_own = '1' else cpu7_adr;
@@ -2160,6 +2435,7 @@ begin
       trig_vblank  => gpu_vblank,
       trig_card    => dma7_card_trig,
       cpu_bus_idle => dma7_idle_ok,
+      yield_bus    => snd_bus_req,
       dma_on       => dma7_on,
       dma_bus_on   => dma7_bus_on,
       mb_ena       => dmab7_ena,
@@ -2234,10 +2510,12 @@ begin
    -- ================= IO register banks =================
    io_wired_out9  <= irq_wired_out9 or timer_wired_out9 or ipc_wired_out9 or sys_wired_out9 or
                      tim_wired_out9 or g2d_wired_out or g2db_wired_out or dma_wired_out or
-                     key_wired_out9 or card_wired_out9 or math_read_data or gx_wired_out_eff;
+                     key_wired_out9 or card_wired_out9 or math_read_data or gx_wired_out_eff or
+                     gx_readback_wired;
    io_wired_done9 <= irq_wired_done9 or timer_wired_done9 or ipc_wired_done9 or sys_wired_done9 or
                      tim_wired_done9 or g2d_wired_done or g2db_wired_done or dma_wired_done or
-                     key_wired_done9 or card_wired_done9 or math_selected or gx_wired_done_eff;
+                     key_wired_done9 or card_wired_done9 or math_selected or gx_wired_done_eff or
+                     gx_readback_selected;
    io_wired_out7  <= irq_wired_out7 or timer_wired_out7 or ipc_wired_out7 or sys_wired_out7 or
                      tim_wired_out7 or key_wired_out7 or spi_wired_out7 or card_wired_out7 or
                      rtc_wired_out7 or snd_wired_out7 or dma7_wired_out;
@@ -2245,18 +2523,27 @@ begin
                      tim_wired_done7 or key_wired_done7 or spi_wired_done7 or card_wired_done7 or
                      rtc_wired_done7 or snd_wired_done7 or dma7_wired_done;
 
+   -- Timer overflow outputs are combinational and can remain high when their
+   -- counters are paused at the overflow boundary. Do not turn that frozen
+   -- phase into a new interrupt while the IRQ owner remains live for lid wake.
    irq_in9 <= (0 => irq9_vblank, 1 => irq9_hblank, 2 => irq9_vcount,
-               3 => irp_timer9(0), 4 => irp_timer9(1), 5 => irp_timer9(2), 6 => irp_timer9(3),
+               3 => irp_timer9(0) and not console_sleep,
+               4 => irp_timer9(1) and not console_sleep,
+               5 => irp_timer9(2) and not console_sleep,
+               6 => irp_timer9(3) and not console_sleep,
                8 => irq_dma9(0), 9 => irq_dma9(1), 10 => irq_dma9(2), 11 => irq_dma9(3),
                16 => ipc9_irq_sync, 17 => ipc9_irq_sendempty, 18 => ipc9_irq_recv,
                19 => irq9_card,
                21 => gx_irq_eff,
                others => '0');
    irq_in7 <= (0 => irq7_vblank, 1 => irq7_hblank, 2 => irq7_vcount,
-               3 => irp_timer7(0), 4 => irp_timer7(1), 5 => irp_timer7(2), 6 => irp_timer7(3),
+               3 => irp_timer7(0) and not console_sleep,
+               4 => irp_timer7(1) and not console_sleep,
+               5 => irp_timer7(2) and not console_sleep,
+               6 => irp_timer7(3) and not console_sleep,
                8 => irq_dma7(0), 9 => irq_dma7(1), 10 => irq_dma7(2), 11 => irq_dma7(3),
                16 => ipc7_irq_sync, 17 => ipc7_irq_sendempty, 18 => ipc7_irq_recv,
-               19 => irq7_card, 23 => irq7_spi,
+               19 => irq7_card, 22 => irq7_lid, 23 => irq7_spi,
                others => '0');
 
    irq9_any <= '1' when irq_in9 /= x"00000000" else '0';
@@ -2299,6 +2586,44 @@ begin
    -- from the visible wired-OR while the HPS service is unavailable, restoring
    -- the exact pre-3D open-IO behavior at 0x04000600 and suppressing timing-7
    -- DMA startup.  IRQ mode is reset with the CPUs between sessions.
+   gx_readback_enabled <= h3d_service_ready when H3D_GX_READBACK_ENABLE else '0';
+   gx_readback_cpu_read <= io9_ena and io9_lat_1x.rnw;
+   -- io_bus9.ena already includes acceptance for the held DMA FIFO lane;
+   -- it also covers DMA writes to individual GX command registers.
+   gx_test_write <= io_bus9.ena and not io_bus9.rnw;
+   -- Invalidate at architectural issue, including held DMA GX writes.
+   -- The DMA event lane now also transports ordinary 2D IO: a BGxHOFS,
+   -- palette-control or Engine-B write cannot change a 3D matrix snapshot.
+   -- Apply the geometry/power/status address qualifier to BOTH sources.
+   -- Otherwise NSMB's per-line scroll DMA evicts the matrix cache between
+   -- consecutive reads, creating unnecessary HPS stalls and late HBlank DMA.
+   gx_readback_geometry_write <= '1' when
+      (dma_gx_write_valid = '1' or (io_bus9.ena = '1' and io_bus9.rnw = '0')) and
+      ((unsigned(io_bus9.Adr) >= 16#400# and unsigned(io_bus9.Adr) <= 16#5cb#) or
+       io_bus9.Adr = x"0000600" or io_bus9.Adr = x"0000304") else '0';
+   h3d_readback_request <= gx_readback_request_i;
+   igx_readback : entity work.nds_h3d_gx_readback_owner
+   port map (
+      clk => clk1x, reset => resetCpu, service_ready => gx_readback_enabled,
+      cpu_read => gx_readback_cpu_read, address => io9_lat_1x.Adr,
+      geometry_write => gx_readback_geometry_write,
+      gx_write => gx_test_write, gx_address => io_bus9.Adr,
+      gx_access => io_bus9.acc, gx_data => io_bus9.Din,
+      test_result_bits => gx_test_status,
+      selected => gx_readback_selected, busy => gx_readback_busy,
+      complete => gx_readback_complete, read_data => gx_readback_value,
+      fence_valid => gx_readback_fence,
+      request_valid => gx_readback_request_i, request_ready => h3d_readback_ready,
+      request_id => h3d_readback_id,
+      response_valid => h3d_readback_response, response_id => h3d_readback_response_id,
+      response_status => h3d_readback_status,
+      cache_index => h3d_readback_index, cache_data => h3d_readback_data
+   );
+   -- The fast DMA bus can replace io_bus9 without changing the CPU latch.
+   -- Never OR an old CPU result into a subsequent DMA read of another address.
+   gx_readback_wired <= gx_readback_value when gx_readback_selected = '1' and
+      io_bus9.rnw = '1' and dma_bus_on = '0' else (others => '0');
+
    ih3d_gx : entity work.nds_h3d_gx_status
    port map
    (
@@ -2306,6 +2631,10 @@ begin
       reset => resetCpu,
       service_ready => h3d_service_ready,
       fifo_level => h3d_gx_fifo_level,
+      geometry_busy => h3d_gx_geometry_busy,
+      stack_status => h3d_gx_stack_status,
+      stack_ack => h3d_gx_stack_ack,
+      test_result_bits => gx_test_status,
       gb_bus => io_bus9,
       wired_out => gx_wired_out,
       wired_done => gx_wired_done,
@@ -2317,16 +2646,47 @@ begin
    gx_wired_done_eff <= gx_wired_done and h3d_service_ready;
    gx_irq_eff <= gx_irq and h3d_service_ready;
 
-   -- First playable island deliberately has no wall-clock service.  Keep the
-   -- donor nds_rtc entity in the analyzed closure for provenance, but remove it
-   -- from the product cone.  The serial RTC register still decodes and reads
-   -- zero so ARM7 firmware cannot fall through to an unrelated IO responder.
-   rtc_wired_out7  <= (others => '0');
-   rtc_wired_done7 <= '1' when io_bus7.Adr = x"0000138" else '0';
+   -- A native BIOS boot reads the serial RTC before loading firmware. Seed
+   -- once from the host; guest reset leaves the calendar and edited date intact.
+   irtc : entity work.nds_nitro_rtc
+   port map (
+      clk => clk1x, ce => '1', reset => resetCpu, fw_boot => fw_boot,
+      rtc_seed => rtc_seed, rtc_seed_toggle => rtc_seed_toggle,
+      rtc_datetime => rtc_datetime, date_written => rtc_date_written,
+      bus7 => io_bus7, wired_out7 => rtc_native_out7,
+      wired_done7 => rtc_wired_done7
+   );
+   -- Firmware and direct games share the same retained, host-seeded calendar.
+   rtc_wired_out7 <= rtc_native_out7;
+
+   -- Private Chrono movie measurement only: count actual completed writes to
+   -- the two PCM buffers observed in the software reference and AUDD1 D tags.
+   -- These address windows affect diagnostics alone, never emulation behavior.
+   gsound_stream : if SOUND_STREAM_DIAGNOSTICS /= 0 generate
+      signal permit9 : std_logic;
+   begin
+      permit9 <= not ld_busy and not dbg_pk_sel;
+      watch : entity work.nds_sound_stream_watch
+      generic map (
+         WINDOW0_FIRST_WORD => 16#2584B0# / 4, WINDOW0_WORDS => 30464 / 4,
+         WINDOW1_FIRST_WORD => 16#2672CC# / 4, WINDOW1_WORDS => 30464 / 4
+      )
+      port map (
+         clk => clk1x, reset => resetCpu,
+         permit9 => permit9, req9 => mem9_ena, rnw9 => mem9_rnw,
+         addr9 => mem9_addr, be9 => mem9_be, done9 => mem9_done,
+         permit7 => '1', req7 => mr7_ena, rnw7 => mr7_rnw,
+         addr7 => mr7_addr, be7 => mr7_be, done7 => mr7_done,
+         diagnostic => sound_stream_diagnostic
+      );
+   end generate;
+   gno_sound_stream : if SOUND_STREAM_DIAGNOSTICS = 0 generate
+      sound_stream_diagnostic <= (others => '0');
+   end generate;
 
    gsound : if SOUND_ENABLE /= 0 generate
       isound : entity work.nds_sound
-      generic map ( is_simu => is_simu )
+      generic map ( is_simu => is_simu, DIAGNOSTICS => SOUND_DIAGNOSTICS )
       port map
       (
          clk => clk1x, ce => '1', reset => resetCpu,
@@ -2341,7 +2701,7 @@ begin
          sample_l     => sound_out_left,
          sample_r     => sound_out_right,
          sample_valid => open,
-         snd_enable => open, snd_active => open
+         snd_enable => open, snd_active => open, diagnostic => sound_diagnostic
       );
    end generate;
 
@@ -2360,6 +2720,7 @@ begin
       snd_bus_own     <= '0';
       sndb7_ena       <= '0';
       sndb7_adr       <= (others => '0');
+      sound_diagnostic <= (others => '0');
       sound_out_left  <= (others => '0');
       sound_out_right <= (others => '0');
    end generate;
@@ -2371,17 +2732,19 @@ begin
    (
       clk => clk1x, reset => resetCpu,
       bus7 => io_bus7, wired_out7 => spi_wired_out7, wired_done7 => spi_wired_done7,
-      irq_spi => irq7_spi,
+      irq_spi => irq7_spi, irq_lid => irq7_lid,
+      lid_closed => lid_closed, mic_blow => mic_blow,
       touch_active => touch_active, touch_x => touch_x, touch_y => touch_y,
       fw_addr => fw_addr, fw_req => fw_req, fw_done => fw_done, fw_data => fw_data,
-      fw_wr => fw_wr, fw_wlane => fw_wlane, fw_wdata => fw_wdata
+      fw_wr => fw_wr, fw_wlane => fw_wlane, fw_wdata => fw_wdata,
+      fw_busy => fw_busy, fw_release => fw_release
    );
 
    itimer9 : entity work.gba_timer
    generic map ( is_simu => '0' )
    port map
    (
-      clk => clk1x, ce => '1', reset => resetCpu,
+      clk => clk1x, ce => not console_sleep, reset => resetCpu,
       savestate_bus => ss_bus9, ss_wired_out => open, ss_wired_done => open,
       loading_savestate => '0',
       gb_bus => io_bus9, wired_out => timer_wired_out9, wired_done => timer_wired_done9,
@@ -2394,7 +2757,7 @@ begin
    generic map ( is_simu => '0' )
    port map
    (
-      clk => clk1x, ce => '1', reset => resetCpu,
+      clk => clk1x, ce => not console_sleep, reset => resetCpu,
       savestate_bus => ss_bus7, ss_wired_out => open, ss_wired_done => open,
       loading_savestate => '0',
       gb_bus => io_bus7, wired_out => timer_wired_out7, wired_done => timer_wired_done7,
@@ -2417,14 +2780,15 @@ begin
    isyscnt : entity work.nds_syscnt
    port map
    (
-      clk => clk1x, reset => resetCpu,
+      clk => clk1x, reset => resetCpu, cold_boot => fw_boot,
       bus9 => io_bus9, wired_out9 => sys_wired_out9, wired_done9 => sys_wired_done9,
       bus7 => io_bus7, wired_out7 => sys_wired_out7, wired_done7 => sys_wired_done7,
       preset_direct => preset_direct,
       wramcnt => wramcnt, vramcnt => vramcnt,
       pow_2da => pow_2da, pow_2db => pow_2db, pow_swap => pow_swap,
       exmem_gba7 => open, exmem_card7 => exmem_card7_s, exmem_prio7 => exmem_prio7,
-      halt7 => cpu7_newhalt
+      halt7 => cpu7_newhalt, wake7 => cpu7_unhalt,
+      console_sleep => console_sleep
    );
 
    -- ================= shared memory fabric =================
@@ -2469,26 +2833,20 @@ begin
    -- makes. That also satisfies nds_vram's "cpu9 request overrun" assert: only
    -- one of the two sides can ever have an op outstanding.
    vr9_src_ena <= dma_vr_ena when dma_bus_on = '1' else vram9_ena;
-   -- Reads and FPGA-only BG/OBJ writes retain the legacy request pulse. LCDC
-   -- texture uploads are presented when their H3D event is accepted.
+   -- Commit VRAM locally on the SAME edge that copies its payload into the
+   -- H3D event skid. Waiting for that skid's later output is incorrect for
+   -- posted DMA: it has already retired and may now be driving a read. That
+   -- used to discard 15 of 16 writes in the focused RAM-to-VRAM regression.
+   -- Credit is computed from these live fields independently of cpu9_ena,
+   -- so this introduces no combinational loop through the event sink.
    vr9_ena  <= vr9_src_ena
       when (vr9_rnw = '1' or h3d_service_ready = '0' or
             h3d_vram9_needed_by_h3d = '0') else
-      h3d_vram9_issue;
+      h3d_vram9_source_valid and h3d_vram9_source_ready;
    vr9_rnw  <= dma_vr_rnw  when dma_bus_on = '1' else vram9_rnw;
-   -- When H3D backpressures a write, the event gate owns an atomic copy of
-   -- its complete payload. Feed that same accepted payload to local VRAM so
-   -- the FPGA and melonDS observe one identical architectural write even if
-   -- the shared source bus has already moved on.
-   vr9_addr <= unsigned(h3d_vram9_write_address(23 downto 2))
-      when (h3d_service_ready = '1' and h3d_vram9_issue = '1') else
-      dma_vr_addr when dma_bus_on = '1' else vram9_addr;
-   vr9_be <= h3d_vram9_write_byte_enable
-      when (h3d_service_ready = '1' and h3d_vram9_issue = '1') else
-      dma_vr_be when dma_bus_on = '1' else vram9_be;
-   vr9_din <= h3d_vram9_write_data
-      when (h3d_service_ready = '1' and h3d_vram9_issue = '1') else
-      dma_vr_din when dma_bus_on = '1' else vram9_din;
+   vr9_addr <= dma_vr_addr when dma_bus_on = '1' else vram9_addr;
+   vr9_be <= dma_vr_be when dma_bus_on = '1' else vram9_be;
+   vr9_din <= dma_vr_din when dma_bus_on = '1' else vram9_din;
    vr7_addr <= unsigned(h3d_vram7_write_address(23 downto 2))
       when (h3d_service_ready = '1' and vram7_rnw = '0') else vram7_addr;
    vr7_be <= h3d_vram7_write_byte_enable
@@ -2502,6 +2860,15 @@ begin
    -- Macro-off is byte-for-byte legacy acceptance: an immediate DMA to the
    -- GXFIFO aperture still retires even though timing-7 startup is disabled.
    dma_gx_write_ready <= (not h3d_service_ready) or h3d_gpu_source_ready;
+   -- A DMA IO write lands on io_bus9 through the fast lane, not through
+   -- io9_ena, so the CPU-side capture above never saw it: a game that sets
+   -- its BGxCNT/scroll/affine registers with a VBlank DMA (Mega Man ZX does
+   -- all of them that way) left the HPS mirror with zeros there, and the
+   -- screens it composes showed garbage tiles. Route every DMA write the
+   -- mirror needs through the same held valid/ready lane GXFIFO DMA uses.
+   dma_io_capture <= '1' when h3d_service_ready = '1' and
+                              h3d_gpu_write_hit(dma_io_adr, dma_io_be, h3d_engine_b_enable)
+                     else '0';
 
    -- ================= VRAM + engine A render path =================
    ivram : entity work.nds_vram
@@ -2509,7 +2876,7 @@ begin
    -- ~10 LABs this image does not currently have. See the generic's own comment
    -- in nds_vram; set it false to get the fitting configuration back at the cost
    -- of that test.
-   generic map ( is_simu => is_simu, POSTED_WRITES => true )
+   generic map ( is_simu => is_simu, POSTED_WRITES => true, RD_LINE_BUF => true )
    port map
    (
       clk => clk1x, reset => reset_boot, vramcnt => vramcnt,
@@ -2520,7 +2887,10 @@ begin
       cpu7_be => vr7_be, cpu7_din => vr7_din, cpu7_dout => vram7_dout, cpu7_done => vram7_done,
       srv_req => vsrv_req, srv_rnw => vsrv_rnw, srv_bank => vsrv_bank, srv_addr => vsrv_addr,
       srv_be => vsrv_be, srv_din => vsrv_din, srv_dout => vsrv_dout, srv_done => vsrv_done,
-      rdr_bg_req => r_bg_req, rdr_bg_addr => r_bg_addr,
+      srv_dout_hi => vsrv_dout_hi,
+      srv_seq => vsrv_seq, srv_wide => vsrv_wide, srv_din_hi => vsrv_din_hi,
+      srv_be_hi => vsrv_be_hi, srv_more => vsrv_more,
+      rdr_bg_req => r_bg_req, rdr_bg_addr => r_bg_addr, rdr_bg_lcdc => g_bg_lcdc,
       rdr_bg_dout => r_bg_dout, rdr_bg_done => r_bg_done,
       rdr_bg_accept => r_bg_accept,
       rdr_obj_req => r_obj_req, rdr_obj_addr => r_obj_addr,
@@ -2558,7 +2928,7 @@ begin
       -- Preserve the beta93 real-time raster. Frame-event pressure describes
       -- HPS input admission, not completion of a visible 3D plane; using it
       -- as a clock-enable made beta95/beta96 hide 3D for seconds.
-      ce              => '1',
+      ce              => not console_sleep,
       reset           => resetCpu,
       gb_bus9         => io_bus9,
       wired_out9      => tim_wired_out9,
@@ -2579,6 +2949,7 @@ begin
       line_trigger    => line_trigger,
       hblank_trigger  => hblank_trigger,
       lcd_phase       => lcd_phase,
+      lcd_phase_line  => lcd_phase_line,
       vblank_trigger  => gpu_vblank,
       refpoint_update => refpoint_update,
       vcount_out      => vcount_out,
@@ -2594,7 +2965,7 @@ begin
    -- directly in that branch so its registered H3D seam stays in clk1x.  The
    -- superseded experimental fast branch is retained for diagnostic builds;
    -- it intentionally receives no H3D plane and exports an idle seam.
-   g_gpu2d_a_slow : if GPU_FAST = 0 generate
+   g_gpu2d_a_slow : if GPU2D_A_ENABLE /= 0 and GPU_FAST = 0 generate
    begin
       igpu2d_a : entity work.nds_gpu2d
       generic map ( is_simu => is_simu )
@@ -2606,10 +2977,11 @@ begin
          linecounter_obj => linecounter_obj, drawObj => drawObj,
          line_trigger => line_trigger, hblank_trigger => hblank_trigger,
          vblank_trigger => gpu_vblank, refpoint_update => refpoint_update,
+         extpal_config => vramcnt(55 downto 32),
          line_busy => line_busy, epfill_busy => epfill_busy, clr_busy => pclr_busy_a,
          pal_we => pal_we_a, pal_addr => pal_addr_lo, pal_din => pal_din, pal_be => pal_be,
          oam_we => oam_we_a, oam_addr => oam_addr_lo, oam_din => oam_din, oam_be => oam_be,
-         srv_bg_req => r_bg_req, srv_bg_addr => g_bg_addr,
+         srv_bg_req => r_bg_req, srv_bg_addr => g_bg_addr, srv_bg_lcdc => g_bg_lcdc,
          srv_bg_data => r_bg_dout, srv_bg_done => r_bg_done,
          srv_bg_accept => r_bg_accept,
          srv_obj_req => r_obj_req, srv_obj_addr => g_obj_addr,
@@ -2635,8 +3007,9 @@ begin
       );
    end generate;
 
-   g_gpu2d_a_fast : if GPU_FAST /= 0 generate
+   g_gpu2d_a_fast : if GPU2D_A_ENABLE /= 0 and GPU_FAST /= 0 generate
    begin
+      g_bg_lcdc <= '0';
       h3d_line_request <= '0';
       h3d_line_request_y <= 0;
       h3d_merge_line_start <= '0';
@@ -2672,42 +3045,31 @@ begin
       );
    end generate;
 
-   -- The previous product tap stopped at the CPU table and DMA source. Latch
-   -- the renderer's exact line-30 acceptance/output receipt together with the
-   -- geometry FIFO and DMA ownership on the same sample boundary. On a normal
-   -- frame [14:6] remains the row fingerprint. On a frame with no BG1HOFS write
-   -- since VBlank, replace the old scroll/fingerprint payload with the exact
-   -- actual ARM9 membus owner rather than the CPU's next pending address:
-   --   [23:21] membus FSM state, [20] accepted transaction active,
-   --   [19:13] transaction age, [12] read/write,
-   --   [11:0] accepted address offset.
-   -- The preceding trace established that missed NSMB parallax updates are
-   -- DMA1 HBlank transfers stuck in GRANT with CPU_bus_idle low. This identifies
-   -- the real outstanding access, or proves the idle flag is stale, without
-   -- changing bus arbitration or timing.
-   p_bg1_line30_dma_receipt : process (clk1x)
+   g_no_gpu2d_a : if GPU2D_A_ENABLE = 0 generate
    begin
-      if rising_edge(clk1x) then
-         if (resetCpu = '1') then
-            bg1_scroll_sample_toggle_d <= '0';
-            dbg_bg1_scroll_triplet <= (others => '0');
-         elsif (bg1_scroll_renderer_diag(31 downto 28) = x"F" and
-                bg1_scroll_renderer_diag(27) /= bg1_scroll_sample_toggle_d) then
-            bg1_scroll_sample_toggle_d <= bg1_scroll_renderer_diag(27);
-            if (bg1_scroll_renderer_diag(24) = '0') then
-               dbg_bg1_scroll_triplet <=
-                  bg1_scroll_renderer_diag(31 downto 24) &
-                  dbg_mb9(2 downto 0) & cpu_access_active &
-                  std_logic_vector(cpu_access_age) & cpu_access_rnw &
-                  cpu_access_addr;
-            else
-               dbg_bg1_scroll_triplet <=
-                  bg1_scroll_renderer_diag(31 downto 3) &
-                  dma_on & dma_bus_on & gx_trig;
-            end if;
-         end if;
-      end if;
-   end process;
+      assert H3D_MATCHED_DISPLAY_TEST /= 0
+         report "Engine A drawer removal requires complete ARM frame ownership" severity failure;
+      registers : entity work.nds_gpu2d_register_shadow
+         generic map (is_engine_b => false)
+         port map (clk1x, resetCpu, io_bus9, g2d_wired_out, g2d_wired_done);
+      -- Only private drawer memories disappear. Architectural palette readback,
+      -- VRAM, event capture, LCD/IRQ/DMA timing and frame publication stay live.
+      pclr_busy_a <= '0';
+      line_busy <= '0'; epfill_busy <= '0';
+      r_bg_req <= '0'; r_obj_req <= '0';
+      r_bgep_req <= '0'; r_objep_req <= '0';
+      g_bg_addr <= 0; g_obj_addr <= 0;
+      g_bgep_addr <= 0; g_objep_addr <= 0; g_bg_lcdc <= '0';
+      pxa_x <= 0; pxa_y <= 0; pxa_data <= (others => '0'); pxa_we <= '0';
+      h3d_line_request <= '0'; h3d_line_request_y <= 0;
+      h3d_merge_line_start <= '0'; h3d_merge_line_end <= '0';
+      h3d_merge_pixel_x <= 0; h3d_merge_pixel_y <= 0;
+      bg1_scroll_renderer_diag <= (others => '0');
+   end generate;
+
+   -- Temporary query observation is absent; retain the wrapper port ABI.
+   dbg_bg1_scroll_triplet <= (others => '0');
+   dbg_query_sample_toggle <= '0';
 
    -- ================= engine B =================
    -- register window 0x1000-0x106C: engine B sees the bus with bit 12
@@ -2724,6 +3086,27 @@ begin
 
    -- palette/OAM 2 KB mirrors: low half engine A, high half engine B;
    -- writes are dropped while the owning engine is powered off (melonDS)
+   -- Readback stays in the ARM9 island. IO completion already serializes the
+   -- POWCNT write before the next CPU/DMA palette or OAM access; use the same
+   -- power qualification as the GPU stores. No additional HPS events.
+   palette_readback : entity work.nds_palette_readback
+      generic map (is_simu => is_simu)
+      port map (clk => clk2x, reset => resetCpu, power_a => pow_2da, power_b => pow_2db,
+                addr => pal_addr, we => i9_pal_we, be => pal_be, data => pal_din,
+                q => pal_read_data, clear_busy => pal_read_busy);
+   oam_readback : entity work.nds_palette_readback
+      generic map (is_simu => is_simu, ignore_byte_writes => true)
+      port map (clk => clk2x, reset => resetCpu, power_a => pow_2da, power_b => pow_2db,
+                addr => oam_addr, we => i9_oam_we, be => oam_be, data => oam_din,
+                q => oam_read_data, clear_busy => oam_read_busy);
+   process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         pal_read_busy_meta <= pal_read_busy or oam_read_busy;
+         pal_read_busy_1x <= pal_read_busy_meta;
+      end if;
+   end process;
+
    pal_we_a    <= pal_we when (pal_addr < 256 and pow_2da = '1') else '0';
    pal_we_b    <= pal_we when (pal_addr >= 256 and pow_2db = '1') else '0';
    pal_addr_lo <= pal_addr mod 256;
@@ -2810,6 +3193,8 @@ begin
    pixelb_out_data <= pxb_data_eff when pow_swap = '1' else pxa_data;
    pixelb_out_we   <= pxb_we       when pow_swap = '1' else pxa_we;
 
+   h3d_lcd_phase_raw <= lcd_phase;
+   h3d_lcd_line_raw <= std_logic_vector(lcd_phase_line);
    vblank_out <= gpu_vblank;
 
    -- Per-engine drop exports. The combined `drawline and (busy_a or busy_b)`

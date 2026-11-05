@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""Summarize an existing guarded replay pair; never changes or accepts a patch."""
+import argparse
+import csv
+import hashlib
+import json
+from pathlib import Path
+import struct
+import sys
+
+import numpy as np
+
+
+def sha(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def read(path):
+    return json.loads(path.read_text())
+
+
+def rows(path):
+    with path.open() as stream:
+        return list(csv.DictReader(stream))
+
+
+def audio_stats(a, b):
+    sizes = [p.stat().st_size for p in (a, b)]
+    assert all(size % 4 == 0 for size in sizes)
+    result = dict(stereo_samples=[size // 4 for size in sizes], lengths_equal=sizes[0] == sizes[1])
+    if sizes[0] != sizes[1]:
+        return result  # Never truncate a changed-length recording to declare equality.
+    if not sizes[0]:
+        result['error'] = 'Empty audio is not usable evidence'
+        return result
+    av, bv = [np.memmap(p, dtype='<i2', mode='r').reshape(-1, 2) for p in (a, b)]
+    count, maximum, squares, first, last = 0, 0, 0, None, None
+    for start in range(0, len(av), 262144):
+        delta = av[start:start+262144].astype(np.int64) - bv[start:start+262144].astype(np.int64)
+        changed = np.flatnonzero(np.any(delta != 0, axis=1))
+        if len(changed):
+            if first is None:
+                first = start + int(changed[0])
+            last = start + int(changed[-1])
+        count += len(changed)
+        maximum = max(maximum, int(np.max(np.abs(delta))))
+        squares += int(np.sum(delta * delta))
+    result.update(different_stereo_samples=count, max_signed16_delta=maximum,
+                  rms_delta=(squares / (len(av) * 2)) ** 0.5,
+                  first_sample=first, last_sample=last,
+                  scope='Same-index signed16 samples; no alignment, masking or audibility judgment')
+    return result
+
+
+def guard_stats(path, guards, instruction_guard=None):
+    expected = {}
+    for guard in list(guards) + ([instruction_guard] if instruction_guard else []):
+        base = int(guard['addr'], 0)
+        for offset, value in enumerate(bytes.fromhex(guard['expect'])):
+            at = base + offset
+            assert at not in expected or expected[at] == value
+            expected[at] = value
+    writes, bad, later, observed = 0, 0, 0, set()
+    for ordinal, row in enumerate(rows(path)):
+        assert int(row['ordinal']) == ordinal and row['kind'] == 'write'
+        at, value, width = int(row['address'], 16), int(row['value'], 16), int(row['width'])
+        assert width in (8, 16, 32)
+        actual = value.to_bytes(width // 8, 'little')
+        assert all(at + i in expected for i in range(len(actual)))
+        writes += 1
+        bad += any(expected[at + i] != byte for i, byte in enumerate(actual))
+        later += int(row['frame']) > 0
+        observed.update(range(at, at + len(actual)))
+    result = dict(writes=writes, writes_not_matching_expected_bytes=bad,
+                writes_after_frame0=later, guarded_bytes=len(expected),
+                guarded_bytes_observed=len(observed), trace_sha256=sha(path),
+                instruction_bytes_included=(len(bytes.fromhex(instruction_guard['expect']))
+                                            if instruction_guard else 0),
+                expected_bytes_scope='Declared data guards plus explicitly selected original/replacement instruction bytes',
+                scope='Captured main-RAM bus stores only; not arbitrary host/state-loader/JIT coverage')
+    if instruction_guard is None:
+        result['writes_not_matching_original_bytes'] = bad  # Legacy data-only report.
+    return result
+
+
+RAM_SPACES = {'mainram': (0x02000000, 0x400000),
+              'sharedwram': (0x037f8000, 0x8000), 'arm7wram': (0x03800000, 0x10000)}
+
+
+def checked_autoload_contexts(contexts):
+    """Explicit physical RAM views; unknown aliases and overlapping guards fail."""
+    assert isinstance(contexts, list) and 0 < len(contexts) <= 64
+    checked = []
+    for item in contexts:
+        assert set(item) == {'space', 'addr', 'expect', 'replace'}
+        space = item['space']; base, size = RAM_SPACES[space]
+        address = int(item['addr'], 0)
+        original, replacement = [bytes.fromhex(item[k]) for k in ('expect', 'replace')]
+        assert 8 <= len(original) <= 4096 and len(original) == len(replacement)
+        assert base <= address < address+len(original) <= base+size
+        for old_space, old_address, old_original, _ in checked:
+            assert old_space != space or address+len(original) <= old_address or old_address+len(old_original) <= address
+        checked.append((space, address, original, replacement))
+    return checked
+
+
+def autoload_comparison_rows(contexts):
+    checked_autoload_contexts(contexts)
+    return ''.join(f"{r['addr']} {r['expect']} {r['replace']} autoload {r['space']}\n" for r in contexts)
+
+
+def arm7_comparison_contexts(source, manifest, patch):
+    """Derive both copies from the existing authenticated virtual-ROM loader."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'standalone_host/fmv'))
+    from guest_byte_patch import assemble, read_arm7_autoload
+    assert patch['cpu'] == 'arm7' and patch['target'].startswith('arm7.bin/autoload:')
+    _, admission = assemble(source, manifest, [patch['id']])
+    assert admission['state'] == 'applied_to_virtual_image', admission
+    header = source.read(0, 512)
+    loaded = read_arm7_autoload(source, header, manifest, patch['target'])
+    file_offset, _, initial, _ = struct.unpack_from('<4I', header, 0x30)
+    address = int(patch['addr'], 0)
+    staging = initial + loaded['file_offset']-file_offset + address-loaded['base']
+    target_space = 'sharedwram' if address < 0x03800000 else 'arm7wram'
+    result = [dict(space=space, addr=hex(at), expect=patch['expect'], replace=patch['replace'])
+              for space, at in [('mainram', staging), (target_space, address)]]
+    checked_autoload_contexts(result)
+    return result
+
+
+def normalize_autoload_memory(memory, space, contexts):
+    """Comparison copy only: absent, partial and overwritten contexts remain raw."""
+    base, size = RAM_SPACES[space]
+    assert len(memory) == size
+    result = bytearray(memory); identities = {}
+    for context_space, address, original, replacement in checked_autoload_contexts(contexts):
+        if context_space != space:
+            continue
+        at = address-base; value = memory[at:at+len(original)]
+        identity = 'original' if value == original else 'replacement' if value == replacement else 'unmatched'
+        identities[f'{space}:{hex(address)}'] = identity
+        if identity == 'replacement':
+            for n, (old, new) in enumerate(zip(original, replacement)):
+                if old != new:
+                    result[at+n] = old
+    return result, identities
+
+
+def overlay_comparison_body(context, patch, base_patches=()):
+    """Authenticate a comparison body including explicitly retained patches.
+
+    Admission remains the virtual loader's job. This only derives the exact
+    baseline body for comparison; it never masks retained patches or arbitrary
+    runtime changes. The original full overlay and every replacement are pinned.
+    """
+    assert context['id'] == patch['overlay'] and context['base'] == patch['overlay_ram']
+    path = Path(context['path'])
+    assert sha(path) == context['sha256']
+    body = path.read_bytes()
+    assert context.get('base_patch_ids', []) == [p['id'] for p in base_patches]
+    if not base_patches:
+        assert context['sha256'] == patch['overlay_sha256']
+        return body
+    original = Path(context['original_path'])
+    assert sha(original) == context['original_sha256'] == patch['overlay_sha256']
+    expected = bytearray(original.read_bytes())
+    base = int(patch['overlay_ram'], 0)
+    at = int(patch['addr'], 0) - base
+    candidate = bytes.fromhex(patch['expect'])
+    assert 0 <= at < at + len(candidate) <= len(expected)
+    assert expected[at:at+len(candidate)] == candidate
+    ranges = [(at, at+len(candidate))]; ids = {patch['id']}
+    for retained in base_patches:
+        assert retained['id'] not in ids; ids.add(retained['id'])
+        assert retained['cpu'] == 'arm9' and retained['target'] == 'arm9.overlay'
+        for key in ['overlay', 'overlay_ram', 'overlay_file_id', 'overlay_sha256']:
+            assert retained[key] == patch[key]
+        before, after = (bytes.fromhex(retained[k]) for k in ('expect', 'replace'))
+        first = int(retained['addr'], 0) - base; last = first + len(before)
+        assert 8 <= len(before) <= 4096 and len(before) == len(after)
+        assert 0 <= first < last <= len(expected) and expected[first:last] == before
+        assert all(last <= lo or first >= hi for lo, hi in ranges)
+        ranges.append((first, last)); expected[first:last] = after
+    assert body == expected, 'Comparison context differs from retained patch bytes'
+    return body
+
+
+def retained_overlay_patches(records, patch):
+    """Bind normalization to the same explicit baseline selection in both runs."""
+    ids = records[0].get('base_patch_ids', [])
+    assert ids == records[1].get('base_patch_ids', [])
+    if not ids:
+        return []
+    assert len(ids) == len(set(ids)) and patch['id'] not in ids
+    assert records[0]['manifest_sha256'] == records[1]['manifest_sha256']
+    path = Path(records[0]['manifest'])
+    assert sha(path) == records[0]['manifest_sha256']
+    assert sha(Path(records[1]['manifest'])) == records[1]['manifest_sha256']
+    assert records[0]['admission']['requested'] == sorted(ids)
+    assert records[1]['admission']['requested'] == sorted(ids + [patch['id']])
+    manifest = read(path); patches = {p['id']: p for p in manifest['patches']}
+    assert len(patches) == len(manifest['patches']) and set(ids) <= patches.keys()
+    assert patches[patch['id']] == patch
+    return [patches[i] for i in ids if patches[i]['target'] == 'arm9.overlay' and
+            patches[i]['cpu'] == 'arm9' and patches[i]['overlay'] == patch['overlay']]
+
+
+def normalize_checkpoint(before, after, patch, records):
+    """Normalize only an authenticated complete code body; leave unknown overlays raw."""
+    assert len(before) == len(after) == 0x400000
+    if patch.get('cpu') == 'arm7':
+        contexts = records[0]['autoload_contexts']
+        assert contexts == records[1]['autoload_contexts']
+        original, old_ids = normalize_autoload_memory(before, 'mainram', contexts)
+        result, new_ids = normalize_autoload_memory(after, 'mainram', contexts)
+        assert original == before and 'replacement' not in old_ids.values()
+        assert 'original' not in new_ids.values()
+        return result, [old_ids, new_ids]
+    original, replacement = bytes.fromhex(patch['expect']), bytes.fromhex(patch['replace'])
+    assert len(original) == len(replacement)
+    at = int(patch['addr'], 0) - 0x02000000
+    assert 0 <= at < at + len(original) <= len(before)
+    result = bytearray(after)
+    if patch['target'] != 'arm9.overlay':
+        assert before[at:at+len(original)] == original and result[at:at+len(replacement)] == replacement
+        result[at:at+len(original)] = original
+        return result, ['original', 'replacement']
+    contexts = [r['overlay_context'] for r in records]
+    assert contexts[0] == contexts[1]
+    context = contexts[0]
+    body = overlay_comparison_body(context, patch, retained_overlay_patches(records, patch))
+    base = int(context['base'], 0) - 0x02000000
+    assert 0 <= base <= at < at + len(original) <= base + len(body) <= len(before)
+    relative = at - base
+    assert body[relative:relative+len(original)] == original
+    changed = bytearray(body)
+    changed[relative:relative+len(replacement)] = replacement
+    identities = []
+    for memory in (before, after):
+        loaded = memory[base:base+len(body)]
+        identities.append('original' if loaded == body else 'replacement' if loaded == changed else 'unmatched')
+    assert identities[0] != 'replacement' and identities[1] != 'original'
+    if identities[1] == 'replacement':
+        result[at:at+len(original)] = original
+    return result, identities
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('control', type=Path)
+    parser.add_argument('candidate', type=Path)
+    parser.add_argument('input', type=Path)
+    parser.add_argument('--reuse-unpatched-control', action='store_true',
+                        help='Verify original-stream identity before reusing a control with a different disabled manifest')
+    parser.add_argument('--include-code-write-watch', action='store_true',
+                        help='Validate watched instruction writes against original control/replacement candidate bytes as well as data guards')
+    parser.add_argument('--output', type=Path, required=True)
+    args = parser.parse_args()
+    assert not args.output.exists()
+    records = [read(p.with_name(p.name + '_STATUS.json')) for p in (args.control, args.candidate)]
+    control, candidate = records
+    assert control['state'] == 'passed_replay_equivalence' and control['mode'] == 'off'
+    assert candidate['state'] in ('passed_replay_equivalence', 'rejected_replay_mismatch') and candidate['mode'] == 'on'
+    assert control['scene'] == candidate['scene']
+    inputs = read(args.input)
+    manifest_path = Path(inputs['manifest'])
+    assert sha(manifest_path) == candidate['manifest_sha256'] == inputs['manifest_sha256']
+    manifest = read(manifest_path)
+    assert control['oracle_sha256'] == candidate['oracle_sha256'] == inputs['oracle_sha256']
+    assert control['job'] == candidate['job']
+    reused = control['manifest_sha256'] != candidate['manifest_sha256']
+    if reused:
+        assert args.reuse_unpatched_control, 'Different control manifest needs explicit verified reuse'
+        old_path = Path(control['manifest'])
+        assert sha(old_path) == control['manifest_sha256']
+        old = read(old_path)
+        for key in ['schema_version', 'game_code', 'revision', 'header_sha1', 'header_bytes',
+                    'rom_sha256', 'arm9_sha256', 'arm9_crc32']:
+            assert old[key] == manifest[key], key
+        assert control['admission']['state'] == 'unchanged' and not control['admission']['applied']
+        assert control['virtual_image_sha256'] == manifest['rom_sha256']
+        assert control['oracle_sha256'] == candidate['oracle_sha256'] == inputs['oracle_sha256']
+        assert control['job'] == candidate['job']
+        assert all(control['output_file_equality'].values())
+        assert not any(control['differing_state_frames'].values())
+        assert control['checkpoint_RAM_equal_after_exact_code_normalization']
+        for filename, digest in control['outputs'].items():
+            assert sha(args.control / filename) == digest, filename
+    patch, = [p for p in manifest['patches'] if p['id'] == inputs['patch_id']]
+    if patch['cpu'] == 'arm7':
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'standalone_host/fmv'))
+        from prepare import Source
+        with Path(control['command'][1]).open('rb') as stream:
+            contexts = arm7_comparison_contexts(Source(stream.fileno()), manifest, patch)
+        assert contexts == control['autoload_contexts'] == candidate['autoload_contexts']
+    frame_rows = [rows(p / 'frames.csv') for p in (args.control, args.candidate)]
+    assert len(frame_rows[0]) == len(frame_rows[1]) == control['job']['frames']
+    differences = {key: [] for key in frame_rows[0][0]}
+    for old, new in zip(*frame_rows):
+        assert old['frame'] == new['frame']
+        for key in differences:
+            if old[key] != new[key]:
+                differences[key].append(int(old['frame']))
+    before = (args.control / 'mainram.bin').read_bytes()
+    after, identities = normalize_checkpoint(before, (args.candidate / 'mainram.bin').read_bytes(), patch, records)
+    av, bv = np.frombuffer(before, '<u4'), np.frombuffer(after, '<u4')
+    changed = np.flatnonzero(av != bv)
+    insn = [r['instruction_totals']['arm9_insn'] for r in records]
+    assert control['profile_start_actual'] == candidate['profile_start_actual']
+    result = dict(state='diagnostic_comparison_complete', scene=control['scene'],
+                  patch_id=patch['id'], strict_replay_state=candidate['state'],
+                  frame_count=len(frame_rows[0]), frame_field_differences={k: len(v) for k, v in differences.items()},
+                  different_screen_frames={k: differences[k] for k in ['hash_top', 'hash_bottom']},
+                  audio=audio_stats(args.control/'audio.s16le', args.candidate/'audio.s16le'),
+                  selected_profile_ARM9_instructions=dict(before=insn[0], after=insn[1],
+                      reduction_percent=(insn[0]-insn[1])/insn[0]*100,
+                      first_frame=control['profile_start_actual'], end_frame_exclusive=len(frame_rows[0]),
+                      scope='Software executed instructions; not native cycles or speed'),
+                  checkpoint_mainRAM=dict(different_words_outside_patch=len(changed),
+                      code_identities=identities,
+                      first_words=[dict(address=hex(0x02000000+int(i)*4), before=hex(int(av[i])), after=hex(int(bv[i]))) for i in changed[:20]],
+                      scope='Existing retained mainram.bin checkpoint; no other memory normalized'),
+                  RAM_frame_differences=candidate['differing_state_frames'],
+                  save_exact=sha(args.control/'save.bin') == sha(args.candidate/'save.bin') and candidate['differing_state_frames']['save'] == 0,
+                  table_and_literal_write_watch=({name: guard_stats(path/'ram_bus.csv',patch.get('data_guards',[]),
+                      dict(addr=patch['addr'],expect=patch['expect' if name=='control' else 'replace'])
+                      if args.include_code_write_watch else None)
+                      for name,path in [('control',args.control),('candidate',args.candidate)]}
+                      if patch.get('data_guards') or args.include_code_write_watch else {}),
+                  source_manifest_sha256=inputs['manifest_sha256'], input_sha256=sha(args.input),
+                  analysis_source_sha256=sha(Path(__file__)), accepted=False, native_measured=False,
+                  reused_original_control=reused,
+                  control_reuse_scope='Same original virtual-ROM digest, game identity, oracle, replay job and exact golden outputs; code normalization extent may differ on an unpatched control.' if reused else None,
+                  inputs={str(path): sha(path) for directory in [args.control,args.candidate]
+                      for path in [directory/'frames.csv',directory/'audio.s16le',directory/'state.csv',directory/'code_normalized_state.csv',directory/'mainram.bin',directory/'save.bin']})
+    with args.output.open('x') as stream:
+        json.dump(result, stream, indent=2)
+        stream.write('\n')
+    print(json.dumps({k:result[k] for k in ['scene','frame_field_differences','audio','selected_profile_ARM9_instructions','checkpoint_mainRAM','RAM_frame_differences','save_exact','table_and_literal_write_watch']}))
+
+
+if __name__ == '__main__':
+    main()

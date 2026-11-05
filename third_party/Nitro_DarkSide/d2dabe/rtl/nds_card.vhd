@@ -116,6 +116,9 @@ entity nds_card is
       fw_boot      : in  std_logic := '0';
 
       chipid       : in  std_logic_vector(31 downto 0);  -- nds_loader cart_id, B8 answer
+      -- Stable while a cartridge session runs. Apply the product's image-bank
+      -- mirroring before the secure-area redirect, not only in the DDR bridge.
+      rom_addr_mask : in std_logic_vector(31 downto 0) := x"FFFFFFFF";
 
       bus9         : in  proc_bus_gb_type;
       wired_out9   : out std_logic_vector(31 downto 0);
@@ -142,6 +145,8 @@ entity nds_card is
       -- mounted .sav channel can use its second port without copying through
       -- the CPU or allocating another RAM.
       backup_addr         : out std_logic_vector(19 downto 0) := (others => '0');
+      nand_base           : in std_logic_vector(31 downto 0) := (others => '0');
+      backup_bank         : out std_logic_vector(3 downto 0) := (others => '0');
       backup_write_data   : out std_logic_vector(7 downto 0) := (others => '0');
       backup_write_enable : out std_logic := '0';
       backup_read_data    : in  std_logic_vector(7 downto 0) := (others => '1');
@@ -149,10 +154,16 @@ entity nds_card is
       backup_save_type    : in  std_logic_vector(3 downto 0) := "0010";
       backup_access_active: out std_logic := '0';
       backup_cache_ready  : in  std_logic := '1';
+      -- Cartridge IR transceiver (melonDS CartRetailIR).  Carts whose game
+      -- code starts with 'I' (Pokemon HG/SS, B/W, B2/W2, Active Health) put an
+      -- IR chip on the AUXSPI bus ahead of the save chip, so every transfer
+      -- carries one extra leading command byte: 0x00 passes through to the
+      -- flash, 0x08 reads back the transceiver ID 0xAA.
+      backup_ir_enable    : in  std_logic := '0';
 
       -- staged card image read port (shared with nds_loader, muxed in nds_top)
       card_ena     : out std_logic := '0';
-      card_addr    : out std_logic_vector(26 downto 2) := (others => '0');
+      card_addr    : out std_logic_vector(28 downto 2) := (others => '0');
       card_din     : in  std_logic_vector(31 downto 0);
       card_done    : in  std_logic
    );
@@ -246,6 +257,59 @@ architecture arch of nds_card is
    -- registered request flags (bus pulses arrive with ce)
    signal pop_req    : std_logic;
 
+   -- NAND uses the main cartridge bus, with a 2 KiB program buffer and
+   -- the existing host-backed sector cache. No whole-save FPGA allocation.
+   -- Protocol reference: melonDS CartRetailNAND (GPL-3.0-or-later), GBATEK.
+   signal nand_enabled, nand_selected : std_logic := '0';
+   signal nand_start : std_logic := '0';
+   signal nand_command : std_logic_vector(63 downto 0) := (others => '0');
+   signal nand_window : unsigned(31 downto 0) := (others => '0');
+   signal nand_size : unsigned(31 downto 0);
+   signal nand_wel, nand_page_valid : std_logic := '0';
+   signal nand_page_addr : unsigned(23 downto 0) := (others => '0');
+   type nand_buffer_t is array(0 to 511) of std_logic_vector(31 downto 0);
+   signal nand_buffer : nand_buffer_t;
+   attribute ramstyle : string;
+   attribute ramstyle of nand_buffer : signal is "M10K";
+   signal nand_initializing : std_logic := '1';
+   signal nand_init_pos : unsigned(8 downto 0) := (others => '0');
+   signal nand_buffer_read : std_logic_vector(31 downto 0);
+   signal nand_buffer_pos : unsigned(8 downto 0) := (others => '0');
+   signal nand_buffer_words : natural range 0 to 512 := 0;
+   signal nand_byte : unsigned(10 downto 0) := (others => '0');
+   signal nand_addr : unsigned(23 downto 0) := (others => '0');
+   signal nand_write_data : std_logic_vector(7 downto 0) := (others => '0');
+   signal nand_we, nand_access, nand_commit : std_logic := '0';
+   signal nand_word_write, nand_read_request, nand_word_ready : std_logic;
+   signal nand_bus_data, nand_data, nand_read_word : std_logic_vector(31 downto 0);
+   signal nand_lane : natural range 0 to 3 := 0;
+   signal nand_settle : natural range 0 to 7 := 0;
+   type nand_state_t is (N_IDLE, N_READ_WAIT, N_READ_BYTE, N_READ_DONE,
+                         N_WRITE_WAIT, N_WRITE_BYTE, N_WRITE_GAP);
+   signal nand_state : nand_state_t := N_IDLE;
+   function nand_id_word(i : natural; command : boolean) return std_logic_vector is
+   begin
+      if command then
+         case i is
+            when 0 => return x"9500F1EC";
+            when 1 => return x"00000040";
+            when 6 => return x"A19E00EC";
+            when 7 => return x"35346551";
+            when 8 => return x"31303530";
+            when 9 => return x"0A021919";
+            when others => return x"00000000";
+         end case;
+      else
+         case i is
+            when 0 => return x"A19E00EC";
+            when 1 => return x"35346551";
+            when 2 => return x"31303530";
+            when 3 => return x"0A021919";
+            when others => return x"FFFFFFFF";
+         end case;
+      end if;
+   end function;
+
    -- ================= AUXSPI cartridge backup =================
    -- Save types follow melonDS ROMList: 1=tiny EEPROM, 2..4=regular
    -- EEPROM/FRAM-compatible, 5..7=flash.  The physical memory is one 512-byte
@@ -257,9 +321,13 @@ architecture arch of nds_card is
    signal sram_wd_r   : std_logic_vector(7 downto 0) := (others => '0');
    signal spi_data    : std_logic_vector(7 downto 0) := (others => '0');  -- AUXSPIDATA readback
    signal spi_hold    : std_logic := '0';
-   signal spi_pos     : unsigned(15 downto 0) := (others => '0');
+   -- Only the command/address/dummy prefix needs an exact byte position.
+   -- Saturate after it: wrapping a full-length save read back to zero would
+   -- reinterpret a data byte as a new command. Includes the IR prefix byte.
+   signal spi_pos     : unsigned(2 downto 0) := (others => '0');
    signal spi_busy    : unsigned(9 downto 0) := (others => '0');          -- busy countdown, bit7 readback
    signal sram_cmd    : std_logic_vector(7 downto 0) := (others => '0');
+   signal ir_cmd      : std_logic_vector(7 downto 0) := (others => '0');  -- IR passthrough selector
    signal sram_addr   : unsigned(19 downto 0) := (others => '0');
    signal sram_status : std_logic_vector(7 downto 0) := (others => '0');  -- bit1 = WEL
    signal backup_access_r : std_logic := '0';
@@ -299,14 +367,168 @@ architecture arch of nds_card is
 
 begin
 
-   backup_addr <= std_logic_vector(masked_save_addr(sram_wa_r, backup_save_type)) when
+   backup_bank <= std_logic_vector(nand_addr(23 downto 20)) when nand_enabled = '1' else (others => '0');
+   backup_addr <= std_logic_vector(nand_addr(19 downto 0)) when nand_enabled = '1' else
+                  std_logic_vector(masked_save_addr(sram_wa_r, backup_save_type)) when
                      sram_we_r = '1' else
                   std_logic_vector(masked_save_addr(erase_addr, backup_save_type)) when
                      erase_active = '1' else
                   std_logic_vector(masked_save_addr(sram_addr, backup_save_type));
-   backup_write_data <= sram_wd_r;
-   backup_write_enable <= sram_we_r;
-   backup_access_active <= backup_access_r or erase_active;
+   backup_write_data <= nand_write_data when nand_enabled = '1' else sram_wd_r;
+   backup_write_enable <= nand_we when nand_enabled = '1' else sram_we_r;
+   backup_access_active <= nand_access when nand_enabled = '1' else backup_access_r or erase_active;
+
+   nand_enabled <= '1' when backup_save_type = x"8" or backup_save_type = x"9" else '0';
+   nand_size <= x"00800000" when backup_save_type = x"8" else x"01000000";
+   nand_bus_data <= bus7.Din when card7 = '1' else bus9.Din;
+   nand_word_write <= '1' when reset = '0' and ce = '1' and nand_selected = '1' and
+      state = DATAREADY and word_ready = '1' and romctrl(30) = '1' and
+      nand_command(63 downto 56) = x"81" and
+      ((card7 = '0' and bus9.ena = '1' and bus9.rnw = '0' and bus9.Adr = ADR_DATA) or
+       (card7 = '1' and bus7.ena = '1' and bus7.rnw = '0' and bus7.Adr = ADR_DATA)) else '0';
+   nand_read_request <= '1' when nand_selected = '1' and state = FETCH and romctrl(30) = '0' else '0';
+   nand_word_ready <= not (nand_commit or nand_initializing) when romctrl(30) = '1' else
+                      '1' when nand_command(63 downto 56) /= x"B7" else
+                      '1' when nand_state = N_READ_DONE else '0';
+   nand_data <= (31 downto 30 => '0', 29 => not nand_commit, 28 => nand_wel,
+                 27 downto 22 => '0', 21 => not nand_commit, 20 => nand_wel,
+                 19 downto 14 => '0', 13 => not nand_commit, 12 => nand_wel,
+                 11 downto 6 => '0', 5 => not nand_commit, 4 => nand_wel, 3 downto 0 => '0')
+                when nand_command(63 downto 56) = x"D6" else
+                nand_id_word(to_integer(xferpos), true) when nand_command(63 downto 56) = x"94" else
+                nand_read_word when nand_command(63 downto 56) = x"B7" else (others => '1');
+
+   -- Registered read / single write port: infer block RAM. Sequential reset
+   -- initialization matches melonDS's zeroed 2 KiB staging buffer without a
+   -- parallel array reset. Short writes retain the rest of the staging buffer;
+   -- discard/reset never commit it to the save backing store.
+   process(clk)
+   begin
+      if rising_edge(clk) then
+         nand_buffer_read <= nand_buffer(to_integer(nand_byte(10 downto 2)));
+         if nand_initializing = '1' then
+            nand_buffer(to_integer(nand_init_pos)) <= (others => '0');
+         elsif nand_word_write = '1' and nand_wel = '1' and nand_page_valid = '1' and nand_commit = '0' then
+            nand_buffer(to_integer(nand_buffer_pos)) <= nand_bus_data;
+         end if;
+      end if;
+   end process;
+
+   process(clk)
+      variable addr, offset : unsigned(31 downto 0);
+      variable idword : std_logic_vector(31 downto 0);
+   begin
+      if rising_edge(clk) then
+         nand_we <= '0';
+         if reset = '1' then
+            nand_initializing <= '1'; nand_init_pos <= (others => '0');
+            nand_window <= (others => '0'); nand_wel <= '0';
+            nand_page_valid <= '0'; nand_page_addr <= (others => '0');
+            nand_buffer_pos <= (others => '0'); nand_buffer_words <= 0;
+            nand_byte <= (others => '0'); nand_addr <= (others => '0');
+            nand_write_data <= (others => '0'); nand_access <= '0'; nand_commit <= '0';
+            nand_read_word <= (others => '1'); nand_lane <= 0; nand_settle <= 0;
+            nand_state <= N_IDLE;
+         else
+            if nand_initializing = '1' then
+               if nand_init_pos = 511 then nand_initializing <= '0';
+               else nand_init_pos <= nand_init_pos+1; end if;
+            end if;
+         if nand_enabled = '1' then
+            -- The peripheral runs on clk even if CPU CE is sparse. Request
+            -- strobes are already qualified by the register interface's CE.
+            if nand_start = '1' and nand_commit = '0' then
+               addr := unsigned(nand_command(55 downto 24));
+               case nand_command(63 downto 56) is
+                  when x"B2" =>
+                     nand_window <= addr(31 downto 17) & to_unsigned(0,17);
+                  when x"8B" => nand_window <= (others => '0');
+                  when x"85" =>
+                     if nand_window >= unsigned(nand_base) and nand_window < unsigned(nand_base)+nand_size then
+                        nand_wel <= '1';
+                        nand_buffer_pos <= (others => '0'); nand_buffer_words <= 0;
+                        nand_page_valid <= '0';
+                     end if;
+                  when x"84" =>
+                     nand_page_valid <= '0'; nand_buffer_pos <= (others => '0'); nand_buffer_words <= 0;
+                  when x"81" =>
+                     if nand_wel = '1' and nand_window >= unsigned(nand_base) and
+                        nand_window < unsigned(nand_base)+nand_size and addr >= nand_window and
+                        addr < nand_window+x"00020000" then
+                        if nand_page_valid = '0' then
+                           nand_page_addr <= resize(addr-unsigned(nand_base),24);
+                           nand_page_valid <= '1';
+                        end if;
+                     else nand_page_valid <= '0'; end if;
+                  when x"82" =>
+                     nand_wel <= '0';
+                     if nand_page_valid = '1' and nand_buffer_words /= 0 and
+                        resize(nand_page_addr,32)+2048 <= nand_size-x"00020000" then
+                        nand_addr <= nand_page_addr; nand_byte <= (others => '0');
+                        nand_commit <= '1'; nand_access <= '1'; nand_settle <= 7;
+                        nand_state <= N_WRITE_WAIT;
+                     end if;
+                     nand_page_valid <= '0'; nand_buffer_words <= 0; nand_buffer_pos <= (others => '0');
+                  when others => null;
+               end case;
+            end if;
+            if nand_word_write = '1' and nand_wel = '1' and nand_page_valid = '1' and nand_commit = '0' then
+               nand_buffer_pos <= nand_buffer_pos+1;
+               if nand_buffer_words < 512 then nand_buffer_words <= nand_buffer_words+1; end if;
+            end if;
+            case nand_state is
+               when N_IDLE =>
+                  if nand_read_request = '1' and nand_command(63 downto 56) = x"B7" then
+                     addr := unsigned(nand_command(55 downto 24));
+                     addr(11 downto 0) := addr(11 downto 0)+shift_left(resize(xferpos,12),2);
+                     nand_read_word <= (others => '1');
+                     if nand_window >= unsigned(nand_base) and nand_window /= 0 and
+                        nand_window < unsigned(nand_base)+nand_size and addr >= nand_window and
+                        addr < nand_window+x"00020000" then
+                        nand_addr <= resize(addr-unsigned(nand_base),24); nand_lane <= 0;
+                        nand_access <= '1'; nand_settle <= 7; nand_state <= N_READ_WAIT;
+                     else nand_state <= N_READ_DONE; end if;
+                  end if;
+               when N_READ_WAIT =>
+                  if nand_settle /= 0 then nand_settle <= nand_settle-1;
+                  elsif backup_cache_ready = '1' then nand_state <= N_READ_BYTE; end if;
+               when N_READ_BYTE =>
+                  if backup_cache_ready = '1' then
+                     offset := resize(nand_addr,32);
+                     if offset >= nand_size-x"00020000" then
+                        if offset >= nand_size-2048 and offset < nand_size-2032 then
+                           idword := nand_id_word(to_integer(offset(3 downto 2)),false);
+                           nand_read_word(nand_lane*8+7 downto nand_lane*8) <= idword(to_integer(offset(1 downto 0))*8+7 downto to_integer(offset(1 downto 0))*8);
+                        else nand_read_word(nand_lane*8+7 downto nand_lane*8) <= x"FF"; end if;
+                     else nand_read_word(nand_lane*8+7 downto nand_lane*8) <= backup_read_data; end if;
+                     if nand_lane = 3 then nand_access <= '0'; nand_state <= N_READ_DONE;
+                     else
+                        nand_addr(11 downto 0) <= nand_addr(11 downto 0)+1;
+                        nand_lane <= nand_lane+1; nand_settle <= 7; nand_state <= N_READ_WAIT;
+                     end if;
+                  else nand_state <= N_READ_WAIT; end if;
+               when N_READ_DONE =>
+                  if nand_read_request = '0' then nand_state <= N_IDLE; end if;
+               when N_WRITE_WAIT =>
+                  if nand_settle /= 0 then nand_settle <= nand_settle-1;
+                  elsif backup_cache_ready = '1' then nand_state <= N_WRITE_BYTE; end if;
+               when N_WRITE_BYTE =>
+                  if backup_cache_ready = '1' then
+                     nand_write_data <= nand_buffer_read(to_integer(nand_byte(1 downto 0))*8+7 downto to_integer(nand_byte(1 downto 0))*8);
+                     nand_we <= '1'; nand_state <= N_WRITE_GAP;
+                  else nand_state <= N_WRITE_WAIT; end if;
+               when N_WRITE_GAP =>
+                  if nand_byte = 2047 then
+                     nand_commit <= '0'; nand_access <= '0'; nand_state <= N_IDLE;
+                  else
+                     nand_byte <= nand_byte+1; nand_addr <= nand_addr+1;
+                     nand_settle <= 7; nand_state <= N_WRITE_WAIT;
+                  end if;
+            end case;
+         end if;
+         end if;
+      end if;
+   end process;
 
    own9 <= not card7;
    own7 <= card7;
@@ -373,10 +595,13 @@ begin
       variable v_pfcnt   : integer range 0 to CARDPREFETCH;
       variable v_inflt   : std_logic;
       variable v_spival  : std_logic_vector(7 downto 0);
-      variable v_spipos  : unsigned(15 downto 0);
+      variable v_spipos  : unsigned(2 downto 0);
       variable v_spilast : std_logic;
       variable v_addrbytes : integer range 1 to 3;
+      variable v_eff_pos : unsigned(2 downto 0);
+      variable v_flash   : boolean;
       variable v_next_sram_addr : unsigned(19 downto 0);
+      variable v_pop     : std_logic;
    begin
       if rising_edge(clk) then
 
@@ -386,13 +611,15 @@ begin
          dma7_card <= '0';
          card_ena  <= '0';
          sram_we_r <= '0';
+         nand_start <= '0';
 
-         if (sram_we_r = '1') then
+         if (sram_we_r = '1' or nand_we = '1') then
             backup_write_toggle <= not backup_write_toggle;
          end if;
 
          if (reset = '1') then
 
+            nand_selected <= '0'; nand_command <= (others => '0');
             spicnt     <= (others => '0');
             romctrl    <= (others => '0');
             cmdbytes   <= (others => '0');
@@ -418,6 +645,7 @@ begin
             spi_pos     <= (others => '0');
             spi_busy    <= (others => '0');
             sram_cmd    <= (others => '0');
+            ir_cmd      <= (others => '0');
             sram_addr   <= (others => '0');
             sram_status <= (others => '0');
             backup_access_r <= '0';
@@ -492,10 +720,12 @@ begin
                       (backup_access_r = '0' or backup_cache_ready = '1')) then
                      v_spival := owner_bus.Din(23 downto 16);
                      -- pos/last bookkeeping (melonDS WriteSPIData)
+                     v_spipos := spi_pos;
+                     if (spi_pos /= 7) then
+                        v_spipos := spi_pos + 1;
+                     end if;
                      if (spicnt(6) = '0') then
-                        if (spi_hold = '1') then
-                           v_spipos := spi_pos + 1;
-                        else
+                        if (spi_hold = '0') then
                            v_spipos := (others => '0');
                         end if;
                         v_spilast := '1';
@@ -505,7 +735,6 @@ begin
                         v_spipos := (others => '0');
                         v_spilast := '0';
                      else
-                        v_spipos := spi_pos + 1;
                         v_spilast := '0';
                      end if;
                      spi_pos <= v_spipos;
@@ -518,7 +747,30 @@ begin
                      -- the real 1->0 / FF semantics where melonDS marks its own
                      -- implementation TODO.
                      spi_data <= (others => '0');
-                     if (v_spipos = 0) then
+                     -- ---- cartridge IR transceiver stage (melonDS CartRetailIR)
+                     -- On an IR cart the first byte of every AUXSPI transfer is
+                     -- consumed by the transceiver, not the flash chip, so the
+                     -- save state machine below runs one byte position later.
+                     v_flash   := nand_enabled = '0';
+                     v_eff_pos := v_spipos;
+                     if (backup_ir_enable = '1') then
+                        if (v_spipos = 0) then
+                           ir_cmd <= v_spival;
+                           backup_access_r <= '0';
+                           v_flash := false;          -- melonDS returns 0 here
+                        else
+                           v_eff_pos := v_spipos - 1;
+                           if (ir_cmd /= x"00") then  -- 0x00 = pass through
+                              v_flash := false;
+                              if (ir_cmd = x"08") then
+                                 spi_data <= x"AA";   -- transceiver ID
+                              end if;
+                           end if;
+                        end if;
+                     end if;
+
+                     if (v_flash) then
+                     if (v_eff_pos = 0) then
                         backup_access_r <= '0';
                         if (v_spival = x"04") then
                            sram_status(1) <= '0';                -- write disable
@@ -537,13 +789,13 @@ begin
                            -- address bit and one following byte supplies A7..A0.
                            case sram_cmd is
                               when x"01" =>
-                                 if (v_spipos = 1) then
+                                 if (v_eff_pos = 1) then
                                     sram_status <= (sram_status and x"01") or
                                                    (v_spival and x"0C");
                                  end if;
                               when x"05" => spi_data <= sram_status or x"F0";
                               when x"02" | x"0A" | x"03" | x"0B" =>
-                                 if (v_spipos = 1) then
+                                 if (v_eff_pos = 1) then
                                     v_next_sram_addr := (others => '0');
                                     v_next_sram_addr(7 downto 0) := unsigned(v_spival);
                                     if (sram_cmd = x"0A" or sram_cmd = x"0B") then
@@ -574,7 +826,7 @@ begin
                         else
                            case sram_cmd is
                               when x"01" =>
-                                 if (v_spipos = 1 and
+                                 if (v_eff_pos = 1 and
                                      unsigned(backup_save_type) <= 4) then
                                     sram_status <= (sram_status and x"01") or
                                                    (v_spival and x"0C");
@@ -582,12 +834,12 @@ begin
                               when x"05" => spi_data <= sram_status;
 
                               when x"02" | x"0A" =>
-                                 if (v_spipos <= v_addrbytes) then
+                                 if (v_eff_pos <= v_addrbytes) then
                                     v_next_sram_addr := shift_left(sram_addr, 8);
                                     v_next_sram_addr(7 downto 0) := unsigned(v_spival);
                                     sram_addr <= masked_save_addr(v_next_sram_addr,
                                                                   backup_save_type);
-                                    if (v_spipos = v_addrbytes) then
+                                    if (v_eff_pos = v_addrbytes) then
                                        backup_access_r <= '1';
                                     end if;
                                  elsif (sram_cmd = x"02" or
@@ -604,25 +856,32 @@ begin
                                           sram_wd_r <= v_spival;
                                        end if;
                                     end if;
-                                    sram_addr <= masked_save_addr(sram_addr + 1,
-                                                                  backup_save_type);
+                                    if (unsigned(backup_save_type) >= 5) then
+                                       -- Both flash program (02h) and page write
+                                       -- (0Ah) wrap within the selected 256-byte
+                                       -- page. Reads and EEPROM writes stay linear.
+                                       sram_addr(7 downto 0) <= sram_addr(7 downto 0) + 1;
+                                    else
+                                       sram_addr <= masked_save_addr(sram_addr + 1,
+                                                                     backup_save_type);
+                                    end if;
                                  end if;
                                  if (v_spilast = '1') then
                                     sram_status(1) <= '0';
                                  end if;
 
                               when x"03" | x"0B" =>
-                                 if (v_spipos <= v_addrbytes) then
+                                 if (v_eff_pos <= v_addrbytes) then
                                     v_next_sram_addr := shift_left(sram_addr, 8);
                                     v_next_sram_addr(7 downto 0) := unsigned(v_spival);
                                     sram_addr <= masked_save_addr(v_next_sram_addr,
                                                                   backup_save_type);
-                                    if (v_spipos = v_addrbytes) then
+                                    if (v_eff_pos = v_addrbytes) then
                                        backup_access_r <= '1';
                                     end if;
                                  elsif (sram_cmd = x"0B" and
                                         unsigned(backup_save_type) >= 5 and
-                                        v_spipos = v_addrbytes + 1) then
+                                        v_eff_pos = v_addrbytes + 1) then
                                     spi_data <= (others => '0'); -- fast-read dummy
                                  else
                                     spi_data <= backup_read_data;
@@ -632,12 +891,12 @@ begin
 
                               when x"D8" | x"DB" =>
                                  if (unsigned(backup_save_type) >= 5 and
-                                     v_spipos <= 3) then
+                                     v_eff_pos <= 3) then
                                     v_next_sram_addr := shift_left(sram_addr, 8);
                                     v_next_sram_addr(7 downto 0) := unsigned(v_spival);
                                     sram_addr <= masked_save_addr(v_next_sram_addr,
                                                                   backup_save_type);
-                                    if (v_spipos = 3 and sram_status(1) = '1') then
+                                    if (v_eff_pos = 3 and sram_status(1) = '1') then
                                        if (sram_cmd = x"D8") then
                                           erase_addr <= masked_save_addr(
                                              v_next_sram_addr and x"F0000",
@@ -665,6 +924,7 @@ begin
                            backup_access_r <= '0';
                         end if;
                      end if;
+                     end if;  -- v_flash
                   end if;
 
                elsif (owner_bus.Adr = ADR_ROMCTRL) then
@@ -699,12 +959,19 @@ begin
 
             end if;
 
-            -- data-port pop (owner read, read direction only)
-            pop_req <= '0';
+            -- Consume the data read on its bus edge. Delaying it through a
+            -- register leaves busy set when the next bus transaction starts,
+            -- and can silently discard an adjacent ROMCTRL command.
+            v_pop := '0';
             if (owner_bus.ena = '1' and owner_bus.rnw = '1' and owner_bus.Adr = ADR_DATA and
                 romctrl(30) = '0' and word_ready = '1') then
-               pop_req <= '1';
+               v_pop := '1';
             end if;
+            if (owner_bus.ena = '1' and owner_bus.rnw = '0' and owner_bus.Adr = ADR_DATA and
+                nand_selected = '1' and romctrl(30) = '1' and word_ready = '1') then
+               v_pop := '1';
+            end if;
+            pop_req <= v_pop; -- passive diagnostic history
 
             -- -------- transfer start --------
             if (v_start = '1') then
@@ -782,12 +1049,29 @@ begin
                      if (cmdbytes(63 downto 56) = x"B7") then
                         v_b7    := '1';
                         v_redir := '1';
+                        -- A 256 MiB cart read at 0x10001000 aliases 0x1000,
+                        -- then redirects to 0x8000. Masking only after
+                        -- eff_addr instead exposes the raw header/padding.
+                        v_addr := v_addr and unsigned(rom_addr_mask);
                      elsif (cmdbytes(63 downto 56) = x"B8") then
                         v_b8 := '1';
                      end if;
 
                end case;
 
+               nand_selected <= '0';
+               if nand_enabled = '1' and cmd_mode = "10" then
+                  nand_start <= '1'; nand_command <= cmdbytes;
+                  case cmdbytes(63 downto 56) is
+                     when x"81" | x"82" | x"84" | x"85" | x"8B" | x"94" | x"B2" | x"D6" =>
+                        nand_selected <= '1'; v_b7 := '0';
+                     when x"B7" =>
+                        if nand_window /= 0 or (v_addr >= unsigned(nand_base) and v_addr < unsigned(nand_base)+nand_size) then
+                           nand_selected <= '1'; v_b7 := '0';
+                        end if;
+                     when others => null;
+                  end case;
+               end if;
                cmd_b7    <= v_b7;
                cmd_b8    <= v_b8;
                cmd_redir <= v_redir;
@@ -858,7 +1142,12 @@ begin
                   end if;
 
                when FETCH =>
-                  if (cmd_b7 = '0') then
+                  if nand_selected = '1' then
+                     if nand_word_ready = '1' then
+                        romdata <= nand_data; word_ready <= '1';
+                        dma9_card <= own9; dma7_card <= own7; state <= DATAREADY;
+                     end if;
+                  elsif (cmd_b7 = '0') then
                      if (cmd_b8 = '1') then
                         romdata <= chipid;
                      else
@@ -888,12 +1177,19 @@ begin
                   end if;
 
                when DATAREADY =>
-                  if (pop_req = '1') then
+                  if (v_pop = '1') then
                      word_ready <= '0';
                      v_pos      := xferpos + 1;
                      xferpos    <= v_pos;
                      if (v_pos >= xferlen) then
-                        state <= FINISH;
+                        -- The final read completes this transfer before the
+                        -- next transaction, including its completion IRQ.
+                        busy <= '0';
+                        if (spicnt(14) = '1') then
+                           irq9_xfer <= own9;
+                           irq7_xfer <= own7;
+                        end if;
+                        state <= IDLE;
                      else
                         -- 4 bus cycles per word, +gap2 at 512-byte boundaries
                         if (romctrl(27) = '1') then v_xcyc := to_unsigned(8, 4); else v_xcyc := to_unsigned(5, 4); end if;
@@ -925,7 +1221,7 @@ begin
             if (busy = '1' and cmd_b7 = '1' and v_inflt = '0' and
                 v_pfcnt < CARDPREFETCH and pf_asked < xferlen) then
                card_ena  <= '1';
-               card_addr <= std_logic_vector(eff_addr(b7_addr, cmd_redir)(26 downto 2));
+               card_addr <= std_logic_vector(eff_addr(b7_addr, cmd_redir)(28 downto 2));
                b7_addr   <= b7_addr + 4;
                pf_asked  <= pf_asked + 1;
                v_inflt   := '1';

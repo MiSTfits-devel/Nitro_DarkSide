@@ -20,10 +20,14 @@
 #define GPU_H
 
 #include <memory>
+#include <cstring>
 
 #include "GPU2D.h"
 #include "GPU3D.h"
 #include "NonStupidBitfield.h"
+#ifdef NDS4MISTER_EXPERIMENTAL_FMV_PACKED_COLOR
+#include "FmvPackedColor.h"
+#endif
 
 namespace melonDS
 {
@@ -49,6 +53,12 @@ struct VRAMTrackingSet
             Mapping[i] = 0x8000;
         }
     }
+    void InvalidateMapping(u32 slot) noexcept
+    {
+        // Preserve a remap even if the bank returns before DeriveState runs.
+        // Another consumer may have cleared that bank's shared dirty bits.
+        Mapping[slot] = 0x8000;
+    }
     NonStupidBitField<Size/VRAMDirtyGranularity> DeriveState(const u32* currentMappings, GPU& gpu);
 };
 
@@ -57,6 +67,22 @@ class Renderer;
 class GPU
 {
 public:
+#ifdef NDS4MISTER_EXPERIMENTAL_FMV_PACKED_COLOR
+    ExperimentalFmv::PackedColor FmvPackedColor;
+    bool ApplyPackedColor(unsigned bank, unsigned offset, unsigned bytes)
+    {
+        // LCDC also covers the smaller banks E-I. They have no transaction or
+        // dirty flag here; indexing DirtyAll for them can corrupt a staging
+        // pointer even though PackedColor::Write rejects the bank itself.
+        if (bank >= FmvPackedColor.Armed.size()) return false;
+        const bool converted = FmvPackedColor.Write(bank, offset, bytes, VRAM[bank]);
+        if (!converted && !FmvPackedColor.DirtyAll[bank]) return false;
+        FmvPackedColor.DirtyAll[bank] = false;
+        for (unsigned block = 0; block < 0x20000 / VRAMDirtyGranularity; ++block)
+            VRAMDirty[bank][block] = true;
+        return true;
+    }
+#endif
     explicit GPU(melonDS::NDS& nds, std::unique_ptr<Renderer>&& renderer = nullptr) noexcept;
     ~GPU() noexcept;
     void Reset() noexcept;
@@ -282,6 +308,9 @@ public:
         {
             *(T*)&VRAM[bank][addr] = val;
             VRAMDirty[bank][addr / VRAMDirtyGranularity] = true;
+#ifdef NDS4MISTER_EXPERIMENTAL_FMV_PACKED_COLOR
+            if (FmvReceiverEnabled) ApplyPackedColor(bank, addr, sizeof(T));
+#endif
         }
     }
 
@@ -325,11 +354,17 @@ public:
         {
             VRAMDirty[2][(addr & 0x1FFFF) / VRAMDirtyGranularity] = true;
             *(T*)&VRAM_C[addr & 0x1FFFF] = val;
+#ifdef NDS4MISTER_EXPERIMENTAL_FMV_PACKED_COLOR
+            if (FmvReceiverEnabled) ApplyPackedColor(2, addr & 0x1FFFF, sizeof(T));
+#endif
         }
         if (mask & (1<<3))
         {
             VRAMDirty[3][(addr & 0x1FFFF) / VRAMDirtyGranularity] = true;
             *(T*)&VRAM_D[addr & 0x1FFFF] = val;
+#ifdef NDS4MISTER_EXPERIMENTAL_FMV_PACKED_COLOR
+            if (FmvReceiverEnabled) ApplyPackedColor(3, addr & 0x1FFFF, sizeof(T));
+#endif
         }
         if (mask & (1<<4))
         {
@@ -425,6 +460,9 @@ public:
         {
             VRAMDirty[2][(addr & 0x1FFFF) / VRAMDirtyGranularity] = true;
             *(T*)&VRAM_C[addr & 0x1FFFF] = val;
+#ifdef NDS4MISTER_EXPERIMENTAL_FMV_PACKED_COLOR
+            if (FmvReceiverEnabled) ApplyPackedColor(2, addr & 0x1FFFF, sizeof(T));
+#endif
         }
         if (mask & (1<<7))
         {
@@ -436,6 +474,59 @@ public:
             VRAMDirty[8][(addr & 0x3FFF) / VRAMDirtyGranularity] = true;
             *(T*)&VRAM_I[addr & 0x3FFF] = val;
         }
+    }
+
+
+    // Ordered external replay can avoid invalidating a bank for a write
+    // whose bytes already match. Compare each physical target separately:
+    // the OR of overlapping read mappings is not proof that each bank matches.
+    // The caller guarantees an aligned access within one dirty block.
+    template<typename T>
+    u32 WriteVRAM_BBGChanged(u32 addr, T val)
+    {
+        const u32 mask = VRAMMap_BBG[(addr >> 14) & 0x7];
+        u32 changed = 0;
+        const auto write = [&](u32 bank, u8* bytes, u32 offset) {
+            // Fixed-width comparisons keep this tiny operation inlined on
+            // Cortex-A9; the generic byte comparison calls __memcmpeq.
+            // memcpy retains the four-byte alignment allowed for word pairs.
+            static_assert(sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8);
+            bool equal;
+            if constexpr (sizeof(T) == 2)
+            {
+                u16 oldValue, newValue;
+                std::memcpy(&oldValue, bytes + offset, sizeof(oldValue));
+                std::memcpy(&newValue, &val, sizeof(newValue));
+                equal = oldValue == newValue;
+            }
+            else if constexpr (sizeof(T) == 4)
+            {
+                u32 oldValue, newValue;
+                std::memcpy(&oldValue, bytes + offset, sizeof(oldValue));
+                std::memcpy(&newValue, &val, sizeof(newValue));
+                equal = oldValue == newValue;
+            }
+            else
+            {
+                u32 oldValue[2], newValue[2];
+                std::memcpy(oldValue, bytes + offset, sizeof(oldValue));
+                std::memcpy(newValue, &val, sizeof(newValue));
+                equal = oldValue[0] == newValue[0] && oldValue[1] == newValue[1];
+            }
+            if (equal) return;
+            std::memcpy(bytes + offset, &val, sizeof(T));
+            VRAMDirty[bank][offset / VRAMDirtyGranularity] = true;
+            changed |= 1u << bank;
+        };
+        if (mask & (1u << 2)) write(2, VRAM_C, addr & 0x1FFFF);
+#ifdef NDS4MISTER_EXPERIMENTAL_FMV_PACKED_COLOR
+        if (FmvReceiverEnabled && (mask & (1u << 2)) &&
+            ApplyPackedColor(2, addr & 0x1FFFF, sizeof(T)))
+            changed |= 1u << 2;
+#endif
+        if (mask & (1u << 7)) write(7, VRAM_H, addr & 0x7FFF);
+        if (mask & (1u << 8)) write(8, VRAM_I, addr & 0x3FFF);
+        return changed;
     }
 
 
@@ -463,6 +554,9 @@ public:
         {
             VRAMDirty[3][(addr & 0x1FFFF) / VRAMDirtyGranularity] = true;
             *(T*)&VRAM_D[addr & 0x1FFFF] = val;
+#ifdef NDS4MISTER_EXPERIMENTAL_FMV_PACKED_COLOR
+            if (FmvReceiverEnabled) ApplyPackedColor(3, addr & 0x1FFFF, sizeof(T));
+#endif
         }
         if (mask & (1<<8))
         {
@@ -569,6 +663,7 @@ public:
         addr &= 0x7FF;
 
         *(T*)&OAM[addr] = val;
+        MarkSpriteOAMWritten(addr, sizeof(T));
         OAMDirty |= 1 << (addr / 1024);
     }
 
@@ -641,6 +736,11 @@ public:
 
     u32 CaptureCnt;
     bool CaptureEnable;
+#ifdef NDS4MISTER_EXPERIMENTAL_FMV_PACKED_COLOR
+    // Selected once, before replay, for a verified virtual movie cartridge.
+    // Keep the receiver call out of ordinary games' VRAM-write paths.
+    bool FmvReceiverEnabled = false;
+#endif
 
     alignas(u64) u8 Palette[2*1024] {};
     alignas(u64) u8 OAM[2*1024] {};
@@ -681,6 +781,25 @@ public:
     melonDS::GPU3D GPU3D;
 
     NonStupidBitField<128*1024/VRAMDirtyGranularity> VRAMDirty[9] {};
+    // Changes whenever the coherent B OBJ bytes may have changed.
+    u64 BOBJCoherencyEpoch = 0;
+    // Off for arbitrary external users that can mutate the public OAM array.
+    // Opt in only when every writer uses WriteOAM or marks its direct writes.
+    bool SpriteOAMWritesTracked = false;
+    u64 SpriteOAMWriteEpoch = 0;
+    void SetSpriteOAMWriteTracking(bool tracked) noexcept
+    {
+        if (SpriteOAMWritesTracked != tracked)
+        {
+            SpriteOAMWritesTracked = tracked;
+            ++SpriteOAMWriteEpoch;
+        }
+    }
+    void MarkSpriteOAMWritten(u32 offset, u32 size) noexcept
+    {
+        if (SpriteOAMWritesTracked && size && offset < sizeof(OAM))
+            ++SpriteOAMWriteEpoch;
+    }
     u64 ExternalRenderMemorySequence = 0;
     u64 ExternalRenderVRAMRevision[9] {};
     u64 ExternalRenderPaletteRevision[4] {};
@@ -712,6 +831,7 @@ public:
     }
     void MarkExternalRenderOAM(u32 offset, u32 size) noexcept
     {
+        MarkSpriteOAMWritten(offset, size);
         if (!size) return;
         const u64 revision = ++ExternalRenderMemorySequence;
         const u32 first = offset / VRAMDirtyGranularity;
@@ -907,6 +1027,24 @@ struct RendererSettings
     // engine on ARM. Skipping engine A also prevents this auxiliary scanline
     // pass from waiting on or restarting the independent 3D raster worker.
     bool EngineBOnly = false;
+
+    // Independent pixel policy for MiSTer's EngineBOnly replay. Disabling B
+    // output must preserve register timing and display-capture VRAM effects.
+    // Ordinary frontends retain their existing rendering by default.
+    bool EngineBPixelsEnabled = true;
+
+    // Cache only B composition in the paired-screen diagnostic renderer.
+    // Sprite preparation still runs at its ordinary phase. Unlike LineCache,
+    // this never requests a future 3D row from the preceding sprite phase.
+    bool PairedBCache = false;
+
+    // Matched MiSTer single-engine mode: draw A and mirror its completed
+    // output on both physical screens. Preserve LCD lifecycle and capture.
+    bool EngineAOnly = false;
+
+    // Opt-in paired composition reuse based on exact prepared sprite pixels.
+    // Sprite preparation still runs at its original phase.
+    bool PreparedSpriteLineReuse = false;
 };
 
 struct ExternalRendererStageProfile
@@ -930,6 +1068,8 @@ struct ExternalRendererStageProfile
     u64 ParallelSleepFallbacks = 0;
     u64 EngineBMaxNs = 0;
     u64 SpritesBMaxNs = 0;
+    u64 EngineBPixelLines = 0;
+    u64 EngineBSpriteLines = 0;
     u64 CompositeFastLines[2] {};
     u64 CompositeMixedLines[2] {};
     u64 CompositeSlowLines[2] {};
@@ -955,6 +1095,10 @@ struct ExternalRendererStageProfile
     u64 ThreeDBandQueueJobs = 0;
     u64 ThreeDBandQueueAdvancedScanlines = 0;
     u64 ThreeDBandQueueShadowFallbackFrames = 0;
+    u64 ThreeDXPartitionFrames = 0;
+    u64 ThreeDXPartitionSplitTotal = 0;
+    u64 ThreeDXPartitionSplitMin = 0;
+    u64 ThreeDXPartitionSplitMax = 0;
     u64 ThreeDRasterCancelRequests = 0;
     u64 ThreeDRasterCanceledFrames = 0;
     u64 ThreeDRasterRecoveryFrames = 0;
@@ -996,6 +1140,10 @@ public:
 
     virtual void SetRenderSettings(RendererSettings& settings) = 0;
 
+    // Caller owns both full-size native output planes until explicitly detached.
+    // Only the replay owner may attach/detach, between completed scanlines.
+    virtual bool SetExternalFramebuffers(u32* top, u32* bottom)
+        { (void)top; (void)bottom; return false; }
     virtual void DrawScanline(u32 line) = 0;
     virtual void DrawSprites(u32 line) = 0;
     virtual void SetExternalLineCacheReuse(u32 line, bool engineA,
@@ -1022,6 +1170,11 @@ public:
     // if the renderer uses RAM buffers, they should be 32-bit BGRA, 256x192 for each screen
     virtual bool GetFramebuffers(void** top, void** bottom) = 0;
     virtual u32* Get3DScanline(u32 line) { (void)line; return nullptr; }
+    // Diagnostic-only observation of the input already consumed by 2D.
+    // Unlike Get3DScanline, this must not consume another scanline token.
+    virtual const u32* GetLastComposited3DLine() const { return nullptr; }
+    virtual bool DumpCompleted3DInputs(const char*) const { return false; }
+    virtual void Record3DPalettePhase215() {}
     virtual bool Is3DFrameIdentical() const { return false; }
     virtual bool Get3DNativeBufferHashes(u64 hashes[3]) const
         { (void)hashes; return false; }
