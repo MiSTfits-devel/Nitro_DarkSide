@@ -25,3 +25,5 @@ Saves and settings carry over.
 ## Credits
 
 Thanks to the MiSTer community, FPGAzumSpass, Nitro_DarkSide, melonDS, heni, InsaneFriend, Corn, skmp and apeekaboo. No ROMs, BIOS files or saves are included.
+
+The original Nitro_DarkSide work by Heni includes the ARM9 CPU, FPGA 2D engines, memory/VRAM fabric, DMA and system integration; SplashDev88's NDS4MiSTer adds the ARM-assisted 3D renderer and the public release line. This repository joins both histories; see [PROVENANCE.md](PROVENANCE.md).
