@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Sarah Truffle
+#
+# Standalone fit of the generated Clash flat-triangle top. No pins: this measures
+# logic utilisation and the register-to-register timing of the block itself.
+
+set_global_assignment -name FAMILY "Cyclone V"
+set_global_assignment -name DEVICE 5CSEBA6U23I7
+set_global_assignment -name TOP_LEVEL_ENTITY topEntity
+set_global_assignment -name VERILOG_FILE nds_gpu3d_flat.v
+set_global_assignment -name SDC_FILE NDS_FLAT.sdc
+set_global_assignment -name NUM_PARALLEL_PROCESSORS 4
+# Logic-only fit: no board pins are assigned, so make every port virtual.
+set_instance_assignment -name VIRTUAL_PIN ON -to *

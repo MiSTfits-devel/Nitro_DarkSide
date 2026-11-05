@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE quartzProject PUBLIC "-//www.altera.com/DTD/quartusProject" "http://www.altera.com/DTD/quartusProject.dtd">
+<quartusProject version="1.0">
+ <project revision="NDS_FLAT" name="NDS_FLAT">
+  <platform name="Cyclone V"/>
+ </project>
+</quartusProject>

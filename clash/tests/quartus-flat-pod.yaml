@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Standalone Quartus fit of the generated Clash flat-triangle top.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nds-quartus-flat
+  labels:
+    app: nds-quartus-flat
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/arch: amd64
+  containers:
+  - name: quartus
+    image: raetro/quartus:17.0
+    command: ["/bin/bash", "-c"]
+    args:
+      - |
+        set -u
+        rm -rf /work/src /work/exitcode
+        mkdir -p /work/src
+        echo "waiting for source..."
+        while [ ! -f /work/src/.ready ]; do sleep 2; done
+        cd /work/src
+        P=$(cat .parallel 2>/dev/null || echo 1)
+        sed -i "s/NUM_PARALLEL_PROCESSORS 1/NUM_PARALLEL_PROCESSORS ${P}/" NDS_FLAT.qsf
+        echo "=== quartus_sh --flow compile NDS_FLAT (parallel=${P}) ==="
+        quartus_sh --flow compile NDS_FLAT
+        rc=$?
+        echo "=== flow finished, exit ${rc} ==="
+        cat "output_files/NDS_FLAT.fit.summary" 2>/dev/null || true
+        cat "output_files/NDS_FLAT.sta.summary" 2>/dev/null || true
+        echo ${rc} > /work/exitcode
+        sleep infinity
+    resources:
+      requests:
+        cpu: "1"
+        memory: 8Gi
+      limits:
+        cpu: "12"
+        memory: 24Gi
+    volumeMounts:
+    - name: work
+      mountPath: /work
+  volumes:
+  - name: work
+    persistentVolumeClaim:
+      claimName: nds-quartus-flat-work
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nds-quartus-flat-work
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 20Gi
