@@ -44,3 +44,38 @@ Differential fuzzers (deterministic, `SEED`-driven):
 
 The isolated dirty-tree Quartus integration build is
 `clash/tests/remote_quartus_integration.sh` (default pod: `nds-quartus-clash-9`).
+
+## 3D inversion
+
+The 3D path is moving into Clash and the 2D path is moving to the ARM; see
+[the inversion plan](../docs/GPU3D_CLASH.md). The first block is the exact
+melonDS edge walk in `src/Nds/Gpu3D/Slope.hs`, gated on the host by
+`tests/run_slope_check.sh`. The flat triangle fill is `src/Nds/Gpu3D/Raster.hs`,
+gated by `tests/run_raster_check.sh`. The streaming top is
+`src/Nds/Gpu3D/Flat.hs`, gated under Clash simulation by
+`tests/run_flat_check.sh`, with the exhaustive row-union gate in
+`tests/run_flat_property.sh` and the reciprocal-table gate in
+`tests/run_recip_check.sh`. The depth interpolator is `src/Nds/Gpu3D/Depth.hs`,
+gated by `tests/run_depth_check.sh` against the production `Interpolator` and
+`Slope` classes. `Nds.Gpu3D.Flat` carries FinalZ and the raw depth-interpolator
+endpoints on every span; its gate compares every expanded pixel against
+`rasterTriFinalDepth`. `Nds.Gpu3D.Frame` is the depth-tested frame model;
+`tests/run_frame_check.sh` renders directed and seeded random frames through the
+production `RenderFrame` and compares all 49,152 pixels on colour and final
+depth. `Nds.Gpu3D.DepthPipe` is the streaming depth engine (Clash top
+`nds_gpu3d_depth`); `tests/run_depth_pipe_check.sh` runs it against a
+behavioural memory and compares the framebuffer and every depth word.
+`tests/run_pixel_gate.sh` type-checks every module, runs the cheap checks
+first and the melonDS oracle gates last. No Quartus build is attempted until those
+gates are green.
+
+The native toolchain is `stack` with `stack.yaml` (GHC 9.6.6, Clash 1.8.4). The
+gate needs no Clash install: the pure model is base-only. Synthesis uses
+`stack exec clash -- --verilog ...`; the checked-in results are
+`rtl/nds_gpu3d_slope.v` and `rtl/nds_gpu3d_flat.v`.
+
+`tools/gx3d_oracle` is the headless melonDS raster oracle. It constructs
+polygons directly, calls the production `SoftRenderer3D::RenderFrame`, and writes
+the 256x192 RGBA buffer, so the Clash rasteriser can be compared against the
+same code the hybrid core runs. `tools/gx3d_oracle/gen_main.py` generates the
+oracle from the vendored headers so layout constants cannot be retyped wrong.
