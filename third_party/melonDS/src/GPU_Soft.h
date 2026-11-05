@@ -70,6 +70,14 @@ public:
         return StageProfile;
     }
 
+    // Diagnostic access for the offline raster bench. The service reaches the
+    // 3D renderer through RendererSettings; a timing harness needs the object
+    // itself to force a synchronous, non-identical frame.
+    SoftRenderer3D* Get3DRenderer() noexcept
+    {
+        return static_cast<SoftRenderer3D*>(Rend3D.get());
+    }
+
     void VBlank() override {};
     void VBlankEnd() override {};
 
