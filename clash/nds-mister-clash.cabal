@@ -8,7 +8,87 @@ license:            GPL-2.0-or-later
 library
   exposed-modules:    Mister.VideoMixer
                     , Mister.HpsIoSubset
+                    , Nds.Gpu3D.Depth
+                    , Nds.Gpu3D.DepthPipe
+                    , Nds.Gpu3D.Flat
+                    , Nds.Gpu3D.Frame
+                    , Nds.Gpu3D.Raster
+                    , Nds.Gpu3D.Slope
+                    , Nds.Gpu3D.Top
   hs-source-dirs:     src
   build-depends:      base >=4.14 && <5
                     , clash-prelude >=1.6 && <1.11
+                    , containers
   default-language:   Haskell2010
+
+executable flat-check
+  main-is:            FlatCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , nds-mister-clash
+                    , containers
+  default-language:   Haskell2010
+  ghc-options:        -O2
+
+executable slope-check
+  main-is:            SlopeCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , nds-mister-clash
+  default-language:   Haskell2010
+  ghc-options:        -O2
+
+executable raster-check
+  main-is:            RasterCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , binary
+                    , bytestring
+                    , containers
+                    , nds-mister-clash
+  default-language:   Haskell2010
+  ghc-options:        -O2
+
+executable flat-property
+  main-is:            FlatProperty.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , nds-mister-clash
+  default-language:   Haskell2010
+  ghc-options:        -O2
+
+executable recip-check
+  main-is:            RecipCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , nds-mister-clash
+  default-language:   Haskell2010
+  ghc-options:        -O2
+
+executable depth-check
+  main-is:            DepthCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , nds-mister-clash
+  default-language:   Haskell2010
+  ghc-options:        -O2
+
+executable depth-pipe-check
+  main-is:            DepthPipeCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , containers
+                    , nds-mister-clash
+  default-language:   Haskell2010
+  ghc-options:        -O2
+
+executable frame-check
+  main-is:            FrameCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , binary
+                    , bytestring
+                    , containers
+                    , nds-mister-clash
+  default-language:   Haskell2010
+  ghc-options:        -O2
