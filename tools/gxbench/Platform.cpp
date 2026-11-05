@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-FileCopyrightText: 2026 Sarah Truffle
+//
 // Minimal headless Platform implementation for the melonDS core (1.1),
 // just enough to link the tracer. No BIOS/firmware files (FreeBIOS +
 // generated firmware), no wifi/LAN/camera/mic, real std::thread

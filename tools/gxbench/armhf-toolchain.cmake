@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Sarah Truffle
+#
 # CMake toolchain for the DE10-Nano's HPS: Cyclone V SoC, dual Cortex-A9 with
 # NEON, armhf (32-bit, hard-float). Used by build-armhf.sh inside a Debian
 # container that has crossbuild-essential-armhf.
