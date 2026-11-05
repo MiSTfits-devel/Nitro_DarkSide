@@ -7,6 +7,7 @@
 
 sim/nvc_work/
 *.o
+*.hi
 *.rbf
 *.sof
 output_files/
@@ -126,3 +127,7 @@ sim/melonds_tracer/build-*/
 # rule above)
 /melonds_trace.log
 /scene.mln
+
+# Clash native toolchain and the host raster oracle build tree.
+clash/.stack-work/
+build/gx3d-oracle/
