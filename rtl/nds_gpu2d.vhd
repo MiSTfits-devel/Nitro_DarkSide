@@ -1,28 +1,3 @@
--- SPDX-License-Identifier: GPL-2.0-or-later
--- NDS 2D engine A orchestrator (the gba_gpu_drawer role): register file,
--- mode routing (0-5; 6/large deferred), the four BG drawers + OBJ drawer +
--- merge, per-BG line buffers, OBJ double buffers, and the memory plumbing:
---
---  * BG char/map fetches: 4 per-BG req/done clients round-robin onto one
---    VRAM line-server BG channel; OBJ fetches pass through to the OBJ
---    channel
---  * std palettes (1 KB) and OAM (1 KB) are internal BRAMs with CPU write
---    ports (wired to the membus at nds_top integration)
---  * extended palettes are shadow BRAMs (32 KB BG / 8 KB OBJ) streamed
---    from the line-server ext-pal channels during vblank - the CPU can
---    only write ext-pal banks while they are remapped to LCDC, so a
---    vblank shadow tracks hardware behavior for well-behaved games
---    (mid-frame ext-pal remaps are not modeled yet)
---
--- Line pacing comes from nds_gpu_timing (drawline at the real dot
--- cadence); within a line the render is functional: drawline starts the
--- BG drawers and a line-buffer clear, the merge streams once every
--- active drawer finished. A drawline landing while the previous line is
--- still busy is dropped (tb_gpu2d_timed counts those as budget overruns).
--- OBJ renders one line ahead into the parity buffer (drawObj +
--- linecounter_obj), donor style. 3D-as-BG0 renders transparent (stub).
--- Affine refs reload on vblank_trigger and on CPU writes, and step by
--- dmx/dmy on refpoint_update. Affine mosaic uses the live ref (TODO).
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -37,10 +12,6 @@ use work.pReg_nds_display.all;
 entity nds_gpu2d is
    generic
    (
-      -- engine B lacks 3D-as-BG0, the DISPCNT char/screen-base blocks, the
-      -- 1D-bitmap OBJ boundary bit and the large/VRAM/FIFO display modes;
-      -- its register window (0x1000 offset), palette/OAM halves and VRAM
-      -- channels are selected by the integration
       is_engine_b : std_logic := '0';
       is_simu     : std_logic := '0'
    );
@@ -53,26 +24,21 @@ entity nds_gpu2d is
       wired_out         : out std_logic_vector(31 downto 0) := (others => '0');
       wired_done        : out std_logic;
 
-      -- line control (nds_gpu_timing later; the frame TB for now)
       linecounter       : in  integer range 0 to 191;
-      drawline          : in  std_logic;   -- pulse: render BG line <linecounter>
+      drawline          : in  std_logic;
       linecounter_obj   : in  integer range 0 to 191;
-      drawObj           : in  std_logic;   -- pulse: render OBJ line <linecounter_obj>
-      line_trigger      : in  std_logic;   -- pulse before drawline: affine ref latch
-      hblank_trigger    : in  std_logic;   -- latches merge config
-      vblank_trigger    : in  std_logic;   -- affine ref reload + ext-pal shadow refill
-      refpoint_update   : in  std_logic;   -- per visible line: ref += dm
+      drawObj           : in  std_logic;
+      line_trigger      : in  std_logic;
+      hblank_trigger    : in  std_logic;
+      vblank_trigger    : in  std_logic;
+      refpoint_update   : in  std_logic;
 
-      line_busy         : out std_logic;   -- high from drawline until the line is merged
-      epfill_busy       : out std_logic;   -- ext-pal shadow refill in progress
-      -- palette/OAM reset clear in progress; nds_top holds the CPUs until it
-      -- drops. Unlike everything else here this pass runs WHILE reset is
-      -- asserted, because reset is resetCpu - see the clear process below.
+      line_busy         : out std_logic;
+      epfill_busy       : out std_logic;
       clr_busy          : out std_logic := '1';
 
-      -- CPU write ports (byte-enabled words)
       pal_we            : in  std_logic;
-      pal_addr          : in  integer range 0 to 255;   -- 0..127 BG, 128..255 OBJ
+      pal_addr          : in  integer range 0 to 255;
       pal_din           : in  std_logic_vector(31 downto 0);
       pal_be            : in  std_logic_vector(3 downto 0);
       oam_we            : in  std_logic;
@@ -80,11 +46,6 @@ entity nds_gpu2d is
       oam_din           : in  std_logic_vector(31 downto 0);
       oam_be            : in  std_logic_vector(3 downto 0);
 
-      -- VRAM line-server channels (req/done, one in flight each)
-      -- BG channel: srv_bg_accept pulses when the line server takes the
-      -- request. The server's per-channel request latch is one deep, so a
-      -- second request may only be presented once the first is accepted -
-      -- after that any number may be in flight, answered in issue order.
       srv_bg_req        : out std_logic := '0';
       srv_bg_addr       : out integer range 0 to 131071;
       srv_bg_data       : in  std_logic_vector(31 downto 0);
@@ -104,17 +65,11 @@ entity nds_gpu2d is
       srv_objep_data    : in  std_logic_vector(31 downto 0);
       srv_objep_done    : in  std_logic;
 
-      -- merged line out
       pixel_out_x       : out integer range 0 to 255;
       pixel_out_y       : out integer range 0 to 191;
-      pixel_out_data    : out std_logic_vector(17 downto 0);   -- BGR666 (B in [17:12])
+      pixel_out_data    : out std_logic_vector(17 downto 0);
       pixel_out_we      : out std_logic;
 
-      -- Debug taps. Behaviourally inert, and they exist so the testbench does
-      -- not have to reach in with external names: `any_bg_busy` / `obj_busy` /
-      -- `R_bgmode` / `R_forced_blank` were aliased from tb_top_frame, which
-      -- broke the moment nds_gpu2d_fast added a hierarchy level above this
-      -- entity. Ports survive re-parenting; external names do not.
       dbg_bg_busy       : out std_logic;
       dbg_obj_busy      : out std_logic;
       dbg_bgmode        : out std_logic_vector(2 downto 0);
@@ -124,7 +79,6 @@ end entity;
 
 architecture arch of nds_gpu2d is
 
-   -- ================= registers =================
    constant REGCOUNT : integer := 72;
    type t_reg_wired_or is array (0 to REGCOUNT-1) of std_logic_vector(31 downto 0);
    signal reg_wired_or   : t_reg_wired_or := (others => (others => '0'));
@@ -190,39 +144,27 @@ architecture arch of nds_gpu2d is
    signal R_eva, R_evb : std_logic_vector(4 downto 0);
    signal R_bldy   : std_logic_vector(4 downto 0);
 
-   -- affine internal refs
    signal ref2x_int, ref2y_int, ref3x_int, ref3y_int : signed(27 downto 0) := (others => '0');
    type t_ref_pair is array (2 to 3) of signed(27 downto 0);
    signal refx_arr, refy_arr : t_ref_pair;
    type t_d_pair is array (2 to 3) of signed(15 downto 0);
    signal dx_arr, dy_arr : t_d_pair;
 
-   -- ================= per-BG derived config =================
    type t_base_arr is array (0 to 3) of unsigned(18 downto 0);
    signal cfg_mapbase, cfg_tilebase, cfg_bmpbase : t_base_arr;
    type t_slot_arr is array (0 to 3) of unsigned(1 downto 0);
    signal cfg_extslot : t_slot_arr;
    type t_var_arr is array (2 to 3) of unsigned(1 downto 0);
    signal cfg_variant : t_var_arr;
-   signal cfg_extbase : t_base_arr;   -- map/bitmap base in extended mode
-   -- what the merged rot/scale drawer is actually rendering this line, and the
-   -- base that goes with it: plain affine reads the map base, extended reads
-   -- the map or bitmap base depending on its variant.
+   signal cfg_extbase : t_base_arr;
    signal cfg_isaff   : std_logic_vector(2 to 3);
    signal cfg_aebase  : t_base_arr;
 
-   -- BG type per mode: 0=off, 1=text, 2=affine, 3=extended
    type t_bgtype_arr is array (0 to 3) of integer range 0 to 3;
    signal bgtype : t_bgtype_arr;
 
-   -- ================= drawer wiring =================
-   -- BG2/BG3 have ONE rot/scale drawer each (nds_drawer_affext), covering both
-   -- affine and extended: bgtype picks one per BG per mode, so a second
-   -- instance would idle all frame for ~1.3-2.1k ALMs. Hence the _ae suffix
-   -- where there used to be an _aff and an _ext set.
    signal drawline_text : std_logic_vector(0 to 3);
    signal drawline_ae   : std_logic_vector(2 to 3);
-   -- drawline/drawObj after the drop gate (see the drawline routing section)
    signal drawline_acc  : std_logic;
    signal drawobj_acc   : std_logic;
 
@@ -238,16 +180,11 @@ architecture arch of nds_gpu2d is
    signal pix_ae      : t_pix_arr;
    signal pixx_ae     : t_x_arr;
 
-   -- per-BG vram clients (muxed from the active drawer)
    type t_vaddr_arr is array (0 to 3) of integer range 0 to 131071;
    signal bgv_req   : std_logic_vector(0 to 3);
    signal bgv_addr  : t_vaddr_arr;
    signal bgv_done  : std_logic_vector(0 to 3);
-   -- BG fetch data, captured with its own done pulse (see the arbiter block)
    signal bgv_data  : std_logic_vector(31 downto 0);
-   -- per-BG accept: the arbiter took that BG's request this cycle, so it may
-   -- present the next one. This is what lets a drawer prefetch - without it a
-   -- drawer would have to wait for done, i.e. one fetch at a time.
    signal bgv_accept : std_logic_vector(0 to 3);
    type t_vaddrt_arr is array (0 to 3) of integer range 0 to 131071;
    signal v_req_text : std_logic_vector(0 to 3);
@@ -255,13 +192,9 @@ architecture arch of nds_gpu2d is
    signal v_req_ae   : std_logic_vector(2 to 3);
    signal v_addr_ae  : t_vaddrt_arr;
 
-   -- palette clients
    type t_paddr_arr is array (0 to 3) of integer range 0 to 127;
    signal p_addr_text, p_addr_ae : t_paddr_arr;
    signal bgp_addr  : t_paddr_arr;
-   -- per-BG palette read data / valid. valid is now unconditional: with a
-   -- private read port the answer always lands the cycle after the address,
-   -- so no drawer ever waits for its turn (see gpal_bg).
    type t_pdata_arr is array (0 to 3) of std_logic_vector(31 downto 0);
    signal bgp_data  : t_pdata_arr;
    signal bgp_valid : std_logic_vector(0 to 3) := (others => '1');
@@ -269,17 +202,16 @@ architecture arch of nds_gpu2d is
    type t_epaddr_arr is array (0 to 3) of integer range 0 to 8191;
    signal ep_addr_text, ep_addr_ae : t_epaddr_arr;
    signal bgep_addr  : t_epaddr_arr;
-   signal bgep_data  : t_pdata_arr;                     -- per-BG, private port
+   signal bgep_data  : t_pdata_arr;
    signal bgep_valid : std_logic_vector(0 to 3) := (others => '1');
 
-   -- OBJ drawer wiring
    signal obj_pal_addr    : integer range 0 to 127;
    signal obj_pal_data    : std_logic_vector(31 downto 0);
    signal obj_ep_addr     : integer range 0 to 2047;
    signal obj_ep_data     : std_logic_vector(31 downto 0);
-   signal obj_oam_addr    : integer range 0 to 127;   -- sprite index
+   signal obj_oam_addr    : integer range 0 to 127;
    signal obj_oam_data    : std_logic_vector(63 downto 0);
-   signal obj_oamaff_addr : integer range 0 to 31;    -- rot/scal group
+   signal obj_oamaff_addr : integer range 0 to 31;
    signal obj_oamaff_data : std_logic_vector(63 downto 0);
    signal obj_we_color    : std_logic;
    signal obj_color       : std_logic_vector(15 downto 0);
@@ -289,13 +221,7 @@ architecture arch of nds_gpu2d is
    signal obj_objwnd      : std_logic;
    signal obj_busy        : std_logic;
 
-   -- ================= memories =================
-   -- palette RAM: two identical M10K copies (the CPU writes both), one read
-   -- port each for the OBJ drawer and the BG palette service; the backdrop
-   -- color (palette entry 0) is snooped into a register on CPU writes.
-   -- OAM is a single M10K (CPU write / OBJ drawer read).
 
-   -- palette/OAM write ports after the reset-clear mux (see p_clear)
    signal pal_we_i, oam_we_i     : std_logic;
    signal pal_addr_i, oam_addr_i : integer range 0 to 255;
    signal pal_din_i, oam_din_i   : std_logic_vector(31 downto 0);
@@ -304,32 +230,14 @@ architecture arch of nds_gpu2d is
    signal clr_addr : unsigned(7 downto 0) := (others => '0');
    signal reset_d  : std_logic := '1';
 
-   -- BG extended palette: 32 KB as FOUR 8 KB SLOT RAMS instead of one array.
-   -- Same total storage, but each slot gets its own dual-port block, and a BG
-   -- can only ever read the one slot its BGxCNT selects - BG0 slot 0 or 2, BG1
-   -- slot 1 or 3, BG2 slot 2, BG3 slot 3. So at most two BGs can want any one
-   -- slot (BG0+BG2 for slot 2, BG1+BG3 for slot 3), which is exactly what a
-   -- dual-port block provides:
-   --
-   --   port A reader: BG0 for slots 0 and 2, BG1 for slots 1 and 3
-   --   port B reader: BG2 for slot 2, BG3 for slot 3 (idle for slots 0, 1)
-   --
-   -- That is a STATIC assignment with no arbitration anywhere - every BG has an
-   -- unconditional ext-pal read port, one lookup per cycle, and the blocking
-   -- round robin that used to answer one BG in four is gone.
-   --
-   -- The vblank refill writes through port A (muxed with its read). Safe by
-   -- phase: epfill only runs from vblank_trigger, when no drawer is reading.
-   constant EPSLOT_WORDS : integer := 2048;   -- 8 KB per slot
+   constant EPSLOT_WORDS : integer := 2048;
    type t_epslot_data is array (0 to 3) of std_logic_vector(31 downto 0);
    signal epslot_qa, epslot_qb : t_epslot_data;
    type t_epslot_addr is array (0 to 3) of integer range 0 to EPSLOT_WORDS - 1;
-   signal epslot_addr_a : t_epslot_addr;   -- within-slot word address, port A
-   signal epslot_addr_b : t_epslot_addr;   -- within-slot word address, port B
-   signal epslot_pa     : t_epslot_addr;   -- port A after the refill-write mux
+   signal epslot_addr_a : t_epslot_addr;
+   signal epslot_addr_b : t_epslot_addr;
+   signal epslot_pa     : t_epslot_addr;
    signal epslot_we     : std_logic_vector(0 to 3);
-   -- slot select delayed one cycle, to line the data mux up with the RAM's
-   -- one-cycle read latency
    type t_slot_d is array (0 to 3) of unsigned(1 downto 0);
    signal extslot_d : t_slot_d := (others => "00");
 
@@ -340,13 +248,7 @@ architecture arch of nds_gpu2d is
    signal epfill       : t_epfill := EPIDLE;
    signal epfill_addr  : integer range 0 to 8191 := 0;
 
-   -- ================= line buffers =================
-   -- BG line buffers: one M10K per BG. Port A takes the drawer's pixel
-   -- writes; port B is the per-line clear sweep during LDRAW (suppressed on
-   -- a same-cycle same-index pixel write - the pixel wins, exactly the old
-   -- single-process resolution) and the merge read during LMERGE. The two
-   -- port-B roles are phase-disjoint: LMERGE requires clear_addr = 256.
-   signal lb_bg    : t_pix_arr;   -- merge read data per BG (port B q)
+   signal lb_bg    : t_pix_arr;
    type t_q32_arr is array (0 to 3) of std_logic_vector(31 downto 0);
    signal lb_bg_q32 : t_q32_arr;
    signal obj_q32   : std_logic_vector(31 downto 0);
@@ -356,12 +258,6 @@ architecture arch of nds_gpu2d is
    signal lb_clrwe : std_logic_vector(0 to 3);
    signal lb_baddr : integer range 0 to 255;
 
-   -- OBJ double buffers: col/set are one M10K each (2 rows x 256, address =
-   -- row*256+x); objwnd stays in flops (512 bits). The BRAM contents are
-   -- never cleared - per-row VALID BITMASKS in flops (cleared in one cycle
-   -- on drawObj, exactly the old whole-row-clear semantics, so no clear-vs-
-   -- draw race exists by construction) and the merge substitutes the old
-   -- clear values for invalid pixels.
    signal objcol_q    : std_logic_vector(15 downto 0);
    signal objset_q    : std_logic_vector(7 downto 0);
    signal objcol_we   : std_logic;
@@ -380,7 +276,6 @@ architecture arch of nds_gpu2d is
    signal linebuf_objcolv : t_objwnd_arr := (others => (others => '0'));
    signal linebuf_objsetv : t_objwnd_arr := (others => (others => '0'));
 
-   -- ================= line FSM =================
    type t_linestate is (LIDLE, LDRAW, LMERGE, LFLUSH);
    signal linestate  : t_linestate := LIDLE;
    signal clear_addr : integer range 0 to 256 := 256;
@@ -392,7 +287,6 @@ architecture arch of nds_gpu2d is
 
    signal any_bg_busy : std_logic;
 
-   -- merge inputs
    signal mrg_bg0, mrg_bg1, mrg_bg2, mrg_bg3 : std_logic_vector(15 downto 0);
    signal mrg_obj : std_logic_vector(23 downto 0);
    signal mrg_objwnd : std_logic;
@@ -400,8 +294,6 @@ architecture arch of nds_gpu2d is
 
    signal ypos_mosaic_bg  : integer range 0 to 191;
    signal ypos_mosaic_obj : integer range 0 to 191;
-   -- mosaic y counters (see the mosaic y block) - these replace two general
-   -- dividers, so they must stay 4-bit counters and not grow an operator
    signal mos_bgy     : integer range 0 to 15  := 0;
    signal mos_bgy_max : integer range 0 to 15  := 0;
    signal mos_bgbase  : integer range 0 to 191 := 0;
@@ -412,7 +304,6 @@ architecture arch of nds_gpu2d is
 
 begin
 
-   -- ================= register instances =================
    iDISPCNT_BG_Mode    : entity work.eProcReg_gba generic map (DISPCNT_BG_Mode)            port map (clk, gb_bus, reg_wired_or(0),  reg_wired_done(0),  R_bgmode, R_bgmode);
    iDISPCNT_BG0_3D     : entity work.eProcReg_gba generic map (DISPCNT_BG0_3D)             port map (clk, gb_bus, reg_wired_or(1),  reg_wired_done(1),  R_bg0_3d, R_bg0_3d);
    iDISPCNT_OBJ1D      : entity work.eProcReg_gba generic map (DISPCNT_Tile_OBJ_1D)        port map (clk, gb_bus, reg_wired_or(2),  reg_wired_done(2),  R_obj1d, R_obj1d);
@@ -469,8 +360,6 @@ begin
    iBG3CNT_WRAP  : entity work.eProcReg_gba generic map (BG3CNT_Wrap)        port map (clk, gb_bus, reg_wired_or(49), reg_wired_done(49), R_bgcnt(3).slotwrap,   R_bgcnt(3).slotwrap);
    iBG3CNT_SIZE  : entity work.eProcReg_gba generic map (BG3CNT_Screen_Size) port map (clk, gb_bus, reg_wired_or(50), reg_wired_done(50), R_bgcnt(3).size,       R_bgcnt(3).size);
 
-   -- unrolled (computed record-aggregate generics inside for-generate
-   -- crash nvc 1.21.1 at model reset)
    iBG0HOFS : entity work.eProcReg_gba generic map (BG0HOFS) port map (clk, gb_bus, reg_wired_or(51), reg_wired_done(51), R_hofs(0), R_hofs(0));
    iBG1HOFS : entity work.eProcReg_gba generic map (BG1HOFS) port map (clk, gb_bus, reg_wired_or(52), reg_wired_done(52), R_hofs(1), R_hofs(1));
    iBG2HOFS : entity work.eProcReg_gba generic map (BG2HOFS) port map (clk, gb_bus, reg_wired_or(53), reg_wired_done(53), R_hofs(2), R_hofs(2));
@@ -530,8 +419,6 @@ begin
       wired_done <= wired_dn;
    end process;
 
-   -- ================= derived config =================
-   -- engine B: no DISPCNT char/screen-base blocks
    eff_screenbase <= R_screenbase when is_engine_b = '0' else "000";
    eff_charbase   <= R_charbase   when is_engine_b = '0' else "000";
    eff_bmpbound   <= R_bmpbound(22) when is_engine_b = '0' else '0';
@@ -541,7 +428,6 @@ begin
                                     + to_integer(unsigned(R_bgcnt(i).screenbase)) * 2048) mod 524288, 19);
       cfg_tilebase(i) <= to_unsigned((to_integer(unsigned(eff_charbase)) * 65536
                                     + to_integer(unsigned(R_bgcnt(i).charbase)) * 16384) mod 524288, 19);
-      -- extended bitmap variants: screen base field * 16 KB, no DISPCNT offset
       cfg_bmpbase(i)  <= to_unsigned((to_integer(unsigned(R_bgcnt(i).screenbase)) * 16384) mod 524288, 19);
    end generate;
 
@@ -555,9 +441,6 @@ begin
                         "01" when R_bgcnt(i).charbase(0) = '0' else
                         "10";
       cfg_extbase(i) <= cfg_mapbase(i) when R_bgcnt(i).hicolor = "0" else cfg_bmpbase(i);
-      -- the merged drawer latches these at drawline, and drawline only fires
-      -- for this BG when bgtype is 2 or 3, so bgtype is stable when they are
-      -- sampled - exactly as it was when each mode had its own instance.
       cfg_isaff(i)   <= '1' when bgtype(i) = 2 else '0';
       cfg_aebase(i)  <= cfg_mapbase(i) when bgtype(i) = 2 else cfg_extbase(i);
    end generate;
@@ -567,7 +450,6 @@ begin
    dx_arr(2)   <= signed(R_bg2dx);  dy_arr(2) <= signed(R_bg2dy);
    dx_arr(3)   <= signed(R_bg3dx);  dy_arr(3) <= signed(R_bg3dy);
 
-   -- BG type per mode (mode 6 / large: everything off for now)
    process (all)
    begin
       bgtype <= (0, 0, 0, 0);
@@ -580,49 +462,11 @@ begin
          when 5 => bgtype <= (1, 1, 3, 3);
          when others => bgtype <= (0, 0, 0, 0);
       end case;
-      -- 3D-as-BG0 stub: BG0 renders nothing (transparent line buffer).
-      -- Engine B has no 3D bit - BG0 always renders as text there.
       if (R_bg0_3d = "1" and is_engine_b = '0') then
          bgtype(0) <= 0;
       end if;
    end process;
 
-   -- ================= mosaic y =================
-   -- These two used to be `linecounter mod (size + 1)`. A variable divisor
-   -- makes Quartus build a general divider: lpm_divide:Mod0 and Mod1, a
-   -- MEASURED 37.7 + 35.6 ALMs per engine and 146 across both, for a row snap
-   -- that a 4-bit counter and a subtract do exactly.
-   --
-   -- The counter is also what the hardware does. melonDS: "Y mosaic uses
-   -- incrementing 4-bit counters" (GPU2D.cpp UpdateMosaicCounters), and the
-   -- two forms differ in two ways whenever MOSAIC is written mid-frame:
-   --
-   --   * BGMosaicYMax is re-latched from MOSAIC only when the counter WRAPS
-   --     (GPU2D_Soft.cpp, end of DrawScanline_BGOBJ), so a mid-frame write
-   --     takes effect at the next block boundary, not on the next line;
-   --   * the counter carries phase from the frame start, so it does not jump
-   --     when the size changes, where the divider re-snaps against absolute
-   --     linecounter.
-   --
-   -- So this is a divergence FIX as well as an area cut, and it is not a speed
-   -- change - it takes a divider out of a combinational path feeding the
-   -- drawers and puts a register there.
-   --
-   -- Phase, which has to stay identical to the divider for constant MOSAIC:
-   -- melonDS updates AFTER drawing a line and clears at VBlankEnd, so block 0
-   -- starts at line 0 and each block is size+1 lines. refpoint_update fires on
-   -- lines 1..191 only (nds_gpu_timing.vhd) and lands before drawline in the
-   -- same line, so line 0 sees the counter at 0 and line L sees it after L
-   -- advances - the same snap the divider gave. sim/run_mosaic_equiv.sh proves
-   -- that over every line x every size.
-   -- Tracked as the block BASE, not as an offset subtracted from linecounter.
-   -- refpoint_update for line L lands before drawline sets linecounter <= L, so
-   -- at this tick linecounter still holds L-1 and the line the tick belongs to
-   -- is linecounter + 1. Driving `linecounter - mos_bgy` instead is what
-   -- run_gpu2d caught: in the window between the two pulses the counter has
-   -- advanced and linecounter has not, and the line 0 -> 1 tick drove
-   -- ypos_mosaic_bg to -1. A base register is valid at every instant rather
-   -- than only when the drawers happen to sample it.
    process (clk)
    begin
       if rising_edge(clk) then
@@ -634,9 +478,6 @@ begin
             if (mos_bgy >= mos_bgy_max) then
                mos_bgy     <= 0;
                mos_bgy_max <= to_integer(unsigned(R_mos_bgv));
-               -- refpoint_update only fires on lines 1..191, so linecounter is
-               -- 0..190 here and the clamp never engages; it is a range guard,
-               -- not behaviour.
                if (linecounter < 191) then
                   mos_bgbase <= linecounter + 1;
                else
@@ -651,13 +492,6 @@ begin
 
    ypos_mosaic_bg <= mos_bgbase;
 
-   -- OBJ renders one line ahead, so linecounter_obj is already melonDS's
-   -- "line + 1" - the value UpdateMosaicCounters stores in OBJMosaicY on a
-   -- wrap - and the base is used directly as the sampled row rather than as an
-   -- offset. drawObj lands at the same point in the line as drawline, and the
-   -- base register updates on that edge, so it is stable for the line the
-   -- pulse starts. The counter is preloaded to the size at vblank so the first
-   -- pulse of the frame wraps and latches base = line 0.
    process (clk)
    begin
       if rising_edge(clk) then
@@ -676,7 +510,6 @@ begin
 
    ypos_mosaic_obj <= mos_objbase;
 
-   -- ================= affine internal refs =================
    process (clk)
    begin
       if rising_edge(clk) then
@@ -698,31 +531,7 @@ begin
       end if;
    end process;
 
-   -- ================= drawline routing =================
-   -- A drawline that lands while the previous line is still rendering is DROPPED:
-   -- the line FSM below only leaves LIDLE on drawline, so it already ignores one.
-   -- The DRAWERS must ignore the same one, which is what these gates are for.
-   --
-   -- Every drawer restarts its whole line on drawline - nds_drawer_text's
-   -- `if (drawline = '1')` clears the tile queue, the tag queue and the fetch
-   -- walk. Ungated, an over-budget line is therefore restarted from tile 0 every
-   -- time the next drawline arrives, so it can never reach the end: any_bg_busy
-   -- never falls, LDRAW never completes, line_busy never falls, and every
-   -- following drawline is dropped as well. That is a LIVELOCK, not slowness, and
-   -- it is latency-independent - it starts the moment a line first needs more
-   -- than its budget, and from then on no line ever completes. It is what stopped
-   -- the renderer dead under real VRAM backpressure while the old always-ready
-   -- memory model hid it: no line ever exceeded budget there, so a drawline never
-   -- landed on a busy drawer. Both prserv models now ASSERT that a request they
-   -- could not take is still on the wire unchanged at the next edge, so a
-   -- requester that pulses and forgets fails at the mistake rather than wedging
-   -- 400,000 cycles later.
-   --
-   -- Dropping it instead leaves that row at the previous frame's content, which is
-   -- what a dropped line means everywhere else here, and progress continues.
    drawline_acc <= drawline when linestate = LIDLE else '0';
-   -- OBJ pre-renders the NEXT line while this one is still in LDRAW, so it cannot
-   -- use the same gate; its own busy is the right one.
    drawobj_acc  <= drawObj  when obj_busy = '0' else '0';
 
    gen_dl_text : for i in 0 to 3 generate
@@ -735,7 +544,6 @@ begin
    any_bg_busy <= busy_text(0) or busy_text(1) or busy_text(2) or busy_text(3)
                   or busy_ae(2) or busy_ae(3);
 
-   -- ================= BG drawers =================
    gen_text : for i in 0 to 3 generate
       itext : entity work.nds_drawer_text
       port map
@@ -772,9 +580,6 @@ begin
       );
    end generate;
 
-   -- ONE rot/scale drawer per BG, doing affine or extended as bgtype says.
-   -- variant / extpalette are passed through unconditionally: is_affine
-   -- overrides both inside the drawer, so there is nothing to gate here.
    gen_affext : for i in 2 to 3 generate
       iae : entity work.nds_drawer_affext
       port map
@@ -816,7 +621,6 @@ begin
       );
    end generate;
 
-   -- ================= OBJ drawer =================
    iobj : entity work.nds_drawer_obj
    port map
    (
@@ -832,14 +636,6 @@ begin
       bitmap_1d_boundary   => eff_bmpbound,
       obj_extpal           => R_objextpal(31),
       Mosaic_H_Size        => unsigned(R_mos_objh),
-      -- DISPCNT.23 is "OBJ Processing during H-Blank" (GBATEK), the NDS
-      -- relocation of the GBA's bit 5 "H-Blank Interval Free" with the
-      -- polarity read from OBJ's side: SET = the OBJ engine gets the
-      -- HBlank interval (1210 cycles), CLEAR = 954. The drawer's hblankfree
-      -- port keeps the donor meaning (SET = CPU takes the interval = 954),
-      -- so the register bit must be inverted here. Without the inversion a
-      -- bit-23 game drew its OAM under the 954-cycle budget and lost the
-      -- tail of every sprite-heavy line - steady, per-frame sprite drops.
       hblankfree           => not R_objhbl(23),
       pixel_we_color       => obj_we_color,
       pixeldata_color      => obj_color,
@@ -862,23 +658,8 @@ begin
       VRAM_Drawer_accept   => srv_obj_accept
    );
 
-   -- ================= palette / OAM =================
    -- M10K stores; the drawer-side reads keep their 1-cycle registered-read
-   -- timing (the BRAM registers the address, q is unregistered)
-   --
-   -- Reset clear pass. A MiSTer ROM change does not reconfigure the FPGA, so
    -- these three M10Ks keep the previous game's palette and sprite table and
-   -- the new game shows its leftovers - the same class of bug as the
-   -- uninitialised main RAM nds_loader's CLR_WR now fixes. Real hardware gets
-   -- this from the firmware boot direct boot skips.
-   --
-   -- This pass must run WHILE reset is asserted: reset here is nds_top's
-   -- resetCpu, which only releases when the CPUs start, so a clear that waited
-   -- for reset to drop would race the first game write. So it is armed on the
-   -- rising edge of reset (and by the power-up initial values) and stepped
-   -- unconditionally, and nds_top gates the CPU release on clr_busy.
-   -- 256 words covers the full 1 KB of each store; the two palette RAMs are
-   -- mirrors on one write port, so one counter clears all three.
    p_clear : process (clk)
    begin
       if rising_edge(clk) then
@@ -930,19 +711,6 @@ begin
       be_b      => "0000"
    );
 
-   -- BG standard palette: ONE COPY PER BG, so every BG has an unshared read
-   -- port. The single shared copy was served by a blind 4-phase round robin
-   -- (pal_serve_cnt), which meant a BG's lookup was answered only one cycle in
-   -- four - and because the drawers park in their WAITREAD state until the
-   -- answer arrives, that round robin STALLED THE PIXEL LOOP for an average of
-   -- 2.5 cycles on every single pixel. It was the largest single term in the
-   -- text drawer's ~21.7 cycles per pixel.
-   --
-   -- These are 256x32 = 1 KB each, about one M10K, and the CPU write port fans
-   -- out to all of them (it already did to two). Four private ports cost ~3
-   -- extra M10K against ~80 free and delete the stall completely: with a
-   -- private port the answer is simply the registered read, valid the cycle
-   -- after the address, every cycle, for every BG at once.
    gpal_bg : for i in 0 to 3 generate
       ipal_bg : entity MEM.SyncRamDualByteEnable
       generic map ( is_simu => is_simu, is_cyclone5 => '1',
@@ -968,24 +736,6 @@ begin
       );
    end generate;
 
-   -- OAM, seen by SPRITE rather than by word. The drawer used to read a sprite
-   -- as two 32-bit words back to back and each rot/scal group as four more -
-   -- 12 serial cycles for an affine sprite. See nds_drawer_obj's t_OAMFetch
-   -- comment for what that was really worth once measured; most of it was
-   -- already hidden behind the previous sprite's pixel walk.
-   --
-   -- Nothing about that had to be serial: OAM is 1 KB, the CPU is its only
-   -- writer, and port A here already sees every write. So the layouts the
-   -- drawer actually wants are maintained as write-through shadows off that
-   -- same write, in the same cycle. No tags, no fill pass, no miss path, and
-   -- no coherency question - a shadow tracks OAM exactly as the read port
-   -- does, including mid-line writes.
-   --
-   -- Two identical copies written in lockstep, read at the even and odd word
-   -- of the same entry, give the 64-bit sprite read out of the ordinary
-   -- 32-bit primitive - no width-mode gymnastics, and the CPU never reads OAM
-   -- back through here (dataout_a was already open), so replication is free
-   -- of correctness questions too.
    goam : for i in 0 to 1 generate
       ioam : entity MEM.SyncRamDualByteEnable
       generic map ( is_simu => is_simu, is_cyclone5 => '1',
@@ -1011,30 +761,11 @@ begin
       );
    end generate;
 
-   -- Rot/scal parameter shadow. Group G's four params are the attr3 fields of
-   -- entries 4G+0..3, i.e. the upper halfword of word addresses 8G+1, 8G+3,
-   -- 8G+5 and 8G+7 - so a write's own address says which group it belongs to
-   -- and which of the four it is. Two 32x32 RAMs hold {PB,PA} and {PD,PC}, so
-   -- one read of each returns the whole group. attr3 is the upper halfword of
-   -- the incoming word, so its two byte enables are oam_be_i(3 downto 2) and
-   -- nothing else: aff_be ROUTES that pair to whichever halfword of the
-   -- shadow this address selects, rather than making up enables of its own.
-   -- A byte the write did not enable therefore cannot land here either, so the
-   -- shadow cannot diverge from the copy above under any write the rest of the
-   -- core can issue (OAM ignores 8-bit writes on hardware, but this port
-   -- carries byte enables and the two must agree regardless).
-   --
-   -- 32x32 is small enough that Quartus may place these in MLABs rather than
-   -- M10Ks, and MLABs are carved out of LABs - the resource this design is
-   -- short of. At this size that is at most 4 LABs, so it is left to the
-   -- fitter; if the LAB number moves, this is the first thing to pin.
    gaff : for i in 0 to 1 generate
       signal aff_we   : std_logic;
-      signal aff_half : std_logic;   -- '1' = upper halfword of this RAM
+      signal aff_half : std_logic;
       signal aff_be   : std_logic_vector(3 downto 0);
    begin
-      -- attr3 words are the odd ones; (addr/2) mod 4 is which param, so bit 1
-      -- of it picks the RAM and bit 0 the halfword inside it
       aff_we   <= oam_we_i when (oam_addr_i mod 2 = 1 and ((oam_addr_i / 4) mod 2) = i) else '0';
       aff_half <= '1'      when ((oam_addr_i / 2) mod 2) = 1 else '0';
       aff_be   <= (oam_be_i(3 downto 2) & "00") when aff_half = '1' else ("00" & oam_be_i(3 downto 2));
@@ -1047,8 +778,6 @@ begin
          clk       => clk,
          ce_a      => '1',
          addr_a    => oam_addr_i / 8,
-         -- attr3 is the upper halfword of the word being written, offered to
-         -- both halves; aff_be decides which one is taken
          datain_a0 => oam_din_i(23 downto 16),
          datain_a1 => oam_din_i(31 downto 24),
          datain_a2 => oam_din_i(23 downto 16),
@@ -1065,12 +794,9 @@ begin
       );
    end generate;
 
-   -- backdrop = palette entry 0, snooped on CPU writes (bit 15 stays '0')
    process (clk)
    begin
       if rising_edge(clk) then
-         -- the clear pass runs through this snoop too, so the backdrop register
-         -- (another leftover across a ROM change) is zeroed with palette entry 0
          if (pal_we_i = '1' and pal_addr_i = 0) then
             if (pal_be_i(0) = '1') then backdrop( 7 downto 0) <= pal_din_i( 7 downto 0); end if;
             if (pal_be_i(1) = '1') then backdrop(14 downto 8) <= pal_din_i(14 downto 8); end if;
@@ -1079,32 +805,19 @@ begin
       end if;
    end process;
 
-   -- BG palette + BG ext-pal service: 4-phase round robin, one BG per slot
    gen_pmux : for i in 0 to 3 generate
       bgp_addr(i)  <= p_addr_text(i)  when bgtype(i) = 1 else
                       p_addr_ae(i)    when (i >= 2 and (bgtype(i) = 2 or bgtype(i) = 3)) else 0;
-      -- affine never reads the ext palette (the drawer forces it off), so the
-      -- ext-pal client stays gated to extended alone.
       bgep_addr(i) <= ep_addr_text(i) when bgtype(i) = 1 else
                       ep_addr_ae(i)   when (i >= 2 and bgtype(i) = 3) else 0;
    end generate;
 
-   -- Every BG now has a private read port into both the standard palette and
-   -- its ext-pal slot, so both answers are simply the registered read: valid
-   -- the cycle after the address, unconditionally, for all four BGs at once.
-   -- The drawers' existing "present address, then wait one state for valid"
-   -- sequence is unchanged - it just never waits more than that one state now.
    bgp_valid  <= (others => '1');
    bgep_valid <= (others => '1');
 
-   -- ---- BG ext-palette slot RAMs ----
-   -- Port A serves BG0 (slots 0,2) or BG1 (slots 1,3) and the vblank refill
-   -- write; port B serves BG2 (slot 2) or BG3 (slot 3).
    gep_addr : for s in 0 to 3 generate
-      -- port A: the low half of the slot word address from BG0 / BG1
       epslot_addr_a(s) <= (bgep_addr(0) mod EPSLOT_WORDS) when (s = 0 or s = 2) else
                           (bgep_addr(1) mod EPSLOT_WORDS);
-      -- port B: BG2 owns slot 2, BG3 owns slot 3; the others never read here
       epslot_addr_b(s) <= (bgep_addr(2) mod EPSLOT_WORDS) when (s = 2) else
                           (bgep_addr(3) mod EPSLOT_WORDS) when (s = 3) else 0;
       epslot_we(s)     <= '1' when (epfill = EPBG_WAIT and srv_bgep_done = '1' and
@@ -1120,7 +833,6 @@ begin
       port map
       (
          clk       => clk,
-         -- port A: refill write, otherwise BG0/BG1's read
          ce_a      => '1',
          addr_a    => epslot_pa(s),
          datain_a0 => srv_bgep_data( 7 downto  0),
@@ -1130,7 +842,6 @@ begin
          dataout_a => epslot_qa(s),
          we_a      => epslot_we(s),
          be_a      => "1111",
-         -- port B: BG2/BG3's read
          ce_b      => '1',
          addr_b    => epslot_addr_b(s),
          datain_b0 => x"00", datain_b1 => x"00", datain_b2 => x"00", datain_b3 => x"00",
@@ -1140,8 +851,6 @@ begin
       );
    end generate;
 
-   -- Slot select, delayed one cycle so the mux below picks with the same slot
-   -- configuration that was current when the address was presented.
    process (clk)
    begin
       if rising_edge(clk) then
@@ -1151,15 +860,11 @@ begin
       end if;
    end process;
 
-   -- Each BG reads the one slot it is configured for; the mux is
-   -- combinational on the RAM outputs, so the total read latency stays at the
-   -- single cycle the drawers expect.
    bgep_data(0) <= epslot_qa(0) when extslot_d(0) = "00" else epslot_qa(2);
    bgep_data(1) <= epslot_qa(1) when extslot_d(1) = "01" else epslot_qa(3);
    bgep_data(2) <= epslot_qb(2);
    bgep_data(3) <= epslot_qb(3);
 
-   -- ================= BG VRAM channel arbiter =================
    gen_vmux01 : for i in 0 to 1 generate
       bgv_req(i)  <= v_req_text(i)  when bgtype(i) = 1 else '0';
       bgv_addr(i) <= v_addr_text(i) when bgtype(i) = 1 else 0;
@@ -1171,41 +876,21 @@ begin
                      v_addr_ae(i)   when (bgtype(i) = 2 or bgtype(i) = 3) else 0;
    end generate;
 
-   -- Pipelined BG channel arbiter. v1 was ARB_IDLE -> ARB_WAIT: one request in
-   -- flight across ALL FOUR BGs, so a BG's fetch latency was serialised behind
-   -- every other BG's, and the two extra states cost a further ~2 cycles per
-   -- op on top of the line server's own.
-   --
-   -- v2 issues one request per cycle and keeps a FIFO of which BG owns each
-   -- op. nds_vram retires in issue order, so popping the FIFO on each
-   -- srv_bg_done routes the answer back to the right BG with no tag on the
-   -- wire. A BG may therefore have several fetches outstanding, which is what
-   -- lets the drawers run their fetch stage ahead of their pixel stage.
    b_arb : block
-      constant OS_DEPTH : integer := 8;   -- ops trackable in flight
+      constant OS_DEPTH : integer := 8;
       type t_owner is array (0 to OS_DEPTH-1) of integer range 0 to 3;
       signal owner    : t_owner := (others => 0);
       signal os_head  : integer range 0 to OS_DEPTH-1 := 0;
       signal os_tail  : integer range 0 to OS_DEPTH-1 := 0;
       signal os_count : integer range 0 to OS_DEPTH := 0;
       signal arb_rr   : integer range 0 to 3 := 0;
-      signal arb_busy : std_logic;   -- probe-friendly: ops in flight
+      signal arb_busy : std_logic;
       signal pending  : std_logic_vector(0 to 3) := (others => '0');
-      -- a request has been presented to the server and not yet accepted; the
-      -- server's request latch is one deep, so a second one would coalesce
-      -- with it and be lost
       signal unaccepted : std_logic := '0';
       signal bg_data_r  : std_logic_vector(31 downto 0) := (others => '0');
    begin
       arb_busy <= '0' when os_count = 0 else '1';
 
-      -- bgv_done is registered, so a drawer sees it one cycle after
-      -- srv_bg_done - but srv_bg_data is only valid ON the done cycle, because
-      -- the line server overwrites it at the next retire. With one op in
-      -- flight that never mattered (nothing could retire in the gap); with
-      -- several it means the drawer reads the NEXT request's word, which shows
-      -- up as pixels wearing their neighbours' colours. So capture the data at
-      -- the same edge as the done it belongs to, and hand the drawers that.
       bgv_data <= bg_data_r;
 
       process (clk)
@@ -1243,7 +928,6 @@ begin
                v_head := os_head;
                v_tail := os_tail;
 
-               -- completion: in-order, so the oldest op owns this answer
                if (srv_bg_done = '1' and v_cnt > 0) then
                   bgv_done(owner(v_head)) <= '1';
                   bg_data_r               <= srv_bg_data;
@@ -1251,8 +935,6 @@ begin
                   v_cnt  := v_cnt - 1;
                end if;
 
-               -- issue: one per cycle, rotating priority, while the server has
-               -- room for it and we can still track it
                found := false;
                sel   := 0;
                for k in 0 to 3 loop
@@ -1284,7 +966,6 @@ begin
       end process;
    end block;
 
-   -- ================= ext-pal shadow fill (vblank) =================
    process (clk)
    begin
       if rising_edge(clk) then
@@ -1305,8 +986,6 @@ begin
                   epfill        <= EPBG_WAIT;
                when EPBG_WAIT =>
                   if (srv_bgep_done = '1') then
-                     -- the write itself goes into the slot RAMs through
-                     -- epslot_we / epslot_pa (see the slot RAM block)
                      if (epfill_addr = 8191) then
                         epfill_addr <= 0;
                         epfill      <= EPOBJ_REQ;
@@ -1334,10 +1013,6 @@ begin
       end if;
    end process;
 
-   -- ================= line buffers =================
-   -- BG write-port mux (mirrors the old per-BG if-chain); the clear write is
-   -- suppressed on a same-cycle same-index pixel write - the pixel wins,
-   -- exactly the old single-process resolution
    process (all)
       variable we : std_logic;
       variable wa : integer range 0 to 255;
@@ -1367,17 +1042,10 @@ begin
       end loop;
    end process;
 
-   -- port B carries the clear sweep during LDRAW, the merge read during
-   -- LMERGE (disjoint: LMERGE requires clear_addr = 256)
    lb_baddr <= clear_addr when clear_addr < 256 else merge_x mod 256;
 
    gen_lb : for i in 0 to 3 generate
    begin
-      -- SyncRamDualByteEnable, not SyncRamDual: the latter's shared-array
-      -- dual-port process is un-inferable for Quartus 17 (falls back to
-      -- ~4.1K flops + 5.8K ALUTs per buffer); this one instantiates
-      -- altsyncram directly on Cyclone V. Its cyclone5 path only supports
-      -- BYTES=4, so the pixel sits in lanes 0-1 of a 32-bit word.
       ilb : entity MEM.SyncRamDualByteEnable
       generic map ( is_simu => is_simu, is_cyclone5 => '1',
                     BYTE_WIDTH => 8, ADDR_WIDTH => 8, BYTES => 4 )
@@ -1404,8 +1072,6 @@ begin
       lb_bg(i) <= lb_bg_q32(i)(15 downto 0);
    end generate;
 
-   -- OBJ buffer writes: drawer only, no clear traffic (validity is tracked
-   -- in the flop bitmasks below)
    objcol_we   <= obj_we_color;
    objset_we   <= obj_we_settings;
    objb_wa_col <= (linecounter_obj mod 2) * 256 + obj_x;
@@ -1415,8 +1081,6 @@ begin
 
    objb_ra <= (cur_y mod 2) * 256 + (merge_x mod 256);
 
-   -- col in lanes 0-1, set in lane 2 of one 32-bit store: one BRAM instead
-   -- of two, and the BYTES=4-only cyclone5 path is satisfied
    iobjbuf : entity MEM.SyncRamDualByteEnable
    generic map ( is_simu => is_simu, is_cyclone5 => '1',
                  BYTE_WIDTH => 8, ADDR_WIDTH => 9, BYTES => 4 )
@@ -1443,19 +1107,10 @@ begin
    objcol_q <= obj_q32(15 downto 0);
    objset_q <= obj_q32(23 downto 16);
 
-   -- merge-side data: BRAM q gated by the valid masks - an invalid pixel
-   -- reads as the old clear values (transparent color, zero settings). The
-   -- mask read is registered on the same edge that latches the BRAM q, so
-   -- both arrive together (the old registered-read timing).
    mrg_objcol_eff <= objcol_q when mrg_objcolv = '1' else x"8000";
    mrg_objset_eff <= objset_q when mrg_objsetv = '1' else x"00";
    mrg_obj        <= mrg_objset_eff & mrg_objcol_eff;
 
-   -- objwnd + the col/set valid masks: flop double buffers (3 x 512 bits),
-   -- one-cycle row clear on drawObj (per-element loop - the Quartus-safe
-   -- shape for a dynamically-indexed row clear), registered merge reads.
-   -- The ACCEPTED drawObj, so the row clear and the drawer's restart stay the
-   -- same event: a dropped drawObj must not clear a row nobody is going to fill.
    process (clk)
    begin
       if rising_edge(clk) then
@@ -1487,7 +1142,6 @@ begin
    mrg_bg2 <= lb_bg(2);
    mrg_bg3 <= lb_bg(3);
 
-   -- ================= line FSM =================
    process (clk)
    begin
       if rising_edge(clk) then
@@ -1508,15 +1162,11 @@ begin
                      cur_y      <= linecounter;
                   end if;
                when LDRAW =>
-                  -- one settle cycle after busy falls covers drawline latency
                   if (any_bg_busy = '0' and obj_busy = '0' and clear_addr = 256) then
                      linestate <= LMERGE;
                      merge_x   <= 0;
                   end if;
                when LMERGE =>
-                  -- the registered buffer read (lb_bg <= buf(merge_x)) lands on
-                  -- the same edge as merge_ena/merge_xpos, and the merge samples
-                  -- data and xpos together - so xpos must equal merge_x
                   if (merge_x < 256) then
                      merge_x    <= merge_x + 1;
                      merge_ena  <= '1';
@@ -1526,7 +1176,6 @@ begin
                      flush_cnt <= 0;
                   end if;
                when LFLUSH =>
-                  -- drain the merge pipeline (5 stages)
                   if (flush_cnt = 7) then
                      linestate <= LIDLE;
                   else
@@ -1545,7 +1194,6 @@ begin
    dbg_bgmode   <= R_bgmode;
    dbg_fblank   <= R_forced_blank(7);
 
-   -- ================= merge =================
    imerge : entity work.nds_drawer_merge
    port map
    (
@@ -1607,13 +1255,6 @@ begin
       pixel_we             => pixel_out_we
    );
 
-   -- forced blank: hardware outputs white
-   -- output stage, melonDS DrawScanline order: forced-blank white
-   -- composites like a normal line (master brightness applies); display
-   -- mode 0 shows white and skips master brightness; engine A's VRAM/FIFO
-   -- display modes (2/3) are unimplemented and render like mode 1.
-   -- Master brightness (18-bit space): up c += ((63-c)*f)/16 (bias 0),
-   -- down c -= (c*f + 15)/16 (bias 0xF), factor clamped to 16.
    raw666 <= (others => '1') when R_forced_blank = "1" else merge_out666;
 
    dispmode_eff <= R_dispmode(17 downto 16) when is_engine_b = '0' else '0' & R_dispmode(16);

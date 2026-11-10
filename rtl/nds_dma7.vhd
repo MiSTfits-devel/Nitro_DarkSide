@@ -1,21 +1,3 @@
--- SPDX-License-Identifier: GPL-2.0-or-later
--- NDS ARM7 DMA: 4 channels, registers 0x040000B0-0x040000DF (no FILL words -
--- those are ARM9-only). Port of nds_dma9 with the ARM7 differences per
--- GBATEK/melonDS:
---
---   * CNT: count in [15:0] - channels 0-2 use 14 bits (0 -> 0x4000),
---     channel 3 uses 16 (0 -> 0x10000); [22:21] dst ctrl, [24:23] src ctrl,
---     [25] repeat, [26] 32-bit, [29:28] start timing (2 bits, GBA layout:
---     0 immediate, 1 vblank, 2 DS card slot, 3 wifi/GBA-slot - stubbed),
---     [30] IRQ, [31] enable. Bit 27 (GBA gamepak DRQ) is dead. Registers
---     read back like the ARM9 side (NDS, unlike GBA).
---   * card trigger: one pulse per ready data word from nds_card when the
---     ARM7 owns the slot (EXMEMCNT[11]=1); games arm count=1 + repeat.
---   * transfers go through membus7 with the CPU paused (same dma_on +
---     CPU_bus_idle grant idiom as the ARM9 side; no TCMs to bypass here).
---
--- Timing is functional-only, same caveat and same FSM shape as nds_dma9 so
--- the DualSOUP pacing can be dialed into both at once (M9).
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -40,7 +22,6 @@ entity nds_dma7 is
       dma_on       : out std_logic := '0';
       dma_bus_on   : out std_logic := '0';
 
-      -- ARM7 membus access port (muxed onto the CPU port in nds_top)
       mb_ena       : out std_logic := '0';
       mb_rnw       : out std_logic := '1';
       mb_adr       : out std_logic_vector(31 downto 0) := (others => '0');
@@ -71,7 +52,7 @@ architecture arch of nds_dma7 is
       enable   : std_logic;
       cur_src  : unsigned(27 downto 0);
       cur_dst  : unsigned(27 downto 0);
-      remain   : unsigned(16 downto 0);   -- 0x10000 max (ch3)
+      remain   : unsigned(16 downto 0);
       pend     : std_logic;
    end record;
    constant CHAN_INIT : t_chan := ((others => '0'), (others => '0'), (others => '0'),
@@ -90,7 +71,6 @@ architecture arch of nds_dma7 is
    signal regsel_reg : integer range 0 to 2;
    signal reg_hit    : std_logic;
 
-   -- per-channel count width mask: 14 bits for 0-2, 16 for 3
    function count_mask(chn : integer) return std_logic_vector is
    begin
       if (chn = 3) then
@@ -113,7 +93,6 @@ architecture arch of nds_dma7 is
 
 begin
 
-   -- ================= register decode =================
    process (all)
       variable off : integer;
    begin
@@ -151,7 +130,6 @@ begin
                  ch(regsel_ch).dstctl & "00000" & ch(regsel_ch).count
                  when reg_hit = '1' else (others => '0');
 
-   -- ================= main FSM + register writes =================
    process (clk)
       variable v_ena   : std_logic;
       variable v_pick  : integer range 0 to 3;
@@ -172,7 +150,6 @@ begin
             dma_bus_on <= '0';
          else
 
-            -- -------- CPU register writes --------
             if (gb_bus.ena = '1' and gb_bus.rnw = '0' and reg_hit = '1') then
                case regsel_reg is
                   when 0 =>
@@ -227,7 +204,6 @@ begin
                end case;
             end if;
 
-            -- -------- triggers --------
             for i in 0 to 3 loop
                if (ch(i).enable = '1') then
                   if (trig_vblank = '1' and ch(i).timing = "01") then
@@ -236,11 +212,9 @@ begin
                   if (trig_card = '1' and ch(i).timing = "10") then
                      ch(i).pend <= '1';
                   end if;
-                  -- timing "11" (wifi / GBA slot) never fires
                end if;
             end loop;
 
-            -- -------- transfer FSM --------
             case state is
 
                when IDLE =>

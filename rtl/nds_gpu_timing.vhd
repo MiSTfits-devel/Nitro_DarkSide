@@ -1,34 +1,4 @@
--- SPDX-License-Identifier: GPL-2.0-or-later
--- NDS LCD timing (the gba_gpu_timing role): free-running dot cadence,
--- DISPSTAT/VCOUNT (one register set per CPU), IRQ pulses, and the
--- nds_gpu2d line-control cadence. Constants and event order follow
--- melonDS GPU.cpp / GBATEK:
---
---  * 6 clk per dot at 33.514 MHz; line = 355 dots = 2130 clk; frame =
---    263 lines (192 visible + 71 vblank). ce paces the dot clock so the
---    module can sit in a faster clock domain later ('1' at 33.5 MHz).
---  * scanline start (cycle 0): VCount updates (VCOUNT writes land here,
---    delayed like melonDS SetVCount; either CPU can write, last wins),
---    hblank flag clears, V-count match evaluates per CPU (+IRQ). The
---    vblank flag sets at VCount 192 (+IRQ +vblank_trigger: gpu2d
---    reloads affine refs and refills the ext-pal shadows) and clears at
---    VCount 262. refpoint_update steps the affine refs on lines 1..191,
 --    after each drawn line (the drawers keep a per-line latched copy,
---    so an overrunning line is unaffected).
---  * render point (cycle 1584 = 48 lead + 256 dots, where hblank
---    begins): hblank flag + IRQ on every line; on visible lines the
---    gpu2d cadence fires hblank_trigger (merge config latch), then
---    line_trigger (affine per-line latch), then drawline. drawObj
---    pre-renders OBJ one line ahead into the parity buffer (line 262
---    pre-renders OBJ line 0 for the next frame, melonDS-style).
---
--- The cadence is keyed on the internal line counter; a written VCount
--- shifts the flag/match values (and can re-fire the vblank events, as
--- in melonDS) but does not move the render cadence or frame length.
--- Timing free-runs: a drawline landing while nds_gpu2d is still busy is
--- dropped there (bounded artifact - the affine/extended fetch budget is
--- the open line-server item, measured by the timed frame TB).
--- No savestates yet - that plumbing lands with the hardware milestone.
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -42,10 +12,9 @@ entity nds_gpu_timing is
    port
    (
       clk               : in  std_logic;
-      ce                : in  std_logic;   -- dot pace ('1' when clk is the 33.5 MHz domain)
+      ce                : in  std_logic;
       reset             : in  std_logic;
 
-      -- register slices: ARM9 and ARM7 each own a DISPSTAT/VCOUNT set
       gb_bus9           : in  proc_bus_gb_type;
       wired_out9        : out std_logic_vector(31 downto 0) := (others => '0');
       wired_done9       : out std_logic;
@@ -60,7 +29,6 @@ entity nds_gpu_timing is
       irq7_hblank       : out std_logic := '0';
       irq7_vcount       : out std_logic := '0';
 
-      -- gpu2d line control (engine B shares the same cadence later)
       linecounter       : out integer range 0 to 191 := 0;
       drawline          : out std_logic := '0';
       linecounter_obj   : out integer range 0 to 191 := 0;
@@ -70,15 +38,15 @@ entity nds_gpu_timing is
       vblank_trigger    : out std_logic := '0';
       refpoint_update   : out std_logic := '0';
 
-      vcount_out        : out unsigned(8 downto 0);  -- live line, for compose/debug
-      dbg_vbl_ena9      : out std_logic := '0'       -- diagnostic-only persistent ARM9 DISPSTAT bit 3
+      vcount_out        : out unsigned(8 downto 0);
+      dbg_vbl_ena9      : out std_logic := '0'
    );
 end entity;
 
 architecture arch of nds_gpu_timing is
 
    constant LINE_CYCLES  : integer := 355 * 6;
-   constant RENDER_START : integer := 48 + 256 * 6;   -- hblank begins here
+   constant RENDER_START : integer := 48 + 256 * 6;
 
    signal cycles : integer range 0 to LINE_CYCLES - 1 := 0;
    signal line   : integer range 0 to 262 := 0;
@@ -87,11 +55,9 @@ architecture arch of nds_gpu_timing is
    signal vblank_flag : std_logic := '0';
    signal hblank_flag : std_logic := '0';
 
-   -- delayed VCOUNT write (melonDS SetVCount: applied at next scanline start)
    signal vcnt_wr_pend : std_logic := '0';
    signal vcnt_wr_val  : unsigned(8 downto 0) := (others => '0');
 
-   -- per-CPU register sets: 0 = ARM9, 1 = ARM7
    constant NREG : integer := 9;
    type t_busarr   is array (0 to 1) of proc_bus_gb_type;
    type t_worarr   is array (0 to 1, 0 to NREG - 1) of std_logic_vector(31 downto 0);
@@ -110,9 +76,6 @@ architecture arch of nds_gpu_timing is
    signal R_vmatch_low   : t_slv8;
    signal vmatch_flag    : std_logic_vector(0 to 1) := "00";
 
-   -- length-matched Din feeds for the flag registers (the eProcReg Din
-   -- formal is ranged (upper downto lower); lengths match, indices don't
-   -- have to)
    signal vblf_in        : std_logic_vector(0 downto 0);
    signal hblf_in        : std_logic_vector(0 downto 0);
    signal vcf_in         : t_slv1;
@@ -192,7 +155,6 @@ begin
          vblank_trigger  <= '0';
          refpoint_update <= '0';
 
-         -- a VCOUNT write from either CPU is held until the next scanline
          if (vcount_wrto(0) = '1') then
             vcnt_wr_pend <= '1';
             vcnt_wr_val  <= unsigned(vcount_wrval(0)(24 downto 16));
@@ -216,7 +178,6 @@ begin
 
             if (cycles = LINE_CYCLES - 1) then
 
-               -- scanline start
                cycles <= 0;
                if (line = 262) then
                   newline := 0;
@@ -265,8 +226,6 @@ begin
                cycles <= cycles + 1;
 
                if (cycles = RENDER_START - 1) then
-                  -- hblank (and the render point: the visible-line cadence
-                  -- fires here, hblank_trigger -> line_trigger -> drawline)
                   hblank_flag <= '1';
                   if (R_hbl_irq_ena(0) = "1") then irq9_hblank <= '1'; end if;
                   if (R_hbl_irq_ena(1) = "1") then irq7_hblank <= '1'; end if;

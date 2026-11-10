@@ -1,23 +1,3 @@
--- SPDX-License-Identifier: GPL-2.0-or-later
--- NDS ARM7 SPI bus (0x040001C0 SPICNT / 0x040001C2 SPIDATA) with the three
--- boot-relevant devices, modeled after melonDS 1.1 src/SPI.cpp for oracle
--- parity:
---   device 0: power management IC (registers 0..7, masks per melonDS,
---             reg4 resets to 0x40; shutdown bit is accepted and ignored)
---   device 1: firmware flash (commands 03 read / 05 RDSR / 04 WRDI /
---             06 WREN; 0A write is accepted bus-side but the image is
---             read-only). The 128 KB image is served through the fw_*
---             port (sim/tests/nds_firmware.hex = melonDS's generated
---             default firmware, dumped by melonds_fwdump).
---   device 2: touchscreen TSC (control byte -> 12-bit conversion; no
---             touch/mic inputs wired yet: X/Y read 0, mic reads 0x800,
---             temperature etc. read 0xFFF - matching headless melonDS)
---
--- A byte transfer takes 8*(8<<baud) clk cycles (SPI shifts one bit per
--- 33 MHz cycle pair set by baud); busy (bit7) is set for the duration and
--- irq_spi pulses at completion when CNT bit14 is set. Reading SPIDATA
--- while busy or disabled returns 0. Disabling the bus (bit15 1->0)
--- releases the selected device's chipselect (libnds relies on this).
 library IEEE;
 use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
@@ -34,13 +14,8 @@ entity nds_spi is
       wired_out7  : out std_logic_vector(31 downto 0);
       wired_done7 : out std_logic;
 
-      irq_spi     : out std_logic := '0';   -- one-cycle pulse (ARM7 IRQ bit 23)
+      irq_spi     : out std_logic := '0';
 
-      -- firmware image read port (256 KB, word addressed). fw_req pulses
-      -- one cycle with a fresh fw_addr; the backing store answers with
-      -- fw_done + valid fw_data any number of cycles later (BRAM: 1 cycle,
-      -- DDR3 pager: tens). The SPI byte busy window stretches until the
-      -- word arrives, so any latency is architecturally invisible.
       fw_addr     : out unsigned(17 downto 2) := (others => '0');
       fw_req      : out std_logic := '0';
       fw_done     : in  std_logic;
@@ -52,13 +27,11 @@ architecture arch of nds_spi is
 
    constant ADR_SPI : std_logic_vector(27 downto 0) := x"00001C0";
 
-   -- host
-   signal cnt        : std_logic_vector(15 downto 0) := (others => '0'); -- bit7 = busy
+   signal cnt        : std_logic_vector(15 downto 0) := (others => '0');
    signal delay_cnt  : unsigned(9 downto 0) := (others => '0');
    signal cnt_rd     : std_logic_vector(31 downto 0);
    signal rdata      : std_logic_vector(7 downto 0);
 
-   -- power management
    type t_pmregs is array (0 to 7) of std_logic_vector(7 downto 0);
    signal pm_regs    : t_pmregs := (others => (others => '0'));
    signal pm_hold    : std_logic := '0';
@@ -77,17 +50,15 @@ architecture arch of nds_spi is
       end case;
    end function;
 
-   -- firmware flash
    signal fw_hold    : std_logic := '0';
    signal fw_cmd     : std_logic_vector(7 downto 0) := (others => '0');
-   signal fw_datapos : unsigned(2 downto 0) := (others => '0');   -- saturates at 4
+   signal fw_datapos : unsigned(2 downto 0) := (others => '0');
    signal fw_a       : unsigned(23 downto 0) := (others => '0');
    signal fw_out     : std_logic_vector(7 downto 0) := (others => '0');
    signal fw_status  : std_logic_vector(7 downto 0) := (others => '0');
-   signal fw_pend    : std_logic := '0';   -- word fetch outstanding (holds busy)
+   signal fw_pend    : std_logic := '0';
    signal fw_lane    : unsigned(1 downto 0) := (others => '0');
 
-   -- touchscreen
    signal tsc_ctrl    : std_logic_vector(7 downto 0) := (others => '0');
    signal tsc_data    : std_logic_vector(7 downto 0) := (others => '0');
    signal tsc_datapos : unsigned(1 downto 0) := (others => '0');
@@ -132,9 +103,6 @@ begin
             tsc_conv   <= (others => '0');
          else
 
-            -- firmware word fetch: request issued at transfer start, byte
-            -- lane latched whenever the backing store answers (the busy
-            -- window below waits for fw_pend to clear)
             fw_req <= '0';
             if (fw_pend = '1' and fw_done = '1') then
                fw_pend <= '0';
@@ -146,7 +114,6 @@ begin
                end case;
             end if;
 
-            -- transfer completion (held while a firmware fetch is in flight)
             if (cnt(7) = '1') then
                if (delay_cnt = 0 and fw_pend = '0') then
                   cnt(7) <= '0';
@@ -160,21 +127,16 @@ begin
 
             if (bus7.ena = '1' and bus7.rnw = '0' and bus7.Adr = ADR_SPI) then
 
-               -- SPICNT low/high bytes (0x1C0/0x1C1)
                if (bus7.bEna(0) = '1') then
-                  -- busy (bit7) is read-only; writable low bits: baud [1:0]
                   cnt(6 downto 2) <= (others => '0');
                   cnt(1 downto 0) <= bus7.Din(1 downto 0);
                end if;
                if (bus7.bEna(1) = '1') then
-                  -- writable: [9:8] device, [11] hold, [14] irq, [15] enable
-                  -- (mask 0xCF03 with byte granularity)
                   if (cnt(15) = '1' and bus7.Din(15) = '0') then
-                     -- disable releases the selected device's chipselect
                      case cnt(9 downto 8) is
                         when "00" => pm_hold <= '0';
                         when "01" => fw_hold <= '0';
-                        when others => null;   -- tsc has no hold state
+                        when others => null;
                      end case;
                   end if;
                   cnt(15 downto 14) <= bus7.Din(15 downto 14);
@@ -184,7 +146,6 @@ begin
                   cnt(10)           <= '0';
                end if;
 
-               -- SPIDATA (0x1C2)
                if (bus7.bEna(2) = '1' and cnt(15) = '1' and cnt(7) = '0') then
                   wval := bus7.Din(23 downto 16);
                   dev  := cnt(9 downto 8);
@@ -194,7 +155,7 @@ begin
 
                   case dev is
 
-                     when "00" =>   -- power management
+                     when "00" =>
                         if (pm_hold = '0') then
                            pm_index   <= wval;
                            pm_hold    <= '1';
@@ -219,7 +180,7 @@ begin
                         end if;
                         if (v_release = '1') then pm_hold <= '0'; end if;
 
-                     when "01" =>   -- firmware flash
+                     when "01" =>
                         if (fw_hold = '0') then
                            fw_cmd     <= wval;
                            fw_hold    <= '1';
@@ -227,19 +188,17 @@ begin
                            fw_datapos <= "001";
                            fw_a       <= (others => '0');
                            case wval is
-                              when x"04" => fw_status(1) <= '0';   -- write disable
-                              when x"06" => fw_status(1) <= '1';   -- write enable
+                              when x"04" => fw_status(1) <= '0';
+                              when x"06" => fw_status(1) <= '1';
                               when others => null;
                            end case;
                         else
                            case fw_cmd is
-                              when x"03" =>   -- read
+                              when x"03" =>
                                  if (fw_datapos < 4) then
                                     fw_a   <= fw_a(15 downto 0) & unsigned(wval);
                                     fw_out <= (others => '0');
                                  else
-                                    -- serve fw[addr & 0x3FFFF], addr++ (2 Mbit
-                                    -- chip mirror-wraps at 256 KB)
                                     fw_addr  <= fw_a(17 downto 2);
                                     fw_lane  <= fw_a(1 downto 0);
                                     fw_req   <= '1';
@@ -249,9 +208,9 @@ begin
                                  if (fw_datapos /= 7) then
                                     fw_datapos <= fw_datapos + 1;
                                  end if;
-                              when x"05" =>   -- read status register
+                              when x"05" =>
                                  fw_out <= fw_status;
-                              when x"0A" =>   -- write: bus behavior only, image is read-only
+                              when x"0A" =>
                                  if (fw_datapos < 4) then
                                     fw_a   <= fw_a(15 downto 0) & unsigned(wval);
                                     fw_out <= (others => '0');
@@ -268,7 +227,7 @@ begin
                         end if;
                         if (v_release = '1') then fw_hold <= '0'; end if;
 
-                     when others =>   -- touchscreen
+                     when others =>
                         if (tsc_datapos = 1) then
                            tsc_data <= '0' & std_logic_vector(tsc_conv(11 downto 5));
                         elsif (tsc_datapos = 2) then
@@ -280,10 +239,10 @@ begin
                            tsc_ctrl    <= wval;
                            tsc_datapos <= "01";
                            case wval(6 downto 4) is
-                              when "001" => conv := (others => '0');      -- touch Y (no touch)
-                              when "101" => conv := (others => '0');      -- touch X (no touch)
-                              when "110" => conv := x"80" & x"0";         -- mic: silence -> 0x800
-                              when others => conv := x"FF" & x"F";        -- everything else: 0xFFF
+                              when "001" => conv := (others => '0');
+                              when "101" => conv := (others => '0');
+                              when "110" => conv := x"80" & x"0";
+                              when others => conv := x"FF" & x"F";
                            end case;
                            if (wval(3) = '1') then
                               conv := conv and x"FF0";

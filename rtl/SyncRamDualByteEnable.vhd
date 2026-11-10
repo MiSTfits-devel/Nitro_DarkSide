@@ -1,12 +1,12 @@
 library ieee;
 use ieee.std_logic_1164.all;
-use IEEE.numeric_std.all;  
+use IEEE.numeric_std.all;
 
 LIBRARY altera_mf;
 USE altera_mf.altera_mf_components.all;
 
 entity SyncRamDualByteEnable is
-   generic 
+   generic
    (
       is_simu     : std_logic;
       is_cyclone5 : std_logic := '0';
@@ -14,10 +14,10 @@ entity SyncRamDualByteEnable is
       ADDR_WIDTH  : natural := 6;
       BYTES       : natural := 4
    );
-   port 
+   port
    (
       clk        : in std_logic;
-      
+
       ce_a       : in std_logic;
       addr_a     : in natural range 0 to 2**ADDR_WIDTH - 1;
       datain_a0  : in std_logic_vector((BYTE_WIDTH-1) downto 0);
@@ -27,7 +27,7 @@ entity SyncRamDualByteEnable is
       dataout_a  : out std_logic_vector((BYTES*BYTE_WIDTH-1) downto 0);
       we_a       : in std_logic := '1';
       be_a       : in  std_logic_vector (BYTES - 1 downto 0);
-		 
+
       ce_b       : in std_logic;
       addr_b     : in natural range 0 to 2**ADDR_WIDTH - 1;
       datain_b0  : in std_logic_vector((BYTE_WIDTH-1) downto 0);
@@ -41,30 +41,27 @@ entity SyncRamDualByteEnable is
 end;
 
 architecture rtl of SyncRamDualByteEnable is
-	--  build up 2D array to hold the memory
 	type word_t is array (0 to BYTES-1) of std_logic_vector(BYTE_WIDTH-1 downto 0);
 	type ram_t is array (0 to 2 ** ADDR_WIDTH - 1) of word_t;
 
 	signal ram : ram_t := (others => (others => (others => '0')));
 	signal q1_local : word_t;
-	signal q2_local : word_t;  
+	signal q2_local : word_t;
 
 begin
 
    gsynth : if is_simu = '0' and is_cyclone5 = '0' generate
    begin
-      -- Reorganize the read data from the RAM to match the output
-      unpack: for i in 0 to BYTES - 1 generate    
+      unpack: for i in 0 to BYTES - 1 generate
          dataout_a(BYTE_WIDTH*(i+1) - 1 downto BYTE_WIDTH*i) <= q1_local(i);
-         dataout_b(BYTE_WIDTH*(i+1) - 1 downto BYTE_WIDTH*i) <= q2_local(i);    
+         dataout_b(BYTE_WIDTH*(i+1) - 1 downto BYTE_WIDTH*i) <= q2_local(i);
       end generate unpack;
-   
+
       process(clk)
       begin
          if(rising_edge(clk)) then
             if (ce_a = '1') then
                if(we_a = '1') then
-                  -- edit this code if using other than four bytes per word
                   if(be_a(0) = '1') then
                      ram(addr_a)(0) <= datain_a0;
                   end if;
@@ -82,13 +79,12 @@ begin
             end if;
          end if;
       end process;
-   
+
       process(clk)
       begin
-         if(rising_edge(clk)) then 
+         if(rising_edge(clk)) then
             if (ce_b = '1') then
                if(we_b = '1') then
-                     -- edit this code if using other than four bytes per word
                   if(be_b(0) = '1') then
                      ram(addr_b)(0) <= datain_b0;
                   end if;
@@ -105,24 +101,24 @@ begin
                q2_local <= ram(addr_b);
             end if;
          end if;
-      end process;  
+      end process;
    end generate;
-        
+
    gsynth_cyclone5 : if is_simu = '0' and is_cyclone5 = '1' generate
       signal data_a : std_logic_vector((BYTES*BYTE_WIDTH-1) downto 0);
       signal data_b : std_logic_vector((BYTES*BYTE_WIDTH-1) downto 0);
-      
+
       signal addr_a_slv : std_logic_vector(ADDR_WIDTH-1 downto 0);
       signal addr_b_slv : std_logic_vector(ADDR_WIDTH-1 downto 0);
-      
+
    begin
-      
+
       data_a <= datain_a3 & datain_a2 & datain_a1 & datain_a0;
       data_b <= datain_b3 & datain_b2 & datain_b1 & datain_b0;
-      
+
       addr_a_slv <= std_logic_vector(to_unsigned(addr_a, ADDR_WIDTH));
       addr_b_slv <= std_logic_vector(to_unsigned(addr_b, ADDR_WIDTH));
-      
+
       altsyncram_component : altsyncram
       GENERIC MAP (
          address_reg_b => "CLOCK1",
@@ -143,7 +139,7 @@ begin
          power_up_uninitialized => "FALSE",
          read_during_write_mode_port_a => "NEW_DATA_NO_NBE_READ",
          read_during_write_mode_port_b => "NEW_DATA_NO_NBE_READ",
-         init_file => " ", 
+         init_file => " ",
          widthad_a => ADDR_WIDTH,
          widthad_b => ADDR_WIDTH,
          width_a => BYTES*BYTE_WIDTH,
@@ -170,22 +166,20 @@ begin
       );
 
    end generate;
-   
+
    gsimu : if is_simu = '1' generate
    begin
-      -- Reorganize the read data from the RAM to match the output
-      unpack: for i in 0 to BYTES - 1 generate    
+      unpack: for i in 0 to BYTES - 1 generate
          dataout_a(BYTE_WIDTH*(i+1) - 1 downto BYTE_WIDTH*i) <= q1_local(i);
-         dataout_b(BYTE_WIDTH*(i+1) - 1 downto BYTE_WIDTH*i) <= q2_local(i);    
+         dataout_b(BYTE_WIDTH*(i+1) - 1 downto BYTE_WIDTH*i) <= q2_local(i);
       end generate unpack;
-   
-   
+
+
       process(clk)
       begin
-         if(rising_edge(clk)) then 
+         if(rising_edge(clk)) then
             if (ce_a = '1') then
                if(we_a = '1') then
-                  -- edit this code if using other than four bytes per word
                   if(be_a(0) = '1') then
                      ram(addr_a)(0) <= datain_a0;
                   end if;
@@ -201,10 +195,9 @@ begin
                end if;
                q1_local <= ram(addr_a);
             end if;
-   
+
             if (ce_b = '1') then
                if(we_b = '1') then
-                     -- edit this code if using other than four bytes per word
                   if(be_b(0) = '1') then
                      ram(addr_b)(0) <= datain_b0;
                   end if;
@@ -221,7 +214,7 @@ begin
                q2_local <= ram(addr_b);
             end if;
          end if;
-      end process;  
+      end process;
    end generate;
-  
+
 end rtl;

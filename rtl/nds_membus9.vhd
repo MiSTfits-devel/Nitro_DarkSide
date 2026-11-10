@@ -1,20 +1,3 @@
--- SPDX-License-Identifier: GPL-2.0-or-later
--- ARM9 memory bus decoder. Same request/done idiom as nds_membus7 (accepts a
--- new CPU request on every completing cycle), plus the ARM946E-S TCM overlay:
---
---   ITCM: physical 32 KB mirrored through [0, 512B << cp15_itcm_size), takes
---         priority over everything; in load mode writes hit the TCM while
---         reads fall through to the external map
---   DTCM: physical 16 KB mirrored through [base, base + 512B << size); data
---         accesses only (never instruction fetches), below ITCM priority
---
---   external map: 0x02 main RAM, 0x03 shared WRAM, 0x04 IO proc-bus,
---   0x06 VRAM (cpu9 port), 0xFFFF0000 boot ROM (32 KB, read-only).
---   Unmapped: open bus (CPU lastread).
---
--- The TCM and boot-ROM backing stores are external ports (combinational read,
--- clocked write) so the island testbench can own them; the synthesizable core
--- will move them into BRAM primitives later.
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -32,7 +15,6 @@ entity nds_membus9 is
       clk            : in  std_logic;
       reset          : in  std_logic;
 
-      -- CP15 configuration (from nds_cpu9)
       itcm_ena       : in  std_logic;
       itcm_load      : in  std_logic;
       itcm_size      : in  std_logic_vector(4 downto 0);
@@ -41,7 +23,6 @@ entity nds_membus9 is
       dtcm_base      : in  std_logic_vector(31 downto 12);
       dtcm_size      : in  std_logic_vector(4 downto 0);
 
-      -- cache attributes of the current address + maintenance (from nds_cpu9)
       bus_cacheable_i : in  std_logic;
       bus_cacheable_d : in  std_logic;
       cache_op_ena    : in  std_logic;
@@ -49,9 +30,6 @@ entity nds_membus9 is
       cache_op_addr   : in  std_logic_vector(31 downto 0);
       cache_op_busy   : out std_logic;
 
-      -- gba_cpu-style bus
-      -- '1' while the DMA owns the bus: DMA cannot access the TCMs, so
-      -- their windows fall through to the external map (GBATEK/DualSOUP)
       dma_bus        : in  std_logic := '0';
 
       cpu_adr        : in  std_logic_vector(31 downto 0);
@@ -65,22 +43,12 @@ entity nds_membus9 is
       cpu_din        : out std_logic_vector(31 downto 0);
       cpu_done       : out std_logic;
 
-      -- ITCM store (32 KB): sync-read BRAM, addr/write presented
-      -- combinationally in the accept cycle (the store registers the
-      -- address; read data valid in the FINISH cycle)
       itcm_addr      : out unsigned(14 downto 2);
       itcm_we        : out std_logic;
       itcm_be        : out std_logic_vector(3 downto 0);
       itcm_writedata : out std_logic_vector(31 downto 0);
       itcm_readdata  : in  std_logic_vector(31 downto 0);
 
-      -- DTCM store (16 KB). Port A is now READ-ONLY and keeps the ITCM's
-      -- contract: address presented combinationally in the accept cycle, read
-      -- data valid in FINISH. The store moved to port B one cycle later, so its
-      -- write enable comes straight off a flop instead of off the CPU's address
-      -- - see "DTCM deferred store" below. The write ports are deliberately
-      -- renamed rather than reused: an instantiation that still wires the old
-      -- port-A write fails analysis instead of quietly writing twice.
       dtcm_addr        : out unsigned(13 downto 2);
       dtcm_readdata    : in  std_logic_vector(31 downto 0);
       dtcm_addr_b      : out unsigned(13 downto 2) := (others => '0');
@@ -88,11 +56,9 @@ entity nds_membus9 is
       dtcm_be_b        : out std_logic_vector(3 downto 0) := (others => '0');
       dtcm_writedata_b : out std_logic_vector(31 downto 0) := (others => '0');
 
-      -- boot ROM store (32 KB at 0xFFFF0000, read-only)
       brom_addr      : out unsigned(14 downto 2) := (others => '0');
       brom_data      : in  std_logic_vector(31 downto 0);
 
-      -- shared WRAM (nds_wram arm9 port)
       wsh_ena        : out std_logic := '0';
       wsh_rnw        : out std_logic := '1';
       wsh_addr       : out unsigned(14 downto 2) := (others => '0');
@@ -102,7 +68,6 @@ entity nds_membus9 is
       wsh_done       : in  std_logic;
       wsh_mapped     : in  std_logic;
 
-      -- VRAM (nds_vram cpu9 port)
       vram_ena       : out std_logic := '0';
       vram_rnw       : out std_logic := '1';
       vram_addr      : out unsigned(23 downto 2) := (others => '0');
@@ -111,10 +76,6 @@ entity nds_membus9 is
       vram_dout      : in  std_logic_vector(31 downto 0);
       vram_done      : in  std_logic;
 
-      -- palette / OAM write ports (word index 0..255 = engine A, 256..511 =
-      -- engine B half of each 2 KB mirror; the integration splits them onto
-      -- the two nds_gpu2d instances. CPU readback is a known gap - reads
-      -- return 0 until the BRAMs grow a read port)
       pal_we         : out std_logic := '0';
       pal_addr       : out integer range 0 to 511 := 0;
       pal_din        : out std_logic_vector(31 downto 0) := (others => '0');
@@ -124,7 +85,6 @@ entity nds_membus9 is
       oam_din        : out std_logic_vector(31 downto 0) := (others => '0');
       oam_be         : out std_logic_vector(3 downto 0) := (others => '0');
 
-      -- main RAM (nds_mainram mem9 port)
       mr_ena         : out std_logic := '0';
       mr_rnw         : out std_logic := '1';
       mr_addr        : out std_logic_vector(21 downto 2) := (others => '0');
@@ -132,23 +92,14 @@ entity nds_membus9 is
       mr_writedata   : out std_logic_vector(31 downto 0) := (others => '0');
       mr_done        : in  std_logic;
       mr_readdata    : in  std_logic_vector(31 downto 0);
-      -- cache line fills ask for an aligned 8-byte pair per request; the second
-      -- word arrives beside mr_readdata on the same mr_done
       mr_pair        : out std_logic := '0';
       mr_readdata_hi : in  std_logic_vector(31 downto 0) := (others => '0');
 
-      -- IO register bus. The peripherals may live in a slower ce domain
-      -- (33 MHz vs the 66 MHz ARM9): io_ce_next is the value their ce will
-      -- have in the NEXT cycle - the 1-cycle io_bus.ena pulse is only issued
-      -- when it will land on an active peripheral cycle. Tie to '1' when the
-      -- peripherals run at full rate.
       io_ce_next     : in  std_logic := '1';
       io_bus         : out proc_bus_gb_type := ((others => '0'), (others => '0'), '1', '0', "00", "0000", '0');
       io_wired_out   : in  std_logic_vector(31 downto 0);
       io_wired_done  : in  std_logic;
 
-      -- diagnostic export for the ch4 debug mailbox:
-      -- {cpu_ena, cpu_done, membus state[2:0]} and the cache's own word
       dbg_mb         : out std_logic_vector(7 downto 0) := (others => '0');
       dbg_cache      : out std_logic_vector(7 downto 0) := (others => '0')
    );
@@ -157,14 +108,6 @@ end entity;
 architecture arch of nds_membus9 is
 
    type t_target is (T_ITCM, T_DTCM, T_BROM, T_MAIN, T_WRAMSH, T_IO, T_VRAM, T_PAL, T_OAM, T_OPEN);
-   -- W_IO_RESP: wait for the IO fabric's completion before retiring the access.
-   -- Before the ARM9 moved to its own clock the IO fabric shared clk1x with the
-   -- CPU, so io_wired_done was already valid in FINISH and going straight there
-   -- was correct. Across the island bridge the round trip takes several island
-   -- cycles, so FINISH was reached with io_wired_done still low - and the read mux
-   -- falls back to x"00000000" for an unclaimed T_IO. Every ARM9 IO read returned
-   -- zero. Measured with sim/tests/iotest: IPCSYNC, IE, DISPCNT and POWCNT1 all
-   -- read back 0 where melonDS returns the written value.
    type t_state  is (IDLE, FINISH, W_WRAMSH, W_VRAM, W_MAIN, W_IO_ALIGN, W_IO_RESP);
 
    signal state    : t_state  := IDLE;
@@ -172,10 +115,6 @@ architecture arch of nds_membus9 is
    signal r_acc    : std_logic_vector(1 downto 0) := "10";
    signal r_low    : std_logic_vector(1 downto 0) := "00";
 
-   -- "bits at or above the region size" mask for a TCM size code: the region is
-   -- 512 << size bytes, so bit 9+size and everything above it must be clear (or
-   -- match the base) for an address to be inside. Pure function of the size
-   -- register - see the TCM decode below for why that matters.
    function region_mask (size : std_logic_vector(4 downto 0)) return unsigned is
       variable m : unsigned(32 downto 0) := (others => '0');
    begin
@@ -202,10 +141,6 @@ architecture arch of nds_membus9 is
 
    signal din_unrot  : std_logic_vector(31 downto 0);
 
-   -- DTCM deferred store (see the block comment at the drive below).
-   -- dw_* is the write presented on port B *this* cycle; it commits at the edge
-   -- ending this cycle. dwq_* is that same write one cycle later, which is what
-   -- a read accepted alongside it has to be bypassed against.
    signal dw_pend    : std_logic := '0';
    signal dw_addr    : unsigned(13 downto 2) := (others => '0');
    signal dw_data    : std_logic_vector(31 downto 0) := (others => '0');
@@ -216,15 +151,10 @@ architecture arch of nds_membus9 is
    signal dwq_data   : std_logic_vector(31 downto 0) := (others => '0');
    signal dwq_be     : std_logic_vector(3 downto 0) := (others => '0');
 
-   -- the accepted read's own address, one cycle on: both valid in FINISH.
-   -- Registering the address here rather than comparing against the live
-   -- cpu_adr in the accept cycle is the point: it keeps the 12-bit bypass
-   -- compare off the ALU's address path, where the old dtcm_we already was.
    signal dr_pend    : std_logic := '0';
    signal dr_addr    : unsigned(13 downto 2) := (others => '0');
    signal dtcm_rd_eff : std_logic_vector(31 downto 0);
 
-   -- cache <-> CPU-request side (main RAM only; the cache owns the mr_* port)
    signal creq_ena       : std_logic := '0';
    signal creq_rnw       : std_logic := '1';
    signal creq_code      : std_logic := '0';
@@ -235,32 +165,11 @@ architecture arch of nds_membus9 is
    signal cresp_done     : std_logic;
    signal cresp_rdata    : std_logic_vector(31 downto 0);
 
-   -- IO read data, held past the completion pulse.
-   --
-   -- io_wired_done is not a level here. nds_top generates it as a one-island-cycle
-   -- COMPLETION event, unconditionally, so that reads of UNCLAIMED addresses retire
-   -- too (see the "IO completion, clk1x -> island" block there). The read mux below
-   -- therefore presents io_wired_out for exactly that one cycle and falls through to
-   -- x"00000000" on every other cycle.
-   --
-   -- The CPU is inside the island and samples in precisely that cycle, so its reads
-   -- are correct. nds_dma9 is not: it is a clk1x unit driven by the stretched
-   -- cpu9_done_1x, which is a registered toggle-edge and so lands one to two clk1x
-   -- cycles LATER. By then T_IO read 0. Every ARM9 DMA read from an IO register
-   -- returned zero, in both the 1:1 and 2:1 island configurations.
-   --
-   -- Found via the NITRO Tester's [04-02] DMA PRIORITY test (progress 011/058),
-   -- which DMAs from TM3CNT_L and so filled both of its VRAM buffers with zeroes -
-   -- reproduced standalone by sim/tests/dmaprio. Only the DMA is affected; every
-   -- other source (VRAM, main RAM, shared WRAM) answers from a register that stays
-   -- valid, which is why ordinary memory-to-memory DMA always worked.
    signal io_rd_hold     : std_logic_vector(31 downto 0) := (others => '0');
    signal io_rd_eff      : std_logic_vector(31 downto 0);
 
 begin
 
-   -- BIOS9 uses a synchronous hot-loadable RAM in hardware. Drive its read
-   -- address in the accept cycle so the registered word is ready in FINISH.
    brom_addr <= unsigned(cpu_adr(14 downto 2));
 
    icache : entity work.nds_cache9
@@ -279,8 +188,6 @@ begin
       req_addr      => creq_addr,
       req_be        => creq_be,
       req_wdata     => creq_wdata,
-      -- the CPU's address before this membus registers it into creq_addr, so the
-      -- cache can index its tag/data BRAMs a cycle earlier (see nds_cache9)
       spec_addr     => cpu_adr,
       resp_done     => cresp_done,
       resp_rdata    => cresp_rdata,
@@ -300,12 +207,9 @@ begin
       dbg_state     => dbg_cache
    );
 
-   -- cpu_done is an out port (unreadable in VHDL-93), so export the terms that
-   -- decide it instead: whichever target the current state is waiting on.
    dbg_mb <= cpu_ena & accept_now & cresp_done & mr_done & "0" &
              std_logic_vector(to_unsigned(t_state'pos(state), 3));
 
-   -- ================= request accept (combinational mirror of can_accept) =================
    accept_now <= '1' when reset = '0' and
                           (state = IDLE or state = FINISH or
                            (state = W_WRAMSH and wsh_done   = '1') or
@@ -313,25 +217,6 @@ begin
                            (state = W_MAIN   and cresp_done = '1') or
                            (state = W_IO_RESP and io_wired_done = '1')) else '0';
 
-   -- ================= TCM store drive =================
-   -- Presented in the accept cycle so the BRAM's internal address register
-   -- takes the role of the old registered itcm_addr/dtcm_addr: read data is
-   -- valid in the FINISH cycle, writes land at the accept edge (one cycle
-   -- earlier than the old external write process - unobservable, the next
-   -- request is accepted no earlier than the FINISH edge).
-   -- These test the hit bits directly rather than `dec_target = T_*`, which is
-   -- the same Boolean function and a shorter path. dec_target is an enum: the
-   -- region decode below encodes itcm_hit/dtcm_hit into it and this comparison
-   -- decodes them back out, two LUT levels of round trip on a signal that is
-   -- already the far end of the ARM9's longest path. The DTCM store's M10K
-   -- write-enable was the worst endpoint in the design after imainram|req9_lock
-   -- (-4.196 ns), and it is reached exactly this way:
-   --    ALU -> bus address -> dtcm_hit -> dec_target -> dtcm_sel -> dtcm_we.
-   --
-   -- Equivalence is by construction from the priority order below:
-   --   dec_target = T_ITCM  <->  itcm_hit
-   --   dec_target = T_DTCM  <->  dtcm_hit and not itcm_hit
-   -- and nothing above ITCM can claim the address.
    itcm_sel       <= accept_now and cpu_ena and itcm_hit;
    itcm_addr      <= unsigned(cpu_adr(14 downto 2));
    itcm_we        <= itcm_sel and not cpu_rnw;
@@ -341,47 +226,9 @@ begin
    dtcm_sel       <= accept_now and cpu_ena and dtcm_hit and not itcm_hit;
    dtcm_addr      <= unsigned(cpu_adr(13 downto 2));
 
-   -- ================= DTCM deferred store =================
-   -- This store's M10K write enable (`idtcm|ram_block1a*~porta_we_reg`) was the
-   -- single biggest timing family in the design: 46 of the 50 worst setup paths in
-   -- build/artifacts-t5, and **2,009 of the ~3,000 paths that violate at 67 MHz**
-   -- across the whole NDS.paths_67mhz.rpt, worst -2.535 ns. ~3.46 ns of it was the
-   -- M10K's own write-enable routing and setup, which no logic work touches.
-   -- Presenting the write in the accept cycle put the whole chain
-   --     ALU -> cpu_adr -> dtcm_hit -> dtcm_sel -> dtcm_we -> M10K we setup
-   -- inside one island cycle. Port B was unused (`ce_b => '0'`), so the write
-   -- moves there with a registered address/data/we: the write enable is now a
-   -- flop output and the M10K tail gets a full cycle of its own.
-   --
-   -- Do not expect this alone to close clk2x. The four other violating families
-   -- (store data -> pal/vram/oam/wsh_din at -2.491, io_bus -2.278, creq_* -2.254,
-   -- shifter/execute_busaddress -2.170) sit within 0.37 ns of this one, so
-   -- removing 67% of the violating paths still leaves WNS near -2.49. See the
-   -- "UPDATE 2026-07-28" section of HANDOFF.md: the front is broad, and the lever
-   -- that moves all of it at once is the island's clock, not its logic.
-   --
-   -- One pending slot is sufficient. This bus accepts at most one request per
-   -- cycle, so a store accepted in cycle N is always issued in N+1 before a
-   -- store accepted in N+1 can need the slot.
-   --
-   -- THE HAZARD, and why the bypass below is not optional. Port A reads
-   -- combinationally off the live cpu_adr and altsyncram registers that address
-   -- at the edge ending the accept cycle. A store accepted in N-1 is presented
-   -- on port B during N and commits at that *same* edge, so a read accepted in
-   -- cycle N is a mixed-port read-during-write at one address on Cyclone V,
-   -- which returns OLD data. The store-forward merge below substitutes the
-   -- pending bytes into the read data in FINISH. Note the merge is safe
-   -- regardless of what the silicon actually returns for mixed-port RDW: it
-   -- substitutes exactly the bytes the write wrote, so if the M10K did return
-   -- new data the bypass is a no-op on an identical value.
-   --
-   -- The simulation model has the same behaviour (`gsimu` reads `ram(addr_a)` as
-   -- a signal, i.e. the pre-edge value), so a sim run does exercise this hazard
-   -- rather than hiding it.
    process (clk)
    begin
       if rising_edge(clk) then
-         -- age this cycle's port-B write by one, for the bypass compare
          dwq_pend <= dw_pend;
          dwq_addr <= dw_addr;
          dwq_data <= dw_data;
@@ -411,8 +258,6 @@ begin
    dtcm_be_b        <= dw_be;
    dtcm_writedata_b <= dw_data;
 
-   -- store-forward merge, consumed in FINISH via din_unrot below. Both operands
-   -- are flops, so this whole compare-and-merge starts at the top of the cycle.
    process (all)
    begin
       dtcm_rd_eff <= dtcm_readdata;
@@ -425,45 +270,10 @@ begin
       end if;
    end process;
 
-   -- size > 23 makes 512 << size overflow the 33-bit limit the old compares
-   -- used, which turned every hit test false. See the TCM decode below.
    itcm_size_ovf <= '1' when (unsigned(itcm_size) > 23) else '0';
    dtcm_size_ovf <= '1' when (unsigned(dtcm_size) > 23) else '0';
 
-   -- ================= TCM decode =================
-   -- Both hit tests used to be unsigned magnitude compares against runtime
-   -- limits, which put the *address* on a carry chain: `a < itcm_limit` for
-   -- ITCM and `a >= dtcm_lo and a < dtcm_hi` for DTCM. In the 88% island build
-   -- that chain (`imembus9|LessThan2~15/34/44/45`) was 3.46 ns of the 21.8 ns
-   -- `decode_RM_op2 -> vram_din` worst path, and it is most of the separate
-   -- `io_bus.Adr -> vram_din` family too.
-   --
-   -- Same rewrite as the CP15 PU region compare above: a TCM region is a power
-   -- of two, so "inside the region" is a test on the address bits *above* the
-   -- region size - an and + zero-detect instead of a compare.
-   --
-   --   ITCM (base is architecturally 0):  a < 2^k          <->  (a and mask) = 0
-   --   DTCM:                              a in [lo,lo+2^k) <->  ((a xor lo) and mask) = 0
-   --
-   -- with mask(i) = '1' iff i >= k. The masks derive from itcm_size/dtcm_size
-   -- only - both registers - so the shift stays off the address path exactly as
-   -- it does for the PU compare.
-   --
    -- Two things the old form did that this has to keep doing:
-   --
-   -- * 512 << size is computed in 33 bits, so any size > 23 shifted the region
-   --   bit off the top and left a limit of 0 - which made the compare false for
-   --   every address. A mask built from k > 32 is all-zero, i.e. hit for every
-   --   address: the exact opposite. `*_size_ovf` restores the old answer, and
-   --   being size-derived it costs nothing on the address path. melonDS wraps
-   --   the same way (u32 `0x200 << N`), so "no hit" is also the oracle's answer.
-   -- * a(32) is always '0' (cpu_adr is 32 bits), so size 23 - mask = bit 32
-   --   alone - hits for every address, which is what `a < 2^32` did.
-   --
-   -- The ITCM form is an identity. The DTCM form additionally assumes the base
-   -- is aligned to the region size; the ARM946E-S requires that (an unaligned
-   -- TCM base is UNPREDICTABLE) and melonDS - the trace oracle - enforces it by
-   -- masking the base. Masking dtcm_lo here makes the two agree.
    process (all)
       variable a         : unsigned(32 downto 0);
       variable itcm_mask : unsigned(32 downto 0);
@@ -475,7 +285,6 @@ begin
       itcm_mask := region_mask(itcm_size);
       itcm_hit  <= '0';
       if (itcm_ena = '1' and itcm_size_ovf = '0' and (a and itcm_mask) = 0 and dma_bus = '0') then
-         -- load mode: writes land in the TCM, reads see the external map
          if (cpu_rnw = '0' or itcm_load = '0') then
             itcm_hit <= '1';
          end if;
@@ -492,7 +301,6 @@ begin
       end if;
    end process;
 
-   -- ================= region decode =================
    process (all)
    begin
       dec_target <= T_OPEN;
@@ -507,7 +315,7 @@ begin
             when x"2" => dec_target <= T_MAIN;
             when x"3" =>
                if (wsh_mapped = '1') then
-                  dec_target <= T_WRAMSH; -- unmapped shared WRAM: ARM9 sees open bus
+                  dec_target <= T_WRAMSH;
                end if;
             when x"4" =>
                if (cpu_adr(23) = '0') then
@@ -521,7 +329,6 @@ begin
       end if;
    end process;
 
-   -- ================= write lane placement (gba_mem_writerotate) =================
    process (all)
    begin
       wdata <= cpu_dout;
@@ -553,7 +360,6 @@ begin
       end case;
    end process;
 
-   -- ================= request FSM =================
    process (clk)
       variable can_accept : boolean;
    begin
@@ -577,15 +383,6 @@ begin
                   io_bus.ena <= '1';
                   state      <= W_IO_RESP;
                end if;
-            -- No dedicated W_IO_RESP branch on purpose. accept_now already covers
-            -- "W_IO_RESP and io_wired_done", so this state completes through the
-            -- shared accept path below exactly like W_MAIN / W_VRAM / W_WRAMSH do.
-            -- A private branch here looks harmless but silently drops a request:
-            -- this bus accepts a new access in the very cycle it completes one, so
-            -- handling the completion without also honouring cpu_ena loses the
-            -- CPU's next request and it waits forever for a done that never comes.
-            -- That is exactly how the first version of this fix hung the ARM9 on
-            -- its second IO access.
             elsif can_accept then
                state <= IDLE;
                if (cpu_ena = '1') then
@@ -596,13 +393,13 @@ begin
                   case dec_target is
 
                      when T_ITCM =>
-                        state <= FINISH;   -- store drive is combinational above
+                        state <= FINISH;
 
                      when T_DTCM =>
-                        state <= FINISH;   -- store drive is combinational above
+                        state <= FINISH;
 
                      when T_BROM =>
-                        state     <= FINISH; -- writes are no-ops
+                        state     <= FINISH;
 
                      when T_WRAMSH =>
                         wsh_ena  <= '1';
@@ -621,7 +418,6 @@ begin
                         state     <= W_VRAM;
 
                      when T_PAL =>
-                        -- std palettes: 2 KB mirror, engine A low / B high
                         if (cpu_rnw = '0') then
                            pal_we   <= '1';
                            pal_addr <= to_integer(unsigned(cpu_adr(10 downto 2)));
@@ -631,7 +427,6 @@ begin
                         state <= FINISH;
 
                      when T_OAM =>
-                        -- OAM: 2 KB mirror, engine A low / B high
                         if (cpu_rnw = '0') then
                            oam_we   <= '1';
                            oam_addr <= to_integer(unsigned(cpu_adr(10 downto 2)));
@@ -647,31 +442,6 @@ begin
                         creq_addr  <= cpu_adr;
                         creq_be    <= be;
                         creq_wdata <= wdata;
-                        -- A DMA access is never cacheable. Two independent reasons,
-                        -- either of which is sufficient:
-                        --
-                        -- 1. Hardware. The ARM9 DMA is a separate bus master; it
-                        --    does not see the CPU's caches. That is precisely why
-                        --    NitroSDK calls DC_FlushRange before a DMA and
-                        --    DC_InvalidateRange after one.
-                        -- 2. bus_cacheable_i/_d are decoded in nds_cpu9 from
-                        --    gb_bus_Adr - the CPU's OWN address register (see
-                        --    nds_cpu9.vhd:642-659) - not from the muxed bus. While
-                        --    the DMA owns the bus that value is whatever address
-                        --    the CPU last presented, which has nothing to do with
-                        --    the address being transferred.
-                        --
-                        -- Leaving it stale is what broke bootreq subtest 14. The
-                        -- CPU was paused mid instruction-fetch from main RAM, i.e.
-                        -- inside the one PU region the test marks cacheable, so
-                        -- bus_cacheable_d read '1' for the whole transfer. The
-                        -- DMA's read of 0x02FFFF60 then allocated a line and its
-                        -- write of 0x02FFFF70 hit that same line and stopped there,
-                        -- dirty. The CPU's read-back went through the uncached
-                        -- mirror straight to main RAM and saw 0. On the bus the
-                        -- transfer looked perfect - correct address, correct data,
-                        -- correct handshake - which is why this survived a probe of
-                        -- the DMA path itself.
                         if (dma_bus = '1') then
                            creq_cacheable <= '0';
                         elsif (cpu_code = '1') then
@@ -710,19 +480,13 @@ begin
                cresp_done     when state = W_MAIN    else
                io_wired_done  when state = W_IO_RESP else '0';
 
-   -- ================= read data mux + rotation (gba_mem_readrotate) =================
    din_unrot <= itcm_readdata when target = T_ITCM   else
                 dtcm_rd_eff   when target = T_DTCM   else
                 brom_data     when target = T_BROM   else
                 wsh_dout      when target = T_WRAMSH else
                 vram_dout     when target = T_VRAM   else
-                x"00000000"   when (target = T_PAL or target = T_OAM) else -- readback gap: BRAMs are write-only from the CPU
+                x"00000000"   when (target = T_PAL or target = T_OAM) else
                 cresp_rdata   when target = T_MAIN   else
-                -- unclaimed NDS9 IO reads 0 (not GBA open bus): calico probes SCFG
-                -- 0x04004000 for NTR/TWL detection. io_wired_out is a wired-OR tree
-                -- and is already 0 when nothing claims the address, so capturing it
-                -- in the completion cycle preserves that and also survives into the
-                -- cycle nds_dma9 retires the access - see io_rd_hold above.
                 io_rd_eff     when target = T_IO     else
                 cpu_lastread;
 

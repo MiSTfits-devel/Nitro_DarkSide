@@ -1,15 +1,4 @@
--- nds_port_wrap — mixed-language shim between NDS.sv (SystemVerilog) and
--- nds_top (VHDL). Quartus can't carry VHDL record ports (dbg_export9/7,
--- cpu_export_type) or ranged-integer ports (pixel_out_x/y) across the
--- language boundary, so this wrapper terminates the debug records (is_simu
--- only anyway), converts the pixel coordinates to plain vectors, and exposes
--- everything else 1:1 as std_logic/std_logic_vector.
---
 -- No logic lives here. Generics keep their nds_top defaults (is_simu='0', main
--- RAM at SDRAM byte offset 8 MB) except the three set explicitly
--- on the generic map below - GPU_FAST, SOUND_ENABLE and DEBUG_ENABLE - each
--- with its reason written out there. SOUND_ENABLE and DEBUG_ENABLE are the two
--- that select which of the two shipping images this tree builds.
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -18,17 +7,14 @@ use IEEE.numeric_std.all;
 entity nds_port_wrap is
    port
    (
-      clk1x            : in  std_logic;   -- 33.513982 MHz system clock
-      clk2x            : in  std_logic;   -- 67.027964 MHz (2x clk1x, same VCO): ARM9 island
-      clkMem           : in  std_logic;   -- 100.541946 MHz (3x clk1x, phase-locked)
-      clkMemIndex      : in  std_logic_vector(1 downto 0);  -- clkMem phase, 0 on clk1x rising edge
+      clk1x            : in  std_logic;
+      clk2x            : in  std_logic;
+      clkMem           : in  std_logic;
+      clkMemIndex      : in  std_logic_vector(1 downto 0);
       reset            : in  std_logic;
       nds_on           : in  std_logic;
       direct_boot      : in  std_logic;
-      -- '1' = boot the real firmware from the retail BIOSes' reset vectors
-      -- instead of HLE direct boot. See the header note on ARCHITECTURE.md.
       fw_boot          : in  std_logic;
-      -- keys (active high)
       KeyA             : in  std_logic;
       KeyB             : in  std_logic;
       KeySelect        : in  std_logic;
@@ -43,28 +29,23 @@ entity nds_port_wrap is
       KeyY             : in  std_logic;
       lid_closed       : in  std_logic;
 
-      -- touchscreen
       touch_active     : in  std_logic;
       touch_x          : in  std_logic_vector(7 downto 0);
       touch_y          : in  std_logic_vector(7 downto 0);
 
-      -- boot status (HLE loader)
       boot_done        : out std_logic;
       boot_error       : out std_logic;
 
-      -- card image read port (word addressed into the staged .nds)
       card_ena         : out std_logic;
-      card_addr        : out std_logic_vector(24 downto 0);  -- word address (byte addr 26:2)
+      card_addr        : out std_logic_vector(24 downto 0);
       card_din         : in  std_logic_vector(31 downto 0);
       card_done        : in  std_logic;
 
-      -- SPI firmware flash image read port (128 KB, word addressed)
-      fw_addr          : out std_logic_vector(15 downto 0);  -- word address (byte addr 17:2)
+      fw_addr          : out std_logic_vector(15 downto 0);
       fw_req           : out std_logic;
       fw_done          : in  std_logic;
       fw_data          : in  std_logic_vector(31 downto 0);
 
-      -- hot-loadable ARM7/ARM9 BIOS RAM write ports
       bios7_load_addr  : in std_logic_vector(13 downto 2);
       bios7_load_data  : in std_logic_vector(31 downto 0);
       bios7_load_be    : in std_logic_vector(3 downto 0);
@@ -76,7 +57,6 @@ entity nds_port_wrap is
       bios9_load_we    : in std_logic;
       bios9_load_done  : in std_logic;
 
-      -- main RAM SDRAM request port + scheduler handshake
       mainram_allow    : in  std_logic;
       mainram_active   : out std_logic;
       mainram_busy     : out std_logic;
@@ -87,16 +67,13 @@ entity nds_port_wrap is
       sdram_be         : out std_logic_vector(3 downto 0);
       sdram_Dout       : in  std_logic_vector(31 downto 0);
       sdram_done32     : in  std_logic;
-      -- upper half of the same ch2 burst + its later done, for nds_mainram's
-      -- ARM9 pair reads (rtl/sdram.sv ch2_dout_hi)
       sdram_Dout_hi    : in  std_logic_vector(31 downto 0) := (others => '0');
       sdram_done64     : in  std_logic := '0';
 
-      -- VRAM banks A..D backing store
       vsrv_req         : out std_logic;
       vsrv_rnw         : out std_logic;
       vsrv_bank        : out std_logic_vector(1 downto 0);
-      vsrv_addr        : out std_logic_vector(14 downto 0);  -- word address (byte addr 16:2)
+      vsrv_addr        : out std_logic_vector(14 downto 0);
       vsrv_be          : out std_logic_vector(3 downto 0);
       vsrv_din         : out std_logic_vector(31 downto 0);
       vsrv_dout        : in  std_logic_vector(31 downto 0);
@@ -108,7 +85,6 @@ entity nds_port_wrap is
       vrsrv_done       : in  std_logic;
       vrsrv_ready      : in  std_logic := '1';
 
-      -- video out, per-screen pixel writes, BGR666 (B in [17:12])
       pixel_out_x      : out std_logic_vector(7 downto 0);
       pixel_out_y      : out std_logic_vector(7 downto 0);
       pixel_out_data   : out std_logic_vector(17 downto 0);
@@ -119,11 +95,9 @@ entity nds_port_wrap is
       pixelb_out_we    : out std_logic;
       vblank_out       : out std_logic;
 
-      -- sound
       sound_out_left   : out std_logic_vector(15 downto 0);
       sound_out_right  : out std_logic_vector(15 downto 0);
 
-      -- Temporary live-hardware telemetry, flattened for SystemVerilog.
       dbg_pc9           : out std_logic_vector(31 downto 0);
       dbg_pc7           : out std_logic_vector(31 downto 0);
       dbg_r0_9          : out std_logic_vector(31 downto 0);
@@ -132,7 +106,6 @@ entity nds_port_wrap is
       dbg_vfy_bad       : out std_logic_vector(17 downto 0);
       dbg_vfy_addr      : out std_logic_vector(31 downto 0);
 
-      -- IS-NITRO-style debug mailbox (ddram ch4 pager lives in NDS.sv)
       dbg_cmd_stb       : in  std_logic := '0';
       dbg_cmd_op        : in  std_logic_vector(7 downto 0) := (others => '0');
       dbg_cmd_arg       : in  std_logic_vector(31 downto 0) := (others => '0');
@@ -162,53 +135,6 @@ begin
    vrsrv_addr   <= std_logic_vector(vrsrv_addr_u);
 
    inds : entity work.nds_top
-   -- GPU_FAST stays 0: SUPERSEDED, and currently incompatible.
-   --
-   -- It runs both 2D engines on clkMem for 3x the cycles per scanline, and it
-   -- works - verified transparent (fbdiff: 0 partial-row differences) and it took
-   -- a rendered line from 5,829 to 3,996 clk1x cycles against a 2,130 budget.
-   -- But the pipelined text drawer does far better on its own: 1,027 cycles per
-   -- line, UNDER budget with ~50% headroom, at GPUCEDIV=1. clkMem bought 31%;
-   -- the drawer buys 5.7x, so the extra clock domain earns nothing.
-   --
-   -- It is also incompatible as written: nds_gpu2d_fast adapts the OLD done-based
-   -- VRAM protocol, and the drawer rework replaced it with an accept-based one, so
-   -- GPU_FAST=1 now stalls the renderer (ops=3965, renders=1, bg busy 1.2M cycles).
-   -- Fixing that means teaching the adapter the accept handshake - not worth doing
-   -- unless a heavier scene turns out to need the headroom.
-   --
-   -- SOUND_ENABLE = 0 compiles nds_sound out. It is 10,032 combinational ALUTs -
-   -- 16% of the design's logic, as much as a whole 2D engine - and main is
-   -- currently OVER the device: the fitter wants 4238 LABs against 4191, so it is
-   -- short by only ~470 ALMs (1.1%) and nothing can be built at all, at either
-   -- clkMem ratio. Dropping sound is by far the cheapest way to a fitting image,
-   -- and it is what makes the 134 MHz switch measurable instead of theoretical.
-   --
-   -- THERE IS NO AUDIO with this at 0.
-   --
-   -- 2026-08-06: SOUND_ENABLE=1 now BUILDS AND SHIPS. The audit this comment
-   -- asked for has been done (FITTING.md "Sound area, measured"): nds_sound is
-   -- 10,060 ALUTs / 4,909 registers, and the ADPCM_STEP table alone is 2,348 of
-   -- them. Nothing has been cut yet - what made it fit was area elsewhere plus
-   -- FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION.
-   --
-   -- THE TWO SHIPPING CONFIGURATIONS - this generic map plus two QSF macros:
-   --   audio : SOUND_ENABLE=>1, DEBUG_ENABLE=>0, MISTER_DEBUG_NOHDMI=1,
-   --           FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
-   --           -> 41,024 ALMs (98%), all slack positive. NO HDMI OUT.
-   --   hdmi  : SOUND_ENABLE=>0, DEBUG_ENABLE=>1, NOHDMI commented out, SEED 3
-   --           -> 38,176 ALMs (91%), all slack positive. NO AUDIO.
-   -- They do not combine; see the HDMI note in NDS.qsf for the arithmetic.
-   --
-   -- 2026-08-08: which is why the SPU is being moved to the HPS - only a full
-   -- farm-out frees enough (~4-5k ALMs) to have HDMI and sound at once, and the
-   -- decode-only split that keeps this module's timers and fetch does not
-   -- (docs/HPS_AUDIO.md). The transport half of that is built and on by default
-   -- (NDS_HPS_AUDIO in NDS.qsf), so SOUND_ENABLE=0 no longer means "there is no
-   -- audio" - it means the fabric SPU is gone and audio comes from the ring.
-   -- Nothing above this line has moved yet: this generic still switches the
-   -- whole of nds_sound, and it stays the reference the daemon is judged
-   -- against until 1-4 in that document are proved.
    generic map ( GPU_FAST => 0, SOUND_ENABLE => 1, DEBUG_ENABLE => 0 )
    port map
    (
@@ -305,8 +231,6 @@ begin
       sound_out_right  => sound_out_right,
 
       -- the record-typed exports only exist in simulation (pragma-stripped
-      -- in nds_top, donor gba_cpu idiom); plain debug taps stay last so the
-      -- stripped list keeps valid comma placement
 -- synthesis translate_off
       dbg_export9_done => open,
       dbg_export9      => open,

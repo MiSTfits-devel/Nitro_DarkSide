@@ -1,16 +1,3 @@
--- NDS IPC: IPCSYNC (0x180) + IPC FIFO (0x184 CNT, 0x188 SEND, 0x100000 RECV)
--- for both CPUs. Register bit meanings per NitroSDK ioreg_PXI.h / GBATEK:
---   IPCSYNC:    [3:0] data-in (other side's out), [11:8] data-out,
---               [13] send-IRQ-to-other (write-only strobe), [14] IRQ enable
---   IPCFIFOCNT: [0] send empty, [1] send full, [2] send-empty IRQ enable,
---               [3] send clear (strobe), [8] recv empty, [9] recv full,
---               [10] recv-not-empty IRQ enable, [14] error (write 1 to ack),
---               [15] FIFO enable
--- Reading RECV when empty sets the error flag and returns the last value read
--- (hardware keeps the last popped word on the bus). Sends when disabled or
--- full are dropped with the error flag set.
---
--- IRQ outputs are one-cycle pulses on the rising edge of their conditions.
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -37,9 +24,6 @@ entity nds_ipc is
       irq9_sync       : out std_logic := '0';
       irq9_sendempty  : out std_logic := '0';
 
-      -- Debug tap (nds_debug op 0x0E). Both CPUs idling with IPC IRQs enabled
-      -- and neither IF pending is a missed-wakeup deadlock, and NOTHING else
-      -- can see it: peek cannot read IO, so IPCSYNC/IPCFIFOCNT are invisible.
       dbg_ipc         : out std_logic_vector(31 downto 0) := (others => '0');
       irq9_recv       : out std_logic := '0'
    );
@@ -54,7 +38,6 @@ architecture arch of nds_ipc is
 
    type t_fifo is array (0 to 15) of std_logic_vector(31 downto 0);
 
-   -- fifo79: ARM7 -> ARM9 (7's send, 9's recv); fifo97 the reverse
    signal fifo79, fifo97       : t_fifo;
    signal cnt79, cnt97         : integer range 0 to 16 := 0;
    signal rd79, wr79           : integer range 0 to 15 := 0;
@@ -64,21 +47,19 @@ architecture arch of nds_ipc is
    signal sync7_ien, sync9_ien : std_logic := '0';
 
    signal en7, en9             : std_logic := '0';
-   signal sirq7, sirq9         : std_logic := '0';   -- send-empty irq enable
-   signal rirq7, rirq9         : std_logic := '0';   -- recv irq enable
+   signal sirq7, sirq9         : std_logic := '0';
+   signal rirq7, rirq9         : std_logic := '0';
    signal err7, err9           : std_logic := '0';
    signal last7, last9         : std_logic_vector(31 downto 0) := (others => '0');
 
    signal sync7_rd, sync9_rd   : std_logic_vector(31 downto 0);
    signal cnt7_rd, cnt9_rd     : std_logic_vector(31 downto 0);
 
-   -- irq edge tracking
    signal p7_sendemp, p9_sendemp : std_logic := '0';
    signal p7_recvpend, p9_recvpend : std_logic := '0';
 
 begin
 
-   -- ================= combinational read data =================
    sync7_rd <= x"0000" & '0' & sync7_ien & '0' & '0' & sync7_out & x"0" & sync9_out;
    sync9_rd <= x"0000" & '0' & sync9_ien & '0' & '0' & sync9_out & x"0" & sync7_out;
 
@@ -95,9 +76,6 @@ begin
    cnt9_rd(10) <= rirq9; cnt9_rd(9)  <= '1' when cnt79 = 16 else '0';
    cnt9_rd(8)  <= '1' when cnt79 = 0 else '0';
    cnt9_rd(7 downto 3) <= (others => '0');
-   -- [31:28] sync9_out  [27:24] sync7_out  [23] sync9_ien [22] sync7_ien
-   -- [21] en9 [20] en7 [19] err9 [18] err7 [17] rirq9 [16] rirq7
-   -- [15] sirq9 [14] sirq7  [12:8] cnt97 (7->9 depth)  [4:0] cnt79 (9->7 depth)
    dbg_ipc <= sync9_out & sync7_out
               & sync9_ien & sync7_ien & en9 & en7 & err9 & err7
               & rirq9 & rirq7 & sirq9 & sirq7
@@ -114,38 +92,12 @@ begin
                  (others => '0');
    wired_done7 <= '1' when (bus7.Adr = ADR_SYNC or bus7.Adr = ADR_CNT or bus7.Adr = ADR_RECV) else '0';
 
-   -- RECV reads present last9, NOT fifo79(rd79), and the asymmetry with the ARM7
-   -- path above is deliberate.
-   --
-   -- The pop happens at the edge ending the cycle in which bus9.ena is high:
-   -- `last9 <= fifo79(rd79)` captures the popped word and rd79 then advances. So
-   -- fifo79(rd79) is only correct for a consumer that samples in the SAME cycle.
-   -- The ARM7 is such a consumer - membus7 raises io_bus.ena and latches
-   -- io_wired_out in the same FINISH cycle - which is why the ARM7 mux above is
-   -- right as written. **The ARM9 is not.** nds_top's IO completion toggles
-   -- cdc_io_cpl on the io9_ena cycle and the island latches io_wired_out9 one
-   -- clk1x LATER (see the block comment at nds_top's cdc_io_cpl), i.e. after the
-   -- pop edge - so it used to read the entry AFTER the one it popped.
-   --
-   -- Queue 11 22 33 44 and the ARM9 read back 22 33 44 44. It was invisible with
-   -- a single queued word, because cnt79 is then 0 and the old mux fell through
-   -- to last9, which holds the correct value - so every one-word test passed.
-   -- NitroSDK's PXI handler drains multi-word messages in a loop, so every burst
-   -- silently lost a word. Caught by bootreq subtests 22 and 25.
-   --
-   -- last9 is also the correct answer for a read of an EMPTY fifo: hardware
-   -- returns the last value read (and err9 is set below), which is exactly what
-   -- last9 holds. So this is unconditional rather than a cnt79 test.
-   --
-   -- This does depend on the ARM9 sampling after the pop edge. If that ever
-   -- changes, this line has to change with it.
    wired_out9 <= sync9_rd when (bus9.Adr = ADR_SYNC) else
                  cnt9_rd  when (bus9.Adr = ADR_CNT)  else
                  last9    when (bus9.Adr = ADR_RECV) else
                  (others => '0');
    wired_done9 <= '1' when (bus9.Adr = ADR_SYNC or bus9.Adr = ADR_CNT or bus9.Adr = ADR_RECV) else '0';
 
-   -- ================= state =================
    process (clk)
       variable v_cnt79, v_cnt97 : integer range 0 to 16;
       variable sendemp7, sendemp9, recvpend7, recvpend9 : std_logic;
@@ -171,7 +123,6 @@ begin
             v_cnt79 := cnt79;
             v_cnt97 := cnt97;
 
-            -- ========== side 7 ==========
             if (bus7.ena = '1' and bus7.rnw = '0') then
                if (bus7.Adr = ADR_SYNC and bus7.bEna(1) = '1') then
                   sync7_out <= bus7.Din(11 downto 8);
@@ -213,7 +164,6 @@ begin
                end if;
             end if;
 
-            -- ========== side 9 ==========
             if (bus9.ena = '1' and bus9.rnw = '0') then
                if (bus9.Adr = ADR_SYNC and bus9.bEna(1) = '1') then
                   sync9_out <= bus9.Din(11 downto 8);
@@ -258,7 +208,6 @@ begin
             cnt79 <= v_cnt79;
             cnt97 <= v_cnt97;
 
-            -- ========== IRQ edges ==========
             sendemp7 := '0'; sendemp9 := '0'; recvpend7 := '0'; recvpend9 := '0';
             if (v_cnt79 = 0 and sirq7 = '1') then sendemp7 := '1'; end if;
             if (v_cnt97 = 0 and sirq9 = '1') then sendemp9 := '1'; end if;

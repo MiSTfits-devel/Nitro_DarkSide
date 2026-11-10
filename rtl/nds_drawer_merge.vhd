@@ -1,28 +1,3 @@
--- SPDX-License-Identifier: GPL-2.0-or-later
--- NDS merge stage (fork of gba_drawer_merge): combines the four BG line
--- buffers + OBJ line buffer (color+settings) into the final line, applying
--- windows (WIN0/WIN1/OBJWND/WINOUT), priority resolution and color special
--- effects. Deltas vs the GBA donor:
---
---   * 256-pixel line, ypos 0..191
---   * OBJ input is 24 bits: [15:0] color ([15] transparent), [17:16] prio,
---     [18] semi-transparent, [19] bitmap sprite, [23:20] bitmap alpha
---   * bitmap sprites force alpha blending like semi-transparent OBJs, but
---     with their own coefficients EVA = alpha+1, EVB = 16-EVA (GBATEK /
---     melonDS); BLDALPHA is ignored for them
---   * NDS color math is 18-bit: 555 palette colors expand to 666 (c << 1)
---     and the effects blend in 6-bit space with hardware rounding biases
---     (melonDS ColorBlend4 / ColorBrightnessUp/Down):
---       alpha    c = min(63, (c1*EVA + c2*EVB + 8) >> 4)
---       whiter   c = c + ((63-c)*EVY + 8) >> 4
---       blacker  c = c - ((c*EVY + 7) >> 4)
---     pixeldata_out is therefore 18-bit BGR666 (B in [17:12], like the
---     555 layout it replaces)
---
--- 3D-as-BG0 and master brightness are handled outside (BG0 arrives as a
--- normal line buffer - transparent while the 3D stub is in place; master
--- brightness applies at compose, also in 666). Priority/window/blend
--- semantics otherwise unchanged from the hardware-verified donor.
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -102,11 +77,6 @@ end entity;
 
 architecture arch of nds_drawer_merge is
 
-   -- The blend/brightness products are 6x5-bit.  They were forced into ALMs
-   -- when the core needed 117 of 112 DSP blocks, but later divider removal
-   -- and the shared sound master-volume multiplier leave room for both merge
-   -- engines again.  Put these products back in DSPs: LAB routing, not DSPs,
-   -- is now the limiting resource (Quartus attribute; ignored by nvc).
    attribute multstyle : string;
    attribute multstyle of arch : architecture is "dsp";
 
@@ -125,7 +95,6 @@ architecture arch of nds_drawer_merge is
    constant OBJBMPA_LO  : integer := 20;
    constant OBJBMPA_HI  : integer := 23;
 
-   -- latch on hsync
    signal WND0_on           : std_logic := '0';
    signal WND1_on           : std_logic := '0';
    signal WNDOBJ_on         : std_logic := '0';
@@ -173,7 +142,6 @@ architecture arch of nds_drawer_merge is
    signal ena_bg3           : std_logic := '0';
    signal ena_obj           : std_logic := '0';
 
-   -- common for whole line
    signal EVA_MAXED   : integer range 0 to 16;
    signal EVB_MAXED   : integer range 0 to 16;
    signal BLDY_MAXED  : integer range 0 to 16;
@@ -185,9 +153,6 @@ architecture arch of nds_drawer_merge is
    signal first_target  : std_logic_vector(5 downto 0) := (others => '0');
    signal second_target : std_logic_vector(5 downto 0) := (others => '0');
 
-   -- ####################################
-   -- #### clock cycle one
-   -- ####################################
    signal enable_cycle1         : std_logic;
    signal xpos_cycle1           : integer range 0 to 255;
    signal ypos_cycle1           : integer range 0 to 191;
@@ -199,9 +164,6 @@ architecture arch of nds_drawer_merge is
    signal enables_cycle1        : std_logic_vector(5 downto 0) := (others => '0');
    signal special_enable_cycle1 : std_logic;
 
-   -- ####################################
-   -- #### clock cycle two
-   -- ####################################
    signal enable_cycle2           : std_logic;
    signal xpos_cycle2             : integer range 0 to 255;
    signal ypos_cycle2             : integer range 0 to 191;
@@ -214,9 +176,6 @@ architecture arch of nds_drawer_merge is
    signal special_enable_cycle2   : std_logic;
    signal topprio_cycle2          : std_logic_vector(5 downto 0) := (others => '0');
 
-   -- ####################################
-   -- #### clock cycle three
-   -- ####################################
    signal enable_cycle3           : std_logic;
    signal xpos_cycle3             : integer range 0 to 255;
    signal ypos_cycle3             : integer range 0 to 191;
@@ -231,9 +190,6 @@ architecture arch of nds_drawer_merge is
    signal secondprio_cycle3       : std_logic_vector(5 downto 0) := (others => '0');
    signal firstpixel_cycle3       : std_logic_vector(14 downto 0) := (others => '0');
 
-   -- ####################################
-   -- #### clock cycle four
-   -- ####################################
    signal enable_cycle4           : std_logic;
    signal xpos_cycle4             : integer range 0 to 255;
    signal ypos_cycle4             : integer range 0 to 191;
@@ -245,13 +201,11 @@ architecture arch of nds_drawer_merge is
    signal topprio_cycle4          : std_logic_vector(5 downto 0);
    signal special_effect_cycle4   : unsigned(1 downto 0) := (others => '0');
    signal special_out_cycle4      : std_logic;
-   -- 555 -> 666: NDS palette colors gain a low zero bit per channel
    function expand666(c : std_logic_vector(14 downto 0)) return std_logic_vector is
    begin
       return c(14 downto 10) & '0' & c(9 downto 5) & '0' & c(4 downto 0) & '0';
    end function;
 
-   -- 6-bit-space effect results (alpha can overflow 63 before the clamp)
    signal alpha_red               : integer range 0 to 127;
    signal alpha_green             : integer range 0 to 127;
    signal alpha_blue              : integer range 0 to 127;
@@ -264,9 +218,6 @@ architecture arch of nds_drawer_merge is
 
 begin
 
-   -- ####################################
-   -- #### latch on hsync
-   -- ####################################
    process (clk)
    begin
       if rising_edge(clk) then
@@ -321,9 +272,6 @@ begin
       end if;
    end process;
 
-   -- ####################################
-   -- #### pipeline independent
-   -- ####################################
    first_target  <= effect_1st_BD & effect_1st_obj & effect_1st_bg3 & effect_1st_bg2 & effect_1st_bg1 & effect_1st_bg0;
    second_target <= effect_2nd_BD & effect_2nd_obj & effect_2nd_bg3 & effect_2nd_bg2 & effect_2nd_bg1 & effect_2nd_bg0;
 
@@ -335,7 +283,6 @@ begin
          if (EVB  < 16) then EVB_MAXED  <= to_integer(EVB);  else EVB_MAXED  <= 16; end if;
          if (BLDY < 16) then BLDY_MAXED <= to_integer(BLDY); else BLDY_MAXED <= 16; end if;
 
-         -- windowcheck
          anywindow <= WND0_on or WND1_on or WNDOBJ_on;
 
          inwin_0y <= '0';
@@ -356,9 +303,6 @@ begin
       end if;
    end process;
 
-   -- ####################################
-   -- #### clock cycle zero
-   -- ####################################
    process (clk)
       variable enables_var    : std_logic_vector(4 downto 0);
    begin
@@ -373,12 +317,10 @@ begin
          pixeldata_bg3_cycle1 <= pixeldata_bg3;
          pixeldata_obj_cycle1 <= pixeldata_obj;
 
-         -- base
          enables_var := not pixeldata_obj(TRANSPARENT) &
                         not pixeldata_bg3(TRANSPARENT) & not pixeldata_bg2(TRANSPARENT) &
                         not pixeldata_bg1(TRANSPARENT) & not pixeldata_bg0(TRANSPARENT);
 
-         -- window select
          special_enable_cycle1 <= '1';
          if (anywindow = '1') then
              if (inwin_0y = '1' and ((WND0_X1 <= WND0_X2 and xpos >= WND0_X1 and xpos < WND0_X2) or (WND0_X1 > WND0_X2 and (xpos >= WND0_X1 or xpos < WND0_X2)))) then
@@ -395,7 +337,7 @@ begin
                enables_var           := enables_var and enables_wndout(4 downto 0);
             end if;
          end if;
-         enables_cycle1 <= '1' & enables_var; -- backdrop is always on
+         enables_cycle1 <= '1' & enables_var;
 
          if (ena_bg0 = '0') then enables_cycle1(0) <= '0'; end if;
          if (ena_bg1 = '0') then enables_cycle1(1) <= '0'; end if;
@@ -406,9 +348,6 @@ begin
       end if;
    end process;
 
-   -- ####################################
-   -- #### clock cycle one
-   -- ####################################
    process (clk)
       variable topprio_var : std_logic_vector(5 downto 0);
    begin
@@ -425,7 +364,6 @@ begin
          enables_cycle2        <= enables_cycle1       ;
          special_enable_cycle2 <= special_enable_cycle1;
 
-         -- priority
          topprio_var := enables_cycle1;
 
          if (topprio_var(BG0) = '1' and topprio_var(OBJ) = '1' and unsigned(pixeldata_obj_cycle1(OBJPRIOH downto OBJPRIOL)) > Prio_BG0) then topprio_var(OBJ) := '0'; end if;
@@ -452,9 +390,6 @@ begin
       end if;
    end process;
 
-   -- ####################################
-   -- #### clock cycle two
-   -- ####################################
    process (clk)
       variable firstprio_var  : std_logic_vector(5 downto 0);
       variable secondprio_var : std_logic_vector(5 downto 0);
@@ -472,8 +407,6 @@ begin
          topprio_cycle3          <= topprio_cycle2       ;
          special_enable_cycle3   <= special_enable_cycle2;
 
-         -- priority first + second; semi-transparent AND bitmap sprites
-         -- force the OBJ layer into the 1st-target set
          firstprio_var := enables_cycle2 and first_target;
          if (pixeldata_obj_cycle2(OBJALPHA) = '1' or pixeldata_obj_cycle2(OBJBITMAP) = '1') then
             firstprio_var(OBJ) := '1';
@@ -505,7 +438,6 @@ begin
 
          secondprio_cycle3 <= secondprio_var and second_target;
 
-         -- special effect data
          firstpixel_cycle3 <= (others => '0');
          if    (firstprio_var(OBJ) = '1')  then firstpixel_cycle3 <= pixeldata_obj_cycle2(14 downto 0);
          elsif (firstprio_var(BG0) = '1')  then firstpixel_cycle3 <= pixeldata_bg0_cycle2(14 downto 0);
@@ -517,9 +449,6 @@ begin
       end if;
    end process;
 
-   -- ####################################
-   -- #### clock cycle three
-   -- ####################################
    process (clk)
       variable special_effect_var : unsigned(1 downto 0);
       variable secondpixel        : std_logic_vector(14 downto 0);
@@ -538,7 +467,6 @@ begin
          pixeldata_obj_cycle4    <= pixeldata_obj_cycle3;
          topprio_cycle4          <= topprio_cycle3      ;
 
-         -- special effect control
          special_effect_var   := special_effect_in;
          special_out_cycle4   <= '0';
 
@@ -574,7 +502,6 @@ begin
 
          special_effect_cycle4 <= special_effect_var;
 
-         -- special effect data
          secondpixel := (others => '0');
          if    (secondprio_cycle3(OBJ) = '1') then secondpixel := pixeldata_obj_cycle3(14 downto 0);
          elsif (secondprio_cycle3(BG0) = '1') then secondpixel := pixeldata_bg0_cycle3(14 downto 0);
@@ -583,8 +510,6 @@ begin
          elsif (secondprio_cycle3(BG3) = '1') then secondpixel := pixeldata_bg3_cycle3(14 downto 0);
          else  secondpixel := pixeldata_back(14 downto 0); end if;
 
-         -- bitmap sprites on top blend with their own coefficients
-         -- (EVA = alpha+1, EVB = 16-EVA); everything else uses BLDALPHA
          if (pixeldata_obj_cycle3(OBJBITMAP) = '1' and firstprio_cycle3(4 downto 0) = "10000") then
             eva_eff := to_integer(unsigned(pixeldata_obj_cycle3(OBJBMPA_HI downto OBJBMPA_LO))) + 1;
             evb_eff := 16 - eva_eff;
@@ -593,8 +518,6 @@ begin
             evb_eff := EVB_MAXED;
          end if;
 
-         -- NDS effect math is 6-bit per channel: expand 555 -> 666 (c << 1),
-         -- blend with the hardware rounding biases (see header)
          alpha_blue    <= (to_integer(unsigned(firstpixel_cycle3(14 downto 10) & '0')) * eva_eff + to_integer(unsigned(secondpixel(14 downto 10) & '0')) * evb_eff + 8) / 16;
          alpha_green   <= (to_integer(unsigned(firstpixel_cycle3( 9 downto  5) & '0')) * eva_eff + to_integer(unsigned(secondpixel( 9 downto  5) & '0')) * evb_eff + 8) / 16;
          alpha_red     <= (to_integer(unsigned(firstpixel_cycle3( 4 downto  0) & '0')) * eva_eff + to_integer(unsigned(secondpixel( 4 downto  0) & '0')) * evb_eff + 8) / 16;
@@ -610,9 +533,6 @@ begin
       end if;
    end process;
 
-   -- ####################################
-   -- #### clock cycle four
-   -- ####################################
    process (clk)
    begin
       if rising_edge(clk) then
@@ -624,17 +544,17 @@ begin
             if (special_out_cycle4 = '1') then
 
                case (to_integer(special_effect_cycle4)) is
-                  when 1 => -- alpha (whiter/blacker cannot overflow by construction)
+                  when 1 =>
                      if (alpha_blue  < 63) then pixeldata_out(17 downto 12) <= std_logic_vector(to_unsigned(alpha_blue , 6)); else pixeldata_out(17 downto 12) <= "111111"; end if;
                      if (alpha_green < 63) then pixeldata_out(11 downto  6) <= std_logic_vector(to_unsigned(alpha_green, 6)); else pixeldata_out(11 downto  6) <= "111111"; end if;
                      if (alpha_red   < 63) then pixeldata_out( 5 downto  0) <= std_logic_vector(to_unsigned(alpha_red  , 6)); else pixeldata_out( 5 downto  0) <= "111111"; end if;
 
-                  when 2 => -- whiter
+                  when 2 =>
                      pixeldata_out(17 downto 12) <= std_logic_vector(to_unsigned(whiter_blue , 6));
                      pixeldata_out(11 downto  6) <= std_logic_vector(to_unsigned(whiter_green, 6));
                      pixeldata_out( 5 downto  0) <= std_logic_vector(to_unsigned(whiter_red  , 6));
 
-                  when 3 => -- blacker
+                  when 3 =>
                      pixeldata_out(17 downto 12) <= std_logic_vector(to_unsigned(blacker_blue , 6));
                      pixeldata_out(11 downto  6) <= std_logic_vector(to_unsigned(blacker_green, 6));
                      pixeldata_out( 5 downto  0) <= std_logic_vector(to_unsigned(blacker_red  , 6));

@@ -1,10 +1,3 @@
--- NDS interrupt controller (one instance per CPU).
--- IME 0x208 / IE 0x210 / IF 0x214, all 32-bit (vs GBA's 16-bit pair packed at
--- 0x200). Follows the gba_top IF-accumulate idiom: irq_in pulses OR into the
--- flags, a write to IF clears the acknowledged bits (write-1-to-clear),
--- cpu_irq is delivered registered when IME(0) and (IE and IF) /= 0.
--- Source bit meanings differ per CPU (see docs/NDS_HARDWARE.md interrupt
--- table); this module is bit-agnostic.
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -14,7 +7,6 @@ use work.pProc_bus_gba.all;
 use work.pRegmap_gba.all;
 
 package pReg_nds_irq is
-   -- IME is a one-bit register.  Bits 31:1 read as zero and ignore writes.
    constant NDS_IME : regmap_type := (16#000208#, 0, 0, 1, 0, readwrite);
    constant NDS_IE  : regmap_type := (16#000210#, 31, 0, 1, 0, readwrite);
    constant NDS_IF  : regmap_type := (16#000214#, 31, 0, 1, 0, readonly);
@@ -39,12 +31,10 @@ entity nds_irq is
       wired_out  : out std_logic_vector(31 downto 0);
       wired_done : out std_logic;
 
-      irq_in     : in  std_logic_vector(31 downto 0);  -- one-cycle pulses
+      irq_in     : in  std_logic_vector(31 downto 0);
       cpu_irq    : out std_logic := '0';
       cpu_unhalt : out std_logic := '0';
 
-      -- Temporary live-hardware diagnostic taps. These expose state only;
-      -- they do not participate in interrupt delivery.
       dbg_ime    : out std_logic_vector(31 downto 0) := (others => '0');
       dbg_ie     : out std_logic_vector(31 downto 0) := (others => '0');
       dbg_if     : out std_logic_vector(31 downto 0) := (others => '0')
@@ -100,8 +90,6 @@ begin
             cpu_irq    <= '0';
             cpu_unhalt <= '0';
          elsif (ce = '1') then
-            -- ack first, then accumulate: a source firing in the same cycle
-            -- as its acknowledge must win (hardware behavior)
             flags := IRPFLags;
             if (IF_written = '1') then
                flags := flags and (not IF_writeval);

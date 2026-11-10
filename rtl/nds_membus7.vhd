@@ -1,23 +1,3 @@
--- SPDX-License-Identifier: GPL-2.0-or-later
--- ARM7 memory bus decoder (the NDS equivalent of the GBA memorymux for the
--- ARM7 side). Single master (no DMA yet), decodes the ARM7 address map:
---
---   0x00000000  BIOS (16 KB, read-only; backing store external)
---   0x02000000  main RAM, 4 MB mirrored through the 16 MB window (nds_mainram)
---   0x03000000  shared WRAM (nds_wram arm7 port); falls back to the ARM7-
---               private WRAM when WRAMCNT maps nothing to us (hardware mirror)
---   0x03800000  ARM7-private WRAM (64 KB, mirrored; backing store external)
---   0x04000000  IO registers via proc_bus (timers/IRQ/IPC/... OR-reduced
---               wired_out, combinational done — same idiom as GBA memorymux)
---   0x06000000  VRAM C/D as ARM7 WRAM (nds_vram cpu7 port)
---   everything else: open bus (CPU's lastread fed back)
---
--- Read rotation and write lane placement replicate gba_mem_readrotate /
--- gba_mem_writerotate: the CPU emits raw low-lane data and consumes the
--- rotated dword (it only extends from the low lane). done is always
--- registered, earliest one cycle after ena, with read data valid on the done
--- cycle. Block-transfer bus_lowbits are accepted but, like the GBA mux,
--- unused for lane math (LDM/STM are word accesses).
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -31,7 +11,6 @@ entity nds_membus7 is
       clk            : in  std_logic;
       reset          : in  std_logic;
 
-      -- gba_cpu side
       cpu_adr        : in  std_logic_vector(31 downto 0);
       cpu_rnw        : in  std_logic;
       cpu_ena        : in  std_logic;
@@ -42,22 +21,15 @@ entity nds_membus7 is
       cpu_din        : out std_logic_vector(31 downto 0);
       cpu_done       : out std_logic;
 
-      -- BIOS store: address registered here, data expected combinational
       bios_addr      : out unsigned(13 downto 2) := (others => '0');
       bios_data      : in  std_logic_vector(31 downto 0);
 
-      -- ARM7-private WRAM store: sync-read BRAM. Address/write presented
-      -- combinationally in the accept cycle; the store registers the address
-      -- (read data valid in the FINISH cycle, same bus timing as the old
-      -- registered-address/asynchronous-read pair) and captures writes at
-      -- the accept edge.
       w7p_addr       : out unsigned(15 downto 2);
       w7p_we         : out std_logic;
       w7p_be         : out std_logic_vector(3 downto 0);
       w7p_writedata  : out std_logic_vector(31 downto 0);
       w7p_readdata   : in  std_logic_vector(31 downto 0);
 
-      -- shared WRAM (nds_wram arm7 port)
       wsh_ena        : out std_logic := '0';
       wsh_rnw        : out std_logic := '1';
       wsh_addr       : out unsigned(14 downto 2) := (others => '0');
@@ -67,7 +39,6 @@ entity nds_membus7 is
       wsh_done       : in  std_logic;
       wsh_mapped     : in  std_logic;
 
-      -- VRAM (nds_vram cpu7 port)
       vram_ena       : out std_logic := '0';
       vram_rnw       : out std_logic := '1';
       vram_addr      : out unsigned(23 downto 2) := (others => '0');
@@ -76,7 +47,6 @@ entity nds_membus7 is
       vram_dout      : in  std_logic_vector(31 downto 0);
       vram_done      : in  std_logic;
 
-      -- main RAM (nds_mainram mem7 port)
       mr_ena         : out std_logic := '0';
       mr_rnw         : out std_logic := '1';
       mr_addr        : out std_logic_vector(21 downto 2) := (others => '0');
@@ -85,10 +55,6 @@ entity nds_membus7 is
       mr_done        : in  std_logic;
       mr_readdata    : in  std_logic_vector(31 downto 0);
 
-      -- IO register bus (wired_out/-done OR-reduced over all banks outside).
-      -- io_ce_next: the ce-gated peripherals' enable in the NEXT cycle; the
-      -- 1-cycle io_bus.ena pulse is only issued when it will land on an
-      -- active peripheral cycle. Tie to '1' at full rate.
       io_ce_next     : in  std_logic := '1';
       io_bus         : out proc_bus_gb_type := ((others => '0'), (others => '0'), '1', '0', "00", "0000", '0');
       io_wired_out   : in  std_logic_vector(31 downto 0);
@@ -117,31 +83,20 @@ architecture arch of nds_membus7 is
 
 begin
 
-   -- BIOS is now a synchronous hot-loadable RAM in hardware. Present the
-   -- request address during the accept cycle so its registered data is ready
-   -- in FINISH, matching the TCM/WRAM store timing below.
    bios_addr <= unsigned(cpu_adr(13 downto 2));
 
-   -- ================= request accept (combinational mirror of can_accept) =================
    accept_now <= '1' when reset = '0' and
                           (state = IDLE or state = FINISH or
                            (state = W_WRAMSH and wsh_done  = '1') or
                            (state = W_VRAM   and vram_done = '1') or
                            (state = W_MAIN   and mr_done   = '1')) else '0';
 
-   -- ================= ARM7-private WRAM store drive =================
-   -- Presented in the accept cycle so the BRAM's internal address register
-   -- takes the role of the old registered w7p_addr: read data is valid in
-   -- the FINISH cycle, writes land at the accept edge (one cycle earlier
-   -- than the old external write process - unobservable, the next request
-   -- is accepted no earlier than the FINISH edge).
    w7p_sel       <= '1' when (accept_now = '1' and cpu_ena = '1' and dec_target = T_WRAM7) else '0';
    w7p_addr      <= unsigned(cpu_adr(15 downto 2));
    w7p_we        <= w7p_sel and not cpu_rnw;
    w7p_be        <= be;
    w7p_writedata <= wdata;
 
-   -- ================= decode (combinational, sampled at ena) =================
    process (all)
    begin
       dec_target <= T_OPEN;
@@ -160,15 +115,14 @@ begin
                end if;
             when x"4" =>
                if (cpu_adr(23) = '0') then
-                  dec_target <= T_IO;      -- includes IPCFIFORECV at +0x100000
-               end if;                     -- 0x048xxxxx (wifi): open bus for now
+                  dec_target <= T_IO;
+               end if;
             when x"6" => dec_target <= T_VRAM;
             when others => null;
          end case;
       end if;
    end process;
 
-   -- ================= write lane placement (gba_mem_writerotate) =================
    process (all)
    begin
       wdata <= cpu_dout;
@@ -200,10 +154,6 @@ begin
       end case;
    end process;
 
-   -- ================= request FSM =================
-   -- The CPU asserts the next ena in the same cycle it samples done, so a
-   -- request must be accepted on every completing cycle (FINISH / W_* with
-   -- done high), not just in IDLE — the GBA memorymux behaves the same way.
    process (clk)
       variable can_accept : boolean;
    begin
@@ -235,10 +185,10 @@ begin
                   case dec_target is
 
                      when T_BIOS =>
-                        state     <= FINISH;   -- writes fall through as no-ops
+                        state     <= FINISH;
 
                      when T_WRAM7 =>
-                        state <= FINISH;   -- store drive is combinational above
+                        state <= FINISH;
 
                      when T_WRAMSH =>
                         wsh_ena  <= '1';
@@ -292,15 +242,14 @@ begin
                vram_done when state = W_VRAM   else
                mr_done   when state = W_MAIN   else '0';
 
-   -- ================= read data mux + rotation (gba_mem_readrotate) =================
    din_unrot <= bios_data     when target = T_BIOS   else
                 w7p_readdata  when target = T_WRAM7  else
                 wsh_dout      when target = T_WRAMSH else
                 vram_dout     when target = T_VRAM   else
                 mr_readdata   when target = T_MAIN   else
                 io_wired_out  when (target = T_IO and io_wired_done = '1') else
-                x"00000000"   when target = T_IO else -- unclaimed NDS7 IO reads 0 (not GBA open bus): calico probes SCFG for NTR/TWL detection
-                cpu_lastread;  -- open bus for unmapped regions
+                x"00000000"   when target = T_IO else
+                cpu_lastread;
 
    process (all)
    begin

@@ -1,19 +1,3 @@
--- NDS shared WRAM: 32 KB, two 16 KB blocks, assigned to the CPUs by WRAMCNT
--- (byte 0x04000247, ARM9-writable; ARM7 reads it back as EXMEMSTAT companion).
---
---   WRAMCNT = 0 : ARM9 all 32 KB              / ARM7 none
---   WRAMCNT = 1 : ARM9 block 1 (0x4000..)     / ARM7 block 0
---   WRAMCNT = 2 : ARM9 block 0                / ARM7 block 1
---   WRAMCNT = 3 : ARM9 none                   / ARM7 all 32 KB
---   (melonDS NDS::MapSharedWRAM semantics; GBATEK "WRAMCNT")
---
--- Mapped windows mirror across the whole 0x03000000 region: callers pass
--- addr(14:2) and the module ignores the block bit in 16 KB modes.
--- "Unmapped" behavior is the caller's problem (ARM9: open bus; ARM7: the region
--- falls through to ARM7 private WRAM) — flagged via *_mapped.
---
--- Protocol per port: pulse ena with rnw/addr/be/din held; done pulses the next
--- cycle (reads: dout valid with done). One op in flight per port.
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -63,7 +47,6 @@ architecture arch of nds_wram is
 
 begin
 
-   -- address transform: 13-bit word address into the 8K x 32 store
    process (all)
    begin
       case wramcnt is
