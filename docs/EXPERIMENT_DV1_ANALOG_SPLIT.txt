@@ -1,0 +1,253 @@
+NDS4MiSTer: independent digital layouts and single-screen native analog
+2026-10-13 — private experiment; first hardware image failed game startup
+
+Branch: experiment/dv1-analog-split
+Base: v0.9.0-rc.7 / dc020c6fb9ba794a98f4a92a2f9c2fd48919f9d5
+
+Scope and controls
+==================
+Analog CRT always receives ONE unscaled 256x192 DS screen centered at (32,24)
+in 320x240, with fixed 262-line native timing. Never shrink a paired layout
+onto the CRT. Digital Layout offers Main, Touch, Side-by-side and Top/bottom.
+Digital transport can be native HDMI DV1 or the existing scaled HDMI path.
+The intended private-kit starting selection is digital Main, analog Touch.
+
+Independent Outputs defaults Off in the core. Status bit 14 enables it;
+bit 15 independently selects analog Main/Touch. The framework permits the
+mode with vga_scaler=0 and no Linux framebuffer override, on analog-capable
+builds. Scaled VGA retains its existing behavior. The host queries command
+0x46: existing signature/config words are unchanged, and new capability word
+0x5350 identifies this ABI. Old cores cannot enable the experimental option.
+Existing settings format and old menu action IDs are retained.
+
+Screen Peek temporarily flips single-screen outputs while held; a paired
+digital layout remains paired. Release restores the underlying selections.
+Temporary Peek status is not saved. Physical screen order, gap controls,
+touch pointer, 3D FPS, lid, microphone, audio and rendering profiles remain.
+Native rotation follows rc.7: upright CRT and receiver rotation on DV1.
+Existing scaled HDMI TATE/menu rotation remains available. Independent native
+FPGA rotation would require another feature, not an implicit layout change.
+
+Implementation
+==============
+There is one renderer frame-publication owner and adoption ACK in the original
+scanout. The digital raster remains the original scanout output and scaler
+input. A second small analog counter/pixel path uses the same video clock.
+All split geometries have the same frame duration, 1,006,080 video clocks:
+
+  Analog and digital single: 384 dots x 10 clocks x 262 lines
+  Digital side-by-side:      640 dots x  6 clocks x 262 lines
+  Digital top/bottom:        640 dots x  3 clocks x 524 lines
+
+At nominal 60 MHz this is 59.6374 Hz. Analog always uses 15,625 Hz horizontal
+sync and 240 active lines. Top/bottom digital has a separate 31,250 Hz raster;
+it can never reach the analog pins in split mode. Digital paired layouts keep
+both 256x192 images, existing gaps and order. RetroTINK acceptance of these
+combined DV1 geometries remains a hardware test, not a simulation conclusion.
+
+The existing 1024x36-bit line RAM is reused, with four contexts indexed by
+{output,physical screen}, each having two whole-line slots. Digital reads use
+video-clock phase 0; analog takes one free early clock in each ten-clock dot.
+Each pixel path captures the synchronous RAM result before its pixel enable.
+No new framebuffer, renderer or scaler is instantiated.
+
+Four pending descriptors and one ticket per context arbitrate the existing
+DDR reader. Completion tickets have an extra video-domain settling clock
+after slot metadata synchronization. One job per context may be outstanding.
+Each output acquires its
+last completed slot only at a row boundary; it cannot request the next line
+until this acquisition occurs. The writer always targets the other slot.
+A delayed read holds a whole old line, rather than changing slots mid-row.
+A shared frame epoch expires queued/issued work from before frame adoption;
+issued DDR commands drain and return their ticket, but cannot promote stale
+or recycled frame data. Session withdrawal drains both output contexts and
+blanks stale pixels. Legacy parity-cache behavior is unchanged with split Off.
+
+Digital requests use h=16 and h=64; analog prefetch uses its own h=96.
+Split requests use only already-adopted banks. Publications arriving between
+the h=0 adoption edge and h=16 prefetch stay pending until the next boundary.
+Those request clocks do not collide across the three digital pixel cadences.
+A third panel read (paired digital plus one analog) costs about 35.18 MB/s
+before bus overhead, versus 23.45 MB/s for two panels. Average bandwidth is
+not evidence of meeting row deadlines; simulation exercises contention and
+hardware measurements must check cadence/faults. Game clocks and NSMB's
+existing alternate rendering-update profile are unchanged.
+
+Framework routing gives analog its own scanline pipeline, native OSD timing
+and csync. The same OSD commands feed a second fixed upright240p OSD instance;
+the bitmap consumes four additional M10Ks. This deliberate cost supports
+independent raster geometry. DV1 continues through the existing digital OSD
+and reconstruction/transmitter path. In split mode DV1 always carries RGB;
+only analog follows RGB/YPbPr/composite/S-video conversion. Legacy YC-over-DV1
+selection is unchanged when split is Off. Analog scanline inputs convert the
+negative source sync polarity to the framework's positive convention.
+
+Resource budget
+===============
+rc.7 fit: 40,611/41,910 ALMs, 549/553 M10Ks, 44 DSPs. Initial experimental
+synthesis passed and retained the original 36,864-bit line RAM. The new menu
+uses the remaining four M10Ks. Short new scanline/csync delay chains are
+constrained to registers so tiny inferred shift RAMs do not waste blocks.
+Actual placement/routing remains required; no functionality is trimmed.
+Static timing reports are diagnostic only. Hardware behavior determines
+acceptance, and timing violations alone do not withhold a build or test.
+
+The first completed fit attempt (807370f) placed but failed routing after
+91m48s of routing. It needed41,074/41,910 ALMs and553/553 M10Ks, with4,181
+of4,191 LABs occupied. The router reported1,834 multiply-used interconnect
+resources and2,358 unrouted signals in its progress sample. This is a
+congestion failure, not rejection of a bitstream for static timing violations.
+
+The follow-up specializes only unreachable OSD geometry. The new analog OSD
+is always upright320x240, so it uses12-bit counters and a240-active-line bound.
+The14-bit line-gap counter still spans the23 line periods from the last
+active-line start to the next frame. All12-bit SPI positions and the full
+16-row bitmap remain. The existing native OSD keeps rotation support and
+14-bit counters, but uses a512-active-line bound: the maximum source height
+is414 with stacked screens,24-pixel gap and FPS row. HDMI's generic OSD stays
+unchanged. No renderer, game clock, cache arbitration or display feature is
+removed. The analog-only specialization saved239 ALUTs and118 registers in
+synthesis. Combined synthesis uses60,832 ALUTs and43,809 registers, a whole-
+design reduction of202 ALUTs and188 registers versus807370f. Memory is
+unchanged. The individual native OSD instances use292 and395 ALUTs; Quartus
+also reorganized unrelated shared logic, so their local savings should not
+be mistaken for the whole-design reduction. Routing remains to be retried.
+Run tools/test_nds_fixed_analog_osd.py for pixel/control equivalence of full
+menus, loading messages, information windows and clipped information windows
+against the generic OSD. The native OSD test covers rotations and maximum
+combined-layout geometries. These passed8,048,640 and12,065,280 pixel/control
+comparisons respectively, with a further12,053,760 comparisons passing for
+the generic-default native configuration after the parameter additions.
+
+The a64b292 follow-up also placed but failed routing, after14m02s of routing.
+It needed41,042 ALMs,32 fewer than the first attempt, with553 RAM blocks.
+The compiler again reported severe congestion and approximately3000ns of
+aggregate routing delay added for hold optimization. The next controlled
+compiler experiment sets OPTIMIZE_HOLD_TIMING OFF, leaving all RTL, clocks,
+seed, setup optimization and features unchanged. This may relieve routing
+demand but is not proof of functional operation; any assembled image must
+be tested on the rig. Hold reports remain diagnostic and are retained.
+Intel's routing-failure guidance explicitly lists disabling hold optimization
+as a way to determine whether timing constraints are contributing to congestion:
+https://www.intel.com/content/www/us/en/programmable/quartushelp/current/msgs/msgs/wvpr20ka10_vpr_no_route_suggestion_message.htm
+The Standard Edition optimization guide describes the inserted delay:
+https://www.intel.com/programmable/technical-pdfs/683230.pdf
+
+The b484807 hold-repair-disabled build completed routing in2h20m56s and
+passed fitting and assembly. It used41,009 ALMs and553 M10Ks. The exact RBF
+SHA-256 is41ed0f808f1365488e45fce4d875ce83e5bcd20ee09bdc0b91dfc5404da78aec.
+It was installed and tested, rather than rejected for its timing reports.
+The native analog menu and240p sync worked, but NSMB was black on both
+analog and1080p HDMI. Both Main and Touch were black; disabling split and
+resetting the game did not recover it.
+
+Mixed-binary tests isolated this to the FPGA image: the new split host with
+the exact rc.7 FPGA ran NSMB visibly, with~59.76 frame-counter increments/s
+and1115 packet-producer increments/s over30s. The rc.7 host with b484807,
+with split Off from cold startup, remained black, with~59.80 frame-counter
+increments/s but only~59.83 packet-producer increments/s. Both bounded
+samples had zero protocol faults. Frame progress alone therefore does not
+establish successful game execution. The same renderer and isolated NSMB
+ROM/save alias were used; original saves and MiSTer.ini were preserved.
+
+The timing reports provide a hypothesis, not a proven cause: slow100C hold
+slack on the33.5/67MHz domains changed from+0.032/+0.311ns in working rc.7
+to-3.909/-3.803ns with hold repair disabled. The next build restores the
+previous default All Paths hold repair. To reduce general routing demand,
+it promotes two existing registered resets to spare global networks:
+h3d_record_cdc|source_reset_pipe[2] (935 loads) and
+console_reset_sync_2x[1] (663 loads). The prior fit used13/16 global networks.
+These fanouts already existed in rc.7, so they are not proof of the original
+congestion cause. No RTL, gameplay clock, renderer or feature is changed by
+this follow-up. Acceptance still depends on the next image's hardware tests.
+
+The first reset-global attempt (b814667) was stopped during routing after
+the fitter explicitly reported both new assignments as invalid node names:
+Quartus retained literal braces in those QSF destinations. The corrected
+attempt uses the same double-quoted destination syntax as the existing
+successfully promoted console_reset_sync_1x reset. No RTL changes accompany
+this correction. Verify that the fitter actually promotes both new nets
+before interpreting its routing result; assignment text alone is insufficient.
+
+Prepared memory-sharing fallback (not yet fitted or tested on hardware)
+---------------------------------------------------------------------
+The two native OSDs now share one4096x8 true-dual-port bitmap. Inspection
+of NDS4MiSTer.sv and hps_io.sv confirms that CLK_VIDEO and HPS_BUS[36]
+carry the same60MHz clk_sys, so this needs no additional clock crossing.
+The digital read port stays dedicated. The other port multiplexes analog
+reads and queued bitmap writes; its read and write address are explicitly
+the same port address so Quartus infers true dual-port storage rather than
+silently replicating the RAM. The ordinary HDMI OSD remains independent.
+
+Analog reads are enabled only while split output is active and the OSD
+pixel scheduler has a nonzero interval. The fixed320x240/10-clock raster
+settles to one OSD read in six video clocks. Four register entries buffer
+writes. At two occupied entries, the existing HPS acknowledgement gate
+waits for room after accepting the current word. It neither drops words
+nor repeats a strobe. Startup and a forced500-clock read-port blockage
+are covered by a test that verifies the resulting bitmap and both read
+ports. No game, renderer, audio, display geometry or rotation is removed.
+
+Full-core synthesis passed:60,707 ALUTs versus60,832,43,900 registers
+versus43,809, and4,202,580 block-memory bits versus4,235,348. The bitmap
+is reported as one32,768-bit True Dual Port RAM. DSP usage remains44.
+This should free four M10Ks, but the final physical count and routing
+result still require fitting. These numbers alone do not qualify a build.
+
+tools/test_nds_shared_osd.py compares both outputs against the frozen
+pre-sharing OSD fixture. It passed12,072,960 pixel/control comparisons
+per output, with22,528 bitmap writes, all native layout sizes, clockwise
+and counterclockwise rotation, full/loading menus and information windows.
+Comparisons cover settled complete frames after geometry acquisition;
+they do not claim identical transient pixels during asynchronous menu
+updates. The separate four-state queue test passed128 writes, peak depth2
+and494 acknowledgement-stall clocks. Existing host-driven loading/rotation
+and dual-OSD tests passed595,968 and589,824 pixels respectively.
+
+This fallback was prepared in an independent checkout while the corrected
+global-reset candidate routed. That4cc032c candidate failed from congestion
+after25m20s of routing. Its applied reset globals reduced the fit to40,912
+ALMs, but it still used all553 M10Ks and reached69% peak routing demand.
+All Paths hold repair was verified in its final report. No RBF was produced.
+The current attempt adopts the tested shared bitmap in a fresh frozen full
+build. It is not installed or published and still needs the same hardware
+acceptance matrix.
+Intel's documented true-dual-port inference model is the primary reference:
+https://www.intel.com/content/www/us/en/support/programmable/support-resources/design-examples/horizontal/ver-true-dual-port-ram-sclk.html
+
+Upstream comparison (primary sources, inspected 2026-10-12)
+=========================================================
+Template, SNES and GBA use the same DV1 selection from vga_data_osd/yc_o.
+They confirm the current framework topology; they are NOT evidence of an
+already-working independent-screen DV1 implementation to copy.
+
+https://github.com/MiSTer-devel/Template_MiSTer/blob/9c8eadb40067c8ce3aef90899844f62d688ac73a/sys/sys_top.v#L1257
+https://github.com/MiSTer-devel/SNES_MiSTer/blob/23026830ff8108fda0f32c0616296845f586b8ce/sys/sys_top.v#L1257
+https://github.com/MiSTer-devel/GBA_MiSTer/blob/93790a023395bbd90e5eaf4dfb2cb5910afd55f5/sys/sys_top.v#L1257
+
+Validation and limits
+=====================
+Run tools/test_split_video.py for tagged Main/Touch pixels through the real
+scanout and real DDR line cache. It tests all four digital layouts, both
+analog selections, both screen orders, gaps, external-plane movement, touch,
+late rows, a read stalled across a frame publication with its source recycled,
+session withdrawal and switching split Off/On while DDR remains owned.
+The two variants cover external_frame_mode Off and On; rc.7 uses the latter.
+The bench supplies frame publications directly and is not a full HPS/renderer
+protocol integration test. It checks immutable visible slots and exact fixed
+analog timing. Existing reader/publication, legacy scanout, native OSD and
+host display/Peek/lid/mic/rotation tests are also required.
+
+Hardware work remains: build and install a separate private kit, capture each
+assignment and all digital geometries, check menu/crop/lock/audio, measure
+analog displacement and gameplay cadence, and inspect existing fault receipts.
+Keep renderer identical to rc.7. Use an isolated NSMB ROM/save alias; preserve
+original SD/NAS saves, normal install, maps, settings and MiSTer.ini.
+
+The one-card rig can capture digital and analog sequentially through the
+RetroTINK-4K. That cannot prove simultaneous display timing or physical CRT
+acceptance. Test the real CRT alongside DV1 on the RetroTINK; a second capture
+path is useful for measurement but not necessary to play.
+
+Nothing from this experiment may be pushed or published without the user's
+separate approval. No new hardware success is claimed by these RTL results.

@@ -1,0 +1,179 @@
+/*
+    Copyright 2016-2026 melonDS team
+
+    This file is part of melonDS.
+
+    melonDS is free software: you can redistribute it and/or modify it under
+    the terms of the GNU General Public License as published by the Free
+    Software Foundation, either version 3 of the License, or (at your option)
+    any later version.
+
+    melonDS is distributed in the hope that it will be useful, but WITHOUT ANY
+    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License along
+    with melonDS. If not, see http://www.gnu.org/licenses/.
+*/
+
+#pragma once
+
+#include "GPU2D.h"
+
+namespace melonDS
+{
+class SoftRenderer;
+
+class SoftRenderer2D : public Renderer2D
+{
+public:
+    SoftRenderer2D(melonDS::GPU2D& gpu2D, SoftRenderer& parent);
+    ~SoftRenderer2D() override;
+    bool Init() override { return true; }
+    void Reset() override;
+
+    void DrawScanline(u32 line) override;
+    void DrawSprites(u32 line) override;
+    void PrepareScanline();
+    void AdvanceLineCacheState();
+    void VBlank() override {}
+    void VBlankEnd() override {};
+    void GetOBJBufferHashes(u64& lineHash, u64& windowHash) const;
+
+private:
+    // The paired output cache compares these buffers before X mosaic changes
+    // them, after sprite preparation and any parallel worker have completed.
+    friend class SoftRenderer;
+    SoftRenderer& Parent;
+
+    // Experimental, opt-in B-only cache of the pre-mosaic sprite result.
+    struct SpritePhaseCache
+    {
+        struct Key
+        {
+            u64 OAMEpoch = 0, VRAMEpoch = 0;
+            u32 DispCnt = 0, MosaicLine = 0;
+            bool operator==(const Key& other) const
+            {
+                return OAMEpoch == other.OAMEpoch && VRAMEpoch == other.VRAMEpoch &&
+                    DispCnt == other.DispCnt && MosaicLine == other.MosaicLine;
+            }
+        };
+        struct Entry
+        {
+            Key Input;
+            alignas(8) u32 Line[256];
+            u8 Window[256];
+            u32 Count = 0;
+            bool Valid = false, OutputValid = false;
+        };
+        std::array<Entry,192> Lines;
+        std::array<u8,1024> OAM {};
+        u64 OAMEpoch = 0, ObservedWriteEpoch = 0;
+        bool OAMValid = false;
+        void Invalidate()
+        {
+            for (auto& entry : Lines) entry.Valid = false;
+            OAMValid = false;
+        }
+    };
+    std::unique_ptr<SpritePhaseCache> SpriteCache;
+
+    // OAM-only setup: pixel data, palettes, mosaic phase, and affine matrices
+    // are still read at the original sprite phase. Preserve OAM priority order.
+    struct SpriteSetupCache
+    {
+        struct Entry
+        {
+            u16 Number, Attr0;
+            s16 X;
+            u8 Y, Width, Height, BoundWidth, BoundHeight;
+        };
+        std::array<Entry, 128> Sprites;
+        std::array<u8, 1024> OAM {};
+        u64 ObservedWriteEpoch = 0;
+        unsigned Count = 0;
+        bool Valid = false;
+    };
+    std::unique_ptr<SpriteSetupCache> SpriteSetup;
+    void UpdateSpriteSetup();
+    bool SpriteBatch = true;
+    bool SpritePriorityIndex = true;
+    bool AffineTileCache = true;
+    bool AffinePackedRows = false;
+    bool StandardPaletteCache = true;
+    bool StandardPaletteValid = false, StandardPaletteChecked = false;
+    alignas(16) u16 StandardPaletteRaw[256] {};
+    alignas(16) u32 StandardPaletteColors[256] {};
+    const u32* GetStandardBGColors(const u16* palette);
+    template<bool cached> static void DrawPalettePixel(u32* dst, u32 color, u32 flag);
+    u8 SpritePriorityPixels[4][256];
+    u16 SpritePriorityCount[4] {};
+    void IndexSpritePriorities();
+    template<bool window> void DrawSpritePixelBatch8(
+        const u8* src, bool fourBit, bool flip, u32 pixelattr, s32 xpos);
+
+
+
+    enum
+    {
+        OBJ_StandardPal = (1<<12),
+        OBJ_DirectColor = (1<<15),
+        OBJ_BGPrioMask = (0x3<<16),
+        OBJ_IsOpaque = (1<<18),
+        OBJ_OpaPrioMask = (OBJ_BGPrioMask | OBJ_IsOpaque),
+        OBJ_IsSprite = (1<<19),
+        OBJ_Mosaic = (1<<20),
+    };
+
+    alignas(8) u32 BGOBJLine[256*2];
+
+    alignas(8) u8 WindowMask[256];
+
+    alignas(8) u32 OBJLine[256];
+    alignas(8) u8 OBJWindow[256];
+
+    u32 NumSprites;
+
+    u8* CurBGXMosaicTable;
+    array2d<u8, 16, 256> MosaicTable = []() constexpr
+    {
+        array2d<u8, 16, 256> table {};
+        // initialize mosaic table
+        for (int m = 0; m < 16; m++)
+        {
+            for (int x = 0; x < 256; x++)
+            {
+                int offset = x % (m+1);
+                table[m][x] = offset;
+            }
+        }
+
+        return table;
+    }();
+
+    u32 ColorComposite(int i, u32 val1, u32 val2) const;
+
+    template<u32 bgmode> void DrawScanlineBGMode(u32 line);
+    void DrawScanlineBGMode6(u32 line);
+    void DrawScanlineBGMode7(u32 line);
+    void DrawScanline_BGOBJ(u32 line, u32* dst);
+
+    static void DrawPixel(u32* dst, u16 color, u32 flag);
+
+    void DrawBG_3D();
+    template<bool mosaic> void DrawBG_Text(u32 line, u32 bgnum);
+    template<bool mosaic, bool cached> void DrawBG_TextImpl(u32 line, u32 bgnum);
+    template<bool mosaic> void DrawBG_Affine(u32 line, u32 bgnum);
+    template<bool mosaic> void DrawBG_Extended(u32 line, u32 bgnum);
+    template<bool mosaic, bool cached> void DrawBG_ExtendedImpl(u32 line, u32 bgnum);
+    template<bool mosaic> void DrawBG_Large(u32 line);
+
+    void ApplySpriteMosaicX();
+    void InterleaveSprites(u32 prio);
+    template<bool window> void DrawSpritePixel(int color, u32 pixelattr, s32 xpos);
+    template<bool window> void DrawSprite_Rotscale(u32 num, u32 boundwidth, u32 boundheight, u32 width, u32 height, s32 xpos, s32 ypos);
+    template<bool window> void DrawSprite_Normal(u32 num, u32 width, u32 height, s32 xpos, s32 ypos);
+};
+
+}

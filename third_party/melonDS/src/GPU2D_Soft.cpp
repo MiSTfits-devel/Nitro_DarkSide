@@ -1,0 +1,2264 @@
+/*
+    Copyright 2016-2026 melonDS team
+
+    This file is part of melonDS.
+
+    melonDS is free software: you can redistribute it and/or modify it under
+    the terms of the GNU General Public License as published by the Free
+    Software Foundation, either version 3 of the License, or (at your option)
+    any later version.
+
+    melonDS is distributed in the hope that it will be useful, but WITHOUT ANY
+    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License along
+    with melonDS. If not, see http://www.gnu.org/licenses/.
+*/
+
+#include "GPU_Soft.h"
+#include "GPU_ColorOp.h"
+#include "NDS.h"
+#include "NDS4MiSTer_2DTrace.h"
+#include <cstdlib>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+namespace melonDS
+{
+
+void SoftRenderer2D::GetOBJBufferHashes(u64& lineHash, u64& windowHash) const
+{
+    constexpr u64 Offset = 1469598103934665603ULL, Prime = 1099511628211ULL;
+    lineHash = Offset; windowHash = Offset;
+    const u8* line = reinterpret_cast<const u8*>(OBJLine);
+    for (size_t i = 0; i < sizeof(OBJLine); i++) { lineHash ^= line[i]; lineHash *= Prime; }
+    for (u8 value : OBJWindow) { windowHash ^= value; windowHash *= Prime; }
+}
+
+SoftRenderer2D::SoftRenderer2D(melonDS::GPU2D& gpu2D, SoftRenderer& parent)
+    : Renderer2D(gpu2D), Parent(parent)
+{
+    // Keep the accepted default unchanged while qualifying this experiment.
+    const char* cache = std::getenv("NDS_GPU_SPRITE_PHASE_CACHE");
+    if (gpu2D.Num == 1 && cache && std::strcmp(cache, "1") == 0)
+        SpriteCache = std::make_unique<SpritePhaseCache>();
+    const char* batch = std::getenv("NDS_GPU_SPRITE_BATCH");
+    SpriteBatch = !batch || std::strcmp(batch, "0") != 0;
+    const char* priorityIndex = std::getenv("NDS_GPU_SPRITE_PRIORITY_INDEX");
+    SpritePriorityIndex = !priorityIndex || std::strcmp(priorityIndex, "0") != 0;
+    const char* affineTile = std::getenv("NDS_GPU_AFFINE_TILE_CACHE");
+    AffineTileCache = !affineTile || std::strcmp(affineTile, "0") != 0;
+    const char* packedRows = std::getenv("NDS_GPU_AFFINE_PACKED_ROWS");
+    AffinePackedRows = packedRows && std::strcmp(packedRows, "1") == 0;
+    const char* paletteCache = std::getenv("NDS_GPU_STANDARD_PALETTE_CACHE");
+    StandardPaletteCache = !paletteCache || std::strcmp(paletteCache, "0") != 0;
+    const char* setup = std::getenv("NDS_GPU_SPRITE_SETUP_CACHE");
+    if (!setup || std::strcmp(setup, "0") != 0)
+        SpriteSetup = std::make_unique<SpriteSetupCache>();
+    // mosaic table is initialized at compile-time
+}
+
+SoftRenderer2D::~SoftRenderer2D()
+{
+}
+
+void SoftRenderer2D::Reset()
+{
+    StandardPaletteValid = StandardPaletteChecked = false;
+    if (SpriteCache) SpriteCache->Invalidate();
+    if (SpriteSetup) SpriteSetup->Valid = false;
+    memset(BGOBJLine, 0, sizeof(BGOBJLine));
+    memset(WindowMask, 0, sizeof(WindowMask));
+    memset(OBJLine, 0, sizeof(OBJLine));
+    memset(OBJWindow, 0, sizeof(OBJWindow));
+
+    NumSprites = 0;
+}
+
+u32 SoftRenderer2D::ColorComposite(int i, u32 val1, u32 val2) const
+{
+    u32 coloreffect = 0;
+    u32 eva, evb;
+
+    u32 flag1 = val1 >> 24;
+    u32 flag2 = val2 >> 24;
+
+    u32 blendCnt = GPU2D.BlendCnt;
+
+    u32 target2;
+    if      (flag2 & 0x80) target2 = 0x1000;
+    else if (flag2 & 0x40) target2 = 0x0100;
+    else                   target2 = flag2 << 8;
+
+    if ((flag1 & 0x80) && (blendCnt & target2))
+    {
+        // sprite blending
+
+        coloreffect = 1;
+
+        if (flag1 & 0x40)
+        {
+            eva = flag1 & 0x1F;
+            evb = 16 - eva;
+        }
+        else
+        {
+            eva = GPU2D.EVA;
+            evb = GPU2D.EVB;
+        }
+    }
+    else if ((flag1 & 0x40) && (blendCnt & target2))
+    {
+        // 3D layer blending
+
+        coloreffect = 4;
+    }
+    else
+    {
+        if      (flag1 & 0x80) flag1 = 0x10;
+        else if (flag1 & 0x40) flag1 = 0x01;
+
+        if ((blendCnt & flag1) && (WindowMask[i] & 0x20))
+        {
+            coloreffect = (blendCnt >> 6) & 0x3;
+
+            if (coloreffect == 1)
+            {
+                if (blendCnt & target2)
+                {
+                    eva = GPU2D.EVA;
+                    evb = GPU2D.EVB;
+                }
+                else
+                    coloreffect = 0;
+            }
+        }
+    }
+
+    switch (coloreffect)
+    {
+        case 0: return val1;
+        case 1: return ColorBlend4(val1, val2, eva, evb);
+        case 2: return ColorBrightnessUp(val1, GPU2D.EVY, 0x8);
+        case 3: return ColorBrightnessDown(val1, GPU2D.EVY, 0x7);
+        case 4: return ColorBlend5(val1, val2);
+    }
+
+    return val1;
+}
+
+void SoftRenderer2D::DrawScanline(u32 line)
+{
+    StandardPaletteChecked = false;
+    u32* dst = Parent.Output2D[GPU2D.Num];
+
+    if (!GPU2D.Enabled)
+    {
+        // if this 2D unit is disabled in POWCNT, the output is a fixed color
+        // (black for unit A, white for unit B)
+        u32 fillcolor = (GPU2D.Num == 0) ? 0xFF000000 : 0xFF3F3F3F;
+        for (int i = 0; i < 256; i++)
+            dst[i] = fillcolor;
+
+        return;
+    }
+
+    if (GPU2D.ForcedBlank)
+    {
+        // forced blank
+        for (int i = 0; i < 256; i++)
+            dst[i] = 0xFF3F3F3F;
+
+        return;
+    }
+
+    PrepareScanline();
+
+    // render BG layers and sprites
+    DrawScanline_BGOBJ(line, dst);
+}
+
+void SoftRenderer2D::PrepareScanline()
+{
+    if (GPU2D.Num == 0)
+    {
+        auto bgDirty = GPU.VRAMDirty_ABG.DeriveState(GPU.VRAMMap_ABG, GPU);
+        GPU.MakeVRAMFlat_ABGCoherent(bgDirty);
+        auto bgExtPalDirty = GPU.VRAMDirty_ABGExtPal.DeriveState(GPU.VRAMMap_ABGExtPal, GPU);
+        GPU.MakeVRAMFlat_ABGExtPalCoherent(bgExtPalDirty);
+        auto objExtPalDirty = GPU.VRAMDirty_AOBJExtPal.DeriveState(&GPU.VRAMMap_AOBJExtPal, GPU);
+        GPU.MakeVRAMFlat_AOBJExtPalCoherent(objExtPalDirty);
+    }
+    else
+    {
+        auto bgDirty = GPU.VRAMDirty_BBG.DeriveState(GPU.VRAMMap_BBG, GPU);
+        GPU.MakeVRAMFlat_BBGCoherent(bgDirty);
+        auto bgExtPalDirty = GPU.VRAMDirty_BBGExtPal.DeriveState(GPU.VRAMMap_BBGExtPal, GPU);
+        GPU.MakeVRAMFlat_BBGExtPalCoherent(bgExtPalDirty);
+        auto objExtPalDirty = GPU.VRAMDirty_BOBJExtPal.DeriveState(&GPU.VRAMMap_BOBJExtPal, GPU);
+        GPU.MakeVRAMFlat_BOBJExtPalCoherent(objExtPalDirty);
+    }
+}
+
+void SoftRenderer2D::AdvanceLineCacheState()
+{
+    PrepareScanline();
+    if (GPU2D.DispCnt & 0xE000)
+        GPU2D.CalculateWindowMask(WindowMask, OBJWindow);
+    else
+        memset(WindowMask, 0xFF, sizeof(WindowMask));
+    ApplySpriteMosaicX();
+    CurBGXMosaicTable = MosaicTable[GPU2D.BGMosaicSize[0]].data();
+}
+
+#define DoDrawBG(type, line, num) \
+    do \
+    { \
+        if ((bgCnt[num] & (1<<6)) && (GPU2D.BGMosaicSize[0] > 0)) \
+        { \
+            DrawBG_##type<true>(line, num); \
+        } \
+        else \
+        { \
+            DrawBG_##type<false>(line, num); \
+        } \
+    } while (false)
+
+#define DoDrawBG_Large(line) \
+    do \
+    { \
+        if ((bgCnt[2] & (1<<6)) && (GPU2D.BGMosaicSize[0] > 0)) \
+        { \
+            DrawBG_Large<true>(line); \
+        } \
+        else \
+        { \
+            DrawBG_Large<false>(line); \
+        } \
+    } while (false)
+
+template<u32 bgmode>
+void SoftRenderer2D::DrawScanlineBGMode(u32 line)
+{
+    u32 dispCnt = GPU2D.DispCnt;
+    u16* bgCnt = GPU2D.BGCnt;
+    for (int i = 3; i >= 0; i--)
+    {
+        if ((bgCnt[3] & 0x3) == i)
+        {
+            if (GPU2D.LayerEnable & (1<<3))
+            {
+                if (bgmode >= 3)
+                    DoDrawBG(Extended, line, 3);
+                else if (bgmode >= 1)
+                    DoDrawBG(Affine, line, 3);
+                else
+                    DoDrawBG(Text, line, 3);
+            }
+        }
+        if ((bgCnt[2] & 0x3) == i)
+        {
+            if (GPU2D.LayerEnable & (1<<2))
+            {
+                if (bgmode == 5)
+                    DoDrawBG(Extended, line, 2);
+                else if (bgmode == 4 || bgmode == 2)
+                    DoDrawBG(Affine, line, 2);
+                else
+                    DoDrawBG(Text, line, 2);
+            }
+        }
+        if ((bgCnt[1] & 0x3) == i)
+        {
+            if (GPU2D.LayerEnable & (1<<1))
+            {
+                DoDrawBG(Text, line, 1);
+            }
+        }
+        if ((bgCnt[0] & 0x3) == i)
+        {
+            if (GPU2D.LayerEnable & (1<<0))
+            {
+                if (!GPU2D.Num && (dispCnt & 0x8))
+                    DrawBG_3D();
+                else
+                    DoDrawBG(Text, line, 0);
+            }
+        }
+        if ((GPU2D.LayerEnable & (1<<4)) && NumSprites)
+        {
+            InterleaveSprites(i);
+        }
+
+    }
+}
+
+void SoftRenderer2D::DrawScanlineBGMode6(u32 line)
+{
+    u32 dispCnt = GPU2D.DispCnt;
+    u16* bgCnt = GPU2D.BGCnt;
+    for (int i = 3; i >= 0; i--)
+    {
+        if ((bgCnt[2] & 0x3) == i)
+        {
+            if (GPU2D.LayerEnable & (1<<2))
+            {
+                DoDrawBG_Large(line);
+            }
+        }
+        if ((bgCnt[0] & 0x3) == i)
+        {
+            if (GPU2D.LayerEnable & (1<<0))
+            {
+                if ((!GPU2D.Num) && (dispCnt & 0x8))
+                    DrawBG_3D();
+            }
+        }
+        if ((GPU2D.LayerEnable & (1<<4)) && NumSprites)
+        {
+            InterleaveSprites(i);
+        }
+    }
+}
+
+void SoftRenderer2D::DrawScanlineBGMode7(u32 line)
+{
+    u32 dispCnt = GPU2D.DispCnt;
+    u16* bgCnt = GPU2D.BGCnt;
+    // mode 7 only has text-mode BG0 and BG1
+
+    for (int i = 3; i >= 0; i--)
+    {
+        if ((bgCnt[1] & 0x3) == i)
+        {
+            if (GPU2D.LayerEnable & (1<<1))
+            {
+                DoDrawBG(Text, line, 1);
+            }
+        }
+        if ((bgCnt[0] & 0x3) == i)
+        {
+            if (GPU2D.LayerEnable & (1<<0))
+            {
+                if (!GPU2D.Num && (dispCnt & 0x8))
+                    DrawBG_3D();
+                else
+                    DoDrawBG(Text, line, 0);
+            }
+        }
+        if ((GPU2D.LayerEnable & (1<<4)) && NumSprites)
+        {
+            InterleaveSprites(i);
+        }
+    }
+}
+
+void SoftRenderer2D::DrawScanline_BGOBJ(u32 line, u32* dst)
+{
+    u64 backdrop;
+    if (GPU2D.Num)
+        backdrop = *(u16*)&GPU.Palette[0x400];
+    else
+        backdrop = *(u16*)&GPU.Palette[0];
+
+    {
+        u8 r = (backdrop & 0x001F) << 1;
+        u8 g = ((backdrop & 0x03E0) >> 4) | ((backdrop & 0x8000) >> 15);
+        u8 b = (backdrop & 0x7C00) >> 9;
+
+        backdrop = r | (g << 8) | (b << 16) | 0x20000000;
+        backdrop |= (backdrop << 32);
+
+        for (int i = 0; i < 256; i+=2)
+            *(u64*)&BGOBJLine[i] = backdrop;
+        for (int i = 256; i < 512; i+=2)
+            *(u64*)&BGOBJLine[i] = 0;
+    }
+
+    if (GPU2D.DispCnt & 0xE000)
+        GPU2D.CalculateWindowMask(WindowMask, OBJWindow);
+    else
+        memset(WindowMask, 0xFF, 256);
+
+    ApplySpriteMosaicX();
+    CurBGXMosaicTable = MosaicTable[GPU2D.BGMosaicSize[0]].data();
+
+    if (SpritePriorityIndex && (GPU2D.LayerEnable & (1<<4)) && NumSprites)
+        IndexSpritePriorities();
+
+    switch (GPU2D.DispCnt & 0x7)
+    {
+        case 0: DrawScanlineBGMode<0>(line); break;
+        case 1: DrawScanlineBGMode<1>(line); break;
+        case 2: DrawScanlineBGMode<2>(line); break;
+        case 3: DrawScanlineBGMode<3>(line); break;
+        case 4: DrawScanlineBGMode<4>(line); break;
+        case 5: DrawScanlineBGMode<5>(line); break;
+        case 6: DrawScanlineBGMode6(line); break;
+        case 7: DrawScanlineBGMode7(line); break;
+    }
+
+    const u8 displayMode = static_cast<u8>(
+        (GPU2D.DispCnt >> 16) & (GPU2D.Num ? 0x1 : 0x3));
+    const u16 masterBrightness =
+        GPU2D.Num ? GPU.MasterBrightnessB : GPU.MasterBrightnessA;
+    if (NDS4MiSTer::CompositeLineEnabled())
+        NDS4MiSTer::EmitCompositeLine(GPU.NDS.NumFrames, static_cast<u16>(line),
+            static_cast<u8>(GPU2D.Num), GPU.ScreenSwap, BGOBJLine, BGOBJLine+256,
+            WindowMask, GPU2D.BlendCnt, GPU2D.EVA, GPU2D.EVB, GPU2D.EVY,
+            displayMode, masterBrightness);
+
+    // A standalone FPGA consumer can perform this exact operation from the
+    // emitted top/second metadata. Keep software composition whenever display
+    // capture is active because the emulated DS may read Output2D back into
+    // VRAM; otherwise the live layer producer does not consume this buffer.
+    bool compositePassthrough =
+        NDS4MiSTer::CompositeLineBypassEnabled() && !GPU.CaptureEnable &&
+        displayMode == 1 && ((masterBrightness >> 14) & 0x3) == 0;
+    bool compositeMixed = false;
+
+    // ColorComposite() can only change an ordinary top pixel when a normal
+    // color effect is selected for at least one first target.  Semi-transparent
+    // OBJ and 3D pixels have their own forced-blend rules, so retain the slow
+    // path whenever either flag occurs anywhere on the line.
+    if (!compositePassthrough &&
+        ((((GPU2D.BlendCnt >> 6) & 0x3) == 0) ||
+         ((GPU2D.BlendCnt & 0x003F) == 0)))
+    {
+        // Without second targets, neither forced OBJ nor forced 3D
+        // blending can change a pixel. Ordinary effects are already ruled
+        // out by the enclosing condition.
+        if ((GPU2D.BlendCnt & 0x3F00) == 0)
+            compositePassthrough = true;
+        else
+        {
+            u64 specialFlags = 0;
+            for (int i = 0; i < 256; i += 2)
+                specialFlags |= *(const u64*)&BGOBJLine[i];
+            if ((specialFlags & 0xC0000000C0000000ULL) == 0)
+                compositePassthrough = true;
+            else
+                compositeMixed = true;
+        }
+    }
+
+    if (compositePassthrough)
+    {
+        memcpy(dst, BGOBJLine, 256*sizeof(u32));
+        if (Parent.StageProfileEnabled)
+            ++Parent.StageProfile.CompositeFastLines[GPU2D.Num];
+    }
+    else if (compositeMixed)
+    {
+        for (int i = 0; i < 256; i += 2)
+        {
+            const u64 top = *(const u64*)&BGOBJLine[i];
+            // An opaque 3D pixel also survives forced ColorBlend5
+            // unchanged (including metadata). Bit 7 excludes translucent
+            // OBJ; ordinary effects remain disabled on this mixed path.
+            if ((top & 0xC0000000C0000000ULL) == 0 ||
+                (top & 0xDF000000DF000000ULL) == 0x5F0000005F000000ULL)
+                *(u64*)&dst[i] = top;
+            else
+            {
+                dst[i] = (BGOBJLine[i] & 0xC0000000u) ?
+                    ColorComposite(i, BGOBJLine[i], BGOBJLine[256+i]) :
+                    BGOBJLine[i];
+                dst[i+1] = (BGOBJLine[i+1] & 0xC0000000u) ?
+                    ColorComposite(i+1, BGOBJLine[i+1], BGOBJLine[257+i]) :
+                    BGOBJLine[i+1];
+            }
+        }
+        if (Parent.StageProfileEnabled)
+            ++Parent.StageProfile.CompositeMixedLines[GPU2D.Num];
+    }
+    else
+    {
+        for (int i = 0; i < 256; i++)
+            dst[i] = ColorComposite(i, BGOBJLine[i], BGOBJLine[256+i]);
+        if (Parent.StageProfileEnabled)
+            ++Parent.StageProfile.CompositeSlowLines[GPU2D.Num];
+    }
+}
+
+
+void SoftRenderer2D::DrawPixel(u32* dst, u16 color, u32 flag)
+{
+    u8 r = (color & 0x001F) << 1;
+    u8 g = ((color & 0x03E0) >> 4) | ((color & 0x8000) >> 15);
+    u8 b = (color & 0x7C00) >> 9;
+
+    *(dst+256) = *dst;
+    *dst = r | (g << 8) | (b << 16) | flag;
+}
+
+void SoftRenderer2D::DrawBG_3D()
+{
+    for (int i = 0; i < 256; i++)
+    {
+        u32 c = Parent.Output3D[i];
+
+        if ((c >> 24) == 0) continue;
+        if (!(WindowMask[i] & 0x01)) continue;
+
+        BGOBJLine[i+256] = BGOBJLine[i];
+        BGOBJLine[i] = c | 0x40000000;
+    }
+}
+
+const u32* SoftRenderer2D::GetStandardBGColors(const u16* palette)
+{
+    // Compare the real bytes once per composed line. This also catches raw
+    // external writes and save-state restores without relying on a revision
+    // hint. Expanded colors retain the renderer's bit-15 green-channel rule.
+    if (!StandardPaletteChecked)
+    {
+        if (!StandardPaletteValid ||
+            std::memcmp(StandardPaletteRaw, palette, sizeof(StandardPaletteRaw)))
+        {
+            std::memcpy(StandardPaletteRaw, palette, sizeof(StandardPaletteRaw));
+            for (unsigned i = 0; i < 256; ++i)
+            {
+                const u32 c = StandardPaletteRaw[i];
+                StandardPaletteColors[i] = ((c & 31u) << 1) |
+                    (((c & 0x3e0u) >> 4 | (c >> 15)) << 8) |
+                    ((c & 0x7c00u) << 7);
+            }
+            StandardPaletteValid = true;
+        }
+        StandardPaletteChecked = true;
+    }
+    return StandardPaletteColors;
+}
+
+template<bool cached>
+void SoftRenderer2D::DrawPalettePixel(u32* dst, u32 color, u32 flag)
+{
+    if constexpr (cached) { dst[256] = dst[0]; dst[0] = color | flag; }
+    else DrawPixel(dst, static_cast<u16>(color), flag);
+}
+
+template<bool mosaic>
+void SoftRenderer2D::DrawBG_Text(u32 line, u32 bgnum)
+{
+    // Converted standard colors also serve 8bpp tile rows. Extended palettes
+    // have separate banks; keep those and the 8bpp mosaic path unchanged.
+    const bool eligible = !(GPU2D.BGCnt[bgnum] & (1u << 7)) ||
+        (!mosaic && !(GPU2D.DispCnt & (1u << 30)));
+    if (StandardPaletteCache && eligible) DrawBG_TextImpl<mosaic, true>(line, bgnum);
+    else DrawBG_TextImpl<mosaic, false>(line, bgnum);
+}
+
+template<bool mosaic, bool cached>
+void SoftRenderer2D::DrawBG_TextImpl(u32 line, u32 bgnum)
+{
+    // workaround for backgrounds missing on aarch64 with lto build
+    asm volatile ("" : : : "memory");
+
+    u16 bgcnt = GPU2D.BGCnt[bgnum];
+
+    u32 tilesetaddr, tilemapaddr;
+    u16* pal;
+    u32 extpal, extpalslot;
+
+    u16 xoff = GPU2D.BGXPos[bgnum];
+    u16 yoff = GPU2D.BGYPos[bgnum];
+
+    if (bgcnt & (1<<6))
+        yoff += GPU2D.BGMosaicLine;
+    else
+        yoff += line;
+    /*u16 yoff = GPU2D.BGYPos[bgnum] + line;
+
+    if (bgcnt & (1<<6))
+    {
+        // vertical mosaic
+        yoff -= GPU2D.BGMosaicY;
+    }*/
+
+    u32 widexmask = (bgcnt & (1<<14)) ? 0x100 : 0;
+
+    extpal = (GPU2D.DispCnt & (1<<30));
+    if (extpal) extpalslot = ((bgnum<2) && (bgcnt&0x2000)) ? (2+bgnum) : bgnum;
+
+    u8* bgvram;
+    u32 bgvrammask;
+    GPU2D.GetBGVRAM(bgvram, bgvrammask);
+    if (GPU2D.Num)
+    {
+        tilesetaddr = ((bgcnt & 0x003C) << 12);
+        tilemapaddr = ((bgcnt & 0x1F00) << 3);
+
+        pal = (u16*)&GPU.Palette[0x400];
+    }
+    else
+    {
+        tilesetaddr = ((GPU2D.DispCnt & 0x07000000) >> 8) + ((bgcnt & 0x003C) << 12);
+        tilemapaddr = ((GPU2D.DispCnt & 0x38000000) >> 11) + ((bgcnt & 0x1F00) << 3);
+
+        pal = (u16*)&GPU.Palette[0];
+    }
+
+    const u32* converted = nullptr;
+    if constexpr (cached)
+        converted = GetStandardBGColors(pal);
+
+    // adjust Y position in tilemap
+    if (bgcnt & (1<<15))
+    {
+        tilemapaddr += ((yoff & 0x1F8) << 3);
+        if (bgcnt & (1<<14))
+            tilemapaddr += ((yoff & 0x100) << 3);
+    }
+    else
+        tilemapaddr += ((yoff & 0xF8) << 3);
+
+    // The non-mosaic path advances monotonically through the source row.
+    // Consume one tile-row span at a time so tilemap, palette, and row state
+    // are loaded once per eight pixels instead of rechecking the tile edge
+    // for every pixel. Mosaic retains the general per-pixel path below.
+    if constexpr (!mosaic)
+    {
+        int screenX = 0;
+        while (screenX < 256)
+        {
+            const u32 xpos = xoff;
+            const u16 curtile = *(u16*)&bgvram[
+                (tilemapaddr + ((xpos & 0xF8) >> 2) +
+                 ((xpos & widexmask) << 3)) & bgvrammask];
+            const u32 sourceOffset = xpos & 0x7;
+            const u32 span = ((8 - sourceOffset) <
+                              static_cast<u32>(256 - screenX)) ?
+                (8 - sourceOffset) : static_cast<u32>(256 - screenX);
+
+            if (bgcnt & (1<<7))
+            {
+                const auto* curpal = [&]() {
+                    if constexpr (cached) return converted;
+                    else return extpal ? GPU2D.GetBGExtPal(extpalslot, curtile >> 12) : pal;
+                }();
+                const u32 pixelsaddr =
+                    tilesetaddr + ((curtile & 0x03FF) << 6) +
+                    (((curtile & (1<<11)) ?
+                      (7-(yoff&0x7)) : (yoff&0x7)) << 3);
+                if (span == 8)
+                {
+                    u32 windowWords[2];
+                    std::memcpy(windowWords, &WindowMask[screenX],
+                                sizeof(windowWords));
+                    const u32 windowBit = 1u << bgnum;
+                    if (((windowWords[0] | windowWords[1]) &
+                         (windowBit * 0x01010101u)) == 0)
+                    {
+                        screenX += 8;
+                        xoff = static_cast<u16>(xoff + 8);
+                        continue;
+                    }
+                    // An entire 8bpp tile row is one aligned doubleword. Its address
+                    // cannot cross the power-of-two flat VRAM boundary. Read
+                    // once and specialize the eight byte positions, retaining
+                    // the ordinary window, transparent-index and layer rules.
+                    u64 packed;
+                    std::memcpy(&packed, &bgvram[pixelsaddr & bgvrammask],
+                                sizeof(packed));
+                    const u32 layerFlag = 0x01000000u << bgnum;
+                    auto draw = [&](u32 outputOffset, u32 shift)
+#if defined(__GNUC__) || defined(__clang__)
+                        __attribute__((always_inline))
+#endif
+                    {
+                        const u32 outputX = screenX + outputOffset;
+                        const u32 color = (packed >> shift) & 0xFFu;
+                        if (color && (WindowMask[outputX] & windowBit))
+                            DrawPalettePixel<cached>(&BGOBJLine[outputX], curpal[color],
+                                      layerFlag);
+                    };
+                    if (curtile & (1u << 10))
+                    {
+                        draw(0, 56); draw(1, 48); draw(2, 40); draw(3, 32);
+                        draw(4, 24); draw(5, 16); draw(6, 8); draw(7, 0);
+                    }
+                    else
+                    {
+                        draw(0, 0); draw(1, 8); draw(2, 16); draw(3, 24);
+                        draw(4, 32); draw(5, 40); draw(6, 48); draw(7, 56);
+                    }
+                    screenX += 8;
+                    xoff = static_cast<u16>(xoff + 8);
+                    continue;
+                }
+                for (u32 j = 0; j < span; ++j)
+                {
+                    const int outputX = screenX + static_cast<int>(j);
+                    if (!(WindowMask[outputX] & (1<<bgnum)))
+                        continue;
+                    const u32 tileX = (curtile & (1<<10)) ?
+                        (7-((xpos+j)&0x7)) : ((xpos+j)&0x7);
+                    const u8 color =
+                        bgvram[(pixelsaddr + tileX) & bgvrammask];
+                    if (color)
+                        DrawPalettePixel<cached>(&BGOBJLine[outputX], curpal[color],
+                                  0x01000000<<bgnum);
+                }
+            }
+            else
+            {
+                const auto* const curpal = [&]() {
+                    if constexpr (cached) return converted + ((curtile & 0xF000) >> 8);
+                    else return pal + ((curtile & 0xF000) >> 8);
+                }();
+                const u32 pixelsaddr =
+                    tilesetaddr + ((curtile & 0x03FF) << 5) +
+                    (((curtile & (1<<11)) ?
+                      (7-(yoff&0x7)) : (yoff&0x7)) << 2);
+                if (span == 8)
+                {
+                    u32 windowWords[2];
+                    std::memcpy(windowWords, &WindowMask[screenX],
+                                sizeof(windowWords));
+                    const u32 windowBit = 1u << bgnum;
+                    if (((windowWords[0] | windowWords[1]) &
+                         (windowBit * 0x01010101u)) == 0)
+                    {
+                        screenX += 8;
+                        xoff = static_cast<u16>(xoff + 8);
+                        continue;
+                    }
+                    // An entire 4bpp tile row is one aligned word. Its address
+                    // cannot cross the power-of-two flat VRAM boundary. Read
+                    // once and specialize the eight nibble positions, retaining
+                    // the ordinary window, transparent-index and layer rules.
+                    u32 packed;
+                    std::memcpy(&packed, &bgvram[pixelsaddr & bgvrammask],
+                                sizeof(packed));
+                    const u32 layerFlag = 0x01000000u << bgnum;
+                    auto draw = [&](u32 outputOffset, u32 shift)
+#if defined(__GNUC__) || defined(__clang__)
+                        __attribute__((always_inline))
+#endif
+                    {
+                        const u32 outputX = screenX + outputOffset;
+                        const u32 color = (packed >> shift) & 0xFu;
+                        if (color && (WindowMask[outputX] & windowBit))
+                            DrawPalettePixel<cached>(&BGOBJLine[outputX], curpal[color],
+                                      layerFlag);
+                    };
+                    if (curtile & (1u << 10))
+                    {
+                        draw(0, 28); draw(1, 24); draw(2, 20); draw(3, 16);
+                        draw(4, 12); draw(5, 8); draw(6, 4); draw(7, 0);
+                    }
+                    else
+                    {
+                        draw(0, 0); draw(1, 4); draw(2, 8); draw(3, 12);
+                        draw(4, 16); draw(5, 20); draw(6, 24); draw(7, 28);
+                    }
+                    screenX += 8;
+                    xoff = static_cast<u16>(xoff + 8);
+                    continue;
+                }
+                for (u32 j = 0; j < span; ++j)
+                {
+                    const int outputX = screenX + static_cast<int>(j);
+                    if (!(WindowMask[outputX] & (1<<bgnum)))
+                        continue;
+                    const u32 tileX = (curtile & (1<<10)) ?
+                        (7-((xpos+j)&0x7)) : ((xpos+j)&0x7);
+                    const u8 packed = bgvram[
+                        (pixelsaddr + (tileX >> 1)) & bgvrammask];
+                    const u8 color = tileX & 1 ?
+                        packed >> 4 : packed & 0x0F;
+                    if (color)
+                        DrawPalettePixel<cached>(&BGOBJLine[outputX], curpal[color],
+                                  0x01000000<<bgnum);
+                }
+            }
+
+            screenX += static_cast<int>(span);
+            xoff = static_cast<u16>(xoff + span);
+        }
+        return;
+    }
+
+    u16 curtile;
+    u16* curpal;
+    u32 pixelsaddr;
+    u8 color;
+    u32 lastxpos;
+
+    if (bgcnt & (1<<7))
+    {
+        // 256-color
+
+        // preload shit as needed
+        if ((xoff & 0x7) || mosaic)
+        {
+            curtile = *(u16*)&bgvram[(tilemapaddr + ((xoff & 0xF8) >> 2) + ((xoff & widexmask) << 3)) & bgvrammask];
+
+            if (extpal) curpal = GPU2D.GetBGExtPal(extpalslot, curtile>>12);
+            else        curpal = pal;
+
+            pixelsaddr = tilesetaddr + ((curtile & 0x03FF) << 6)
+                                     + (((curtile & (1<<11)) ? (7-(yoff&0x7)) : (yoff&0x7)) << 3);
+        }
+
+        if (mosaic) lastxpos = xoff;
+
+        for (int i = 0; i < 256; i++)
+        {
+            u32 xpos;
+            if (mosaic) xpos = xoff - CurBGXMosaicTable[i];
+            else        xpos = xoff;
+
+            if ((!mosaic && (!(xpos & 0x7))) ||
+                (mosaic && ((xpos >> 3) != (lastxpos >> 3))))
+            {
+                // load a new tile
+                curtile = *(u16*)&bgvram[(tilemapaddr + ((xpos & 0xF8) >> 2) + ((xpos & widexmask) << 3)) & bgvrammask];
+
+                if (extpal) curpal = GPU2D.GetBGExtPal(extpalslot, curtile>>12);
+                else        curpal = pal;
+
+                pixelsaddr = tilesetaddr + ((curtile & 0x03FF) << 6)
+                                         + (((curtile & (1<<11)) ? (7-(yoff&0x7)) : (yoff&0x7)) << 3);
+
+                if (mosaic) lastxpos = xpos;
+            }
+
+            // draw pixel
+            if (WindowMask[i] & (1<<bgnum))
+            {
+                u32 tilexoff = (curtile & (1<<10)) ? (7-(xpos&0x7)) : (xpos&0x7);
+                color = bgvram[(pixelsaddr + tilexoff) & bgvrammask];
+
+                if (color)
+                    DrawPixel(&BGOBJLine[i], curpal[color], 0x01000000<<bgnum);
+            }
+
+            xoff++;
+        }
+    }
+    else
+    {
+        // 16-color
+        const auto* palette4 = [&]() {
+            if constexpr (cached) return converted;
+            else return pal;
+        }();
+        const auto* curpal4 = palette4;
+
+        // preload shit as needed
+        if ((xoff & 0x7) || mosaic)
+        {
+            curtile = *(u16*)&bgvram[((tilemapaddr + ((xoff & 0xF8) >> 2) + ((xoff & widexmask) << 3))) & bgvrammask];
+            curpal4 = palette4 + ((curtile & 0xF000) >> 8);
+            pixelsaddr = tilesetaddr + ((curtile & 0x03FF) << 5)
+                                     + (((curtile & (1<<11)) ? (7-(yoff&0x7)) : (yoff&0x7)) << 2);
+        }
+
+        if (mosaic) lastxpos = xoff;
+
+        for (int i = 0; i < 256; i++)
+        {
+            u32 xpos;
+            if (mosaic) xpos = xoff - CurBGXMosaicTable[i];
+            else        xpos = xoff;
+
+            if ((!mosaic && (!(xpos & 0x7))) ||
+                (mosaic && ((xpos >> 3) != (lastxpos >> 3))))
+            {
+                // load a new tile
+                curtile = *(u16*)&bgvram[(tilemapaddr + ((xpos & 0xF8) >> 2) + ((xpos & widexmask) << 3)) & bgvrammask];
+                curpal4 = palette4 + ((curtile & 0xF000) >> 8);
+                pixelsaddr = tilesetaddr + ((curtile & 0x03FF) << 5)
+                                         + (((curtile & (1<<11)) ? (7-(yoff&0x7)) : (yoff&0x7)) << 2);
+
+                if (mosaic) lastxpos = xpos;
+            }
+
+            // draw pixel
+            if (WindowMask[i] & (1<<bgnum))
+            {
+                u32 tilexoff = (curtile & (1<<10)) ? (7-(xpos&0x7)) : (xpos&0x7);
+                if (tilexoff & 0x1)
+                {
+                    color = bgvram[(pixelsaddr + (tilexoff >> 1)) & bgvrammask] >> 4;
+                }
+                else
+                {
+                    color = bgvram[(pixelsaddr + (tilexoff >> 1)) & bgvrammask] & 0x0F;
+                }
+
+                if (color)
+                    DrawPalettePixel<cached>(&BGOBJLine[i], curpal4[color], 0x01000000<<bgnum);
+            }
+
+            xoff++;
+        }
+    }
+}
+
+template<bool mosaic>
+void SoftRenderer2D::DrawBG_Affine(u32 line, u32 bgnum)
+{
+    u16 bgcnt = GPU2D.BGCnt[bgnum];
+
+    u32 tilesetaddr, tilemapaddr;
+    u16* pal;
+
+    u32 coordmask;
+    u32 yshift;
+    switch ((bgcnt >> 14) & 0x3)
+    {
+        case 0: coordmask = 0x07800; yshift = 7; break;
+        case 1: coordmask = 0x0F800; yshift = 8; break;
+        case 2: coordmask = 0x1F800; yshift = 9; break;
+        case 3: coordmask = 0x3F800; yshift = 10; break;
+    }
+
+    u32 overflowmask;
+    if (bgcnt & (1<<13)) overflowmask = 0;
+    else                 overflowmask = ~(coordmask | 0x7FF);
+
+    s16 rotA = GPU2D.BGRotA[bgnum-2];
+    s16 rotC = GPU2D.BGRotC[bgnum-2];
+
+    s32 rotX = GPU2D.BGXRefInternal[bgnum-2];
+    s32 rotY = GPU2D.BGYRefInternal[bgnum-2];
+
+    u8* bgvram;
+    u32 bgvrammask;
+    GPU2D.GetBGVRAM(bgvram, bgvrammask);
+
+    if (GPU2D.Num)
+    {
+        tilesetaddr = ((bgcnt & 0x003C) << 12);
+        tilemapaddr = ((bgcnt & 0x1F00) << 3);
+
+        pal = (u16*)&GPU.Palette[0x400];
+    }
+    else
+    {
+        tilesetaddr = ((GPU2D.DispCnt & 0x07000000) >> 8) + ((bgcnt & 0x003C) << 12);
+        tilemapaddr = ((GPU2D.DispCnt & 0x38000000) >> 11) + ((bgcnt & 0x1F00) << 3);
+
+        pal = (u16*)&GPU.Palette[0];
+    }
+
+    u16 curtile;
+    u8 color;
+
+    yshift -= 3;
+
+    for (int i = 0; i < 256; i++)
+    {
+        if (WindowMask[i] & (1<<bgnum))
+        {
+            s32 finalX, finalY;
+            if (mosaic)
+            {
+                int im = CurBGXMosaicTable[i];
+                finalX = rotX - (im * rotA);
+                finalY = rotY - (im * rotC);
+            }
+            else
+            {
+                finalX = rotX;
+                finalY = rotY;
+            }
+
+            if ((!((finalX|finalY) & overflowmask)))
+            {
+                curtile = bgvram[(tilemapaddr + ((((finalY & coordmask) >> 11) << yshift) + ((finalX & coordmask) >> 11))) & bgvrammask];
+
+                // draw pixel
+                u32 tilexoff = (finalX >> 8) & 0x7;
+                u32 tileyoff = (finalY >> 8) & 0x7;
+
+                color = bgvram[(tilesetaddr + (curtile << 6) + (tileyoff << 3) + tilexoff) & bgvrammask];
+
+                if (color)
+                    DrawPixel(&BGOBJLine[i], pal[color], 0x01000000<<bgnum);
+            }
+        }
+
+        rotX += rotA;
+        rotY += rotC;
+    }
+}
+
+template<bool mosaic>
+void SoftRenderer2D::DrawBG_Extended(u32 line, u32 bgnum)
+{
+    // Only standard-palette tiled affine backgrounds use expanded colors.
+    // Bitmap/direct-color and extended palette paths retain their old work.
+    if (StandardPaletteCache && !(GPU2D.BGCnt[bgnum] & (1u << 7)) &&
+        !(GPU2D.DispCnt & (1u << 30)))
+        DrawBG_ExtendedImpl<mosaic, true>(line, bgnum);
+    else
+        DrawBG_ExtendedImpl<mosaic, false>(line, bgnum);
+}
+
+template<bool mosaic, bool cached>
+void SoftRenderer2D::DrawBG_ExtendedImpl(u32 line, u32 bgnum)
+{
+    u16 bgcnt = GPU2D.BGCnt[bgnum];
+
+    u32 tilesetaddr, tilemapaddr;
+    u16* pal;
+    u32 extpal;
+
+    u8* bgvram;
+    u32 bgvrammask;
+    GPU2D.GetBGVRAM(bgvram, bgvrammask);
+
+    extpal = (GPU2D.DispCnt & (1<<30));
+
+    s16 rotA = GPU2D.BGRotA[bgnum-2];
+    s16 rotC = GPU2D.BGRotC[bgnum-2];
+
+    s32 rotX = GPU2D.BGXRefInternal[bgnum-2];
+    s32 rotY = GPU2D.BGYRefInternal[bgnum-2];
+
+    if (bgcnt & (1<<7))
+    {
+        // bitmap modes
+
+        u32 xmask, ymask;
+        u32 yshift;
+        switch ((bgcnt >> 14) & 0x3)
+        {
+            case 0: xmask = 0x07FFF; ymask = 0x07FFF; yshift = 7; break;
+            case 1: xmask = 0x0FFFF; ymask = 0x0FFFF; yshift = 8; break;
+            case 2: xmask = 0x1FFFF; ymask = 0x0FFFF; yshift = 9; break;
+            case 3: xmask = 0x1FFFF; ymask = 0x1FFFF; yshift = 9; break;
+        }
+
+        u32 ofxmask, ofymask;
+        if (bgcnt & (1<<13))
+        {
+            ofxmask = 0;
+            ofymask = 0;
+        }
+        else
+        {
+            ofxmask = ~xmask;
+            ofymask = ~ymask;
+        }
+
+        tilemapaddr = ((bgcnt & 0x1F00) << 6);
+
+        if (bgcnt & (1<<2))
+        {
+            // direct color bitmap
+
+            u16 color;
+
+            for (int i = 0; i < 256; i++)
+            {
+                if (WindowMask[i] & (1<<bgnum))
+                {
+                    s32 finalX, finalY;
+                    if (mosaic)
+                    {
+                        int im = CurBGXMosaicTable[i];
+                        finalX = rotX - (im * rotA);
+                        finalY = rotY - (im * rotC);
+                    }
+                    else
+                    {
+                        finalX = rotX;
+                        finalY = rotY;
+                    }
+
+                    if (!(finalX & ofxmask) && !(finalY & ofymask))
+                    {
+                        color = *(u16*)&bgvram[(tilemapaddr + (((((finalY & ymask) >> 8) << yshift) + ((finalX & xmask) >> 8)) << 1)) & bgvrammask];
+
+                        if (color & 0x8000)
+                            DrawPixel(&BGOBJLine[i], color & 0x7FFF, 0x01000000<<bgnum);
+                    }
+                }
+
+                rotX += rotA;
+                rotY += rotC;
+            }
+        }
+        else
+        {
+            // 256-color bitmap
+
+            if (GPU2D.Num) pal = (u16*)&GPU.Palette[0x400];
+            else           pal = (u16*)&GPU.Palette[0];
+
+            u8 color;
+
+            for (int i = 0; i < 256; i++)
+            {
+                if (WindowMask[i] & (1<<bgnum))
+                {
+                    s32 finalX, finalY;
+                    if (mosaic)
+                    {
+                        int im = CurBGXMosaicTable[i];
+                        finalX = rotX - (im * rotA);
+                        finalY = rotY - (im * rotC);
+                    }
+                    else
+                    {
+                        finalX = rotX;
+                        finalY = rotY;
+                    }
+
+                    if (!(finalX & ofxmask) && !(finalY & ofymask))
+                    {
+                        color = bgvram[(tilemapaddr + (((finalY & ymask) >> 8) << yshift) + ((finalX & xmask) >> 8)) & bgvrammask];
+
+                        if (color)
+                            DrawPixel(&BGOBJLine[i], pal[color], 0x01000000<<bgnum);
+                    }
+                }
+
+                rotX += rotA;
+                rotY += rotC;
+            }
+        }
+    }
+    else
+    {
+        // mixed affine/text mode
+
+        u32 coordmask;
+        u32 yshift;
+        switch ((bgcnt >> 14) & 0x3)
+        {
+            case 0: coordmask = 0x07800; yshift = 7; break;
+            case 1: coordmask = 0x0F800; yshift = 8; break;
+            case 2: coordmask = 0x1F800; yshift = 9; break;
+            case 3: coordmask = 0x3F800; yshift = 10; break;
+        }
+
+        u32 overflowmask;
+        if (bgcnt & (1<<13)) overflowmask = 0;
+        else                 overflowmask = ~(coordmask | 0x7FF);
+
+        if (GPU2D.Num)
+        {
+            tilesetaddr = ((bgcnt & 0x003C) << 12);
+            tilemapaddr = ((bgcnt & 0x1F00) << 3);
+
+            pal = (u16*)&GPU.Palette[0x400];
+        }
+        else
+        {
+            tilesetaddr = ((GPU2D.DispCnt & 0x07000000) >> 8) + ((bgcnt & 0x003C) << 12);
+            tilemapaddr = ((GPU2D.DispCnt & 0x38000000) >> 11) + ((bgcnt & 0x1F00) << 3);
+
+            pal = (u16*)&GPU.Palette[0];
+        }
+
+        const auto* colors = [&]() {
+            if constexpr (cached) return GetStandardBGColors(pal);
+            else return pal;
+        }();
+        u16 curtile;
+        const auto* curpal = colors;
+        u8 color;
+
+        yshift -= 3;
+
+        // With unit horizontal stepping, one tile-map/palette lookup serves
+        // the remaining pixels of this tile. Keep this within one scanline:
+        // register, VRAM and palette changes remain visible on the next call.
+        if constexpr (!mosaic)
+        {
+            if (AffineTileCache && rotA == 0x100 && rotC == 0)
+            {
+                if (rotY & overflowmask) return;
+                const u32 mapRow = ((rotY & coordmask) >> 11) << yshift;
+                const u32 tileY = (rotY >> 5) & 56u;
+                const u32 layer = 0x01000000u << bgnum;
+                const u8 windowBit = 1u << bgnum;
+                int i = 0;
+                while (i < 256)
+                {
+                    const u32 tileX = (rotX >> 8) & 7u;
+                    const int run = std::min<int>(8 - tileX, 256 - i);
+                    if (!(rotX & overflowmask))
+                    {
+                        const u32 mapAddress = (tilemapaddr +
+                            ((mapRow + ((rotX & coordmask) >> 11)) << 1)) & bgvrammask;
+                        const u16 tile = *(u16*)&bgvram[mapAddress];
+                        const u32 flipX = (tile & (1u << 10)) ? 7u : 0u;
+                        const u32 row = tileY ^ ((tile & (1u << 11)) ? 56u : 0u);
+                        const u32 rowAddress = (tilesetaddr +
+                            ((tile & 0x3FFu) << 6) + row) & bgvrammask;
+                        // Tile rows and the VRAM wrap boundary are aligned
+                        // to eight bytes, so this row cannot cross the wrap.
+                        const u8* pixels = &bgvram[rowAddress];
+                        const auto* palette = colors;
+                        if constexpr (!cached)
+                            if (extpal) palette = GPU2D.GetBGExtPal(bgnum, tile >> 12);
+                        // A complete, aligned tile row is one doubleword.
+                        // Keep the two partial boundary runs on the scalar path.
+                        // Palette pointers and pixels are still fetched afresh
+                        // for every scanline; this introduces no lifetime cache.
+                        if (AffinePackedRows && run == 8)
+                        {
+                            u32 windows[2];
+                            std::memcpy(windows, &WindowMask[i], sizeof(windows));
+                            const u32 bits = windowBit * 0x01010101u;
+                            if ((windows[0] | windows[1]) & bits)
+                            {
+                                u64 packed;
+                                std::memcpy(&packed, pixels, sizeof(packed));
+                                const bool allVisible = (windows[0] & windows[1] & bits) == bits;
+                                auto draw = [&](u32 x, u32 shift)
+#if defined(__GNUC__) || defined(__clang__)
+                                    __attribute__((always_inline))
+#endif
+                                {
+                                    const u32 index = (packed >> shift) & 255u;
+                                    if (index && (allVisible || (WindowMask[i+x] & windowBit)))
+                                        DrawPalettePixel<cached>(&BGOBJLine[i+x], palette[index], layer);
+                                };
+                                if (flipX)
+                                {
+                                    draw(0,56); draw(1,48); draw(2,40); draw(3,32);
+                                    draw(4,24); draw(5,16); draw(6,8); draw(7,0);
+                                }
+                                else
+                                {
+                                    draw(0,0); draw(1,8); draw(2,16); draw(3,24);
+                                    draw(4,32); draw(5,40); draw(6,48); draw(7,56);
+                                }
+                            }
+                        }
+                        else for (int j = 0; j < run; ++j)
+                        {
+                            if (!(WindowMask[i + j] & windowBit)) continue;
+                            const u8 index = pixels[(tileX + j) ^ flipX];
+                            if (index)
+                                DrawPalettePixel<cached>(&BGOBJLine[i + j], palette[index], layer);
+                        }
+                    }
+                    i += run;
+                    rotX += run * 0x100;
+                }
+                return;
+            }
+        }
+
+        if (AffineTileCache)
+        {
+            // Adjacent affine pixels usually address the same tile even when
+            // rotated or scaled. Reuse only its map entry and palette pointer
+            // within this call. VRAM and register changes on the next scanline
+            // start with an empty cache; all pixel fetches remain live.
+            u32 previousMapAddress = ~0u;
+            u32 tileBase = 0, tileFlip = 0;
+            const auto* tilePalette = colors;
+            for (int i = 0; i < 256; ++i)
+            {
+                if (WindowMask[i] & (1<<bgnum))
+                {
+                    const int im = mosaic ? CurBGXMosaicTable[i] : 0;
+                    const s32 finalX = rotX - im * rotA;
+                    const s32 finalY = rotY - im * rotC;
+                    if (!((finalX | finalY) & overflowmask))
+                    {
+                        const u32 mapAddress = (tilemapaddr +
+                            (((((finalY & coordmask) >> 11) << yshift) +
+                              ((finalX & coordmask) >> 11)) << 1)) & bgvrammask;
+                        if (mapAddress != previousMapAddress)
+                        {
+                            const u16 tile = *(u16*)&bgvram[mapAddress];
+                            previousMapAddress = mapAddress;
+                            tileBase = tilesetaddr + ((tile & 0x03FF) << 6);
+                            tileFlip = (tile & (1<<10) ? 7u : 0u) |
+                                (tile & (1<<11) ? 56u : 0u);
+                            if constexpr (!cached)
+                                tilePalette = extpal ? GPU2D.GetBGExtPal(bgnum, tile >> 12) : pal;
+                        }
+                        const u32 offset = (((finalY >> 5) & 56) |
+                            ((finalX >> 8) & 7)) ^ tileFlip;
+                        const u8 index = bgvram[(tileBase + offset) & bgvrammask];
+                        if (index)
+                            DrawPalettePixel<cached>(&BGOBJLine[i], tilePalette[index], 0x01000000<<bgnum);
+                    }
+                }
+                rotX += rotA;
+                rotY += rotC;
+            }
+            return;
+        }
+
+        for (int i = 0; i < 256; i++)
+        {
+            if (WindowMask[i] & (1<<bgnum))
+            {
+                s32 finalX, finalY;
+                if (mosaic)
+                {
+                    int im = CurBGXMosaicTable[i];
+                    finalX = rotX - (im * rotA);
+                    finalY = rotY - (im * rotC);
+                }
+                else
+                {
+                    finalX = rotX;
+                    finalY = rotY;
+                }
+
+                if ((!((finalX|finalY) & overflowmask)))
+                {
+                    curtile = *(u16*)&bgvram[(tilemapaddr + (((((finalY & coordmask) >> 11) << yshift) + ((finalX & coordmask) >> 11)) << 1)) & bgvrammask];
+
+                    if constexpr (!cached)
+                        curpal = extpal ? GPU2D.GetBGExtPal(bgnum, curtile>>12) : pal;
+
+                    // draw pixel
+                    u32 tilexoff = (finalX >> 8) & 0x7;
+                    u32 tileyoff = (finalY >> 8) & 0x7;
+
+                    if (curtile & (1<<10)) tilexoff = 7-tilexoff;
+                    if (curtile & (1<<11)) tileyoff = 7-tileyoff;
+
+                    color = bgvram[(tilesetaddr + ((curtile & 0x03FF) << 6) + (tileyoff << 3) + tilexoff) & bgvrammask];
+
+                    if (color)
+                        DrawPalettePixel<cached>(&BGOBJLine[i], curpal[color], 0x01000000<<bgnum);
+                }
+            }
+
+            rotX += rotA;
+            rotY += rotC;
+        }
+    }
+}
+
+template<bool mosaic>
+void SoftRenderer2D::DrawBG_Large(u32 line) // BG is always BG2
+{
+    u16 bgcnt = GPU2D.BGCnt[2];
+
+    u16* pal;
+
+    // large BG sizes:
+    // 0: 512x1024
+    // 1: 1024x512
+    // 2: 512x256
+    // 3: 512x512
+    u32 xmask, ymask;
+    u32 yshift;
+    switch ((bgcnt >> 14) & 0x3)
+    {
+        case 0: xmask = 0x1FFFF; ymask = 0x3FFFF; yshift = 9; break;
+        case 1: xmask = 0x3FFFF; ymask = 0x1FFFF; yshift = 10; break;
+        case 2: xmask = 0x1FFFF; ymask = 0x0FFFF; yshift = 9; break;
+        case 3: xmask = 0x1FFFF; ymask = 0x1FFFF; yshift = 9; break;
+    }
+
+    u32 ofxmask, ofymask;
+    if (bgcnt & (1<<13))
+    {
+        ofxmask = 0;
+        ofymask = 0;
+    }
+    else
+    {
+        ofxmask = ~xmask;
+        ofymask = ~ymask;
+    }
+
+    s16 rotA = GPU2D.BGRotA[0];
+    s16 rotC = GPU2D.BGRotC[0];
+
+    s32 rotX = GPU2D.BGXRefInternal[0];
+    s32 rotY = GPU2D.BGYRefInternal[0];
+
+    u8* bgvram;
+    u32 bgvrammask;
+    GPU2D.GetBGVRAM(bgvram, bgvrammask);
+
+    // 256-color bitmap
+
+    if (GPU2D.Num) pal = (u16*)&GPU.Palette[0x400];
+    else           pal = (u16*)&GPU.Palette[0];
+
+    u8 color;
+
+    for (int i = 0; i < 256; i++)
+    {
+        if (WindowMask[i] & (1<<2))
+        {
+            s32 finalX, finalY;
+            if (mosaic)
+            {
+                int im = CurBGXMosaicTable[i];
+                finalX = rotX - (im * rotA);
+                finalY = rotY - (im * rotC);
+            }
+            else
+            {
+                finalX = rotX;
+                finalY = rotY;
+            }
+
+            if (!(finalX & ofxmask) && !(finalY & ofymask))
+            {
+                color = bgvram[((((finalY & ymask) >> 8) << yshift) + ((finalX & xmask) >> 8)) & bgvrammask];
+
+                if (color)
+                    DrawPixel(&BGOBJLine[i], pal[color], 0x01000000<<2);
+            }
+        }
+
+        rotX += rotA;
+        rotY += rotC;
+    }
+}
+
+
+void SoftRenderer2D::ApplySpriteMosaicX()
+{
+    /*
+     * apply X mosaic if needed
+     * X mosaic for sprites is applied after all sprites are rendered
+     *
+     * rules:
+     * pixels are processed from left to right
+     * current pixel value is latched if:
+     * - the X mosaic counter is 0
+     * - the current pixel doesn't receive sprite mosaic
+     * - the current pixel receives sprite mosaic and the previous one didn't, or vice versa
+     * - the current BG-relative priority value is lower than the previous one
+     */
+
+    u8 mosw = GPU2D.OBJMosaicSize[0];
+    if (mosw == 0) return;
+
+    u8 mosx = 0;
+    u32 latchcolor;
+    for (int i = 0; i < 256; i++)
+    {
+        u32 curcolor = OBJLine[i];
+        bool latch = false;
+
+        if (mosx == 0)
+            latch = true;
+        else if (!(curcolor & OBJ_Mosaic))
+            latch = true;
+        else if (!(latchcolor & OBJ_Mosaic))
+            latch = true;
+        else if ((curcolor & OBJ_BGPrioMask) < (latchcolor & OBJ_BGPrioMask))
+            latch = true;
+
+        if (latch)
+            latchcolor = curcolor;
+
+        OBJLine[i] = latchcolor;
+
+        if (mosx == mosw)
+            mosx = 0;
+        else
+            mosx++;
+    }
+}
+
+void SoftRenderer2D::IndexSpritePriorities()
+{
+    // Mosaic and window evaluation have already completed for this scanline.
+    // Build only the pixel positions; palette reads remain at composition time.
+    // Nothing is retained across scanlines or memory/register writes.
+    std::memset(SpritePriorityCount, 0, sizeof(SpritePriorityCount));
+    for (u32 x = 0; x < 256; ++x)
+    {
+        const u32 pixel = OBJLine[x];
+        if (!(pixel & OBJ_IsOpaque) || !(WindowMask[x] & 0x10)) continue;
+        const u32 priority = (pixel >> 16) & 3;
+        SpritePriorityPixels[priority][SpritePriorityCount[priority]++] = x;
+    }
+}
+
+void SoftRenderer2D::InterleaveSprites(u32 prio)
+{
+    u32 attrmask = (prio << 16) | OBJ_IsOpaque;
+    u16* pal = (u16*)&GPU.Palette[GPU2D.Num ? 0x600 : 0x200];
+    u16* extpal = GPU2D.GetOBJExtPal();
+
+    if (SpritePriorityIndex)
+    {
+        for (u32 n = 0; n < SpritePriorityCount[prio]; ++n)
+        {
+            const u32 i = SpritePriorityPixels[prio][n];
+            const u32 pixel = OBJLine[i];
+            const u16 color = (pixel & OBJ_DirectColor) ? (pixel & 0x7FFF) :
+                (pixel & OBJ_StandardPal) ? pal[pixel & 0xFF] : extpal[pixel & 0xFFF];
+            DrawPixel(&BGOBJLine[i], color, pixel & 0xFF000000);
+        }
+        return;
+    }
+
+    for (u32 i = 0; i < 256; i++)
+    {
+        if ((OBJLine[i] & OBJ_OpaPrioMask) != attrmask)
+            continue;
+        if (!(WindowMask[i] & 0x10))
+            continue;
+
+        u16 color;
+        u32 pixel = OBJLine[i];
+
+        if (pixel & OBJ_DirectColor)
+            color = pixel & 0x7FFF;
+        else if (pixel & OBJ_StandardPal)
+            color = pal[pixel & 0xFF];
+        else
+            color = extpal[pixel & 0xFFF];
+
+        DrawPixel(&BGOBJLine[i], color, pixel & 0xFF000000);
+    }
+}
+
+#define DoDrawSprite(type, ...) \
+    do \
+    { \
+        if (iswin) \
+        { \
+            DrawSprite_##type<true>(__VA_ARGS__); \
+        } \
+        else \
+        { \
+            DrawSprite_##type<false>(__VA_ARGS__); \
+        } \
+    } while (0)
+
+void SoftRenderer2D::UpdateSpriteSetup()
+{
+    auto& cache = *SpriteSetup;
+    if (cache.Valid && GPU.SpriteOAMWritesTracked &&
+        cache.ObservedWriteEpoch == GPU.SpriteOAMWriteEpoch)
+        return;
+    const u8* bytes = GPU.OAM + (GPU2D.Num ? 0x400 : 0);
+    cache.ObservedWriteEpoch = GPU.SpriteOAMWriteEpoch;
+    if (cache.Valid && !std::memcmp(cache.OAM.data(), bytes, cache.OAM.size()))
+        return;
+    std::memcpy(cache.OAM.data(), bytes, cache.OAM.size());
+    const u16* oam = reinterpret_cast<const u16*>(bytes);
+    static constexpr u8 widths[16] =
+        {8,16,8,8,16,32,8,8,32,32,16,8,64,64,32,8};
+    static constexpr u8 heights[16] =
+        {8,8,16,8,16,8,32,8,32,16,32,8,64,32,64,8};
+    cache.Count = 0;
+    for (unsigned num = 0; num < 128; ++num)
+    {
+        const u16 a0 = oam[num*4], a1 = oam[num*4+1];
+        const unsigned type = (a0 >> 8) & 3;
+        if (type == 2) continue;
+        const unsigned size = (a0 >> 14) | ((a1 & 0xC000) >> 12);
+        const unsigned width = widths[size], height = heights[size];
+        const unsigned bw = width << (type == 3), bh = height << (type == 3);
+        const s32 x = (a1 & 0x1FF) - ((a1 & 0x100) ? 512 : 0);
+        if (x <= -static_cast<s32>(bw)) continue;
+        cache.Sprites[cache.Count++] = {
+            static_cast<u16>(num), a0, static_cast<s16>(x),
+            static_cast<u8>(a0), static_cast<u8>(width), static_cast<u8>(height),
+            static_cast<u8>(bw), static_cast<u8>(bh)};
+    }
+    cache.Valid = true;
+}
+
+void SoftRenderer2D::DrawSprites(u32 line)
+{
+    // the OBJ buffers don't get updated at all if the 2D engine is disabled
+    if (!GPU2D.Enabled)
+    {
+        StandardPaletteValid = StandardPaletteChecked = false;
+    if (SpriteCache) SpriteCache->Invalidate();
+        return;
+    }
+
+    if (GPU2D.Num == 0)
+    {
+        auto objDirty = GPU.VRAMDirty_AOBJ.DeriveState(GPU.VRAMMap_AOBJ, GPU);
+        GPU.MakeVRAMFlat_AOBJCoherent(objDirty);
+    }
+    else
+    {
+        auto objDirty = GPU.VRAMDirty_BOBJ.DeriveState(GPU.VRAMMap_BOBJ, GPU);
+        GPU.MakeVRAMFlat_BOBJCoherent(objDirty);
+    }
+
+    SpritePhaseCache::Entry* cacheEntry = nullptr;
+    SpritePhaseCache::Key cacheKey;
+    bool storeSpriteResult = false;
+    if (SpriteCache)
+    {
+        // Stay at the original sprite phase. Coherency above always runs,
+        // including when this cache hits. Capture/tracing use the full path.
+        const bool eligible = line < 192 && GPU2D.OBJEnable &&
+            !GPU.CaptureEnable && !(GPU.CaptureCnt & (1u << 31)) &&
+            !NDS4MiSTer::Trace2DEnabled() && !NDS4MiSTer::CompositeLineEnabled();
+        if (eligible)
+        {
+            // Full OAM includes every affine matrix. Compare effective bytes:
+            // games commonly rewrite the same OAM contents each frame.
+            if (!SpriteCache->OAMValid || !GPU.SpriteOAMWritesTracked ||
+                SpriteCache->ObservedWriteEpoch != GPU.SpriteOAMWriteEpoch)
+            {
+                // A write generation is only a dirty hint, never evidence of
+                // changed contents: redundant/rejected writes remain exact hits.
+                if (!SpriteCache->OAMValid ||
+                    std::memcmp(SpriteCache->OAM.data(), GPU.OAM+1024, 1024))
+                {
+                    std::memcpy(SpriteCache->OAM.data(), GPU.OAM+1024, 1024);
+                    ++SpriteCache->OAMEpoch;
+                    SpriteCache->OAMValid = true;
+                }
+                SpriteCache->ObservedWriteEpoch = GPU.SpriteOAMWriteEpoch;
+            }
+            cacheKey = {SpriteCache->OAMEpoch, GPU.BOBJCoherencyEpoch,
+                        GPU2D.DispCnt, GPU2D.OBJMosaicLine};
+            cacheEntry = &SpriteCache->Lines[line];
+            storeSpriteResult = cacheEntry->Valid && cacheEntry->Input == cacheKey;
+            if (storeSpriteResult && cacheEntry->OutputValid)
+            {
+                std::memcpy(OBJLine, cacheEntry->Line, sizeof(OBJLine));
+                std::memcpy(OBJWindow, cacheEntry->Window, sizeof(OBJWindow));
+                NumSprites = cacheEntry->Count;
+                return;
+            }
+        }
+        else SpriteCache->Invalidate();
+    }
+
+    NumSprites = 0;
+    memset(OBJLine, 0, sizeof(OBJLine));
+    memset(OBJWindow, 0, sizeof(OBJWindow));
+
+    if (!GPU2D.OBJEnable)
+        return;
+
+    u16* oam = (u16*)&GPU.OAM[GPU2D.Num ? 0x400 : 0];
+
+    const s32 spritewidth[16] =
+    {
+        8, 16, 8, 8,
+        16, 32, 8, 8,
+        32, 32, 16, 8,
+        64, 64, 32, 8
+    };
+    const s32 spriteheight[16] =
+    {
+        8, 8, 16, 8,
+        16, 8, 32, 8,
+        32, 16, 32, 8,
+        64, 32, 64, 8
+    };
+
+    if (SpriteSetup)
+    {
+        UpdateSpriteSetup();
+        for (unsigned n = 0; n < SpriteSetup->Count; ++n)
+        {
+            const auto& spr = SpriteSetup->Sprites[n];
+            s32 ypos = (line - spr.Y) & 0xFF;
+            if (ypos >= spr.BoundHeight) continue;
+            const bool iswin = ((spr.Attr0 >> 10) & 3) == 2;
+            if ((spr.Attr0 & (1 << 12)) && !iswin)
+            {
+                ypos = (GPU2D.OBJMosaicLine - spr.Y) & 0xFF;
+                if (ypos >= spr.BoundHeight) ypos = 0;
+            }
+            if (spr.Attr0 & (1 << 8))
+                DoDrawSprite(Rotscale, spr.Number, spr.BoundWidth, spr.BoundHeight,
+                             spr.Width, spr.Height, spr.X, ypos);
+            else
+                DoDrawSprite(Normal, spr.Number, spr.Width, spr.Height, spr.X, ypos);
+            ++NumSprites;
+        }
+    }
+    else for (int sprnum = 0; sprnum < 128; sprnum++)
+    {
+        u16* attrib = &oam[sprnum*4];
+
+        u16 sprtype = (attrib[0] >> 8) & 0x3;
+        if (sprtype == 2) // disabled
+            continue;
+
+        bool iswin = (((attrib[0] >> 10) & 0x3) == 2);
+
+        u32 sizeparam = (attrib[0] >> 14) | ((attrib[1] & 0xC000) >> 12);
+        s32 width = spritewidth[sizeparam];
+        s32 height = spriteheight[sizeparam];
+        s32 boundwidth = width;
+        s32 boundheight = height;
+
+        if (sprtype == 3) // double-size rotscale sprite
+        {
+            boundwidth <<= 1;
+            boundheight <<= 1;
+        }
+
+        // TODO checkme (128-tall sprite overflow thing)
+        s32 ypos = attrib[0] & 0xFF;
+        if (((line - ypos) & 0xFF) >= boundheight)
+            continue;
+
+        s32 xpos = (s32)(attrib[1] << 23) >> 23;
+        if (xpos <= -boundwidth)
+            continue;
+
+        if ((attrib[0] & (1<<12)) && (!iswin))
+        {
+            // adjust Y position for sprite mosaic
+            // (sprite mosaic does not apply to OBJ-window sprites)
+            // a ypos greater than the sprite height means we underflowed, due to OBJMosaicLine being
+            // latched before the sprite's top, so we clamp it to 0
+            ypos = (GPU2D.OBJMosaicLine - ypos) & 0xFF;
+            if (ypos >= boundheight) ypos = 0;
+        }
+        else
+            ypos = (line - ypos) & 0xFF;
+
+        if (sprtype & 1)
+            DoDrawSprite(Rotscale, sprnum, boundwidth, boundheight, width, height, xpos, ypos);
+        else
+            DoDrawSprite(Normal, sprnum, width, height, xpos, ypos);
+
+        NumSprites++;
+    }
+    if (cacheEntry)
+    {
+        cacheEntry->Input = cacheKey;
+        // A changed key is cheap to remember. Store pixels only once that
+        // exact key repeats, avoiding 1,280 bytes of write traffic per miss
+        // in scenes whose sprite inputs change every frame.
+        cacheEntry->OutputValid = storeSpriteResult;
+        if (storeSpriteResult)
+        {
+            std::memcpy(cacheEntry->Line, OBJLine, sizeof(OBJLine));
+            std::memcpy(cacheEntry->Window, OBJWindow, sizeof(OBJWindow));
+            cacheEntry->Count = NumSprites;
+        }
+        cacheEntry->Valid = true;
+    }
+}
+
+template<bool window>
+void SoftRenderer2D::DrawSpritePixel(int color, u32 pixelattr, s32 xpos)
+{
+    if (window)
+    {
+        if (color != -1)
+            OBJWindow[xpos] = 1;
+    }
+    else
+    {
+        u32 oldpixel = OBJLine[xpos];
+        bool oldisopaque = !!(oldpixel & OBJ_IsOpaque);
+        bool newisopaque = (color != -1);
+        bool priocheck = (pixelattr & OBJ_BGPrioMask) < (oldpixel & OBJ_BGPrioMask);
+
+        if (newisopaque && (!oldisopaque || priocheck))
+        {
+            OBJLine[xpos] = color | pixelattr;
+        }
+        else if (!newisopaque && !oldisopaque)
+        {
+            OBJLine[xpos] &= ~(OBJ_Mosaic | OBJ_BGPrioMask);
+            OBJLine[xpos] |= (pixelattr & (OBJ_IsSprite | OBJ_Mosaic | OBJ_BGPrioMask));
+        }
+    }
+}
+
+// Complete tile rows do not cross the OBJ VRAM wrap boundary. Decode eight
+// neighboring palette indices once and apply the original priority/mosaic rules.
+template<bool window>
+void SoftRenderer2D::DrawSpritePixelBatch8(
+    const u8* src, bool fourBit, bool flip, u32 pixelattr, s32 xpos)
+{
+#if defined(__ARM_NEON)
+    uint8x8_t colors;
+    if (fourBit)
+    {
+        u32 packed;
+        std::memcpy(&packed, src, sizeof(packed));
+        const auto bytes = vcreate_u8(packed);
+        colors = vzip_u8(vand_u8(bytes, vdup_n_u8(15)),
+                         vshr_n_u8(bytes, 4)).val[0];
+    }
+    else colors = vld1_u8(src);
+    if (flip) colors = vrev64_u8(colors);
+    if constexpr (window)
+    {
+        const auto present = vand_u8(vmvn_u8(vceq_u8(colors, vdup_n_u8(0))),
+                                    vdup_n_u8(1));
+        vst1_u8(OBJWindow+xpos, vorr_u8(vld1_u8(OBJWindow+xpos), present));
+    }
+    else
+    {
+        const auto wide = vmovl_u8(colors);
+        const auto attr = vdupq_n_u32(pixelattr);
+        const auto zero = vdupq_n_u32(0);
+        const auto priority = vdupq_n_u32(OBJ_BGPrioMask);
+        const auto attrPriority = vdupq_n_u32(pixelattr & OBJ_BGPrioMask);
+        const auto attrTransparent = vdupq_n_u32(
+            pixelattr & (OBJ_IsSprite | OBJ_Mosaic | OBJ_BGPrioMask));
+        auto draw = [&](uint32x4_t color, u32* dst) {
+            const auto old = vld1q_u32(dst);
+            const auto oldTransparent = vceqq_u32(
+                vandq_u32(old, vdupq_n_u32(OBJ_IsOpaque)), zero);
+            const auto newTransparent = vceqq_u32(color, zero);
+            const auto replace = vandq_u32(vmvnq_u32(newTransparent),
+                vorrq_u32(oldTransparent,
+                          vcltq_u32(attrPriority, vandq_u32(old, priority))));
+            const auto empty = vandq_u32(oldTransparent, newTransparent);
+            const auto transparent = vorrq_u32(
+                vbicq_u32(old, vdupq_n_u32(OBJ_Mosaic | OBJ_BGPrioMask)),
+                attrTransparent);
+            const auto opaque = vbslq_u32(replace, vorrq_u32(color, attr), old);
+            vst1q_u32(dst, vbslq_u32(empty, transparent, opaque));
+        };
+        draw(vmovl_u16(vget_low_u16(wide)), OBJLine+xpos);
+        draw(vmovl_u16(vget_high_u16(wide)), OBJLine+xpos+4);
+    }
+#else
+    for (unsigned x=0; x<8; ++x)
+    {
+        const unsigned offset = flip ? 7-x : x;
+        const unsigned color = fourBit ?
+            ((src[offset/2] >> ((offset&1)*4)) & 15) : src[offset];
+        DrawSpritePixel<window>(color ? static_cast<int>(color) : -1,
+                                pixelattr, xpos+x);
+    }
+#endif
+}
+
+template<bool window>
+void SoftRenderer2D::DrawSprite_Rotscale(u32 num, u32 boundwidth, u32 boundheight, u32 width, u32 height, s32 xpos, s32 ypos)
+{
+    u16* oam = (u16*)&GPU.OAM[GPU2D.Num ? 0x400 : 0];
+    u16* attrib = &oam[num * 4];
+    u16* rotparams = &oam[(((attrib[1] >> 9) & 0x1F) * 16) + 3];
+
+    u32 pixelattr = ((attrib[2] & 0x0C00) << 6) | OBJ_IsSprite | OBJ_IsOpaque;
+    u32 tilenum = attrib[2] & 0x03FF;
+    u32 spritemode = window ? 0 : ((attrib[0] >> 10) & 0x3);
+
+    u32 ytilefactor;
+
+    u8* objvram;
+    u32 objvrammask;
+    GPU2D.GetOBJVRAM(objvram, objvrammask);
+
+    s32 centerX = boundwidth >> 1;
+    s32 centerY = boundheight >> 1;
+
+    if ((attrib[0] & (1<<12)) && !window)
+    {
+        // apply Y mosaic
+        pixelattr |= OBJ_Mosaic;
+    }
+
+    u32 xoff;
+    if (xpos >= 0)
+    {
+        xoff = 0;
+        if ((xpos+boundwidth) > 256)
+            boundwidth = 256-xpos;
+    }
+    else
+    {
+        xoff = -xpos;
+        xpos = 0;
+    }
+
+    s16 rotA = (s16)rotparams[0];
+    s16 rotB = (s16)rotparams[4];
+    s16 rotC = (s16)rotparams[8];
+    s16 rotD = (s16)rotparams[12];
+
+    s32 rotX = ((xoff-centerX) * rotA) + ((ypos-centerY) * rotB) + (width << 7);
+    s32 rotY = ((xoff-centerX) * rotC) + ((ypos-centerY) * rotD) + (height << 7);
+
+    width <<= 8;
+    height <<= 8;
+
+    u16 color = 0; // transparent in all cases
+
+    if (spritemode == 3)
+    {
+        u32 alpha = attrib[2] >> 12;
+        if (!alpha) return;
+        alpha++;
+
+        pixelattr |= (0xC0000000 | (alpha << 24));
+
+        u32 pixelsaddr;
+        if (GPU2D.DispCnt & 0x40)
+        {
+            if (GPU2D.DispCnt & 0x20)
+            {
+                // 'reserved'
+                // draws nothing
+
+                return;
+            }
+            else
+            {
+                pixelsaddr = tilenum << (7 + ((GPU2D.DispCnt >> 22) & 0x1));
+                ytilefactor = ((width >> 8) * 2);
+            }
+        }
+        else
+        {
+            if (GPU2D.DispCnt & 0x20)
+            {
+                pixelsaddr = ((tilenum & 0x01F) << 4) + ((tilenum & 0x3E0) << 7);
+                ytilefactor = (256 * 2);
+            }
+            else
+            {
+                pixelsaddr = ((tilenum & 0x00F) << 4) + ((tilenum & 0x3F0) << 7);
+                ytilefactor = (128 * 2);
+            }
+        }
+
+        for (; xoff < boundwidth;)
+        {
+            if ((u32)rotX < width && (u32)rotY < height)
+            {
+                color = *(u16*)&objvram[(pixelsaddr + ((rotY >> 8) * ytilefactor) + ((rotX >> 8) << 1)) & objvrammask];
+
+                DrawSpritePixel<window>((color&0x8000) ? color : -1, pixelattr, xpos);
+            }
+
+            rotX += rotA;
+            rotY += rotC;
+            xoff++;
+            xpos++;
+        }
+    }
+    else
+    {
+        u32 pixelsaddr = tilenum;
+        if (GPU2D.DispCnt & (1<<4))
+        {
+            pixelsaddr <<= ((GPU2D.DispCnt >> 20) & 0x3);
+            ytilefactor = (width >> 11) << ((attrib[0] & 0x2000) ? 1:0);
+        }
+        else
+        {
+            ytilefactor = 0x20;
+        }
+
+        if (spritemode == 1) pixelattr |= 0x80000000;
+        else                 pixelattr |= 0x10000000;
+
+        ytilefactor <<= 5;
+        pixelsaddr <<= 5;
+
+        if (attrib[0] & (1<<13))
+        {
+            // 256-color
+
+            if (!window)
+            {
+                if (!(GPU2D.DispCnt & (1<<31)))
+                    pixelattr |= OBJ_StandardPal;
+                else
+                    pixelattr |= ((attrib[2] & 0xF000) >> 4);
+            }
+
+            for (; xoff < boundwidth;)
+            {
+                if ((u32)rotX < width && (u32)rotY < height)
+                {
+                    color = objvram[(pixelsaddr + ((rotY>>11)*ytilefactor) + ((rotY&0x700)>>5) + ((rotX>>11)*64) + ((rotX&0x700)>>8)) & objvrammask];
+
+                    DrawSpritePixel<window>(color ? color : -1, pixelattr, xpos);
+                }
+
+                rotX += rotA;
+                rotY += rotC;
+                xoff++;
+                xpos++;
+            }
+        }
+        else
+        {
+            // 16-color
+            if (!window)
+            {
+                pixelattr |= OBJ_StandardPal;
+                pixelattr |= ((attrib[2] & 0xF000) >> 8);
+            }
+
+            for (; xoff < boundwidth;)
+            {
+                if ((u32)rotX < width && (u32)rotY < height)
+                {
+                    color = objvram[(pixelsaddr + ((rotY>>11)*ytilefactor) + ((rotY&0x700)>>6) + ((rotX>>11)*32) + ((rotX&0x700)>>9)) & objvrammask];
+                    if (rotX & 0x100)
+                        color >>= 4;
+                    else
+                        color &= 0x0F;
+
+                    DrawSpritePixel<window>(color ? color : -1, pixelattr, xpos);
+                }
+
+                rotX += rotA;
+                rotY += rotC;
+                xoff++;
+                xpos++;
+            }
+        }
+    }
+}
+
+template<bool window>
+void SoftRenderer2D::DrawSprite_Normal(u32 num, u32 width, u32 height, s32 xpos, s32 ypos)
+{
+    u16* oam = (u16*)&GPU.OAM[GPU2D.Num ? 0x400 : 0];
+    u16* attrib = &oam[num * 4];
+
+    u32 pixelattr = ((attrib[2] & 0x0C00) << 6) | OBJ_IsSprite | OBJ_IsOpaque;
+    u32 tilenum = attrib[2] & 0x03FF;
+    u32 spritemode = window ? 0 : ((attrib[0] >> 10) & 0x3);
+
+    u32 wmask = width - 8; // really ((width - 1) & ~0x7)
+
+    if ((attrib[0] & (1<<12)) && !window)
+    {
+        // apply Y mosaic
+        pixelattr |= OBJ_Mosaic;
+    }
+
+    u8* objvram;
+    u32 objvrammask;
+    GPU2D.GetOBJVRAM(objvram, objvrammask);
+
+    // yflip
+    if (attrib[1] & (1<<13))
+        ypos = height-1 - ypos;
+
+    u32 xoff;
+    u32 xend = width;
+    if (xpos >= 0)
+    {
+        xoff = 0;
+        if ((xpos+xend) > 256)
+            xend = 256-xpos;
+    }
+    else
+    {
+        xoff = -xpos;
+        xpos = 0;
+    }
+
+    u16 color = 0; // transparent in all cases
+
+    if (spritemode == 3)
+    {
+        // bitmap sprite
+
+        u32 alpha = attrib[2] >> 12;
+        if (!alpha) return;
+        alpha++;
+
+        pixelattr |= (0xC0000000 | (alpha << 24));
+
+        u32 pixelsaddr = tilenum;
+        if (GPU2D.DispCnt & 0x40)
+        {
+            if (GPU2D.DispCnt & 0x20)
+            {
+                // 'reserved'
+                // draws nothing
+
+                return;
+            }
+            else
+            {
+                pixelsaddr <<= (7 + ((GPU2D.DispCnt >> 22) & 0x1));
+                pixelsaddr += (ypos * width * 2);
+            }
+        }
+        else
+        {
+            if (GPU2D.DispCnt & 0x20)
+            {
+                pixelsaddr = ((tilenum & 0x01F) << 4) + ((tilenum & 0x3E0) << 7);
+                pixelsaddr += (ypos * 256 * 2);
+            }
+            else
+            {
+                pixelsaddr = ((tilenum & 0x00F) << 4) + ((tilenum & 0x3F0) << 7);
+                pixelsaddr += (ypos * 128 * 2);
+            }
+        }
+
+        s32 pixelstride;
+
+        if (attrib[1] & (1<<12)) // xflip
+        {
+            pixelsaddr += ((width-1) << 1);
+            pixelsaddr -= (xoff << 1);
+            pixelstride = -2;
+        }
+        else
+        {
+            pixelsaddr += (xoff << 1);
+            pixelstride = 2;
+        }
+
+        for (; xoff < xend;)
+        {
+            color = *(u16*)&objvram[pixelsaddr & objvrammask];
+
+            pixelsaddr += pixelstride;
+
+            DrawSpritePixel<window>((color&0x8000) ? color : -1, pixelattr, xpos);
+
+            xoff++;
+            xpos++;
+        }
+    }
+    else
+    {
+        u32 pixelsaddr = tilenum;
+        if (GPU2D.DispCnt & (1<<4))
+        {
+            pixelsaddr <<= ((GPU2D.DispCnt >> 20) & 0x3);
+            pixelsaddr += ((ypos >> 3) * (width >> 3)) << ((attrib[0] & 0x2000) ? 1:0);
+        }
+        else
+        {
+            pixelsaddr += ((ypos >> 3) * 0x20);
+        }
+
+        if (spritemode == 1) pixelattr |= 0x80000000;
+        else                 pixelattr |= 0x10000000;
+
+        if (attrib[0] & (1<<13))
+        {
+            // 256-color
+            pixelsaddr <<= 5;
+            pixelsaddr += ((ypos & 0x7) << 3);
+            s32 pixelstride;
+
+            if (!window)
+            {
+                if (!(GPU2D.DispCnt & (1<<31)))
+                    pixelattr |= OBJ_StandardPal;
+                else
+                    pixelattr |= ((attrib[2] & 0xF000) >> 4);
+            }
+
+            if (attrib[1] & (1<<12)) // xflip
+            {
+                pixelsaddr += (((width-1) & wmask) << 3);
+                pixelsaddr += ((width-1) & 0x7);
+                pixelsaddr -= ((xoff & wmask) << 3);
+                pixelsaddr -= (xoff & 0x7);
+                pixelstride = -1;
+            }
+            else
+            {
+                pixelsaddr += ((xoff & wmask) << 3);
+                pixelsaddr += (xoff & 0x7);
+                pixelstride = 1;
+            }
+
+            for (; xoff < xend;)
+            {
+                if (SpriteBatch && !(xoff & 7) && xend-xoff >= 8)
+                {
+                    const bool flip = pixelstride < 0;
+                    const auto address = (pixelsaddr - (flip ? 7 : 0)) & objvrammask;
+                    DrawSpritePixelBatch8<window>(objvram+address, false, flip,
+                                                  pixelattr, xpos);
+                    pixelsaddr += 64 * pixelstride;
+                    xoff += 8; xpos += 8;
+                    continue;
+                }
+                color = objvram[pixelsaddr & objvrammask];
+
+                pixelsaddr += pixelstride;
+
+                DrawSpritePixel<window>(color ? color : -1, pixelattr, xpos);
+
+                xoff++;
+                xpos++;
+                if (!(xoff & 0x7)) pixelsaddr += (56 * pixelstride);
+            }
+        }
+        else
+        {
+            // 16-color
+            pixelsaddr <<= 5;
+            pixelsaddr += ((ypos & 0x7) << 2);
+            s32 pixelstride;
+
+            if (!window)
+            {
+                pixelattr |= OBJ_StandardPal;
+                pixelattr |= ((attrib[2] & 0xF000) >> 8);
+            }
+
+            // TODO: optimize VRAM access!!
+            // TODO: do xflip better? the 'two pixels per byte' thing makes it a bit shitty
+
+            if (attrib[1] & (1<<12)) // xflip
+            {
+                pixelsaddr += (((width-1) & wmask) << 2);
+                pixelsaddr += (((width-1) & 0x7) >> 1);
+                pixelsaddr -= ((xoff & wmask) << 2);
+                pixelsaddr -= ((xoff & 0x7) >> 1);
+                pixelstride = -1;
+            }
+            else
+            {
+                pixelsaddr += ((xoff & wmask) << 2);
+                pixelsaddr += ((xoff & 0x7) >> 1);
+                pixelstride = 1;
+            }
+
+            for (; xoff < xend;)
+            {
+                if (SpriteBatch && !(xoff & 7) && xend-xoff >= 8)
+                {
+                    const bool flip = pixelstride < 0;
+                    const auto address = (pixelsaddr - (flip ? 3 : 0)) & objvrammask;
+                    DrawSpritePixelBatch8<window>(objvram+address, true, flip,
+                                                  pixelattr, xpos);
+                    pixelsaddr += 32 * pixelstride;
+                    xoff += 8; xpos += 8;
+                    continue;
+                }
+                if (attrib[1] & (1<<12))
+                {
+                    if (xoff & 0x1) { color = objvram[pixelsaddr & objvrammask] & 0x0F; pixelsaddr--; }
+                    else              color = objvram[pixelsaddr & objvrammask] >> 4;
+                }
+                else
+                {
+                    if (xoff & 0x1) { color = objvram[pixelsaddr & objvrammask] >> 4; pixelsaddr++; }
+                    else              color = objvram[pixelsaddr & objvrammask] & 0x0F;
+                }
+
+                DrawSpritePixel<window>(color ? color : -1, pixelattr, xpos);
+
+                xoff++;
+                xpos++;
+                if (!(xoff & 0x7)) pixelsaddr += ((attrib[1] & 0x1000) ? -28 : 28);
+            }
+        }
+    }
+}
+
+}

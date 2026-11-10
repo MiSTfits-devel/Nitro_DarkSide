@@ -1,0 +1,2640 @@
+# Pokémon Platinum guest-code optimization — 27–28 October 2026
+
+Platinum became the sole active target when the user explicitly advanced from
+FFT due diminishing returns. Use exact rc12 with cumulative accepted changes;
+preserve the earlier player-character and furniture fixes. Historical PBOX
+binaries, timings and room screenshots are context, not the current baseline.
+The terrain-visibility experiment improves native publication throughput by
+13.162% in paired outdoor trials. The user approved its video/audio comparison,
+and native save, soft reset, cold reload, room entry/exit and unpatched save
+compatibility checks pass. The user then explicitly instructed: "just promote
+it,. works great". Enable only the tested48-byte terrain patch for a cumulative
+private Platinum Beta1. Other candidates remain disabled. This is
+perceptual acceptance with bounded coverage; strict RAM/audio and six outdoor
+frame differences remain in the evidence. Exact rc12 and accepted Beta2 archives
+remain unchanged. Actual archive installation is qualified separately.
+
+
+Historical disabled/pending statements below are investigation snapshots; the
+current promotion decision above supersedes them for terrain visibility only.
+
+For ongoing work, the user's later instruction, "as long as the game still
+functions lets continue", establishes the functional/perceptual budget.
+Timing, RNG and exact replay differences remain evidence, but do not by
+themselves block investigation or require another permission request. Earlier
+exact-only rejection/no-retry statements are historical. Crashes, save
+corruption, broken progression or perceptible defects remain unacceptable;
+promotion still requires useful measured benefit and appropriate coverage.
+
+Earlier isolated native perceptual trials of empty-tail cleanup, FIFO
+predication and font-table reuse found no worthwhile walking/menu/Bag gain.
+The later OAM and font battle screens also show no worthwhile native gain.
+They remain disabled. Later native-screening sections supersede historical
+no-retry restrictions only for the authorized experiments.
+
+The owned local ROM is USA CPUE revision 1, 128 MiB, SHA-256
+`fbce4c4def0c7797f8dd238a3d7a5e48b4a7e3abd86890ac65f6321cef781bdb`.
+The guarded patch manifest is `platinum-cpue-r1.json`. Original ROM and saves
+remain untouched. The earlier hardware-created room save loads successfully.
+The original backup is entirely `ff` and contains no saved checkpoint; it is
+preserved. A fresh read-only CIFS header inventory finds files reporting CPUJ
+revision 0 and CPUE revisions 0, 1 and 10. The filename labelled Europe reports
+CPUE revision 10, so its filename cannot establish its identity. Only the fully
+hashed local CPUE revision 1 image is admitted to this investigation.
+
+Initial targets are active walking, menus and room transitions, followed by a
+battle and intro route as reachable from the seed. Establish a deterministic,
+visually verified unpatched replay and fixed RTC behavior before selecting
+hotspots or patches. Native expected cadence, gameplay timing, pacing and
+audio require current measurements; instruction samples and buffer publication
+counts cannot substitute for those measurements. Intro visuals are not assumed
+to be FMV assets without inspection.
+
+Reuse `tools/game_optimization/replay_oracle.cpp`, the existing generic
+profilers/scanners and `prepare.VirtualRom`/`hook_guard.py`. There are 122
+ARM9 overlays and no ARM7 overlays in this image. A patch in an overlay needs
+its ID, exact content identity and a verified reload mechanism; a reused RAM
+address is insufficient. Persistent core save states remain unsupported.
+
+The existing ARM structural scanner completed read-only main/autoload
+screening. It flags the known branch-heavy halfword-copy shape at ARM9
+`020c4b18` and ARM7 `037fb040`. The new selected-window profile samples the
+ARM9 extent 41,067 times (4.230% of ARM9 samples), and the ARM7 extent zero
+times. These are not safe patch sites merely because a detector matches. The
+analogous FFT rewrite failed whole-game exactness; do not transplant it on
+signature similarity alone. This scan excludes Thumb code and overlays and
+establishes no shared SDK identity.
+
+## Bounded reference baseline
+
+`ROOM_ROUTE_V4` and its independent repeat each run 6,000 frames from the
+same private seed, fixed RTC, input file and pinned existing reference oracle.
+The existing comparator passes both screens, RAM hashes, audio, save and RAM
+dumps. A supplemental audit matches all 100 output files, including both PC
+profiles, actual periodic screen captures and five full memory/CPU checkpoints
+at frames 4200, 4440, 5000, 5300 and 5900. No patch is active. The save remains
+identical to its private seed; this is not a save-write/reload test.
+
+Visual review identifies boot, Continue, the opening rival dialogue, menu
+opening/dismissal and bedroom movement. The first attempted movement route
+became blocked in dialogue and is not a gameplay performance control. Later
+stair approaches remain in the bedroom: no room transition is qualified.
+The profile covers frames 4200–5999, after dialogue, and includes menu,
+movement and stationary room time. It is not a pure walking benchmark or a
+native renderer/accuracy qualification.
+
+There are 248,802,085 ARM9 and 45,859,032 ARM7 instruction entries in that
+selected window. The 970,952 ARM9 and 178,229 ARM7 samples reconcile exactly
+with the observer's every-256th-entry, per-frame sampling rule. They are not
+native cycle shares; fixed-stride sampling can alias periodic service work.
+`INITIAL_PROFILE_SCREEN_V1.json` retains every 256-byte bin at or above 2%
+for both CPUs, including unresolved ARM7 and live-overlay regions.
+
+| ARM9 extent, end exclusive | Sample share | Evidence and interpretation |
+|---|---:|---|
+| `01ff8000–01ff81e4` | 19.114% | IRQ acknowledgment, dispatch and context switching, including CPSR/SPSR and register preservation; not established idle work |
+| `020c99fc–020c9a78` | 9.615% | Register context save/restore around DIV/SQRT MMIO, called by the context path; not evidence of an expensive software divide |
+| `020c4b90–020c4bb8` | 5.675% | Reads successive words and writes repeatedly to one destination; the guarded census below identifies geometry FIFO |
+| `020c4b18–020c4b4c` | 4.230% | Known halfword-copy pattern; the guarded census below identifies mostly tiny OAM fields |
+
+The listed code bytes match the unpacked ROM at all five live checkpoints.
+Static disassembly and existing emulator register definitions support these
+bounded interpretations. The transfer census below adds runtime mode guards
+and actual arguments; other hotspots still require them. A fixed-destination
+word stream must not be treated as ordinary memcpy, nor a large interrupt
+sample share as removable dead work.
+
+## Guarded transfer census
+
+The existing observer captures 1,206,700 entry/return events with exact ARM9,
+ARM-mode, opcode, pipeline-PC and mapped DTCM-stack guards. Both the preliminary
+register census and guarded capture preserve all six required golden outputs.
+`audit_transfer_calls.py` pairs all 603,350 calls, checks declared leaf-register
+effects, final equal-compare flags and unchanged stack bytes, and binds its
+input to that passing comparison. Seven adversarial tests pass. The measured
+window remains frames 4200–5999; no new gameplay coverage is implied.
+
+| Routine | Calls | Requested bytes | Actual role in this window |
+|---|---:|---:|---|
+| Fixed-destination word stream | 160,545 | 8,138,460 | Destination argument is always geometry FIFO `04000400`; 19,800 calls have length zero and perform no transfer |
+| Halfword copy | 442,805 | 1,778,456 | 442,800 calls / 1,778,400 bytes target OAM; five calls / 56 bytes target main RAM |
+
+The word stream's 140,745 nonempty calls comprise 36,525 main-RAM sources and
+104,220 ARM9 DTCM sources. All observed sources/destinations are word-aligned;
+two return sites are `020b2834` and `020b0fd8`. One complete call crosses an
+emulator frame boundary and remains in the audit. No call is nested in this
+capture. Fixed source addresses or identical lengths do not establish repeated
+command payloads.
+
+The halfword routine mostly copies tiny fields: 223,200 six-byte calls and
+219,600 two-byte calls. Five other calls use lengths 8, 10, 12 or 16. Many
+sources/destinations are 2 mod 4, so replacing these with ordinary aligned word
+accesses is not justified. OAM callers return to `020a7ee8`, `020a7f9c`,
+`020a7fac`, `020a7fbc` and `020a7fcc`; the five RAM calls return to Thumb
+address `0200aeb5`. The routines themselves were observed in ARM mode.
+
+Evidence: `TRANSFER_CALL_FINDINGS_V2.json`,
+`TRANSFER_CALL_AUDIT_FIXTURE_V2.json` and
+`TRANSFER_GUARDED_V1_COMPARISON.json`. V1 findings retained DTCM sources as
+unclassified; V2 labels them using the mapped ARM9 DTCM range without rerunning
+or changing the replay. No beta patch or scratch allocation is installed.
+
+## Word-stream branch trial — rejected
+
+`fifo-word-stream-predication` replaces 40 bytes of initial ARM9 ARM code at
+`020c4b90`. Predicated LDM/STR instructions retain the ordered source reads and
+fixed-destination writes while removing branch scaffolding. It uses no scratch,
+overlay hook, new service or RTL. The existing guarded VirtualRom loader admits
+the exact CPUE revision 1 header/ROM/raw-ARM9 identity and original bytes;
+only 26 byte values change within the declared 40-byte extent. Four negative
+admission cases preserve the complete original stream. No ROM file is written.
+
+The existing synthetic runner passes 1,680 cases with identical registers,
+CPSR, mapped memory and ordered data accesses, including zero/null calls,
+odd lengths, alignment, overlap, signed-address boundaries, wraparound and
+ARM/Thumb returns. Synthetic MMIO remains ordinary memory and does not prove
+interrupt or native hardware equivalence. The unpatched virtual adapter
+reproduces the golden replay before the candidate is run.
+
+| Measurement | Unpatched control | Candidate |
+|---|---:|---:|
+| Screen pairs | 6,000 | All 6,000 bit-exact |
+| Declared full RAM checkpoint sets | 5 | All 5 exact outside 40 patch bytes |
+| Additional per-frame main RAM / DTCM / ARM7 WRAM hash differences | 0 / 0 / 0 | 247 / 348 / 107 |
+| Stereo samples | 4,813,950 | 175,017 differ; maximum signed-16 delta 2,146 |
+| Save data | Original private seed | Bit-exact throughout and at end |
+| ARM9 reference entries, frames 4200–5999 | 248,802,085 | 245,648,794 (−1.267%) |
+| Native cycles, frame time, pacing and HPS load | Unavailable in this trial | Not run |
+| Transition, battle, save-write/reload and reset coverage | Pending | Not run |
+
+Audio mismatch rejects this version under the strict budget, despite identical
+screens, saves and fixed RAM checkpoints. The additional transient RAM changes
+are unexplained; do not classify the differences as harmless timing or infer
+audibility from their maximum alone. The earlier fixed-workload estimate was
+4,390,320 fewer entries (1.765%), from `6 * words + 8 * calls` versus
+`4 * words + 6 * calls`. The empirical reduction is smaller; neither value is
+native speed. Do not repeat this unchanged version, trial it natively or
+include it in a beta. FFT's earlier perceptual review does not qualify a new
+Platinum soundtrack.
+
+Private trial evidence: `FIFO_WORD_STREAM_SYNTHETIC_V1.json`,
+`FIFO_WORD_STREAM_PREFLIGHT_V1.json`, `FIFO_WORD_STREAM_COMPARISON_V1.json`,
+`FIFO_WORD_STREAM_BEFORE_AFTER_V1.csv` and `FIFO_WORD_STREAM_DECISION_V1.json`.
+
+Private evidence: `platinum-optimization-20261027/INPUTS_V1.json`,
+`STATIC_PATTERN_SCREEN_V1.json`, `ROOM_ROUTE_V4_COMPLETE_REPEAT_AUDIT.json`,
+`REPLAY_SCENE_REVIEW_V1.json`, `INITIAL_PROFILE_SCREEN_V1.json`,
+`STATIC_ARM9_HOTSPOT_LEADS_V1.txt` and `WORKFLOW.json`. The last verified
+cumulative beta remains FFTA2 Beta2 until a Platinum change qualifies.
+
+## Overlay and ARM7 classification
+
+All 30 retained bins now have a structural classification. All 1,021 sampled
+instruction sites match the exact ROM main/autoload bytes, checkpoint-matched
+overlay bytes or the reference oracle's embedded FreeBIOS. This screens the
+executed instructions; it does not establish every function's runtime semantics
+or native cost. The ARM7 bins predominantly cover sound-channel arithmetic,
+parameter propagation, modulation and status collection, plus timed callbacks,
+IRQ/CPSR helpers and SWI dispatch/completion. The pitch and volume helpers call
+Thumb SWIs `1b` and `1c`; their actual argument recurrence remains unmeasured.
+The channel update already compares values and sets dirty flags on changes.
+
+The owned ROM's full SHA-1 `0862ec35b24de5c7e2dcb88c9eea0873110d755c`
+matches the decompilation project's USA revision 1 identity. External source is
+pinned to commit `579d2d5c65e736a1a4268fb7acbfd70712177c6c`; no external build
+or downloaded ROM was used. Both large overlay bins belong to overlay 5 at
+`021d0d80`: its entire 201,632-byte decoded body matches all five checkpoints.
+Decoded SHA-256 is
+`6e2095b04c6db198d2c16f81964732d5b2119fa66edb907bec3b3774f41d43f9`.
+Source names support the matching disassembly, rather than admitting a patch
+by address or symbol alone.
+
+The existing observer captured frames 4200–4319 with exact CPU, Thumb mode,
+opcode, pipeline-PC and memory mapping guards. All 100 baseline output files
+still match across the full 6,000-frame run. The observations are:
+
+| Lead | Unpatched evidence | Patched result |
+|---|---|---|
+| Resource queue compaction, `021ee030` | All 60 entries have 64 empty records; nested searches read 2,016 later-slot flags per empty invocation | Not implemented; an early exit after the first exhausted search would require 63 such reads in this case |
+| HBlank dispatch, `021ef47c` | All 63,120 dispatches, 526 per frame, target the empty `BX LR` routine at `021ef498`; both task slots are unused | Not implemented; real callbacks in other scenes must still execute |
+| Both screens, RAM, audio and save | All six golden comparisons and all 100 retained baseline files match | No new patch trial |
+| Native speed, pacing and HPS load | Not measured in this investigation | No gain claimed |
+
+The queue routine accounts for 5.816% of ARM9 samples, including 5.447% in
+compaction and 5.109% in its inner search. HBlank dispatch and its dummy return
+together account for 4.350%. These are overlapping subextents within the queue
+routine, not additive savings, and no percentage is a native speed estimate.
+The source's [nested compaction loop](https://github.com/pret/pokeplatinum/blob/579d2d5c65e736a1a4268fb7acbfd70712177c6c/src/overlay005/ov5_021ECE40.c#L1552)
+and [HBlank system](https://github.com/pret/pokeplatinum/blob/579d2d5c65e736a1a4268fb7acbfd70712177c6c/src/overlay005/hblank_system.c)
+correspond to these instruction and data observations.
+
+The initial generic byte-patch path rejected overlays. Investigation of the
+existing FMV preparation code found that overlay 5 is already uncompressed:
+its 201,632 stored bytes equal its decoded body. It therefore needs no FAT,
+compression, file-layout, converter or ITCM-extension change. The implementation
+below reuses the existing reader and virtual stream. No new hardware hook,
+HPS service or scratch allocation has been introduced.
+
+Evidence: `THRESHOLD_CLASSIFICATION_V1.json`,
+`THRESHOLD_PROFILE_OPCODE_AUDIT_V1.json`, `THRESHOLD_SOURCE_PROVENANCE_V1.json`,
+`ARM7_CLASSIFICATION_SUPPORT_V1.txt`, `OVERLAY5_GUARDED_FINDINGS_V1.json`,
+`OVERLAY5_SAMPLE_EXTENTS_V1.json` and `OVERLAY5_PATCH_DELIVERY_PROPOSAL_V1.json`.
+
+## Unchanged overlay delivery qualification
+
+`prepare.read_overlay` now supplies the shared ID/table/FAT decoder to both
+FMV preparation and the existing `guest_byte_patch` loader. Generic overlay
+diagnostics require the exact full ROM/header/ARM9 identities, overlay ID,
+file ID, RAM base, entire decoded SHA-256 and expected instruction bytes.
+They admit only uncompressed, unflagged ARM9 overlays in canonical main RAM.
+The original header, FAT and overlay table remain byte-exact. Mismatches fall
+back atomically to the original virtual image; each selection remains explicit.
+
+The all-overlay check exposed a limitation in the old unconditional compression
+autodetection: uncompressed overlay 62 contains bytes that resemble a compressed
+footer. The shared reader now follows the table's compression flag, as the
+normal overlay decoder does. All 122 owned overlays match the independent
+`ndspy` overlay decoder. A regression test covers the misleading-footer case;
+compressed FMV-reader support is also exercised. The selected byte-patch path
+continues to reject compressed or flagged overlays.
+
+All 38 loader/preparation/guard tests pass, including the actual disposable
+stream-worker protocol, IDs sharing one RAM address, mixed main/overlay atomic
+fallback, wrong content/metadata/bytes, protected data, source mutation and
+unchanged repeated file reads. The owned-ROM preflight passes one selected
+unchanged-overlay case and nine rejection cases, each producing the original
+complete 128 MiB SHA-256. The selected `expect == replace` diagnostic then
+passes the full 6,000-frame replay: all 100 baseline output files are identical,
+with no RAM normalization. No instruction is optimized in this control.
+
+| Measurement | Original baseline | Selected unchanged-overlay control |
+|---|---:|---:|
+| Complete virtual cartridge | Original SHA-256 | Identical |
+| Both-screen pairs | 6,000 | All exact |
+| Retained baseline output files | 100 | All exact |
+| ARM9 selected reference entries | 248,802,085 | 248,802,085 |
+| ARM7 selected reference entries | 45,859,032 | 45,859,032 |
+| Instruction byte changes / enabled optimizations | 0 / 0 | 0 / 0 |
+| Native speed and changed-code fetch after reload | Not measured here | Not qualified |
+
+An additional 12,000-frame route performs the game's L+R+Start+Select soft
+reset at frame 6000, returns through the copyright/intro/Continue screens and
+loads the saved bedroom again. Overlay 5's body is still present at checkpoint
+6100, differs at 6400 and 7200, then matches all 201,632 bytes at 8400, 10000
+and 11500. The selected unchanged-overlay repeat matches all 166 baseline
+files. The existing observer records 1,800 post-reset Thumb compaction entries
+in frames 8400–11999 with exact opcode/pipeline guards; all have 64 empty
+records. Both runs preserve the original 6,000-frame prefix and private save.
+This is soft reset and Continue, not a save-write test or core save state.
+
+This qualifies adapter neutrality and a bounded unpatched software reload
+route, not the two optimization ideas. Changed-code execution/cache visibility
+and native lifecycle/benefit still require candidate-specific evidence.
+This stage identified the need for full-overlay RAM comparison and Thumb
+synthetic support. Both are qualified below. Existing accepted binaries and
+beta packages remain untouched.
+
+Evidence: `OVERLAY_DELIVERY_PREFLIGHT_V2.json`,
+`OVERLAY_DELIVERY_TOOL_TESTS_V2.log`, `OVERLAY_DELIVERY_CONTROL_MANIFEST_V1.json`
+and `OVERLAY_DELIVERY_CONTROL_V1_STATUS.json`. The failed initial reader check
+is retained as `OVERLAY_DELIVERY_PREFLIGHT_V1_FAILED.json`; no replay started
+on that failure. The later staircase approach in `ROOM_ROUTE_V5` still remains
+upstairs; it does not expand room-transition coverage. Reset evidence is in
+`OVERLAY_RESET_SCENE_REVIEW_V1.json`, `OVERLAY_DELIVERY_RESET_FINDINGS_V1.json`
+and `OVERLAY_DELIVERY_BEFORE_AFTER_V1.csv`.
+
+## Empty-tail exit trial
+
+The disabled `overlay5-empty-tail-exit` candidate changes six byte values across
+five Thumb instructions in a 54-byte extent beginning at `0x021ee0a0`. After
+an unsuccessful inner search it advances the outer index to its limit; active
+records and successful moves bypass that adjustment. The final reload is
+unsigned only after the signed entry test admits a count greater than one.
+The capacity must remain immutable during the call. There is no scratch,
+trampoline, new service or RTL change.
+
+The existing synthetic runner now supports Thumb and explicitly declared
+ordinary-memory read elimination. All 1,338 cases preserve registers, flags,
+complete mapped memory, writes and required reads, including exhaustive small
+occupancies and larger/random/stale-payload cases. The prior 1,680 ARM cases
+still pass. Five Python unit tests and 27 C++ comparison checks pass.
+The comparison accepts only a complete original/replacement overlay body before
+normalizing declared instruction bytes. Partial, absent or different bodies
+remain raw. The new unpatched 6,000/12,000-frame controls match all 100/166
+golden files, including profiles. The first control attempt rejected a
+byte-reversed return-opcode guard; the corrected specification passes without
+relaxing the observer.
+
+There are 900 paired queue entries/returns before reset and 1,800 after reset.
+Every observed queue has 64 empty records with identical complete bytes at
+return. Full-replay bus watches show the original capacity and records are
+initialized at frame 1307, with no subsequent writes through frame 5999.
+After reset the queue moves by `0x60`; its last initialization writes occur at
+7307, before the observed 8400–11999 window. Live-window writes touch only
+the processed-count field and a separate upload flag. Owned-byte disassembly
+corroborates the VBlank functions using the other array at header `+0x10`,
+instead of the compaction queue at `+0x0c`. This is bounded CPU/DMA evidence,
+not proof for arbitrary scenes, native execution or asynchronous host writes.
+
+| Measurement, 6,000-frame trial | Control | Candidate |
+|---|---:|---:|
+| ARM9 executed reference instructions, frames 4200–5999 | 248,802,085 | 237,158,299 (−4.679939%) |
+| ARM7 executed reference instructions, same window | 45,859,032 | 45,859,032 |
+| Both-screen pairs matching golden | 6,000 | 6,000 |
+| Fixed full RAM checkpoint sets matching golden | 5 | 5, excluding qualified patch bytes |
+| Same-length stereo sample count | 4,813,950 | 4,813,950 |
+| Stereo samples differing from golden | 0 | 1,660 |
+| Maximum signed-16 audio delta | 0 | 312 |
+| Save data | Exact | Exact |
+| Native cycles / frame time / FPS | Unmeasured | Unmeasured |
+
+Audio RMS delta is 0.148479 across all signed-16 channels, without alignment or
+masking. No audibility judgment is established. Audio alone fails the requested
+bit-exact budget, so the candidate is rejected and disabled; no optimized reset
+or native trial follows. All fixed checkpoints pass, while 246 main-RAM, 250
+DTCM and 19 ARM7-WRAM frame hashes differ. Those transient differences remain
+diagnostic and are not silently classified as harmless. Reference instruction
+reduction is not a MiSTer speedup. ROM and private save inputs remain unchanged.
+
+Evidence: `EMPTY_TAIL_SYNTHETIC_V1.json`, `EMPTY_TAIL_TOOL_TESTS_V1.json`,
+`EMPTY_TAIL_WRITER_CONTRACT_V1.json`, `EMPTY_TAIL_RESET_WRITER_CONTRACT_V1.json`,
+`EMPTY_TAIL_LIFECYCLE_DISASSEMBLY_V1.json`, `EMPTY_TAIL_COMPARISON_V1.json`,
+`EMPTY_TAIL_DECISION_V1.json` and `EMPTY_TAIL_BEFORE_AFTER_V1.csv`.
+
+## HBlank candidate screening
+
+The owned 28-byte dispatcher plus its two-byte dummy return and two-byte
+alignment region does not yet have a demonstrated layout for a whole-empty
+fast path with a preserved real-callback path. The existing synthetic runner
+confirms 25 executed instructions for the two-empty-slot function. A simple
+per-slot target load/compare/branch guard adds work around the two-instruction
+`BLX`/`BX LR` pair it would skip; sharing a constant changes the calculation
+but still needs a layout and machine-state proof. These are instruction counts,
+not native cycle estimates, and do not rule out every HBlank optimization.
+
+Checking `used == FALSE` is insufficient. Registration writes parameter,
+callback and then `used`; deletion clears `used` before replacing callback
+and parameter. The owned sequences contain no IRQ masking, and caller-side
+exclusion has not been proved. A synthetic registration snapshot with `used=0`
+and a live callback still performs that callback's write. Skipping it changes
+behavior. No actual race is claimed to have occurred in the captured scene.
+Even the dummy call sets LR to `0x021ef48d`, so deleting it without reproducing
+the caller-visible state does not satisfy the current equivalence contract.
+
+No HBlank patch is implemented or enabled. Retain a whole-empty fast path as
+a proposal requiring safe code space and complete callback/lifecycle proof;
+do not overwrite the neighboring function, assume scratch or disable the whole
+interrupt. Evidence: `HBLANK_COST_SCREEN_V1.json`,
+`HBLANK_SYNTHETIC_SCREEN_V1.json` and `HBLANK_BEFORE_AFTER_V1.csv`.
+
+## Downstairs and Twinleaf Town reference
+
+`ROOM_ROUTE_V9` now covers the bedroom/menu prefix, the stairs downstairs,
+both conversations and the exit to Twinleaf Town. Earlier V5/V6 attempts
+stopped at grid positions 9,6 and 8,5; continuing north from 8,5 reaches the
+stair warp at 8,4. Read-only RAM analysis uses consistent manager/avatar/object
+backlinks and matching integer, fixed-point and location coordinates. The map
+IDs and screenshots agree: downstairs is 414, then town is 411. These values
+help navigate the recorded replay; no game state or original save is edited.
+
+The independent 16,800-frame cold-boot repeat matches every screen pair, the
+entire audio/save, all per-frame game RAM hashes and 235 complete output files,
+including the retained raw checkpoints. The repeat profiles only stable town
+frames 15000–16799, so three measurement files differ intentionally: the two
+instruction-counter columns are zero before 15000 and match the baseline
+afterward, and the two PC profiles contain that window only. Every other state
+column is exact. The raw comparator's state-file mismatch is retained and
+fully explained in `ROOM_ROUTE_V9_REPEAT_COMPARISON.json`; no game-state
+difference is masked.
+
+The outdoor window has 292,331,250 ARM9 and 45,944,604 ARM7 executed reference
+instructions. All 30 bins above 2% are screened and every sampled opcode in
+them matches owned code or the pinned reference BIOS. Twenty-eight bins reuse
+the prior static interpretation; two new bins contain IRQ-handler table mask
+traversal and sound-envelope state updates. The former is a new candidate
+lead: a 22-position loop continues through empty high positions after the
+remaining mask is zero. Capture actual masks and callback values before
+estimating savings. Preserve the high-bit cap, all selected table writes,
+literal addresses and complete machine state; do not skip an IRQ or handler.
+Its SDK identity is not yet established.
+
+The town observer also records 60 empty 64-record queue entries and 63,120
+dummy HBlank calls over frames 16400–16519. This broadens the unpatched scene
+evidence, not the rejected optimizations' qualification. Outdoor walking beyond
+the exit step, battle, save-write/reload, optimized transitions and all native
+accuracy/cadence/performance work remain pending. No new beta is produced.
+
+Evidence: `ROOM_ROUTE_V9_REVIEW.png`, `ROUTE_COORDINATE_FINDINGS_V1.json`,
+`TOWN_REFERENCE_BEFORE_AFTER_V1.csv`, `TOWN_PROFILE_SCREEN_V1.json`,
+`TOWN_NEW_THRESHOLD_DISASSEMBLY_V1.txt`, `TOWN_GUARDED_FINDINGS_V1.json`,
+`IRQ_MASK_SCAN_PROPOSAL_V1.json` and `REPLAY_SCENE_REVIEW_V3.json`.
+
+## IRQ-handler mask traversal
+
+The guarded town census observes 57,840 complete entry/setup/exit triples.
+Of these, 57,600 select bit 21 and 240 select bit 6. All preserve the expected
+stack, literal-derived DTCM/main-table pointers, selected table effects and
+return operands. An empty-tail cutoff passes 12,262 synthetic cases but has
+only a 0.007389% weighted instruction-count opportunity in this scene, so it
+does not merit a full-game trial. That estimate is not native timing.
+
+The tested replacement instead visits only set bits, in ascending order, with
+ARM9 CLZ. It occupies the same 128-byte initial ARM9 function, changes 97 byte
+values, retains the original eight-byte literal pool and uses no scratch,
+trampoline or HPS service. A separate semantic argument covers zero/high-only
+masks, the 22-bit cap and upper-bit return. All 12,262 synthetic cases preserve
+registers, CPSR, mapped memory and every ordered read/write. V1 assembly was
+never executed; V2 reverses multiplication operands to avoid an ARMv5
+destination/first-source alias.
+
+The unpatched virtual-stream control reproduces all 241 census output files.
+Both code/literal write watches contain exactly the 34 initial-load words and
+no later observed stores. The candidate's 57,840 guarded calls each satisfy the
+same selected-table and saved-stack contract, with the same mask/callback
+histograms. Those checks do not establish whole-game equivalence:
+
+| Metric | Control | Candidate |
+|---|---:|---:|
+| ARM9 reference entries, frames 15000–16799 | 292,331,250 | 285,962,200 |
+| ARM7 reference entries, same window | 45,944,604 | 45,943,922 |
+| Top-screen frame mismatches | 0 | 1, at frame 14359 |
+| Bottom-screen frame mismatches | 0 | 0 |
+| Different stereo samples of 13,479,065 | 0 | 6,591,626 |
+| Maximum signed-16 audio delta | 0 | 6,731 |
+| Failed main-RAM/DTCM/ARM7-WRAM checkpoint sets | 0 | All 11 |
+| Per-frame/final save mismatches | 0 | 0 |
+
+Audio RMS delta is 186.388139 without alignment or masking. Main RAM diverges
+from frame 9, and DTCM/ARM7 WRAM from frame 8. The retained frame-2600 main-RAM
+dump differs by 138,355 words outside the declared code. No timing-only,
+audibility or benign-allocation explanation has been proved. In particular,
+nearly identical screens and an unchanged save do not justify masking the RAM
+or audio differences.
+
+**Historical exact-only rejection, superseded by the later functional screen.**
+The measured 2.178710% reduction is software
+instruction entries, not native cycles, frame time or gameplay speed. Native
+p50/p95/max frame time, dropped frames, HPS load and load-time changes remain
+unmeasured. No optimized reset, native trial, unchanged rerun or beta follows a
+failed replay gate. The accepted FFTA2 Beta2 package remains unchanged.
+
+The generic pattern detector also finds a 25-bit ARM7 loop with no samples in
+this window. It is a separate lead: ARM7 cannot execute the ARM9 CLZ replacement.
+Six detector tests cover renamed registers and unsafe near matches; four
+comparison tests cover explicit combined code/data write watches and existing
+overlay normalization. No game addresses were added to the shared tools.
+
+Evidence: `IRQ_MASK_CENSUS_EFFECT_AUDIT_V1.json`, `IRQ_MASK_COST_SCREEN_V1.json`,
+`IRQ_SPARSE_SEMANTIC_ARGUMENT_V2.json`, `IRQ_SPARSE_SYNTHETIC_V2.json`,
+`IRQ_SPARSE_CONTROL_V2_STATUS.json`, `IRQ_SPARSE_CANDIDATE_EFFECT_AUDIT_V2.json`,
+`IRQ_SPARSE_COMPARISON_V2.json`, `IRQ_SPARSE_DECISION_V2.json`,
+`IRQ_SPARSE_BEFORE_AFTER_V2.csv` and `IRQ_SPARSE_PATTERN_SCAN_V1.json`.
+
+Priorities after the IRQ trial (the sound census is completed below):
+
+1. Capture ARM7 pitch/volume operands and caller recurrence before considering
+   arithmetic reuse. Preserve stateful envelope updates and audio cadence.
+2. Extend active outdoor movement, battle and isolated save-write/reload
+   coverage, then profile those scenes before optimizing more town-idle work.
+3. Revisit the whole-empty HBlank proposal only with a proved layout and
+   callback/IRQ contract. A startup- or caller-scoped IRQ optimization would
+   require a new proof and supported delivery, not an unchanged rerun of this
+   rejected patch. Any perceptual budget needs separate user approval.
+
+## ARM7 sound arithmetic census
+
+The existing observer now captures registers without dereferencing memory, with
+the same CPU/mode/opcode/pipeline-PC guards. This avoids incorrectly treating
+ARM7 WRAM as main RAM. All 68 observer checks and six recurrence tests pass.
+Only the diagnostic frontend is rebuilt; its linked CPU, audio and renderer
+objects are unchanged. The 16,800-frame unpatched replay reproduces all 238
+game/profile files, including every screen, RAM checkpoint, audio sample, save
+and instruction count. Only the three observer trace files differ intentionally.
+
+The 462,616 guarded events contain 57,827 complete calls each to pitch and
+volume helpers, plus their lookup input/output sites. No incomplete boundary
+call is discarded. Pitch's only observed caller returns to `037fc770`, and
+volume's to `037fc760`. Four-stage audits validate normalization/clamping,
+stack-pointer deltas and BL links. They do not claim saved-stack byte or full
+register/flag equivalence for a replacement.
+
+| Numerical operation | Calls | Distinct captured inputs | Conflicting R0 results | Hypothetical 16-entry LRU hits |
+|---|---:|---:|---:|---:|
+| Pitch, base timer + signed offset | 57,827 | 397 | 0 | 55,815 |
+| Pitch BIOS lookup | 57,827 | 252 | 0 | 56,226 |
+| Volume, signed level | 57,827 | 1,039 | 0 | 9,985 |
+| Volume BIOS lookup | 57,827 | 722 | 0 | 10,385 |
+
+Pitch base timers range from 379 to 1,047 and signed offsets from -960 to
+1,088 in this window. The caller obtains the base with a halfword load; that
+does not prove this narrower observed range for every scene. Zero pitch occurs
+13,874 times, always returning the observed base, whereas normalized lookup
+index zero occurs 16,888 times. Those conditions are not interchangeable.
+Volume levels range from -1,416 to -2 and exercise the lower clamp at -723.
+The existing caller already skips sound-state writes when derived output has
+not changed; that alone does not avoid computing the output.
+
+Pitch reuse is worth further investigation, but no cache is implemented.
+Its 16-entry LRU covers about 96.5% of calls before lookup/storage costs;
+a single global last-result entry covers only 1,233 calls. Volume's weaker
+local reuse makes a small generic cache less attractive. Same-address R4
+contexts do not prove a voice's lifetime or make any fields safe scratch.
+No HPS offload or ARM7 CLZ path is available by assumption. The current byte
+loader supports ARM9 main/uncompressed overlays, so ARM7 delivery needs its
+own guarded mapping and unchanged-stream qualification before a candidate.
+
+The next bounded step is a no-scratch zero-pitch arithmetic proof: retain
+out-of-range/clamped behavior, BIOS/table invariants and all observable CPU
+effects, then screen its actual instruction cost. Do not simply skip the call
+because the captured base values exceed the minimum clamp. No new patch, native
+performance result or beta follows from this census.
+
+Evidence: `REGISTER_WATCH_BUILD_V10.json`, `REGISTER_WATCH_TESTS_V10.json`,
+`ARM7_SOUND_CENSUS_QUALIFICATION_V1.json`, `ARM7_SOUND_WATCH_IDENTITY_V1.json`,
+`ARM7_SOUND_RECURRENCE_V1.json`, `ARM7_SOUND_CALL_CONTRACT_V1.json` and
+`ARM7_SOUND_CENSUS_BEFORE_AFTER_V1.csv`.
+
+Next three investigations after this census:
+
+1. Prove and cost a guarded zero-pitch path without scratch; qualify ARM7
+   in-memory delivery only if a worthwhile exact candidate emerges.
+2. Extend active outdoor movement, battle and isolated save-write/reload
+   coverage, then profile representative scenes.
+3. Evaluate a small pitch cache only after a safe storage/lifetime contract;
+   keep whole-empty HBlank as a separate unresolved layout/callback proposal.
+
+No RTL, new HPS service, save-state-format change or non-bit-exact acceptance
+is authorized here. No speed improvement or new beta is claimed.
+
+## Carry-derived zero multiply in the pitch helper — 28 October UTC
+
+The investigation found a smaller change than bypassing the zero-pitch helper.
+Keep the BIOS call, normalization, shifts and clamps. In the ARM7 autoload-2
+routine, `MOV ip,#0; ADC r3,ip,#0` produces `r3=C`. The intervening instructions
+preserve C. At `037fbe00`, `MLA r1,r3,r5,r1` therefore leaves R1 unchanged when
+C is clear. Changing its condition to CS preserves the original operation when
+C is set and skips an identity operation when it is clear. No scratch, new
+service or BIOS-table assumption is needed. Only one byte changes, inside a
+36-byte authenticated context: `e0211593` becomes `20211593`.
+
+The algebra covers arbitrary 32-bit block inputs. All 6,800 synthetic cases,
+including carry boundaries, negative bases and all NZCV combinations, preserve
+R0–R12, SP/LR/PC, CPSR, mapped memory and ordered accesses. Both versions still
+have nine instruction entries and zero data accesses. Failed ARM predicates
+are still fetched and counted; any benefit would come from avoiding multiply
+latency, not fewer instruction entries. Native timing is unmeasured.
+
+The extra unpatched observation site reproduces all 238 game/profile files
+over 16,800 frames. All 462,616 events from the original eight sites also match
+after removing only the event ordinal. The 57,827 additional events reconstruct
+the target's entire register/CPSR pre-state from the lookup-return snapshot.
+Every observed call has C=0 and R3=0. This supports a projected 57,827 avoided
+MLA executions in the observed window; it is not a patched replay or speedup.
+
+| Check | Original | Candidate |
+|---|---:|---:|
+| Synthetic block instruction entries | 9 | 9 |
+| Synthetic block data accesses | 0 | 0 |
+| Exact synchronous cases | Reference | 6,800 passed |
+| Target MLA executions, observed window | 57,827 measured | 0 projected |
+| Full-game patched replay | Unpatched control exact | Not run |
+| Native frame time / cycles / HPS load | Not measured here | Not measured |
+
+A larger three-instruction alternative also passed 65,833 synthetic cases,
+but requires a bounded BIOS return and changes twelve byte values. Preserve it
+as private evidence; prefer the one-byte all-input argument. A direct helper
+skip would also remove BIOS stack/register effects and is not qualified.
+
+The shared scanner now finds the carry-derived shape with renamed registers
+and rejects broken dataflow, flag updates, conditional context, special
+registers and ARMv4 multiply destination/source aliases. Thirteen detector
+tests pass, including the existing dispatch/mask tests. The actual ROM scan
+finds the exact ARM7 autoload-2 sequence, without title-specific scanner logic.
+Capstone reports a carry read as a flag update for ADC in this environment;
+the detector verifies the encoded S bit for these five specific opcodes.
+
+The candidate remains disabled. Current delivery explicitly rejects ARM7
+autoload targets and reproduces all 128 MiB of the original cartridge on that
+fallback. No candidate ROM is written. Extending the existing guarded virtual
+stream needs exact ARM7/section identity, verified load mapping and an unchanged
+control before a changed-code replay. Entry paths, interrupt/audio timing,
+cache visibility, reset and state-load behavior remain separate obligations.
+The three earlier rejected Platinum patches stay disabled; FFTA2 Beta2 is
+unchanged. The proof establishes no perceptual allowance or release readiness.
+
+Evidence: `ARM7_PITCH_CARRY_DECISION_V1.json`,
+`ARM7_PITCH_CARRY_SYNTHETIC_V1.json`,
+`ARM7_PITCH_CARRY_CENSUS_QUALIFICATION_V1.json`,
+`ARM7_PITCH_CARRY_CALL_CONTRACT_V1.json`,
+`ARM7_PITCH_CARRY_DELIVERY_PREFLIGHT_V1.json`,
+`ARM7_PITCH_CARRY_PATTERN_SCAN_V1.json` and
+`ARM7_PITCH_CARRY_BEFORE_AFTER_V1.csv`.
+
+Next three investigations:
+
+1. Qualify ARM7 autoload delivery in the existing virtual-stream loader, then
+   run the one-byte candidate through strict replay comparison. Keep it only
+   if it produces a measurable benefit after all required validation.
+2. Extend active outdoor movement, battle and isolated save-write/reload
+   coverage. Profile those scenes before spending further effort on town idle.
+3. Investigate pitch reuse only if a safe storage/lifetime contract emerges;
+   the apparent cache hit rate alone does not authorize guest scratch.
+
+## ARM7 autoload delivery control
+
+The existing `guest_byte_patch` loader now supports an explicitly pinned,
+uncompressed ARM7 WRAM autoload section. Platinum's settings are at ARM7
+offset `1d0`; the raw final copy table and all three payloads match the shared
+decoder. Selected section 2 starts at `037f8000`, contains 60,564 bytes and has
+16,952 BSS bytes. Its source starts at cartridge offset `409aa4`. The original
+boot prefix, table, BSS sizes, header and cartridge layout are preserved.
+This prepares bytes in the existing virtual stream; it installs no new hook.
+
+All 33 loader tests pass, including existing ARM9 main/overlay paths, malformed
+table and identity rejection, mixed-selection atomic fallback, protected data,
+same-byte control and the actual stream worker protocol. The original ROM is
+opened read-only. The same-byte control reproduces all 128 MiB, and offline
+preparation of the candidate changes exactly one byte at cartridge `40d8a7`.
+The changed stream has not been executed or delivered as a beta.
+
+The long control reproduces all 241 files of the 16,800-frame town reference,
+including the nine-site register trace. A separate 2,601-frame boot baseline
+and its same-byte control reproduce all 83 files. Their screens, every RAM/save
+frame hash, audio prefix, captures and retained dumps also match the long
+reference's prefix. Only the explicitly different profile window and observer
+diagnostics differ from that long reference.
+
+The existing register observer captures all 40,316 word stores in the original
+ARM7 copy routine at `02380154`, during frames 0–5. Each table pointer, source,
+destination, length/end, data word and return/pipeline link matches the pinned
+image: 47 words for section 1, 15,141 for section 2 and 25,128 for section 3.
+This directly verifies the bounded original boot mapping, beyond inferring it
+from a parser. It does not test changed instruction timing or native mapping.
+
+| Delivery check | Original | Identical-byte control |
+|---|---:|---:|
+| Cartridge bytes | 134,217,728 | All identical |
+| Town replay frames / complete files | 16,800 / 241 | All identical |
+| Boot replay frames / complete files | 2,601 / 83 | All identical |
+| Boot copy word stores | 40,316 | All identical |
+| Changed-code replay / native timing | Not part of control | Not run |
+
+The 36-byte target context is absent from shared WRAM at frame 0 and present
+by frame 1. Its initial staging copy at `02384088` still matches through the
+early checkpoints, but has been overwritten by frame 2600. The comparison
+extension must handle both physical copies and leave reused or unmatched
+memory raw. The current comparator only supports ARM9 main/overlay RAM, so
+it cannot yet authorize an ARM7 candidate comparison. Never blindly subtract
+the patch address from the main-RAM base or mask the staging location forever.
+
+The candidate remains disabled, and no speedup or new beta is claimed. Next:
+qualify context-aware ARM7 shared/private-WRAM and staging comparisons, then
+run the changed stream through exact replay, lifecycle and native-performance
+gates. Broader active outdoor, battle and save-write/cold-reload routes remain
+needed; safe pitch-cache storage is still unproved.
+
+Evidence: `ARM7_AUTOLOAD_DECISION_V1.json`,
+`ARM7_AUTOLOAD_LOADER_TESTS_V1.json`, `ARM7_AUTOLOAD_NOOP_PREFLIGHT_V1.json`,
+`ARM7_AUTOLOAD_CANDIDATE_PREFLIGHT_V1.json`, `ARM7_AUTOLOAD_CONTROL_V1_STATUS.json`,
+`ARM7_AUTOLOAD_BOOT_MAPPING_V1.json`, `ARM7_AUTOLOAD_BOOT_CONTROL_V1_STATUS.json`
+and `ARM7_AUTOLOAD_BEFORE_AFTER_V1.csv`.
+
+## ARM7 comparison qualification
+
+The existing comparison helper now accepts explicit main/shared/private RAM
+views for authenticated autoload contexts. It checks the full 36-byte context
+before normalizing the single changed byte in a local copy. Unloaded, partial
+and reused contents remain raw. Both initial staging and executing copies are
+derived from the existing guarded loader; no alternate patch loader or live
+memory mutation is involved. Legacy ARM9 and full-body overlay behavior remains.
+
+All 51 C++ comparison checks and seven Python tests pass. Only the diagnostic
+frontend is rebuilt as `arm7_compare_oracle_v11`; the linked CPU, core, renderer
+and audio objects remain identical. Its unpatched town control reproduces all
+241 files over 16,800 frames, and its boot control reproduces all 83 files over
+2,601 frames. Normalized main/shared/private RAM hashes equal the raw control
+hashes on every frame. The counters explicitly retain unmatched staging after
+reuse instead of masking it by address. This qualifies comparison controls,
+not the candidate's asynchronous behavior or native performance.
+
+Evidence: `ARM7_COMPARISON_TESTS_V1.json`, `ARM7_COMPARISON_BUILD_V11.json`,
+`ARM7_COMPARISON_QUALIFICATION_V1.json`, `ARM7_PITCH_CARRY_CONTROL_V2_STATUS.json`
+and `ARM7_COMPARISON_BOOT_CONTROL_V1_STATUS.json`.
+
+## One-byte ARM7 pitch trial — rejected
+
+The changed stream completed all 16,800 frames. The observer fetched the new
+`20211593` opcode in all 57,827 target calls, each with C=0 and R3=0. Pitch
+still has 397 captured input pairs, with identical R0 results for every shared
+pair. This verifies bounded changed-instruction execution in the software
+reference; it does not prove native fetch/cache behavior or whole-game equality.
+
+| Metric | Control | Candidate |
+|---|---:|---:|
+| ARM9 reference entries, frames 15000–16799 | 292,331,250 | 292,330,960 |
+| ARM7 reference entries, same window | 45,944,604 | 45,944,758 |
+| Top / bottom screen mismatches | 0 / 0 | 0 / 0 |
+| Different stereo samples of 13,479,065 | 0 | 73,833 |
+| Maximum signed-16 audio delta | 0 | 2,974 |
+| Main-RAM / DTCM word differences at checkpoint 14300 | 0 / 0 | 49 / 3 |
+| Per-frame / final save mismatches | 0 / 0 | 0 / 0 |
+
+Audio RMS delta is 8.593533, with no alignment, masking or audibility judgment.
+Ten of eleven fixed RAM checkpoint sets match; frame 14300 fails main RAM and
+DTCM. Its ARM7 private/shared RAM and ITCM still match after exact code
+normalization. The retained frame-2600 main-RAM dump also matches. Transient
+per-frame differences occur in main RAM on 30 frames, DTCM on 110 and ARM7
+private WRAM on 618; normalized shared WRAM and save hashes match throughout.
+The reference frame timestamp differs on 445 frames, with identical per-frame
+audio sample counts. No benign or timing-only explanation has been established
+for the differing data, and the output gate is not relaxed.
+
+**Rejected and disabled.** The two CPU entry totals are reference observations,
+not native cycles or gameplay speed. The failed predicate still has an
+instruction entry; skipping the multiply does not make the nine-entry block
+shorter. No native frame-time, dropped-frame, HPS-load or load-time improvement
+is qualified. Do not repeat the unchanged candidate, combine it, transfer FFT's
+perceptual allowance or promote it to a beta. The existing Beta2 stays intact.
+
+The shared ARM7 loader and comparison remain useful for future candidates.
+The next priority is a visually reviewed active outdoor route, then a battle
+and isolated save-write/cold-reload coverage, followed by profiling those
+scenes. A safe pitch cache and the whole-empty HBlank callback idea remain
+deferred; neither has a storage/lifecycle or layout proof.
+
+Evidence: `ARM7_PITCH_CARRY_REPLAY_DECISION_V1.json`,
+`ARM7_PITCH_CARRY_PAIR_COMPARISON_V1.json`,
+`ARM7_PITCH_CARRY_EXECUTION_AUDIT_V1.json`,
+`ARM7_PITCH_CARRY_CHECKPOINT_DIFF_V1.json`,
+`ARM7_PITCH_CARRY_CANDIDATE_V1_STATUS.json` and
+`ARM7_PITCH_CARRY_REPLAY_BEFORE_AFTER_V1.csv`.
+
+## Bounded outdoor walking baseline
+
+The unpatched route now walks 16 tiles outside the player's house. Five
+checkpoint positions follow `(116,886) → (119,886) → (119,891) → (119,886) →
+(116,886)`. Screenshots, coherent avatar/manager backlinks, stored location and
+fixed-point world position agree. The 600-frame profile window includes turns,
+pauses and a collision at the southern tree boundary. This establishes bounded
+walking coverage, not continuous movement, battle or a representative full-game
+benchmark.
+
+An independent 15,600-frame repeat matches all 180 complete output files:
+both screens, per-frame RAM hashes, five full checkpoint sets, audio, saves and
+profiles. No code bytes or RAM regions are normalized for these unpatched runs.
+
+| Metric | Baseline | Independent repeat |
+|---|---:|---:|
+| Complete replay frames | 15,600 | 15,600 |
+| ARM9 reference entries, frames 15000–15599 | 98,783,080 | 98,783,080 |
+| ARM7 reference entries, same window | 16,043,379 | 16,043,379 |
+| Different complete output files | 0 | 0 |
+| Native speed improvement | Unmeasured | Unmeasured |
+
+All 31 256-byte bins above 2% of that CPU's instruction-sample total were
+screened. The largest ARM9 bins remain IRQ/context dispatch (10.53%), transfer
+helpers (10.40%), and hardware-math context preservation (6.49%). These are bin
+sample shares, not function cycle shares. Two additional ARM7 bins cross the
+threshold: timed callback queue dispatch at `037fa700` (2.23%) and sound sequence
+state traversal at `037fd000` (2.06%). The former changes timer/queue state and
+calls callbacks; the latter traverses 16 state records, advances accumulators
+and invokes sound helpers. Neither is established as dead or redundant work.
+All 133 newly sampled sites in these bins match owned main/autoload bytes;
+overlay 5 matches its complete original body at all five checkpoints.
+
+The generic ARM detector again finds the known copy, sparse-mask and
+carry-predication shapes. This is no reason to reinstate rejected candidates.
+All four remain disabled, and rc12 plus accepted FFTA2 Beta2 are unchanged.
+
+The first navigation probe exposed a tooling issue: a comment stopped the
+oracle's formatted input reader before the added movement. That run is retained
+and excluded. The shared `validate_replay_inputs.py` preflight now rejects
+comments, malformed rows and invalid bounds/masks. Eight tests pass, and the
+actual malformed route is rejected. The corrected route has 127 validated
+intervals. The oracle and product runtime were not rebuilt or changed.
+
+Next priorities are ordinary-input rival/story progression into a battle,
+isolated save-write/cold reload, and candidate selection from that broader
+workload. A pitch cache still requires safe storage/lifetime proof; the
+whole-empty HBlank idea still lacks layout and callback/IRQ proof.
+
+Evidence: `OUTDOOR_ROUTE_V2_REPEAT_COMPARISON.json`,
+`OUTDOOR_ROUTE_V2_REVIEW.png`, `OUTDOOR_ROUTE_V2_COORDINATES.json`,
+`OUTDOOR_PROFILE_SCREEN_V1.json`, `OUTDOOR_PATTERN_SCREEN_V1.json`,
+`OUTDOOR_BASELINE_REPEAT_V1.csv`, `REPLAY_SCENE_REVIEW_V4.json`,
+`REPLAY_INPUT_VALIDATION_TESTS_V1.json` and
+`ACTIVE_BATTLE_ROUTE_PROPOSAL_V1.json`.
+
+## Rival story, in-game save and cold-load baseline
+
+Normal inputs now reach the rival's outdoor collision/dialogue event and enter
+his house. Screenshots and checkpoint coordinates show the outdoor event at
+`(105,877)` after the scripted push-back, followed by house 1F, map 412, at
+`(6,10)`. The independent 23,000-frame story-and-save repeat matches all 258
+complete output files, including both screens, every RAM/save hash, seven full
+checkpoint sets, audio and the final save. Unchanged prefixes of every route
+extension also match; the initial navigation profile has a separately declared
+measurement window.
+
+The game menu's normal Save command writes only to the disposable replay
+buffer. Its first 19,600-frame probe ended mid-write and is excluded as a seed.
+The extended run visibly displays "A saved the game" at frame 19920 and returns
+to the room. Save hashes first change at 19435, last change at 19776, and remain
+stable for the final 3,223 frames. The independently repeated save is identical.
+The original ROM and parent save remain unchanged.
+
+| Metric | Baseline | Independent repeat |
+|---|---:|---:|
+| Complete story/save frames | 23,000 | 23,000 |
+| Identical story/save output files | 258 | 258 |
+| Last save-hash change frame | 19,776 | 19,776 |
+| Stable final save frames | 3,223 | 3,223 |
+| Cold-load frames | 3,200 | 3,200 |
+| Identical cold-load output files | 61 | 61 |
+| Native speed improvement | Unmeasured | Unmeasured |
+
+Cold boot with the completed game-generated save restores house 1F at `(6,10)`
+in all three checkpoints (1600, 2600 and 3000), rather than the original bedroom.
+Screenshots and internally consistent avatar/location state agree. The complete
+save remains unchanged on every cold-load frame. A second independent cold-load
+run reproduces all 61 files exactly. This qualifies an unpatched software-reference
+seed for later route construction; it is not native save validation or an emulator
+save-state round trip.
+
+The new 524,288-byte seed has SHA-256
+`706c9febdf25cb903481c4a6d405f647c4309cfdf841a995a4c56f01157e6292`.
+Its admission receipt pins the original parent, complete producing input route,
+save completion evidence, both repeats and cold-load inputs. Keep this provenance
+when using it to shorten future setup. Never use the excluded partial output.
+
+The exploratory navigation/dialogue window at frames 15600–16799 has 30 bins
+above 2% instruction-sample share. They retain previously evidenced roles; all
+21 newly sampled sites match owned code. There is no new removable-work proof.
+Save and cold-load runs disable profiling. All four guest candidates remain
+disabled, with no new native measurement, beta, RTL or product-runtime change.
+
+The next three priorities are rival-house 2F/story progression into a deterministic
+battle, a controlled native walking/battle baseline after fresh ownership checks,
+and candidate selection from that broader workload. The pinned source suggests a
+staircase at `(2,3)` in house 1F; the route around furniture is still a proposal.
+Pitch-cache storage/lifetime and the HBlank callback/IRQ proof remain open.
+
+Evidence: `STORY_SAVE_SEED_ADMISSION_V1.json`,
+`STORY_SAVE_V2_REPEAT_COMPARISON.json`,
+`STORY_COLD_LOAD_V1_REPEAT_COMPARISON.json`,
+`STORY_SAVE_V2_COMPLETION_REVIEW.png`, `STORY_COLD_LOAD_V1_REVIEW.png`,
+`STORY_ROUTE_PREFIX_AUDIT_V3.json`, `STORY_NAVIGATION_PROFILE_SCREEN_V1.json`,
+`STORY_SAVE_RELOAD_BASELINE_REPEAT_V1.csv`, `REPLAY_SCENE_REVIEW_V5.json`
+and `RIVAL_HOUSE_BATTLE_ROUTE_PROPOSAL_V2.json`.
+
+## First trainer battle and broader profile — 28 October 2026
+
+Ordinary input from the admitted rival-house save now reaches house 2F,
+Route 201, starter selection and the first rival battle. Turtwig fights Chimchar,
+uses Tackle, takes damage, wins, gains 69 experience points and reaches level 6.
+The 26,000-frame exploratory route then returns home. No coordinates, story
+flags, ROM bytes or save data were edited. Its final save remains the original
+pre-starter checkpoint; it is not a post-battle seed.
+
+An independent 23,400-frame run repeats the exact input prefix and profiles
+frames 18000–23399: trainer introduction, turns, victory, level-up and the exit
+transition. Both screen hashes, frame metadata, every game RAM/save hash,
+18,774,412 stereo audio samples and all 247 shared complete files match. The six
+fixed checkpoint sets include full CPU registers and RAM. Only the declared
+instruction counters and PC-sample files differ because the first run disabled
+profiling. No game data is normalized. The later return-home tail is visually
+reviewed but is outside this independent repeat.
+
+| Metric | Unpatched baseline prefix | Independent profiled repeat |
+|---|---:|---:|
+| Compared frames | 23,400 | 23,400 |
+| Different screen / game-RAM / save frames | 0 | 0 |
+| Different stereo samples | 0 | 0 |
+| Matching complete shared files | 247 | 247 |
+| ARM9 entries, frames 18000–23399 | Profiling disabled | 294,410,989 |
+| ARM7 entries, same window | Profiling disabled | 203,495,901 |
+| Native speed improvement | Unmeasured | Unmeasured |
+
+The profile has 21 bins above 2% of their CPU's periodic instruction samples,
+including seven newly prominent bins. All 502 newly sampled sites in these bins
+match owned code. The six battle checkpoints also match the entire decoded
+overlay 16 body, SHA-256
+`cdee3e91570eca14296be7164b03926d729d914a293d4db5098aeed4bb7f1950`.
+These are 256-byte screening bins, not function cycle shares or native speed.
+
+The leading ARM9 bin is cartridge block-read polling at `020cd400` (27.38%).
+Owned instructions at `020cd488–020cd4ac` poll `040001a4`, read `04100010` when
+data is ready, and store data for a 512-byte block. This is an active transfer
+with request bookkeeping; blindly removing the loop or replacing it with a
+generic interrupt wait is not justified. A request/recurrence census can test
+whether repeated reads offer a safe cache or prefetch opportunity.
+
+Other leads are six-byte strided callback uploads at `020a7e00` (3.33%), a
+four-input packed-nibble lookup-table generator at `0201da00` (2.48%), a
+completion-flag wait at `020cac00` (2.18%), and overlay 16's 256-byte table
+reduction at `02251f00` (2.02%). The generator writes 256 halfwords into existing
+storage; repeated inputs and all table writers have not yet been observed.
+The overlay's nearby helpers mutate its table, so caching the sum requires an
+invalidation/lifetime proof. The wait condition has mode-dependent service
+calls, whose wakeup contract remains unknown. ARM7 adds stateful sound-sequence
+work and a 25-bit IRQ-table scan; neither is established as removable work.
+
+The existing generic ARM scanner was rerun with the new profiles. Its coverage
+still excludes Thumb and overlays; the new generator and reduction are manual
+leads, not reusable automatic signatures or admitted patches. No unchanged
+rejected candidate was retried, and all four patches remain disabled.
+
+The first contact sheet had red and blue swapped because legacy `.rgba` files
+contain BGRA8888. Correct decoding shows the trainer followed by Chimchar;
+there is no retained-trainer evidence in those frames. Corrected previews are
+new artifacts. Raw captures, equality evidence and the renderer are unchanged.
+
+Native tooling was inspected offline only. The old FFT wrapper hard-codes a
+64 KiB save; Platinum needs 512 KiB. Reuse the existing rig with an isolated
+Platinum configuration and fresh ownership/lease/process checks. The diagnostic
+PC collector requires a tagged bitstream; exact rc12 support and overhead are
+unqualified. No hardware was contacted, no new service/RTL was introduced,
+and no new beta or native improvement is claimed.
+
+The next three investigations are the table generator's input/write lifetime,
+cartridge transfer recurrence and phase distribution, and the upload/reduction
+helpers' data contracts. Native walking/battle cadence, pacing and audio remain
+a separate required baseline before accepting a speedup.
+
+Evidence: `FIRST_BATTLE_REPEAT_COMPARISON_V1.json`,
+`FIRST_BATTLE_PROFILE_SCREEN_V1.json`, `FIRST_BATTLE_PATTERN_SCREEN_V1.json`,
+`FIRST_BATTLE_NEW_BINS_DISASSEMBLY_V1.txt`,
+`FIRST_BATTLE_NEW_BINS_CONTEXT_V1.txt`, `FIRST_BATTLE_OVERLAY_IDENTITY_V1.json`,
+`FIRST_BATTLE_ROUTE_V1_REVIEW_BGRA.png`,
+`FIRST_BATTLE_ROUTE_V2_PROGRESS_BGRA.png`, `FIRST_BATTLE_RESULT_REVIEW_BGRA.png`,
+`FIRST_BATTLE_PREVIEW_FORMAT_REVIEW_V1.json`,
+`FIRST_BATTLE_BASELINE_REPEAT_V1.csv`, `REPLAY_SCENE_REVIEW_V6.json`,
+`NATIVE_BASELINE_PREPARATION_FINDINGS_V1.json`
+and `BATTLE_HOTSPOT_CONTRACT_PROPOSAL_V1.json`.
+
+## Font lookup-table recurrence and complete-function effects
+
+The owned Thumb routine at `0201d9fc` builds 256 halfwords at `021c0500` from
+three color arguments. Its structure matches the pinned decompilation's
+`Text_GenerateFontHalfRowLookupTable`: four nested loops enumerate combinations
+of `[0, foreground, shadow, background]`. That source calls the generator
+before immediate text rendering and during text-printer task updates. It is a
+semantic guide; the exact owned bytes, observed arguments and writes establish
+the contract. No shared SDK or cross-title signature is claimed.
+
+The existing generic memory and RAM-bus observers were enabled for the entire
+23,400-frame route. The first probe incorrectly requested a main-RAM stack
+span and stopped on the existing mapping guard. It is retained and excluded.
+The corrected probe records entry table/metadata and entry/exit registers
+without guessing the stack mapping. All 250 shared complete output files,
+screen/frame metadata, audio, save and game-RAM hashes match the qualified
+unpatched replay. Only declared counters/sample files and new observer files
+differ. No product code or observer binary changed.
+
+| Observation | Full route, 0–23399 | Battle window, 18000–23399 |
+|---|---:|---:|
+| Complete generator calls | 8,900 | 1,338 |
+| Distinct color triples | 12 | 8 |
+| Existing table already correct for current inputs | 8,833 | 1,281 |
+| Existing three-color key falsely predicts a correct table | 0 | 0 |
+| Same-table opportunities | 99.25% | 95.74% |
+
+The generic recurrence tool separately verifies complete argument recurrence
+and the declared R0/R1/R2 output registers. Its fixture does not pretend to
+capture output table bytes. A separate write-contract audit validates every
+one of the 2,278,400 table halfword stores, plus 26,700 color-metadata stores,
+against the exact nested-loop model and paired entry arguments. All 8,900
+invocations complete, and their pre-POP registers and NZCV match the modeled
+original effects.
+
+All 2,305,400 observed writes to the selected ranges are attributed: the
+generator, 130 bootstrap zero-word stores, and 170 writes to an unrelated
+metadata byte at `021c04d8`. After initialization, the generator is the only
+observed table/color-field writer. There are no ARM7 or DMA writes to these
+ranges in this replay. This is bounded interpreter/bus evidence; direct host
+initialization, untested scenes, save-state loading and native cache visibility
+are outside that claim. No unused scratch memory is asserted.
+
+A naive early return would fail exactness even with a correct table. Thirty-two
+synthetic cases using the existing equivalence runner verify that the original
+function also leaves R0=4, R1=510, R2 as the background value replicated by
+bitwise shifts/ORs, R12 and LR equal to entry SP minus 40, and NZCV=`0110`.
+It restores saved registers/SP but writes 72 bytes below entry SP, including
+local counters, pointers, colors and saved registers. The observed entry SPs
+are `027e3510–027e3700`, within the DTCM range shown by the checkpoints; frame
+boundary SP snapshots in a different task did not predict this call stack.
+Dynamic stack bytes were not captured in the corrected census. The synthetic
+model checks their complete original contents and all mapped memory effects.
+
+The original takes 5,247 synthetic instruction entries per call. Eliminating
+every instruction from all 1,281 matching battle calls would remove at most
+6,721,407 entries, or 2.283% of that window's ARM9 total. This intentionally
+optimistic bound excludes the necessary guard, register/stack reproduction and
+fallback costs. It is not a measured candidate improvement or native speedup.
+
+The next patch design should use a guarded replacement within the authenticated
+function extent, preserve the original input-domain semantics and complete CPU/
+stack effects, and retain generation on a miss. No extra validity flag, code
+cave or scratch area is admitted. Cache lifetime, asynchronous readers, reset,
+save/reload and non-target scenes still need qualification. All four earlier
+patches remain rejected and disabled; no new candidate or beta is enabled.
+
+Evidence: `LOOKUP_TABLE_IDENTITY_V1.json`, `LOOKUP_TABLE_SOURCE_GUIDE_V1.json`,
+`LOOKUP_TABLE_CENSUS_V1_EXCLUSION.json`,
+`LOOKUP_TABLE_CENSUS_QUALIFICATION_V1.json`, `LOOKUP_TABLE_RECURRENCE_V1.json`,
+`LOOKUP_TABLE_ENTRY_REUSE_V1.json`, `LOOKUP_TABLE_WRITER_CENSUS_V1.json`,
+`LOOKUP_TABLE_WRITE_CONTRACT_V1.json`,
+`LOOKUP_TABLE_ORIGINAL_EFFECT_MODEL_V1.json`,
+`LOOKUP_TABLE_BEFORE_AFTER_V1.csv` and `LOOKUP_TABLE_REUSE_PROPOSAL_V1.json`.
+
+## Font-table reuse replacement: rejected by full replay
+
+`font-table-last-colors-reuse` fits in the original 164-byte ARM9 Thumb
+function/literal extent at `0201d9fc`. It compares the three stored 16-bit
+colors with the complete 32-bit arguments. A match reuses the table; a miss
+regenerates it. Both paths reproduce the original register, flags and 72-byte
+stack effects. There is no code cave, new scratch, overlay, HPS service or RTL
+change. The original ROM is read-only; the existing virtual cartridge loader
+streams the guarded replacement into the reference instance.
+
+The existing block checker now supports explicit ordinary-RAM effect ranges
+and reads of unchanged code literals. It still compares every mapped byte,
+all CPU effects and ordered accesses outside the declared ranges. Six focused
+tests and the prior 6,800-case ARM7 suite pass. The new patch passes 8,672 cases:
+all 4,096 four-bit color triples as coherent hits and misses, wider inputs,
+every mismatch branch, all NZCV combinations and ARM/Thumb returns. A deliberate
+matching-key/wrong-table case fails as expected. Table coherence remains a
+precondition, not a consequence of matching the key.
+
+The unchanged virtual-adapter control matches all 253 baseline files across
+23,400 frames. The first control launch used a system Python without NumPy and
+failed before starting the oracle; it is retained and excluded. The successful
+control and candidate use the existing testing-rig virtual environment.
+
+| Measurement | Original | Replacement |
+|---|---:|---:|
+| Synthetic coherent-table hit, entries/call | 5,247 | 42 |
+| Synthetic changed-color miss, entries/call | 5,247 | 6,701–6,707 |
+| ARM9 reference entries, frames 18000–23399 | 294,410,989 | 287,746,374 |
+| ARM7 reference entries, same window | 203,495,901 | 203,495,544 |
+| Upper-screen frames differing from control | 0 | 5 of 23,400 |
+| Lower-screen frames differing from control | 0 | 0 |
+| Stereo samples differing from control | 0 | 61,453 of 18,774,412 |
+| Fixed RAM checkpoint sets matching control | 6 | 6 |
+| Per-frame save hashes and final save | Reference | Exact |
+| Native cycles, pacing, HPS load and load time | Unavailable | Unavailable |
+
+All 1,338 watched battle calls execute the replacement: 1,281 reuse the table
+and 57 regenerate it. Their input sequence and entry/exit frame bounds match
+the original census, and every observed pre-POP CPU state meets the declared
+model. Dynamic stack bytes were not captured; their complete effects were
+checked synthetically. The replacement body is recognized on every replay
+frame. These observations establish execution and the local call contract,
+not full-game equivalence or native cache visibility.
+
+Upper-screen hashes differ at frames 18131, 19457, 20891, 22807 and 22819.
+Audio lengths match, but the maximum signed-16 delta is 2,870 and RMS delta
+15.591, without alignment, masking or an audibility judgment. Per-frame RAM
+hashes differ in 200 main-RAM, 607 DTCM and 75 ARM7-WRAM frames. All six fixed
+checkpoint sets and retained frame-2600 main RAM are exact after normalizing
+only the authenticated code extent; no game RAM or stack is masked.
+
+The measured 2.264% reduction is reference instruction accounting, not native
+speed. The unchanged-call synthetic model predicts 2.237%; the full reference
+also changes execution timing and surrounding work. Reject the patch under
+the current screen/audio gate and retain it disabled. Do not rerun it unchanged,
+combine it with other rejected patches, or transfer FFT's perceptual approval.
+Further reset, save/reload, unrelated-scene and native trials are not performed
+for this rejected version. Accepted Beta2 and exact rc12 remain unchanged.
+
+Next, prepare the native walking/battle baseline using the existing rig with
+an isolated 512 KiB save and fresh ownership/runtime checks. The three deferred
+optimization leads are cartridge-request recurrence and transfer phases,
+small strided upload callbacks/data, and overlay 16 table-reduction lifetime.
+Active cartridge FIFO polling is not proven dead work. Native profiling that
+needs a new diagnostic bitstream remains a proposal requiring approval.
+
+Evidence: `LOOKUP_TABLE_REUSE_BUILD_V1.json`,
+`LOOKUP_TABLE_REUSE_INPUT_MANIFEST_V1.json`,
+`LOOKUP_TABLE_REUSE_SYNTHETIC_SUITE_V1.json`,
+`LOOKUP_TABLE_REUSE_COST_MODEL_V1.json`,
+`LOOKUP_TABLE_REUSE_CONTROL_V1_EXCLUSION.json`,
+`LOOKUP_TABLE_REUSE_CONTROL_V2_STATUS.json`,
+`LOOKUP_TABLE_REUSE_CANDIDATE_V1_STATUS.json`,
+`LOOKUP_TABLE_REUSE_PAIR_COMPARISON_V1.json`,
+`LOOKUP_TABLE_REUSE_EXECUTION_AUDIT_V1.json`,
+`LOOKUP_TABLE_REUSE_REPLAY_DECISION_V1.json`,
+`LOOKUP_TABLE_REUSE_BEFORE_AFTER_V1.csv`,
+`LOOKUP_TABLE_REUSE_FINAL_AUDIT_V1.json` and
+`AFTER_FONT_REUSE_NEXT_STEPS_V1.json`.
+
+## overlay5-empty-tail-exit — authorized native perceptual screening
+
+The user explicitly authorized testing potentially imperceptible differences and
+recording videos on 28 October. This supersedes the historical no-retry/native
+restriction for this isolated experiment, without accepting its mismatches.
+
+Walking: 16.70–16.80 control versus 16.65 patched screen publications/s; menu: 14.89–15.13 control versus 14.74 patched. No native gain demonstrated. These are endpoint screen-buffer publication counts, not unique gameplay
+FPS, frame-time percentiles or emulated cycles. Native battle benefit remains
+unmeasured. The candidate stays disabled.
+
+The cold-boot trial used the same qualified disposable story save, stock 1 GHz,
+unchanged rc12 FPGA and accepted Beta2 renderer. Expected original bytes and
+the selected virtual-cartridge replacement were guarded; this is not direct
+ARM instruction-cache readback. Saves remained exact and OBS added no dropped
+frames. No RTL, new HPS service, persistent save-state format or ROM file changed.
+
+Reference audiovisual review: `Platinum_Overlay_Review.mov` (verified original PCM),
+with an AAC convenience copy. Both screens are shown side by side; every scene
+repeats with control then candidate audio, without mixing or volume changes.
+These deterministic software clips are separate from the native speed tests.
+Evidence: `NATIVE_PERCEPTUAL_RESULTS_V1.json`, native trial `PLATINUM_E2`,
+`PERCEPTUAL_EMPTY_CONTROL_V1_STATUS.json`,
+`PERCEPTUAL_EMPTY_CANDIDATE_V1_STATUS.json`, and `Platinum_Overlay_Review.json`.
+
+## fifo-word-stream-predication — authorized native perceptual screening
+
+The user explicitly authorized testing potentially imperceptible differences and
+recording videos on 28 October. This supersedes the historical no-retry/native
+restriction for this isolated experiment, without accepting its mismatches.
+
+Menu: 14.6755 control versus 14.6280 patched; Bag: 30.2040 versus 30.0440 screen publications/s. Bag-opening near-black mean: 0.4333s control versus 0.4417s patched. No native gain demonstrated. These are endpoint screen-buffer publication counts, not unique gameplay
+FPS, frame-time percentiles or emulated cycles. Native battle benefit remains
+unmeasured. The candidate stays disabled.
+
+The cold-boot trial used the same qualified disposable story save, stock 1 GHz,
+unchanged rc12 FPGA and accepted Beta2 renderer. Expected original bytes and
+the selected virtual-cartridge replacement were guarded; this is not direct
+ARM instruction-cache readback. Saves remained exact and OBS added no dropped
+frames. No RTL, new HPS service, persistent save-state format or ROM file changed.
+
+Reference audiovisual review: `Platinum_FIFO_Review.mov` (verified original PCM),
+with an AAC convenience copy. Both screens are shown side by side; every scene
+repeats with control then candidate audio, without mixing or volume changes.
+These deterministic software clips are separate from the native speed tests.
+Evidence: `NATIVE_PERCEPTUAL_RESULTS_V1.json`, native trial `PLATINUM_Q1`,
+`PERCEPTUAL_FIFO_CONTROL_V1_STATUS.json`,
+`PERCEPTUAL_FIFO_CANDIDATE_V1_STATUS.json`, and `Platinum_FIFO_Review.json`.
+
+## Native before/after — 28 October perceptual screening
+
+All trials use the same rc12 FPGA, accepted Beta2 renderer, stock 1 GHz and
+qualified disposable story seed. This comparison isolates each guest patch;
+it is not an overall Beta2-versus-original-rc12 comparison. C4/E2/C5 share the
+boundary-traversal then menu route. F1/Q1/C6 share field anchor, menu, then Bag
+without the traversal warmup. C5 Bag is supplementary control evidence.
+
+| Native scene / metric | Original game code | One patched routine | Result |
+|---|---:|---:|---|
+| Anchored walking, screen publications/s | 16.7975, 16.6995 | Empty tail: 16.6457 | No demonstrated gain |
+| Menu after walking, publications/s | 15.1344, 14.8884 | Empty tail: 14.7406 | No demonstrated gain |
+| Menu from field, publications/s | 14.6755 | Font: 14.6349; FIFO: 14.6280 | No demonstrated gain |
+| Bag cycling, publications/s | 30.2040 | Font: 30.0610; FIFO: 30.0440 | No demonstrated gain |
+| Bag-opening near-black mean, 4 cycles | 0.4333 s | Font: 0.4500 s; FIFO: 0.4417 s | No shorter visible transition |
+| Bag-closing near-black mean, 4 cycles | 1.3208 s | Font/FIFO: 1.3167 s | Sub-frame mean difference; not a qualified gain |
+| HPS helper, menu, percent of one core | 147.54% | Font: 147.30%; FIFO: 147.29% | No worthwhile load reduction |
+| HPS helper, Bag, percent of one core | 122.20% | Font: 122.68%; FIFO: 121.83% | No worthwhile load reduction |
+| Native cycles, unique-frame pacing p50/p95/max, missed VBlanks | Unavailable | Unavailable | Do not infer from publication counts |
+| Capture drops added by OBS | 0 | 0 | Capture health passed, not an emulated dropped-frame metric |
+
+Native real-time input and RTC are not deterministic reference replay. Initial
+short walking C3/E1 trials had a one-tile mismatch and are excluded, including
+their apparent positive delta. The anchored scene snapshots differ only in
+player-foot animation at entry. Staged cartridge hashes and saves match the
+intended trial before/after; direct ARM fetch/cache readback is unavailable.
+No native save-write, soft-reset, unrelated-scene or combined-patch validation
+is claimed. These results justify keeping the screened candidates disabled,
+not declaring all possible Platinum optimizations exhausted.
+
+After all measurements, a separate 15-second, 199 Hz CPU-clock profile collected
+4,668 HPS-helper leaf samples. Symbolization uses the exact accepted renderer
+binary. Functions in `SoftRenderer3D` account for 1,409 samples (30.18%); its
+cached perspective interior batch alone accounts for 332 (7.11%). Additional
+perspective math, command processing and transfer work are recorded individually
+in `PLATINUM_HPS_BASELINE_ANALYSIS_V1.json`; overlapping name groups must not be
+summed. This is HPS sampling, not an ARM9/ARM7 guest profile or cycle share.
+It supports investigating unnecessary game-side graphics submissions before
+spending more effort on small CPU-only loop savings. It does not prove that a
+particular draw call is removable or authorize a renderer/RTL change.
+
+The top three unfinished investigations are:
+
+1. Trace game-side graphics submissions in the slow outdoor scene and classify
+   repeated or provably invisible work. Test visibility/dependency contracts
+   before removing a call; no safe call site or gain has yet been established.
+2. Census the six-byte strided upload callback at `020a7e00`: compare destination,
+   data and reader lifetime to determine whether uploads repeat unnecessarily.
+   A redundant-looking transfer may still synchronize another component.
+3. Census cartridge request recurrence around `020cd488–020cd4ac`, recording
+   actual blocks, consumers and completion semantics. Active FIFO polling is
+   not dead code; any cache must fit existing mechanisms and be proven safe.
+
+The font patch's battle-specific native effect is also unmeasured. A future
+battle test first needs a qualified native route matching the reference scene;
+its reference-entry saving alone is not a reason to enable it.
+
+## font-table-last-colors-reuse — authorized native perceptual screening
+
+The user explicitly authorized testing potentially imperceptible differences and
+recording videos on 28 October. This supersedes the historical no-retry/native
+restriction for this isolated experiment, without accepting its mismatches.
+
+Menu: 14.6755 control versus 14.6349 patched; Bag: 30.2040 versus 30.0610 screen publications/s. Bag-opening near-black mean: 0.4333s control versus 0.4500s patched. No native gain demonstrated. These are endpoint screen-buffer publication counts, not unique gameplay
+FPS, frame-time percentiles or emulated cycles. Native battle benefit remains
+unmeasured. The candidate stays disabled.
+
+The cold-boot trial used the same qualified disposable story save, stock 1 GHz,
+unchanged rc12 FPGA and accepted Beta2 renderer. Expected original bytes and
+the selected virtual-cartridge replacement were guarded; this is not direct
+ARM instruction-cache readback. Saves remained exact and OBS added no dropped
+frames. No RTL, new HPS service, persistent save-state format or ROM file changed.
+
+Reference audiovisual review: `Platinum_Font_Review.mov` (verified original PCM),
+with an AAC convenience copy. Both screens are shown side by side; every scene
+repeats with control then candidate audio, without mixing or volume changes.
+These deterministic software clips are separate from the native speed tests.
+Evidence: `NATIVE_PERCEPTUAL_RESULTS_V1.json`, native trial `PLATINUM_F1`,
+`PERCEPTUAL_FONT_CONTROL_V1_STATUS.json`,
+`PERCEPTUAL_FONT_CANDIDATE_V1_STATUS.json`, and `Platinum_Font_Review.json`.
+
+## Qualified geometry census and existing prop culling
+
+The next investigation reuses the existing `NDS4MiSTer_2DTrace` sink through a
+bounded, read-only extension of the reference frontend. It changes no core,
+renderer, FPGA, HPS service or game byte. Across the full 15,600-frame outdoor
+replay, all 180 retained golden files remain exact, including screens, audio,
+saves, RAM/CPU checkpoints, profiles and instruction totals. Observation covers
+frames 15000–15599; the scene remains the previously verified walking route.
+
+| Measurement | Golden replay | Geometry observer |
+|---|---:|---:|
+| Retained golden files matching | Reference | 180 / 180 |
+| Selected ARM9 instruction entries | 98,783,080 | 98,783,080 |
+| Selected ARM7 instruction entries | 16,043,379 | 16,043,379 |
+| Native speed/pacing measurement | Not part of this unit | Not part of this unit |
+| Game patches enabled | None | None |
+
+The 600-frame observation has 300 swap submissions and 5,686,767 normalized
+command parameter packets; 4,811,611 occur while DMA is active. Of 299 complete
+swap-bounded intervals, 197 payload hashes are distinct and 102 adjacent pairs
+match. Partial leading traffic is excluded. Matrix, texture, palette and other
+external dependencies still matter; no frame reuse or draw omission is admitted.
+The existing geometry-frame counters report 1,075–1,327 vertices and 280–350
+polygons (medians 1,284 and 339). These are renderer bookkeeping counters, not
+unique animation FPS or guest/native cycle counts.
+
+The leading CPU context is the known word-stream store at `020c4bac`, reached
+from `020b2834`, with 842,156 parameter packets. The guarded disassembly shows
+that this caller sends an opcode to `04000400`, then calls the word-stream
+helper. It is a submission path, not a proof that its payload is redundant.
+DMA traffic is deliberately not attributed to the interrupted instruction.
+
+Owned ARM9 instructions at `0201ced8–0201cf73` match the model-box-test
+structure described in the pinned decompilation: set model transforms, push/
+scale, issue the query, wait for completion, pop and return. The overlay-5 call
+at `021e1824` tests the result and branches around the prop draw at `021e1862`.
+An independently qualified register census matches all 180 golden files and
+records 2,400 complete calls with no partial boundaries: 1,729 return zero and
+671 return two. The owned getter at `020bfe80` explicitly masks GXSTAT with 2;
+raw success is **2**, not 1. Any replacement must preserve that actual value.
+All calls originate at `021e1829` in this scene. This confirms substantial
+existing prop culling, rather than a missing off-screen-prop test.
+
+Only four model resource pointers appear, but several are shared by different
+instances. Model `022fbe64` returns visible 300 times and hidden 900 times, with
+four scale pointers and reused stack position/rotation pointers. Model-pointer
+or stack-pointer equality is not a valid visibility-cache key. Actual object
+transforms, camera/projection, bounds, viewport and all query side effects must
+be captured before proposing a cache.
+
+The first register census stopped on the strict opcode guard: at aligned Thumb
+`0201ced8`, the sampler exposes the two-halfword prefetch value `b08db5f0` although
+the current instruction is `b5f0`. That run is excluded. The corrected observer
+uses `0201ceda`, after the unchanged register push, where R0–R3/LR are intact and
+SP is caller-SP minus 20. The byte/mode guard is retained. No failed trace was
+used to establish runtime behavior.
+
+A separate owned overlay path at `021e89d0–021e8a97` calculates a map-chunk
+position, checks its loaded-valid flag, sets identity rotation/unit scale and
+calls the draw helper at `021e8a56`; it then handles props separately. This
+matches the decompiled terrain path, which lacks the prop-level box test.
+The exact call-site bytes are retained with the decoded overlay identity.
+This is a promising **research lead**, not proof that a loaded terrain chunk is
+invisible or can safely be skipped. Next census its model/transform inputs and
+actual visibility, then prove state effects and a safe patch location. Added
+query/round-trip costs could outweigh saved submissions, so native A/B remains
+mandatory before recommending a beta.
+
+The next three bounded investigations are terrain-chunk draw/visibility
+contracts, complete visibility-query input/state recurrence, and repeated
+strided-upload data/reader lifetimes. Cartridge-request recurrence remains
+queued. No native session, patch enablement or new beta follows this census.
+
+Evidence: `GEOMETRY_BUILD_V12.json`, `GEOMETRY_OUTDOOR_QUALIFICATION_V1.json`,
+`GEOMETRY_OUTDOOR_CENSUS_V1.json`, `GEOMETRY_CALLER_DISASSEMBLY_V1.txt`,
+`GEOMETRY_OVERLAY5_CALL_SITES_V1.json`, `TERRAIN_DRAW_DISASSEMBLY_V1.txt`,
+`BOXTEST_REGISTER_CENSUS_V1_EXCLUSION.json`,
+`BOXTEST_REGISTER_QUALIFICATION_V2.json`, `BOXTEST_REGISTER_FINDINGS_V2.json`
+and `BOXTEST_RESULT_DISASSEMBLY_V1.txt`.
+
+
+## overlay5-terrain-visibility — disabled reference experiment
+
+A terrain-only argument census at the owned overlay-5 call `021e8a56` passes
+all 180 retained golden files. It observes 1,200 draws: four render objects,
+300 calls each. Every rotation and scale equals the existing overlay's identity
+matrix at `021faeb8` and unit vector at `021faea0`. The four model pointers and
+positions remain stable in frames 15000–15599. Full-route RAM bus observation
+records loading writes, but none to these model headers or constants during
+that target window; this does not establish globally unused memory.
+
+The experiment replaces exactly 48 bytes at `021e8a2a`, within the original
+terrain function. It calls the game's existing `GFXBoxTest_IsModelInView` with
+that chunk's model and transforms, then draws only on a nonzero result. Props
+continue through the original independent path. Passing the existing immutable
+rotation/scale constants directly frees space previously used for stack copies.
+No trampoline, new storage, HPS service, RTL or ROM-file write is involved.
+Overlay ID 5, its full decoded hash, game/header/ARM9 identities and all original
+bytes are guarded by the existing virtual-cartridge mechanism. The replacement
+inherits overlay loading and reloading; it is not keyed by address alone.
+
+| Target-window measurement | Control | Terrain candidate |
+|---|---:|---:|
+| ARM9 instruction entries | 98,783,080 | 97,162,803 (−1.640%) |
+| ARM7 instruction entries | 16,043,379 | 16,043,379 |
+| Terrain draw-helper calls | 1,200 | 590 |
+| Added terrain box tests | 0 | 1,200 |
+| Existing prop tests: hidden / visible | 1,729 / 671 | 1,729 / 671 |
+| Later native mean publications/s | 17.0125 | 19.2518 (+13.162%) |
+
+The new tests return 610 hidden and 590 visible results. Other draw callers
+retain their observed counts. These are reference execution counts, not native
+cycles, geometry work saved, unique FPS or a native speedup. Extra synchronous
+queries could erase the benefit on hardware.
+
+The full 15,600-frame replay fails the strict gate: six top-screen frames differ
+(14357, 14359, 14479, 14481, 14483, 14485), while every bottom screen and the
+final save match. All 600 target-window screen pairs match. Of 12,516,274 stereo
+samples, 239,992 differ, with maximum channel delta 1,215 and RMS 9.153. Fixed
+main-RAM and DTCM checkpoints also differ after normalizing only the exact code
+replacement. Removed stack copies and the added graphics query alter execution,
+but that is not a blanket explanation or acceptance of all RAM/audio changes.
+The differing frames, audio and RAM remain explicit and unaccepted.
+
+The user authorized perceptual experiments. Visual inspection and the isolated
+native A/B below are complete; user review and broader qualification remain.
+Cold boot is covered by reference replay; native save/load, reset, additional
+transition/overlay and unrelated-scene checks remain pending. The core does not
+currently support persistent save states. Nothing is enabled in a default beta.
+
+Evidence: `DRAW_REGISTER_QUALIFICATION_V1.json`, `DRAW_REGISTER_FINDINGS_V1.json`,
+`TERRAIN_CONTRACT_QUALIFICATION_V1.json`, `TERRAIN_CONTRACT_FINDINGS_V1.json`,
+`TERRAIN_CULL_BUILD_V1.json`, `TERRAIN_CULL_DISASSEMBLY_V1.txt`,
+`TERRAIN_CULL_CONTROL_V1_STATUS.json`, `TERRAIN_CULL_CANDIDATE_V1_STATUS.json`,
+`TERRAIN_CULL_REFERENCE_FINDINGS_V1.json`, `TERRAIN_CULL_RAM_DIFF_V1.json`.
+
+
+## Terrain visibility — repeated native gain, approval still pending
+
+Four cold-boot sessions alternate control and candidate using the same qualified
+story seed and the same south/west collision anchor. All four starting views and
+the second pair's ending views were inspected. Stock 1 GHz, unchanged rc12 FPGA,
+accepted Beta2 renderer and the existing virtual-loader host are pinned. The
+48-byte virtual cartridge replacement and CPUE revision 1 identity were checked
+before and after capture; this is not an instruction-cache readback claim.
+
+| Trial | Complete buffer publications/s | Renderer CPU, one core = 100% |
+|---|---:|---:|
+| PLATINUM_TC1 (control) | 16.7726 | 149.88% |
+| PLATINUM_T1 (candidate) | 19.1382 | 150.64% |
+| PLATINUM_TC2 (control) | 17.2525 | 150.73% |
+| PLATINUM_T2 (candidate) | 19.3653 | 151.18% |
+
+The means are **17.0125 → 19.2518 publications/s (+13.162%)**. Both candidate
+runs exceed both controls; control range is 2.821% of its mean. No formal
+statistical confidence interval or whole-game improvement is claimed. The
+20-second interior idle screen stays near its publication ceiling: 59.7131
+control versus 59.6371 patched (−0.127%). That single pair does not qualify every
+interior or battle. Every captured interval reports zero added OBS drops, and
+all disposable saves remain equal to the admitted seed.
+
+The measured ABI word is `frame_publish_sequence` at offset 0x30. The exact
+accepted renderer source commits it after screen-buffer publication; query
+replies use a separate path. More queries do not by themselves count as more
+completed screen buffers. Publications still are not necessarily unique images,
+so this result is a **rendering throughput gain**, not measured animation FPS or
+faster game-clock progression. A preliminary background-motion census shows
+roughly similar crossing durations; it is not a qualified traversal-time test.
+Native ARM9/ARM7 cycles and frame-time percentiles remain unavailable.
+
+Reference clips include all six differing banner/transition frames, the exact
+600-frame walking window, and the largest measured RMS and peak audio-difference
+windows (frames 4958 and 8105). The original PCM comparison alternates control
+and patched sound without gain changes, mixing or resampling. The MP4 is an AAC
+convenience copy. Native recordings retain original encoded game-audio/video
+packets and exact timestamps. The initial shorter reference clip omitted the
+largest audio-difference windows and is superseded by the expanded V2 review.
+
+The archive remains unchanged Beta2. A user-facing review is a request to judge
+these audiovisual differences, not evidence that unclassified RAM changes or
+all game behavior are safe. Native save-write/load, soft reset, additional
+transitions, an unrelated scene and RAM-effect classification remain to be done
+before default enablement. All six Platinum candidates stay disabled.
+
+Operational exclusions are retained: the first staging connection timed out
+in verification after copying its private kit; a fresh idle/full-hash recovery
+admitted the completed files without rewriting them. An early boot-input route
+landed at Continue rather than the field and was corrected before measurement.
+The first interior measurement fixture omitted the required terminal marker;
+it failed before measurement and was replaced by V2. None contributes a result.
+
+Evidence: `TERRAIN_NATIVE_FINDINGS_V1.json`, `TERRAIN_NATIVE_INTERIOR_FINDINGS_V1.json`,
+`TERRAIN_NATIVE_METRIC_AUDIT_V1.json`, `TERRAIN_NATIVE_MOTION_CENSUS_V1.json`,
+`TERRAIN_CULL_AUDIO_WINDOW_AUDIT_V1.json`, `TERRAIN_CULL_PIXEL_FINDINGS_V1.json`,
+`TERRAIN_CULL_VISUAL_AUDIT_V1.json` and the individual capture/status/stop receipts.
+
+The top three optimization ideas not completed are:
+
+1. Reuse visibility results only with complete model/transform/camera keys and
+   proven storage/lifetimes; existing prop queries are frequent, but pointer-only
+   reuse is already disproven. Any cheaper conservative terrain test must retain
+   correctness at camera and map boundaries.
+2. Census the six-byte strided upload at `020a7e00` for repeated data, destination
+   and reader lifetime before removing a transfer.
+3. Measure the disabled font-table reuse patch in its actual first-battle target
+   on hardware. Its prior menu/Bag tests found no benefit and do not establish
+   battle performance. Cartridge-request recurrence remains queued after these.
+
+## Terrain visibility — RAM writer and transfer qualification
+
+Two additional 15,600-frame replays reuse the existing main-RAM bus observer.
+All 181 common artifacts match their respective earlier control/candidate runs;
+the observer does not change their results. Its stores reconstruct all watched
+words at all five checkpoints exactly. All 574,730 CPU-store PC observations in
+the target window agree with the instruction profiler. No dynamic RAM is masked.
+
+The recurring differing words at `021cd008` and `021cd00c` are the graphics
+transfer source cursor and remaining byte count, not elapsed-time counters.
+Owned ARM disassembly at `020c4808`, `020c4900` and `020c49ac` establishes their
+initialization, chunk updates of at most 0x1d8 bytes, FIFO destination `04000400`,
+busy flag and completion callback. The observed protocol completes every started
+transfer and has no overlap, invalid pointer/length update or unfinished transfer
+at replay end. These checks concern guest bookkeeping, not physical bus capture.
+
+| Existing graphics transfer path | Control | Terrain patch |
+|---|---:|---:|
+| Full-replay starts / completions | 93,777 / 93,777 | 89,249 / 89,249 |
+| Walking-window starts / completions | 9,371 / 9,371 | 7,831 / 7,831 |
+| Walking-window requested bytes | 23,671,508 | 17,882,308 |
+| Walking-window chunk updates | 54,197 | 41,197 |
+| Protocol violations | 0 | 0 |
+
+Requested bytes through this path fall 24.46%; this is not a measurement of all
+DMA traffic or native bandwidth. A transfer can span a replay-frame boundary,
+so checkpoints may capture different live transfer positions. That explains the
+purpose of these differing fields without establishing general equivalence.
+
+Other watched main-RAM differences resolve to projection/translation state,
+the active model-draw context pointer, a graphics busy flag and its DMA callback.
+The projection word `021c5acc` is copied by the existing field-effect projection
+adjust/restore code; it is not gameplay position. The owned bytes, caller LR and
+store trace support this classification. The DTCM word `027e0054` is the graphics
+FIFO IRQ handler slot: the transfer path installs `020c4900` and restores the
+prior handler. Other DTCM differences include stack contents, but CPU snapshots
+show different live execution points and IRQ modes. They are not all proven dead
+stack. No RAM difference is accepted or excluded on this analysis alone.
+
+The private V6 runner's legacy field
+`checkpoint_RAM_equal_after_exact_code_normalization` describes its early
+`mainram.bin` snapshot only. It must not override the explicit per-checkpoint
+failures or the overall `rejected_replay_mismatch` result. This interpretation is
+recorded without changing historical receipts or weakening the comparison.
+
+Evidence: `TERRAIN_RAM_WRITER_REPEAT_V1.json`,
+`TERRAIN_RAM_WRITER_ANALYSIS_V1.json`, `TERRAIN_TRANSFER_LIFECYCLE_V1.json`,
+`TERRAIN_RAM_CLASSIFICATION_V1.json` and owned disassemblies V1–V4. The existing
+13.162% native publication gain is unchanged; no native session ran for this
+analysis. User audiovisual review, full RAM liveness, native save-write/cold-load,
+soft reset, additional overlay transitions and unrelated-scene validation remain
+pending. All six patches remain disabled and the morning beta remains Beta2.
+
+The user subsequently approved the presented audiovisual review ("Everything
+looks good"). This closes the human video/audio review step for this candidate;
+remaining RAM and lifecycle qualification still gates beta enablement. See
+`TERRAIN_USER_REVIEW_APPROVAL_V1.json`.
+
+## Terrain visibility — native save, reset and reload
+
+The candidate completed an ordinary in-game Save in Twinleaf Town using its
+isolated disposable save. Both Save/overwrite prompts were inspected, followed
+by a return to the field and a changed, stable 524,288-byte save. The timed
+"saved" message itself was not captured. L+R+Start+Select returned to copyright;
+Continue restored the outdoor location. A clean session stop and a new patched
+host/core startup restored the same location again. Entering the rival's house
+and exiting to town also passed. No original user save was changed.
+
+An unpatched control then cold-loaded that same candidate-generated save.
+The post-save, reset-loaded, patched cold-loaded and control cold-loaded PNGs
+are byte-identical. All three sessions stopped cleanly; the generated save hash
+remained unchanged after reset and both reloads. This verifies bounded native
+save compatibility and rollback for this scene, not full-game save equivalence
+or a physical power-cycle test. Exact staged cartridge bytes and fresh process,
+save-FD and kit identities were checked in each session; direct instruction-cache
+readback is not available. Persistent core save states remain unsupported.
+
+The final audit verified all 2,024 protected files, 83 private runtime files,
+the new disposable save and unchanged rc12/Beta2 archives, with MENU restored.
+No OBS recording or settings were changed for these lifecycle checks. Reference
+reset/unrelated-scene comparisons and remaining RAM liveness are still pending.
+The patch remains disabled by default; audiovisual review is already approved.
+
+Evidence: `TERRAIN_NATIVE_SAVE_SEED_V1.json`,
+`TERRAIN_NATIVE_LIFECYCLE_V1.json`,
+`NATIVE_TERRAIN_LIFECYCLE_PRESERVATION_V1.json`, and the
+`PLATINUM_TERRAIN_LIFE1`, `LIFE2`, `LIFE3` input/status/stop receipts.
+
+## Promotion and reset comparison — 28 October
+
+The separate12000-frame bedroom/reset replay has exact top/bottom frames,
+final save, and all seven full checkpoint RAM sets after authenticating and
+normalizing only the48-byte patch. Per-frame transient RAM and audio still differ:
+184514of9627902 stereo samples, maximum channel delta4058 and RMS40.630.
+This reset audio was not included in the earlier review video. It is retained as
+a limitation of the explicitly requested private promotion, not relabelled exact
+or proven inaudible. Full-game coverage and complete RAM-reader liveness remain
+open. Persistent core save states remain unsupported.
+
+Cumulative packaging uses an opt-in generic FMV fallback after a guest patch is
+skipped by its identity/byte guards. An admitted guest image remains exclusive;
+other games retain their independently guarded existing movie path. No new
+HPS service, FPGA change, guest clock change or save-state format is introduced.
+
+## Accepted baseline, functional budget and strided uploads — 28 October
+
+Platinum Beta1 R2 was installed and qualified from archive SHA-256
+`716c70cd1be4612b6e8aed50c9536917cb8585bba9c46e7b9bf9696e43e785bb`.
+Further first-battle coverage retains the exact comparison failure: the fixed
+input replay reaches different turn/HP states with terrain enabled. The
+unpatched observer control matches all 253 golden files. The user then stated,
+"I dont care about that. as long as the game still functions lets continue".
+Timing-driven RNG and replay-trajectory differences no longer block progress.
+Continue functional gameplay, progression, save and audiovisual screening;
+do not relabel differing outputs bit-exact or infer that crashes/corruption are
+accepted. The promoted terrain patch stays enabled.
+
+Owned code at `02051ea4–02051ed4` constructs a battle seed from RTC data plus
+the frame counter at `021bf6a8`. Three checkpoint words differ by five between
+the terrain control and original image (`2b0c431c` versus `2b0c4321`). This
+supports a timing explanation but is not a complete causal proof of the HP
+variation. RNG-only tracing is discontinued under the user's direction.
+Its V1 configuration was rejected before replay because its watch began before
+profiling; V2 aborted on an instruction/mode guard at a reused overlay address.
+Neither failed diagnostic validates the private RNG sequence or demonstrates
+a gameplay crash. Keep the guards intact.
+
+The OAM upload census observes 661,368 six-byte copies in the original battle
+window, of which 99.467% repeat. The accepted terrain run records 669,312 copies,
+99.447% repeated. Their different battle trajectories prohibit a direct speed
+comparison. The owned callback table resolves to main/sub OAM, with three
+ordered halfword stores per eight-byte slot and separate affine updates.
+Dirty-write skipping remains unqualified.
+
+The new disabled `oam-six-byte-inline` candidate replaces the 56-byte ARM loop
+at `020a7ed4` in the initial ARM9 image. It removes per-sprite callback and copy
+loop overhead while retaining every three-halfword read/write sequence. It uses
+no scratch, trampoline, hardware hook or HPS service. Existing zero-count,
+full-copy and affine paths remain. Normal manager screen indices must be 0/1
+and sprite ranges within 0–127; broader runtime coverage remains necessary.
+
+The shared synthetic block runner now accepts an explicit code-context base so
+the full original function and its earlier callbacks execute together. All 92
+fixtures pass complete register/CPSR/memory checks and ordered accesses outside
+two authenticated immutable callback literals. Fixtures include zero counts,
+range boundaries, both screens, active/inactive affine paths, initial flags and
+ARM/Thumb returns. For 128 sprites without affine updates, complete-function
+entries fall from 6,435/6,563 to 1,064. This is a synthetic instruction count,
+not native speed. A cumulative first-battle replay against the accepted terrain
+image is the next functional screen. New candidate remains disabled.
+
+Evidence: `FUNCTIONAL_BUDGET_STEERING_20261028.json`,
+`BETA1_UPLOAD_CONTROL_FINDINGS_V1.json`, `BETA1_UPLOAD_ACCEPTED_FINDINGS_V1.json`,
+`BETA1_BATTLE_RNG_OWNED_DISASSEMBLY_V1.txt`, `OAM_INLINE_BUILD_V1.json`,
+`OAM_INLINE_FULL_FUNCTION_PROOF_V1.json` and `OAM_INLINE_BATTLE_CANDIDATE_V1_JOB.json`.
+
+The cumulative 23,400-frame candidate replay completed. Compared with approved
+terrain alone, 1,596 top-screen and 127 bottom-screen hashes differ; reviewed
+checkpoints show coherent trainer introduction and battle turns without obvious
+sprite/UI corruption. Save and ITCM match; RAM/audio differences remain. The
+callback-table writer trace contains only the two expected startup stores and
+no later writes. ARM9 entries in the battle window are 264,018,986 versus
+234,692,591, but differing timing/trajectories prevent treating this as native
+speed. This is sufficient to proceed to the authorized functional native screen,
+not to enable the candidate. See `OAM_INLINE_BATTLE_VISUAL_REVIEW_V1.json`.
+
+## OAM inline native screen — no worthwhile walking/menu gain
+
+The isolated test kit reuses Platinum Beta1 R2's exact host, renderer and FPGA,
+at stock 1 GHz. Both trials cold-load the same disposable save and reach the
+same boundary anchor. Each records two east/west traversals, then eight menu
+open/close cycles. Actual staged bytes authenticate terrain enabled in both,
+with the new 56-byte OAM replacement only in the candidate.
+
+| Complete screen-buffer publications/s | Approved terrain | Terrain + OAM | Change |
+|---|---:|---:|---:|
+| Walking | 18.9384 | 19.0116 | +0.387% |
+| Menu cycles | 16.5761 | 16.5354 | −0.245% |
+
+This first pair does not demonstrate a worthwhile gain. These counters are
+not unique game FPS, guest cycles or frame-time percentiles. Native input and
+RTC remain real-time; no exact trajectory claim is made. Keep OAM disabled.
+Native battle performance remains unmeasured; new target-scene evidence, rather
+than another identical walking trial, is needed to justify further work.
+
+Both recordings have zero added capture drops. Reviewed movement/menu views
+show intact sprites and readable menu entries, matching start/end positions.
+Both sessions stop cleanly to MENU and preserve the disposable save. This is
+not a new save-write/reset test or full-game qualification. The initial staging
+connection timed out after creating the kit; read-only recovery verified 2,274
+protected files and 84 runtime files without rewriting the kit. The separate
+final preservation receipt covers the post-test audit.
+
+Evidence: `OAM_NATIVE_FINDINGS_V1.json`, `NATIVE_OAM_STAGE_V1.json`,
+`PLATINUM_OC1_WALK_MENU_CAPTURE.json`, `PLATINUM_O1_WALK_MENU_CAPTURE.json`,
+`OAM_NATIVE_MENU_PHASE_REVIEW_V1.png`, both stop receipts, and
+`NATIVE_OAM_FINAL_PRESERVATION_V1.json`. Raw native recordings are retained;
+no new beta or approval request is justified by this result.
+
+## Native first-battle route and functional control — 28 October 2026
+
+The accepted terrain-only baseline now completes the first rival battle on
+the MiSTer. A new disposable save starts from the already admitted
+`STORY_SAVE_V2` (SHA-256
+`706c9febdf25cb903481c4a6d405f647c4309cfdf841a995a4c56f01157e6292`).
+The exact previously verified OAM experiment kit is reused, with its OAM patch
+off for control. Host, renderer, FPGA, clock and original ROM are unchanged.
+Twenty recorded bounded input segments reach Turtwig versus Chimchar at full
+HP. Each segment has an input receipt and screenshot; timing is real-time and
+the endpoint must be checked before treating a replay as a benchmark.
+
+The control records Chimchar using Leer and Turtwig using Tackle, foe HP loss,
+return to the command menu, subsequent victory, 69 experience points, level-up
+to 23 maximum HP, and the return home to Mom's dialogue. The disposable save
+remains unchanged at clean stop. This is bounded functional progression, not
+full-game equivalence or a new save-write/reset qualification. Original audio
+is recorded; independent human listening approval is not claimed.
+
+| Terrain-only native interval | Seconds | Complete buffer publications/s |
+|---|---:|---:|
+| Command menu | 20.017 | 59.649 |
+| Move selection | 33.042 | 59.621 |
+| First actual Leer/Tackle turn and return | 30.024 | 59.619 |
+
+All captures have zero added rendering/output drops. These counts can include
+repeated game states and do not establish unique gameplay FPS or guest cycles.
+The first attempted attack sequence only opened move selection: Tackle still
+had 35/35 PP and both combatants were undamaged. It is retained as menu coverage,
+not attack timing. The separate Tackle recording starts from the verified move
+selection and visibly executes the turn. Whole turn durations must not be
+compared if RNG changes the opponent's move or critical-hit dialogue.
+
+Evidence: `NATIVE_BATTLE_STAGE_V1.json`, `NATIVE_FIRST_BATTLE_ROUTE_V1.json`,
+`NATIVE_BATTLE_CONTROL_FUNCTIONAL_REVIEW_V1.json`,
+`NATIVE_BATTLE_MEASUREMENTS_PLATINUM_BC1.json`, the `PLATINUM_BC1_COMBAT`,
+`PLATINUM_BC1_TACKLE` and `PLATINUM_BC1_FINISH` capture receipts, and
+`PLATINUM_BC1_HOME.png` / `PLATINUM_BC1_STOP.json`.
+
+## OAM first-battle native screen — remains disabled
+
+The candidate follows the same recorded route, with only
+`oam-six-byte-inline` added to the accepted terrain baseline. Both configurations
+use the same admitted seed, isolated save path, original ROM, runtime hashes and
+1 GHz HPS clock. Fresh loaded-cartridge guards verify the original OAM bytes in
+control and the replacement in the candidate. Both sessions stop cleanly to MENU
+with the disposable save unchanged.
+
+| Interval | Terrain only, publications/s | Terrain + OAM, publications/s | Change |
+|---|---:|---:|---:|
+| Battle command menu | 59.6491 | 59.6128 | −0.061% |
+| First-turn observation window | 59.6191 | 59.6240 | +0.008% |
+
+This single pair demonstrates no worthwhile publication-throughput benefit.
+It does not establish zero possible guest-cadence benefit. Renderer CPU usage
+is 91.82%/92.86% of one core in the menu and 88.03%/88.84% in the turn window;
+host CPU usage remains about 4%. Unique guest FPS, guest cycles and frame-time
+percentiles are unavailable. No recording drops were added.
+
+The candidate's first turn is visually coherent: Chimchar uses Scratch, Turtwig
+takes damage from 21/21 to 18/21 HP, Tackle damages Chimchar, and the command menu
+returns. The control began at 20/20 HP and its opponent used Leer. These native
+RTC/input-dependent rolls are allowed by the user's functional budget, and are
+not attributed solely to the patch. The candidate's earlier menu return cannot
+be called a speedup: Scratch and Leer perform different work. The videos retain
+those differences. Candidate native victory, save-write/reset and broader scenes
+were not qualified, and no promotion is sought.
+
+Keep OAM disabled after the flat walking/menu and battle screens. Do not repeat
+these same trials without a new performance reason. The next bounded candidate
+is the separately disabled font-table reuse in a verified native battle phase;
+complete model/transform/camera visibility reuse and cartridge-read recurrence
+remain larger investigations, not admitted patches.
+
+Evidence: `NATIVE_BATTLE_OAM_FINDINGS_V1.json`,
+`NATIVE_BATTLE_OAM_BEFORE_AFTER_V1.csv`, `NATIVE_BATTLE_OAM_TACKLE_REVIEW_V1.png`,
+`PLATINUM_BO1_MENU_CAPTURE.json`, `PLATINUM_BO1_TACKLE_CAPTURE.json`,
+both stop receipts and `NATIVE_BATTLE_FINAL_PRESERVATION_V1.json`.
+
+
+## Font-table reuse on accepted terrain — no worthwhile battle gain
+
+The user's functional timing budget admits a bounded screen of the unchanged
+164-byte font replacement individually added to the accepted terrain baseline.
+OAM remains disabled. No ROM file, runtime service, renderer or FPGA changes.
+The 23,400-frame reference records 8,830 complete font calls, 8,756 reuse hits
+and 74 regeneration misses. The actual battle window has 1,265 calls and 1,201
+hits. Every matching-key entry has the expected 256-halfword table. All 18,944
+generated halfwords and 222 ordered key halfwords match their arguments;
+observed external writers only initialize the table/key or change an unrelated
+metadata byte. This is replay-bounded coherence, not a proof for all scenes.
+
+In frames 18000–23399, ARM9 instruction entries fall from 264,018,986 to
+257,764,054 (2.369%). These are software instruction entries, not native cycles.
+Strict comparison still fails: four upper-screen frames and 95,550 of
+18,774,412 stereo samples differ, along with transient/checkpoint RAM. Bottom
+frames and the save match. Audio maximum signed16 delta is 2,727, RMS 12.9273;
+no audibility conclusion follows. Six inspected battle checkpoint pairs have
+coherent matching phases. All original mismatch evidence is retained.
+
+The native candidate reaches starter selection and the rival battle through
+ordinary inputs. Chimchar uses Leer; Turtwig uses Tackle, misses, and returns to
+the command menu at 21/21 HP. The earlier control has 20/20 HP and its Tackle hits.
+Background appearance also differs. Native RTC/setup timing is uncontrolled;
+these differences are not attributed solely to the patch. A missed attack does
+less work than a hit, so whole-turn duration is excluded as a speed measure.
+
+| Measurement | Accepted terrain | Terrain + font reuse | Observation |
+|---|---:|---:|---|
+| Battle menu buffer publications/s | 59.6491 | 59.6336 | −0.026% |
+| First-turn window buffer publications/s | 59.6191 | 59.6370 | +0.030% |
+| Identical text, first through final glyph | 1.2333s | 1.2667s | No shortening |
+
+The text measurement covers “TURTWIG used Tackle!” before its hit/miss outcome.
+The same pixel regions and thresholds locate the first T and final exclamation;
+all four boundary images were inspected for each arm. Media-PTS sampling bounds
+are 1.2167–1.2500s control and 1.2500–1.2833s candidate. They bound capture timing,
+not run-to-run variation. This single observation neither demonstrates a speedup
+nor establishes a repeatable regression. Publications do not establish unique
+animation FPS. Guest cycles and frame-time percentiles remain unavailable.
+
+This is an initial screen against the preserved same-boot control, not a fresh
+interleaved qualification. With no useful gain, more repeats and lifecycle
+qualification are not warranted. Renderer CPU is 91.82%/93.40% in the menu and
+88.03%/88.32% in the turn window, with host usage about 4%. Captures add no drops.
+The candidate stops cleanly to MENU with its private seed unchanged. A full
+audit preserves 2,442 protected files, 84 staged runtime files and all 3 accepted
+archives. Native candidate victory, save-write/reset and human listening
+approval were not established; no promotion is sought.
+
+Keep font reuse disabled after flat menu/Bag and battle screens. The promoted
+terrain beta remains the testable build. Next investigate complete visibility
+query inputs and their lifetime, then cartridge-request recurrence. A third
+lead is removing repeated geometry state only where all side effects are
+proven. These are investigations, not admitted patches.
+
+Evidence: `FONT_TERRAIN_CONTRACT_V1.json`,
+`FONT_TERRAIN_METADATA_KEY_WRITES_V1.json`,
+`FONT_TERRAIN_BATTLE_VISUAL_REVIEW_V1.json`,
+`NATIVE_FONT_BATTLE_FINDINGS_V1.json`,
+`NATIVE_FONT_BATTLE_BEFORE_AFTER_V1.csv`, both
+`FONT_NATIVE_*_TEXT_TIMING_V1.json`/PNG receipts,
+`PLATINUM_BF1_MENU_CAPTURE.json`, `PLATINUM_BF1_TACKLE_CAPTURE.json`,
+`PLATINUM_BF1_STOP.json`, and `NATIVE_FONT_BATTLE_FINAL_PRESERVATION_V1.json`.
+
+
+## Visibility-query input census on accepted terrain
+
+A read-only observer run reproduces all 183 preserved terrain-baseline output
+files over 15,600 frames, including the 600-frame full-resolution capture,
+state, audio, save, instruction profiles and checkpoints. Only the deliberately
+changed memory-watch diagnostics are excluded from this observer comparison.
+The historical terrain-versus-unpatched strict mismatch remains recorded. No
+new patch or native hardware session occurred.
+
+In frames 15000–15599, the existing box-test helper completes 3,600 calls:
+1,200 terrain and 2,400 props, returning raw 2 for 1,261 and raw 0 for 2,339.
+The trace captures actual model bounds, copied position/rotation, scale, a
+612-byte global context and the exact 252-byte packed graphics submission.
+Every box agrees with model bounds, and copied transforms agree with inputs.
+All 3,600 packets contain the same command sequence, including projection/view
+and object transforms, lighting, materials, viewport and texture state.
+
+| Observed key | Distinct keys | Repeated calls | Different result on repeated key | LRU16 hits |
+|---|---:|---:|---:|---:|
+| Model pointer only | 8 | 3,592 | 661 | 3,592 |
+| Model and transform bytes, no camera | 12 | 3,588 | 519 | 3,588 |
+| Submitted graphics bytes + box + box scale | 780 | 2,820 | 0 | 2,052 |
+| All captured context and submission | 780 | 2,820 | 0 | 2,052 |
+
+These are captured-key counts, not proof of complete hardware-state equivalence.
+One counterexample changes only the view-matrix word at packed offset 0x70:
+identical model/position/rotation/scale returns 2 at frame 15000 and 0 at 15023.
+Ignoring camera state would therefore return an incorrect visibility answer.
+There are 65 distinct view matrices and 12 object transforms in this window.
+
+The 16-entry simulation hits 57.0% overall, but only 276 of 1,728 calls (15.97%)
+while direction buttons are held, versus 1,776 of 1,872 (94.87%) after release.
+These labels describe inputs, not verified per-frame physical motion. Most
+small-cache reuse is concentrated in the less active portion of this route.
+The 78.33% all-history repeat rate needs up to 780 captured keys and must not be
+presented as the practical hit rate of a small cache or a speedup.
+
+A direct 16-entry key/result payload alone needs at least 4,352 bytes before
+validity, replacement metadata, code and alignment. No storage has been proven
+available. The helper has observable global/graphics effects beyond its returned
+boolean: setters and flush, matrix push/scale/pop, polygon attributes, primitive
+begin/end, box-test result and queued-work completion. Matching return values do
+not authorize removing those effects.
+
+Retain this as a concrete lead, with no manifest patch or new beta. Before a
+candidate, prove state effects, safe storage/lifetime and reset/reload/IRQ
+behavior, then measure lookup cost and native benefit. Prioritize the cartridge
+request/transfer-phase census next before investing in cache injection. Other
+remaining ideas are a storage-qualified visibility cache and redundant graphics
+state with all dependent effects preserved. Native speedup and guest-cycle
+savings are unavailable for this census.
+
+Evidence: `VISIBILITY_INPUT_QUALIFICATION_V1.json`,
+`VISIBILITY_INPUT_FINDINGS_V1.json`, `VISIBILITY_INPUT_DEPENDENCY_AUDIT_V1.json`,
+`VISIBILITY_INPUT_OWNED_DISASSEMBLY_V1.txt`,
+`VISIBILITY_INPUT_BEFORE_AFTER_V1.csv` and `VISIBILITY_REUSE_PROPOSAL_V1.json`.
+
+
+## Cartridge request census — existing resident-font path identified
+
+The accepted terrain image completes a full 23,400-frame route with guarded
+ARM9 request/completion snapshots. All 251 comparable output files and every
+emulated-state hash column match the accepted reference. Profiling begins at
+frame 0 instead of 18000 to capture prior read history; only those diagnostic
+instruction counts/profiles differ, and counts match exactly in the common
+18000–23399 window. This is observation equivalence, not a new optimization.
+
+The CPU-driven worker at 020cd41c completes 20,179 invocations and 36,376 paired
+512-byte block deliveries. Each completion has 128 delivered words/512 bytes,
+matching descriptor arithmetic and a cleared ROMCTRL busy bit. Its separate
+DMA path and other command types are not captured. The game already serves
+partial reads through a one-block buffer at 021cf480 and helper 020cd080; those
+existing cache hits are not counted as new physical request opportunities.
+
+| Observed transfer metric | Whole route | Battle window |
+|---|---:|---:|
+| CPU-driven block requests | 36,376 | 10,232 |
+| Distinct source blocks | 7,581 | 688 |
+| Delivered block bytes | 18,624,512 | 5,238,784 |
+| Bytes consumed by logical requests | 8,289,577 | 1,646,951 |
+| Direct destination blocks | 14,024 | 2,752 |
+| Staging-buffer blocks | 22,352 | 7,480 |
+
+A simulated two-block cache hits 3,045 battle requests, four blocks 4,491 and
+16 blocks 5,875 when warmed by the route. One entry hits zero: no adjacent source-block repeats remain in this
+observed transfer stream. These are immutable
+source-offset opportunities, not observed byte-cache equivalence or speed.
+Destination data, cache storage, completion effects, copying and IRQ behavior
+would still need proof for a new block-cache implementation.
+
+The owned FAT/FNT maps 2,536 of 10,232 battle requests (24.78%) to
+`graphic/pl_font.narc`, including 1,154 requests for its first 512-byte block.
+Item/move data and battle graphics also recur. Another 2,052 requests load
+overlays 12 and 14, both based at 0221fc20; they share memory and cannot simply
+be retained together or have their reloads skipped.
+
+A more direct font opportunity exists in the game's own code. The owned Thumb
+call at 02002bcc reaches FontManager_New at 020232e0 with lazy-mode argument 1
+set by `0122` at 02002bca. Its existing immediate-mode dispatcher allocates the
+glyph data through Heap_Alloc, reads it once, selects the RAM decompressor, and
+has a matching free path. Four checkpoint manager candidates have mode 1 and
+lazy callback 02023565, corresponding to the owned font archive members 0–3.
+Each contains 509 glyphs of 64 bytes: 32,576 bytes of resident glyph data, or
+130,304 bytes for four managers before allocator overhead.
+
+The proposed guarded change is `0122` → `0022`, selecting the existing resident
+path. It is not implemented or enabled yet. First authenticate live arguments,
+heap IDs, dispatch and allocation lifetimes. The resident loader does not show
+an allocation-failure fallback, so heap headroom and successful allocations are
+required. This uses the game's allocator; no unused-memory or new HPS-service
+claim is made. Keep the previous color-table reuse and OAM patches disabled.
+A native trial must target load/instant-text work as well as normal gameplay;
+typewriter pacing may remain fixed even after fewer cartridge reads.
+
+Next priorities: admit and test the existing resident-font mode, investigate
+repeated archive metadata using the existing loader, and retain visibility
+reuse only with proven storage/state effects. No new beta or native speedup is
+claimed for this census.
+
+Evidence: `CART_REQUEST_QUALIFICATION_V1.json`, `CART_REQUEST_FINDINGS_V1.json`,
+`CART_REQUEST_FILE_MAPPING_V1.json`, `CART_REQUEST_OVERLAY_MAPPING_V1.json`,
+`CART_REQUEST_BEFORE_AFTER_V1.csv` and `FONT_RESIDENT_MODE_PROPOSAL_V1.json`.
+
+
+## All-font residency — rejected for a gameplay failure
+
+The accepted terrain observer reproduces all 254 comparable full-profile output
+files. Live constructors confirm three startup managers on heap 3 (system,
+message and Unown) and the later subscreen manager on heap 5. All 7,229 observed
+ordinary allocator calls return nonnull in the control. Battle checkpoints have
+249,348 free bytes on heap 3, but those snapshots do not establish earlier or
+full-route headroom.
+
+The guarded experiment changes `movs r2,#1` to `movs r2,#0` at 02002bca, within
+an unchanged eight-byte loader guard at 02002bc8. Existing game functions allocate
+and free the glyph data. Each of the three startup buffers contains 32,576 bytes
+and exactly matches its owned archive member at frames 60 and 1200.
+
+The game nevertheless fails during field setup at frame 1318. A request for 84
+bytes on heap 8 reaches Heap_Alloc with a null heap handle. ARM9 subsequently
+remains in abort mode at PC ffff0108 in every recorded checkpoint from 1320
+onward. The first run stopped at the observer's memory-range check; a separate
+diagnostic records the handle without dereferencing it and confirms the fault.
+No guard was weakened to accept the candidate. The exact child-heap allocation
+that failed is not yet traced; added long-lived font allocations implicate heap
+pressure, rather than proving every step of that causal chain.
+
+| Measurement | Accepted terrain | All-font residency |
+|---|---:|---:|
+| Startup resident glyph bytes | 0 | 97,728 |
+| First-battle route completes | Yes | No; field-setup fault |
+| Native speedup | Unmeasured | Rejected before hardware |
+
+Keep `font-resident-glyph-mode` disabled. This exceeds the user's functionality
+budget. A separate system/message-only proposal uses 65,152 bytes and retains
+lazy mode for subscreen and Unown; its benefit and functionality must be tested
+independently. No existing beta, ROM, seed, renderer or FPGA was modified.
+
+Evidence: `FONT_RESIDENT_CONTROL_QUALIFICATION_V1.json`,
+`FONT_RESIDENT_CONTROL_FINDINGS_V1.json`, `FONT_RESIDENT_ALL_FAILURE_V2.json`,
+`FONT_RESIDENT_ALL_BEFORE_AFTER_V2.csv`, and the retained V1/V2 traces.
+
+
+## System/message residency — completes replay, insufficient margin for selection
+
+A separate guarded Thumb selector computes `member >> 1`. The owned four-entry
+archive table is also guarded, so system/member 0 and message/member 1 use the
+existing resident path; subscreen/member 2 and Unown/member 3 retain lazy reads.
+The same eight-byte code extent changes one instruction. Resident glyph payload
+falls to 65,152 bytes, excluding allocator overhead.
+
+The 23,400-frame route completes with 7,290 nonnull allocator returns. Both
+resident buffers exactly match their owned archive payload at all 28 recorded
+buffer checkpoints. No resident font is freed during the route; destruction and
+broader lifetime are still unqualified. Field checkpoints leave only 3,892 bytes
+free on application heap 3. Heap 8 now exists with a 98,248-byte data extent,
+consistent with the earlier blanket variant losing a large child allocation.
+This is not a full-route minimum or a full-game memory guarantee.
+
+| Observed replay workload | Accepted terrain | Two resident fonts |
+|---|---:|---:|
+| Full-route CPU-driven 512-byte cart blocks | 36,376 | 26,364 |
+| Full-route font-archive cart blocks | 10,779 | 586 |
+| Battle-window ARM9 instruction entries | 264,018,986 | 249,954,154 |
+| Battle-window CPU-driven cart blocks | 10,232 | 8,274 |
+
+The apparent 5.327% instruction reduction is a screening observation, not a
+controlled speed measurement: battle starts earlier, Turtwig has 21 HP rather
+than 20, and turn/dialogue timing differs. Four inspected framebuffer pairs
+show coherent glyphs and battle progression through the foe's defeat/experience
+message. They do not establish identical combat trajectories or listening
+quality. Strict comparison retains 12,683 differing upper frames, 991 lower
+frames, RAM differences, and 11,365,490 differing stereo samples (maximum channel
+delta 61,454; RMS 5,058.548). Final save is exact.
+
+Keep `font-resident-system-message` disabled and prefer a message-only trial
+before hardware: it recovers another 32,608 bytes including allocation overhead
+while covering most baseline glyph calls. No native gain or new beta is claimed.
+Evidence: `FONT_RESIDENT_SELECTIVE_FINDINGS_V3.json`,
+`FONT_RESIDENT_SELECTIVE_BEFORE_AFTER_V3.csv`, and
+`FONT_RESIDENT_SELECTIVE_CONTACT_V3.png`.
+
+
+## Message-only residency — reference screen complete, native measurement next
+
+The current candidate uses the existing immediate mode only for message font
+member 1. System, subscreen and Unown retain lazy mode. The 52-byte Thumb
+constructor replacement includes its unchanged 12-byte literal pool. Combining
+its existing stack reservation/store into an equivalent push leaves space for
+the selector; no trampoline or unused-memory storage is introduced. Original
+instructions, game/revision hashes and the four-entry archive table are guarded.
+The ROM file is never modified.
+
+All 384 bounded constructor cases preserve the stack bytes, required arguments
+except the intended mode, and post-callee manager store/return behavior. Callee
+entry flags differ intentionally; the owned callee sets flags before its
+conditional use. Wrong header, original bytes, table contents and unknown patch
+IDs all fall back atomically to the original cartridge image.
+
+The 23,400-frame reference completes through the first battle and returns to
+outdoor dialogue. All 7,659 observed allocator calls return nonnull. Its single
+32,576-byte glyph buffer matches the owned archive at all 14 checkpoints.
+Application-heap free space at sampled field checkpoints rises to 36,500 bytes,
+32,608 more than the two-font variant including allocation overhead. These are
+samples, not a proven full-route or full-game minimum. No font destruction is
+exercised, and save-write/reset/unrelated-scene qualification remains pending.
+
+| Observed workload | Accepted terrain | Message-only residency |
+|---|---:|---:|
+| Full-route font-archive 512-byte cart blocks | 10,779 | 1,225 |
+| Full-route CPU-driven cart blocks | 36,376 | 30,609 |
+| Battle-window ARM9 instruction entries | 264,018,986 | 323,410,873 |
+| Battle-window font-archive cart blocks | 2,536 | 584 |
+
+The higher battle-window instruction count is not a demonstrated slowdown:
+the candidate has already returned to outdoor rendering while the control is
+still finishing combat. Turtwig has 21 HP versus 20 and the turn trajectory
+differs. Likewise, the earlier battle end cannot be presented as a speedup.
+Fresh native comparisons must cover the same dialogue or text-heavy transition,
+with matched phase and save, rather than total battle length.
+
+Strict comparison retains 11,414 differing upper frames, 1,339 lower frames,
+RAM differences, and 16,430,574 differing stereo samples (maximum channel delta
+56,430; RMS 5,139.997). The final save matches. Four inspected framebuffer pairs
+show coherent glyphs, combat and the return to outdoor dialogue; audio listening
+quality and full-game equivalence are not claimed. These timing/RNG differences
+remain eligible for investigation under the user's functional budget.
+
+`font-resident-message-only` stays disabled pending measured native benefit,
+video review and lifecycle checks. The all-font and two-font variants remain
+disabled. Approved Platinum Beta1 R2 is unchanged.
+
+Evidence: `FONT_RESIDENT_MESSAGE_BUILD_V4.json`,
+`FONT_RESIDENT_MESSAGE_GUARD_TESTS_V4.json`,
+`FONT_RESIDENT_MESSAGE_FINDINGS_V4.json`,
+`FONT_RESIDENT_MESSAGE_BEFORE_AFTER_V4.csv`, and
+`FONT_RESIDENT_MESSAGE_VISUAL_REVIEW_V4.json`/contact PNG.
+
+
+## Message-font native screen — parked for insufficient benefit
+
+Fresh control and candidate sessions use the same ordinary game-created outdoor
+save, accepted terrain patch, published rc12 FPGA, host/renderer and stock 1GHz
+clock. The only patch-selection difference is message-font residency. Runtime
+identity, original/replacement constructor bytes and the unchanged save are
+verified. Both runs reach the same Twinleaf sign and southern pond NPC.
+
+| Native observation | Terrain control | Message-font candidate |
+|---|---:|---:|
+| Identical dialogue second line, repetition 1 | 1.9667s | 1.9333s |
+| Identical dialogue second line, repetition 2 | 1.9833s | 1.9167s |
+| Six sign cycles, buffer publications/s | 22.003 | 21.068 |
+| NPC page sequence, buffer publications/s | 20.625 | 19.849 |
+| Sign sequence, host / renderer CPU, one-core percent | 3.09 / 166.68 | 3.15 / 165.04 |
+| NPC sequence, host / renderer CPU, one-core percent | 3.02 / 157.39 | 3.11 / 155.44 |
+
+The manually reviewed line is “around the world...wirelessly!”; timing uses its
+first visible `a` through final `!` in media PTS. Control bounds are
+1.9500–1.9833s and 1.9667–2.0000s; candidate bounds are 1.9167–1.9500s and
+1.9000–1.9333s. The mean difference is 50ms, about 2.53% less line time. This is
+one cold session per arm with two within-session repetitions, not independent
+boot replicates or a qualified gameplay speedup. Publication counters include
+fixed waits and repeated visual states; the lower candidate observations do not
+establish a general slowdown. The instant sign panel has fixed animation, so
+it is not used as a typewriter-speed or input-latency measurement.
+
+All four recordings have zero added render/output drops. Cold Continue,
+ordinary movement, six sign read/close cycles and repeated NPC conversations
+show coherent glyphs and return to the field. Both clean exits preserve the
+524,288-byte disposable save exactly. Original audio is retained, but listening
+quality is not claimed. Save-write/reset/rollback, font destruction and wider
+heap demands remain unqualified.
+
+Keep `font-resident-message-only` disabled and park it. The small observed text
+saving and absent throughput improvement do not justify 32,608 extra game-heap
+bytes and further lifecycle cost. This decision is about useful measured gain,
+not exact timing/RNG equality, and does not rule out every text-heavy scene.
+Approved Platinum Beta1 R2 remains the current beta. Continue with repeated
+archive metadata in existing guest loader paths.
+
+Evidence: `NATIVE_MESSAGE_FONT_STAGE_V1.json`,
+`NATIVE_MESSAGE_FONT_SOURCE_ADMISSION_V1.json`,
+`NATIVE_MESSAGE_FONT_MEASUREMENTS_V1.json`,
+`NATIVE_MESSAGE_FONT_FINDINGS_V1.json`,
+`NATIVE_MESSAGE_FONT_VISUAL_REVIEW_V1.json`, and
+`MESSAGE_FONT_NATIVE_BEFORE_AFTER_V32.csv`. Original capture, endpoint-counter,
+ROI-specification and transition-review receipts remain in private evidence.
+
+
+## Archive metadata — owned layout and call census
+
+After parking message-font residency, the existing loader is the next target.
+All 215 owned NARC files have a 16-byte header. The move archive contains 471
+contiguous 16-byte members; personal data has 508 contiguous 44-byte members.
+Item data has 446 members of 34 bytes with padding, so size alone must not be
+used as its stride. These are static facts of the guarded ROM revision, not
+proof of removable cartridge transfers or a new speedup.
+
+The observer reuses the existing full 23,400-frame accepted-terrain replay,
+seven paired NARC routine types and two physical PIO sites. Its 16-site limit
+is unchanged. Entries and returns are paired by routine and saved stack extent;
+constructors identify open archive objects and destructors retire them.
+
+| Battle-window routine | Archive | Completed calls |
+|---|---|---:|
+| resident_partial | `graphic/pl_font.narc` | 1146 |
+| resident_partial | `msgdata/pl_msg.narc` | 276 |
+| alloc_path | `itemtool/itemdata/pl_item_data.narc` | 170 |
+| read_path | `poketool/waza/pl_waza_tbl.narc` | 152 |
+| read_path | `poketool/personal/pl_personal.narc` | 101 |
+| read_path | `battle/skill/sub_seq.narc` | 85 |
+| read_path | `poketool/pokegra/pl_pokegra.narc` | 66 |
+| read_path | `poketool/personal/pl_growtbl.narc` | 51 |
+| read_path | `poketool/icongra/pl_poke_icon.narc` | 24 |
+| resident_partial | `poketool/trmsg/trtbl.narc` | 22 |
+| read_path | `battle/graphic/pl_batt_bg.narc` | 18 |
+| resident_partial | `poketool/poke_edit/pl_poke_data.narc` | 12 |
+
+All 254 comparable accepted-control output files are byte
+identical, including frames, RAM checkpoints, audio, save and full PC profiles.
+The original golden mismatch from the accepted terrain patch is preserved in
+the runner receipt; it is separate from observer qualification. The raw trace
+has 36,376 physical request events, matching the
+existing census. Whole-route samples in local NARC code are
+1,955 of 11,683,023
+(0.0167%). Sampling occurs every 256 ARM9
+instruction entries; this excludes nested filesystem/card/IRQ work and does
+not establish native cycles or the target scene's cycle share. Nested routine
+counts must not be summed as distinct logical reads.
+
+A trace configuration first exceeded the existing site cap; it was narrowed.
+The next attempt exposed a generic observer bug: ARMv5's Thumb prefetch retains
+the next halfword in `CurInstr`, which was incorrectly compared as a full ARM
+instruction. The observer now guards the executing 16-bit Thumb instruction,
+keeps ARM at 32 bits, and reports CPU/frame/PC plus raw and decoded values on
+failure. Wrong opcode/mode and atomic-output checks still pass (75 tests), and
+the full unchanged-control comparison above validates observation behavior.
+No emulator execution, FPGA, renderer, HPS service or save-state format changed.
+
+No archive patch is implemented. Next admission should distinguish repeated
+metadata work from immutable payload reads and the existing one-block cache.
+Prefer a guarded precomputed constant or existing archive object where the
+calling contract and file-position/completion effects can be preserved without
+new persistent heap storage. Fixed layouts alone do not authorize skipping
+file operations. Larger block/visibility caches still need storage and
+side-effect proof. Approved Platinum Beta1 R2 remains unchanged.
+
+Evidence: `ARCHIVE_METADATA_LAYOUT_CENSUS_V1.json`,
+`ARCHIVE_METADATA_ADMISSION_V2.json`, `ARCHIVE_METADATA_CALLS_V4.json`,
+`ARCHIVE_METADATA_FINDINGS_V4.json`, `ARCHIVE_METADATA_QUALIFICATION_V4.json`,
+and `ARCHIVE_METADATA_OBSERVER_EXCLUSIONS_V1.json`.
+
+
+## Size-only archive dead work — reference screen
+
+`narc-size-dead-position-work` replaces two Thumb instructions in the main ARM9
+size-only NARC routine. A branch at `02006bbe` skips the BTNF chunk-size
+seek/read; one at `02006bfa` skips the final payload-position seek. The return
+still subtracts the original BTAF start/end offsets. The full 76-byte span is
+guarded, only four bytes change, and there is no scratch, allocation, overlay,
+trampoline or service. The original member-count/nonzero-size assertions and
+existing missing-close behavior remain.
+
+Owned disassembly of `FS_SeekFile` (`020c81e4..020c8250`) contains no calls and
+only writes the supplied local file-position field at `+0x2c`. That establishes
+the removed seek's local effect, but not the global cache/IRQ effects of the
+removed read. The fixture executes this owned seek body; Init/Open/Read/assert
+are explicit synchronous synthetic models. It tests 808 nonempty members over
+194 present indexed archives plus one empty-member assertion. Return value,
+R3–R11, SP, PC, CPSR, retained reads and memory outside the old stack frame
+match. Caller-save registers and dead stack/file fields may differ. One indexed
+debug archive is absent from the owned ROM and was not tested or observed live.
+
+The existing guest byte-patch loader rejects wrong header, instruction bytes,
+ARM9 identity or patch ID atomically, returning the original virtual image.
+Nothing is written to the ROM. The complete 23,400-frame reference runs with
+accepted terrain plus this candidate; all 426 observed size returns match the
+owned archive table. No checkpoint enters ARM9 abort/undefined mode. Sparse
+paired images show coherent Continue, battle and outdoor progression, and all
+save hashes match. The candidate wins the battle earlier on a different turn
+trajectory; that is not evidence of equal-work speedup.
+
+| Metric | Accepted terrain | Plus size-only skip | Scope |
+|---|---:|---:|---|
+| FS reads per size query | 6 | 5 | Bounded synthetic call contract |
+| FS seeks per size query | 5 | 3 | Bounded synthetic call contract |
+| Size queries, frames 0–1199 | 53 | 53 | Reference boot window |
+| Physical PIO blocks, frames 0–1199 | 3,651 | 3,621 | Reference boot window |
+| ARM9 instruction entries, frames 0–1199 | 58,302,294 | 58,084,099 | Reference; 0.374% fewer |
+| Full-route ARM9 instruction entries | 2,993,746,030 | 3,064,334,437 | Different trajectories |
+| Full-route physical PIO blocks | 36,376 | 39,836 | Different trajectories |
+
+The strict runner rejection is retained: 9,560 top/1,329 bottom frame hashes
+and 5,888,533 of 18,774,412 stereo samples differ. Main RAM, DTCM and ARM7 WRAM
+also differ; no blanket timing exclusion was applied. Under the user's current
+functional budget, these differences permit further investigation but do not
+establish native speed, audio quality, save-write/reset or full lifecycle
+behavior. Keep the patch disabled pending an isolated native loading screen.
+Approved Platinum Beta1 R2 remains unchanged.
+
+Evidence: `ARCHIVE_SIZE_SKIP_BUILD_V1.json`,
+`ARCHIVE_SIZE_SKIP_DISASSEMBLY_V1.txt`, `ARCHIVE_SIZE_SKIP_GUARD_TESTS_V1.json`,
+`ARCHIVE_SIZE_SKIP_FINDINGS_V1.json`, `ARCHIVE_SIZE_SKIP_CALL_RESULTS_V1.json`,
+`ARCHIVE_SIZE_SKIP_BEFORE_AFTER_V1.csv` and `ARCHIVE_SIZE_SKIP_VISUAL_REVIEW_V1.json`.
+
+
+## Size-only archive native screen — parked for insufficient benefit
+
+Fresh control/candidate runs use the same ordinary outdoor save, accepted
+terrain patch, host/renderer, published rc12 FPGA and stock 1GHz clock. Live
+cartridge/replacement bytes and sole disposable-save ownership are verified.
+Both reach the same town and execute four Bag open/close cycles. This seed
+precedes starter acquisition, so it does not provide a party-screen test.
+
+| Native observation | Terrain control | Size-only skip |
+|---|---:|---:|
+| Bag opening near-black intervals | 0.4667 / 0.4333 / 0.4500 / 0.4167s | 0.4667 / 0.4167 / 0.4500 / 0.4667s |
+| Mean opening near-black interval | 0.4417s | 0.4500s |
+| Mean closing near-black interval | 1.3167s | 1.3083s |
+| Mean combined near-black interval | 1.7583s | 1.7583s |
+| Buffer publications per second | 33.651 | 33.624 |
+| Host / renderer CPU, one-core percent | 3.41 / 129.82 | 3.55 / 129.69 |
+
+Media PTS measures only the interval when both screen regions are near black;
+it excludes nonblack fading, input latency and panel animation. All events
+are visually assigned to the correct opening or closing transition. Four
+within-session repeats are not independent cold replicates. No useful native
+improvement appears in this screen; tiny opposite differences in opening and
+closing cancel. Publication counters are not unique FPS or guest cycles. This
+is neither a general slowdown claim nor proof against every asset-heavy scene.
+Native routine-entry counts were not captured, so the workload in the changed
+routine is not quantified for this scene.
+
+Both recordings have zero added render/output drops. Sampled pre/post-transition
+frames show coherent Bag/menu screens and return to the field. Both sessions
+exit cleanly with the copied save unchanged; MENU is restored. Audio is retained
+but no listening-equivalence claim is made. Wider story, save-write/reset and
+lifecycle qualification is not pursued for this parked candidate.
+
+Keep `narc-size-dead-position-work` disabled because useful native benefit was
+not demonstrated, irrespective of the permitted timing differences. The
+canonical manifest's default virtual image still hashes to the accepted
+terrain image; explicit trial selection reproduces the tested candidate image.
+Platinum Beta1 R2 remains unchanged.
+
+A broader next lead is supported by the owned layout census: all 215 NARCs
+have both a 16-byte header and a 16-byte BTNF chunk. Guarded constants in the
+existing read/allocate paths could remove metadata work from more calls.
+This is static admission only: invalid-path/member/allocation behavior,
+resulting payload offsets and actual physical-transfer savings must still be
+proved. No fixed-metadata patch has been implemented.
+
+Evidence: `NATIVE_ARCHIVE_SIZE_FINDINGS_V1.json`,
+`NATIVE_ARCHIVE_SIZE_VISUAL_REVIEW_V1.json`,
+`ARCHIVE_SIZE_NATIVE_BEFORE_AFTER_V33.csv`,
+`ARCHIVE_SIZE_CANONICAL_SELECTION_V1.json` and
+`ARCHIVE_FIXED_METADATA_ADMISSION_V1.json`.
+
+
+## Path-based archive reader — fixed metadata candidate
+
+`narc-read-fixed-metadata` replaces two metadata seek/read pairs in the ARM9
+Thumb reader at `020068c8..020069a8`. All 215 NARCs in this exact owned ROM
+have 16-byte headers and 16-byte BTNF chunks. The existing loader checks the
+full cartridge SHA-256 as well as header, revision, ARM9 and original code, so
+these constants cannot silently extend to another asset layout. Two short
+in-function replacements occupy the original 88-byte guarded extent beginning
+at `020068ee`; ten bytes change. No scratch, allocator, overlay or service is
+introduced. Member-count/nonzero assertions, requested offset/count, payload
+read and file close remain.
+
+The first fixture assumption that all observed calls were whole-member reads
+was rejected before any trial. Adding two DTCM spans to the existing 16-site
+observer captured the fifth argument and returned local file structure. All
+254 accepted-control output files remain byte-exact. Of 835 original calls,
+826 use the whole-member wrapper and nine use the explicit-length wrapper.
+Eight read two bytes at offset 1702. The other deliberately reads 7,488 bytes
+starting at the first 16-byte move record, spanning subsequent records. A new
+member-length clamp would break this supported calling behavior.
+
+The fixture covers all 215 owned archives with edge/random whole/partial cases
+and observed argument tuples. All 1,644 payload cases preserve output bytes,
+registers, flags, stack and mapped memory; three empty-member assertions and
+430 modeled invalid-index/open-failure cases retain the assertion behavior.
+The owned SDK seek body executes unchanged. Init/Open/Read/Close/assert are
+explicit synchronous models; actual filesystem errors, cache and IRQ effects
+are not proved by this fixture. Five loader failure cases return the original
+virtual image atomically, including wrong full-ROM identity.
+
+| Reference observation | Accepted terrain | Fixed reader metadata |
+|---|---:|---:|
+| FS reads per path read | 7 | 5 |
+| FS seeks per path read | 5 | 3 |
+| Same ordered read-call prefix | 448 | 448 |
+| PIO blocks associated with that prefix | 2,086 | 1,759 |
+| PIO blocks, frames 0–17999 | 26,144 | 26,017 |
+| ARM9 instruction entries, frames 0–17999 | 2,729,727,044 | 2,728,653,519 |
+| Full-route path read calls | 835 | 735 |
+
+Associated transfers fall about 15.7% in the matching call prefix, but unrelated
+scheduler/cache activity is not independently controlled. Pre-battle total
+instruction work falls only 0.0393%. Full-route totals mix different later
+battle trajectories and do not establish equal-work speedup.
+
+The 23,400-frame candidate completes with all 735 observed read ranges, lengths
+and final file positions matching owned archive metadata. That trace validates
+selected ranges, not independently sampled live destination bytes. Sparse
+paired screens show normal Continue/battle progress and eventual post-battle
+field/home transitions. No sampled ARM9 abort/undefined mode appears, and all
+save hashes match. Strict mismatches remain recorded: 10,528 top and 1,467
+bottom frame hashes, plus 6,982,861 of 18,774,412 stereo samples. The user permits
+functional investigation despite timing/RNG drift; no native, listening or
+broader lifecycle acceptance is claimed. The candidate remains disabled pending
+an isolated native first-battle loading screen, with accepted terrain only as
+control. Approved Platinum Beta1 R2 remains unchanged.
+
+Evidence: `ARCHIVE_READ_CALL_QUALIFICATION_V1.json`,
+`ARCHIVE_READ_CALL_CONTRACT_V1.json`, `ARCHIVE_READ_FIXED_BUILD_V1.json`,
+`ARCHIVE_READ_FIXED_GUARD_TESTS_V1.json`, `ARCHIVE_READ_FIXED_FINDINGS_V1.json`,
+`ARCHIVE_READ_FIXED_BEFORE_AFTER_V1.csv` and `ARCHIVE_READ_FIXED_VISUAL_REVIEW_V1.json`.
+
+
+## Fixed archive reader native screen — parked for insufficient benefit
+
+The control and candidate use the same accepted terrain baseline, ordinary
+copied story save, host/renderer, rc12 FPGA and stock 1GHz clock. Cartridge
+identity and original/replacement bytes are checked live. Historical timed
+navigation encountered an NPC and different dialogue progress; short inspected
+inputs recover the same completed challenge prompt before either measurement.
+A pilot already past the challenge is excluded. One capture configuration was
+rejected before input because it lacked the required endpoint idle marker.
+
+| Native observation | Terrain control | Fixed reader metadata |
+|---|---:|---:|
+| Challenge panel removed to first FIGHT label | 16.1333s | 16.0833s |
+| First transition near-black interval | 0.1000s | 0.1000s |
+| Post-wipe near-black interval | 1.1333s | 1.1000s |
+| Loading-section buffer publications/s | 58.145 | 58.041 |
+| Host / renderer CPU, one-core percent | 3.88 / 93.93 | 3.85 / 93.81 |
+
+The complete visible transition includes battle animation and paced text and
+excludes input-emission delay. The same detector, fixed from control before
+candidate analysis, identifies challenge-panel removal and the first FIGHT
+label; adjacent boundary frames are visually reviewed. Both near-black events
+are also reviewed, and neither is pure filesystem time. One cold pair at 60Hz
+shows only 50ms/about 0.31% shorter overall transition and 33ms less near-black
+time. This does not establish a repeatable, worthwhile speedup. Publication
+counts include idle/repeated screens and are not unique FPS or guest cycles.
+Native archive-entry counts are unavailable for this screen.
+
+Both recordings reach the same full 21/21HP Turtwig/Chimchar setup and normal
+Fight/move menus. The recorded input sequence ends at move selection in both;
+a separate confirm advances the first attack and returns to Fight with reduced
+enemy HP. That supplemental step is outside the recordings and supplies no
+whole-turn performance metric. Both captures have zero added drops. Both clean
+exits preserve the copied save; original audio is retained without a listening
+claim. Further save-write/reset, broad story and lifecycle work is not pursued
+for a candidate without useful native benefit.
+
+Keep `narc-read-fixed-metadata` disabled and retain Platinum Beta1 R2 unchanged.
+Default manifest selection still yields the accepted terrain virtual image;
+explicit selection reproduces the tested archive candidate. This is a bounded
+negative result, not proof that every other asset-heavy scene is unaffected.
+
+The shared scanner now has an opt-in Thumb structural detector for stack-local
+file-header reads. Fifteen pattern tests pass; the owned scan finds the three
+related reader/allocation/size-query sites. The scan has no attached PC profile,
+so zero sample fields mean unprovided measurements. Constants, function meaning
+and safe replacement still require the separate disassembly/data/call proofs.
+
+Evidence: `NATIVE_ARCHIVE_READ_FIXED_FINDINGS_V1.json`,
+`NATIVE_ARCHIVE_READ_FIXED_VISUAL_REVIEW_V1.json`,
+`ARCHIVE_READ_FIXED_NATIVE_BEFORE_AFTER_V34.csv`,
+`ARCHIVE_READ_FIXED_CANONICAL_SELECTION_V1.json`,
+`ARCHIVE_METADATA_PATTERN_SCAN_V1.json` and
+`NATIVE_ARCHIVE_READ_FIXED_FINAL_PRESERVATION_V1.json`.
+
+## Battle command queue early exit — parked after native screen
+
+The remaining-strategy review found a concrete guest-code opportunity in
+overlay 16. `BattleIO_QueueIsEmpty` at Thumb `02251fc8` sums a 256-byte unsigned
+queue and returns whether the sum is zero. The empty path also clears the
+counter at context+`3148`. The owned instructions match the control flow and
+fields in `pret/pokeplatinum` commit
+`579d2d5c65e736a1a4268fb7acbfd70712177c6c`,
+`src/battle/battle_lib.c:266`. Five owned direct callers consume Boolean R0;
+three execute in the observed battle window. This is semantic corroboration,
+not a claim of rebuilding that repository into the owned revision.
+
+The disabled `overlay16-battle-queue-early-exit` patch fits within the original
+84-byte function/literal extent and retains the original push/pop, timeout
+reset, return blocks and literal. It reads in the original order and stops at
+the first nonzero byte. The maximum original sum is 65,280, so overflow cannot
+turn a nonempty queue into an empty result. It uses no scratch/cache and no new
+HPS/RTL hook. Existing full-ROM, header, overlay ID/file/hash and byte guards
+apply; seven negative loader cases fall back atomically to the original image.
+
+The only differing return register is caller-clobbered R2: first nonzero byte
+instead of the complete sum. In 940 focused cases, Boolean R0, all other return
+registers, flags, stack, mapped memory and ordered writes match. Queue reads
+are an exact prefix of the original, and all other data reads match. Cases
+cover every first-nonzero position with three byte values, empty tables with
+all initial NZCV combinations, maximum sum, random tables and observed tables.
+The existing synthetic runner tests identically relocated leaf bodies within
+one page; actual in-place branches and the literal are independently decoded.
+This does not model interrupt/DMA interleavings or native instruction costs.
+
+The extended read-only observer passes 85 focused checks and preserves all
+254 nonobserver outputs over 23,400 accepted-terrain control frames. At each
+of 3,754 observed original and candidate calls, the full function bytes and
+queue/timeout contract match; all six complete-overlay checkpoints match.
+3,696 calls are nonempty. All 3,754 paired calls match in entry frame, context,
+stack, caller, complete queue bytes and timeout value. The replacement models
+94.17% fewer instructions inside this routine for that observed distribution.
+
+| Reference metric | Terrain control | Queue trial |
+|---|---:|---:|
+| ARM9 instruction entries, battle frames 18000–23399 | 264,018,986 | 258,153,023 |
+| ARM9 instruction entries, whole 23,400-frame route | 2,993,746,030 | 2,987,824,920 |
+| Observed queue calls / empty results | 3,754 / 58 | 3,754 / 58 |
+| Save bytes | reference | exact |
+| Differing top / bottom frames | — | 1 / 0 |
+| Differing stereo samples | — | 293,543 of 18,774,412 |
+
+Battle-window instruction entries fall 2.2218%; whole-route entries fall
+0.1978%. These are software instruction counts, not native cycles or gameplay
+speed. The sole top-frame difference is frame 17,970. Sparse visual review
+shows the same battle deployment, Tackle/Leer turns, foe defeat and 69-point
+experience award. The save matches; raw audio/RAM differences remain recorded.
+The latest functional/perceptual budget permits native screening without
+another exact-equality approval request. Native screening is complete below;
+listening and broader save/reset/overlay lifecycle qualification remain open.
+The patch stays disabled and the approved terrain beta is unchanged.
+
+Evidence: `BATTLE_PENDING_STATIC_IDENTITY_V1.json`,
+`BATTLE_PENDING_OBSERVER_QUALIFICATION_V1.json`,
+`BATTLE_PENDING_CONTRACT_V2.json`, `BATTLE_PENDING_BUILD_V1.json`,
+`BATTLE_PENDING_GUARD_TESTS_V1.json`,
+`BATTLE_PENDING_CANDIDATE_ANALYSIS_V1.json` and
+`BATTLE_PENDING_VISUAL_REVIEW_V1.json`.
+
+The isolated native candidate cold-boots and reaches the first rival battle
+through ordinary starter selection. Its recorded first turn shows Chimchar's
+Leer, lowered defense, Turtwig's Tackle, enemy damage and command-menu return.
+Capture has zero added drops. The copied save is unchanged at clean stop.
+The prior terrain-only control is on the same hardware boot, with identical
+runtime files except the guest manifest and matching seed/settings. It is a
+historical control, not a fresh interleaved pair. The candidate has a night
+backdrop and different rolled stats, so whole-turn and renderer-load values
+are descriptive observations, not causal speed measurements.
+
+| Native first-turn screen | Terrain control | Queue trial |
+|---|---:|---:|
+| Buffer publications/s | 59.6191 | 59.6088 |
+| Host CPU, percent of one core | 3.93 | 4.06 |
+| Renderer CPU, percent of one core | 88.03 | 87.42 |
+| “TURTWIG used Tackle!” first-to-final glyph | 1.2333s | 1.2500s |
+| Media-frame bounds on that text interval | 1.2167–1.2500s | 1.2333–1.2667s |
+| Added render/output capture drops | 0 / 0 | 0 / 0 |
+
+Identical control ROIs measure the same text, with adjacent boundary frames
+visually confirmed. No shortening is observed and the intervals overlap;
+one comparison does not establish a regression. Publication change is
+−0.0173%, effectively flat in this screen. Publications are not unique FPS,
+and native cycles/frame-time percentiles are unavailable. The recording retains
+original audio without a listening or inaudibility claim.
+
+Keep the queue patch disabled: its measured reduction in reference instructions
+has not produced a useful native gain in this scene. Do not repeat this exact
+screen unchanged. A newly evidenced CPU-limited battle workload could justify
+reconsideration; native victory, save-write/reset and broader lifecycle work are
+not pursued for this candidate now. Platinum's completion gate is still open:
+the strategy ledger identifies the IRQ sparse scan as unassessed under the
+current functional budget, and separates it from speculative cache/storage work.
+
+Native evidence: `BATTLE_PENDING_NATIVE_CONTROL_ADMISSION_V1.json`,
+`NATIVE_BATTLE_PENDING_FINDINGS_V1.json`,
+`NATIVE_BATTLE_PENDING_VISUAL_REVIEW_V1.json`,
+`BATTLE_PENDING_NATIVE_TEXT_REVIEW_V1.json`,
+`BATTLE_PENDING_NATIVE_BEFORE_AFTER_V35.csv` and
+`PLATINUM_BQ1_TACKLE_CAPTURE.json`.
+
+Final preservation verifies all 3,110 protected native files, 84 kit files,
+the copied seed and all three accepted local archives. MENU is restored and
+no NDS process or recording remains. See
+`NATIVE_BATTLE_PENDING_FINAL_PRESERVATION_V1.json`.
+
+## ARM7 carry shortcut: functional-budget cost reassessment
+
+The earlier exact-only rejection is no longer the deciding gate. The one-byte
+MLA predication remains disabled because its prospective benefit is too small
+at the observed frequency. The shipped FPGA input archive, authenticated against
+the accepted beta manifest and build-input hashes, instantiates `gba_cpu` for
+ARM7. The MLA decodes R5 as its timed multiplier. All 57,827 observed values
+are 379–1,047, producing one wait beat, one multiply/accumulate beat and one
+completion beat beyond the skipped conditional instruction. Fetch and decode
+remain; the patch removes no memory traffic or renderer work.
+
+That is 173,481 local ARM7 clock beats over 1,800 reference frames, approximately
+5.176 milliseconds total at the shipped 33.513982 MHz clock, or 2.876 microseconds
+per frame. Arbitrary 32-bit multipliers have a five-beat upper bound in this
+local path. This is a source-derived opportunity estimate, not measured native
+cycles or a rigorous whole-game speed bound: native call rate, stalls and event
+interleavings can differ. No additional native trial is justified without a
+substantially larger representative call rate or an ARM7 pacing bottleneck.
+
+The prior 6,800 focused checks, exact screen/save pairs and raw audio/RAM
+differences remain recorded. No new patch bytes, RTL, HPS service, save format
+or beta change results. Evidence: `ARM7_PITCH_FUNCTIONAL_COST_V1.json` and
+`IRQ_FUNCTIONAL_SHIPPED_CORE_SUPPORT_V1.json`.
+
+## IRQ sparse scan: functional-budget reassessment
+
+The unchanged IRQ patch was retested with accepted terrain visibility under the
+user's functional budget. Its earlier exact-only rejection is historical.
+The original routine still performs all selected handler-table updates; the
+replacement visits set bits in the same order and preserves the literal pool,
+stack, return registers and flags. No service, scratch or RTL change is needed.
+The 12,262-case synchronous proof remains byte-identical, and five current
+wrong-identity/bytes/literal/selection cases fall back atomically to the original
+cartridge stream. The approved terrain image remains unchanged.
+
+Owned caller disassembly shows the main graphics caller explicitly setting the
+IRQ mask before its table update and restoring it afterward. This is not a
+global exclusion guarantee: the new first-battle census has 81 IRQ-disabled
+calls and one IRQ-enabled single-bit call, all 82 satisfying the table/stack
+contract. The new callback and context prevent generalizing the older town
+observation that every call had IRQs disabled. Actual packaged FPGA inputs,
+pinned to the shipped core, confirm the ARM9 CLZ implementation.
+
+The 23,400-frame replay reaches matching inspected story events, Tackle/Leer,
+first-battle victory and 69 experience points. All six checkpoint code/pool
+identities match the replacement. Seven top hashes differ, all bottom hashes
+and the final save match, and 8,744,151 of 18,774,412 stereo samples differ
+(maximum signed-16 delta29,784; RMS201.409466). Raw RAM differences are retained.
+These differences are not automatically rejected under the current budget,
+and are not asserted inaudible or causally explained as timing alone.
+
+| Reference instruction entries | Terrain control | IRQ candidate | Reduction |
+|---|---:|---:|---:|
+| Frames 0–17999, ARM9 | 2,729,727,044 | 2,699,997,893 | 1.0891% |
+| Frames 18000–23399, ARM9 | 264,018,986 | 263,927,471 | 0.0347% |
+| Frames 0–23399, ARM9 | 2,993,746,030 | 2,963,925,364 | 0.9961% |
+
+A fresh native pair uses the same night-time save, exact starting screenshot,
+identical runtime and input sequence on one hardware boot at the stock HPS
+clock. Each recorded run completes two east/west traversals and repeated menu
+open/close operations. Both clean stops preserve the copied seed.
+
+| Native screen | Terrain control | IRQ candidate |
+|---|---:|---:|
+| Walking, publications/s | 18.9194 | 18.8408 |
+| Walking, Host CPU (% of one core) | 2.79 | 2.75 |
+| Walking, Renderer CPU (% of one core) | 150.36 | 150.05 |
+| Menu, publications/s | 16.5944 | 16.5088 |
+| Menu, Host CPU (% of one core) | 2.75 | 2.72 |
+| Menu, Renderer CPU (% of one core) | 149.04 | 148.48 |
+
+Keep the IRQ patch disabled: there is no useful measured native gain in this
+screen. These counters are completed buffer publications, not unique gameplay
+FPS or emulated cycles. A single fresh pair cannot establish a small regression;
+no repeated test or expanded lifecycle qualification is justified by this flat
+result. Native per-frame p50/p95/max and load-time gains remain unmeasured.
+Both recordings retain audio, with zero added capture drops; no listening or
+inaudibility claim is made. Approved Platinum Beta1 R2 stays the testable beta.
+
+Evidence: `IRQ_FUNCTIONAL_ADMISSION_V1.json`,
+`IRQ_FUNCTIONAL_CALLER_EVIDENCE_V1.json`,
+`IRQ_FUNCTIONAL_SHIPPED_CORE_SUPPORT_V1.json`,
+`IRQ_FUNCTIONAL_BATTLE_EFFECT_AUDIT_V1.json`,
+`IRQ_FUNCTIONAL_BATTLE_ANALYSIS_V1.json`,
+`IRQ_FUNCTIONAL_NATIVE_FINDINGS_V1.json`,
+`IRQ_FUNCTIONAL_NATIVE_REVIEW_V1.json` and
+`IRQ_FUNCTIONAL_BEFORE_AFTER_V36.csv`.
+
+## Disposition of the supported patch pass
+
+Retain the user-approved terrain-only Platinum Beta1 R2 and advance to
+HeartGold under the agreed evidence-based exhaustion gate. The supported,
+evidence-backed candidates have now been accepted, rejected for functional
+failure, or parked for insufficient measured/prospective benefit. This is a
+practical pass disposition, not attainment of a native FPS target or proof
+that every conceivable optimization is exhausted. No new beta is warranted
+by the follow-up screens.
+
+The fresh terrain-only walking control uses 150.36% of one HPS core for the
+renderer and 2.79% for the host, at 18.9194 buffer publications/s. Several
+guest arithmetic/housekeeping reductions fail to improve that throughput.
+These observations are consistent with remaining graphics/renderer pressure;
+they do not replace a new function-level causal profile. The older detailed
+HPS profile predates terrain and is not claimed as current.
+
+Three future ideas remain documented, with prerequisites before reconsideration:
+
+1. Visibility-result reuse: prove all graphics-state effects and safe storage/
+   lifetime. The 16-entry estimate hits only 15.972% during held input and needs
+   at least 4,352 payload bytes before metadata/code.
+2. Whole-empty HBlank queue handling: preserve registration/callback ordering
+   and authenticate code space; naive flag guards are unsafe or add overhead.
+3. Archive-call consolidation: retain the caller's null-allocation handling and
+   identify a materially more expensive workload than the two neutral screens.
+
+Final preservation verifies 3,277 protected native files, 84 kit files, the
+copied seed and all three accepted local archives. MENU is restored; no NDS
+process, recording or active job remains. The 08:00 Central handoff retains
+Platinum Beta1 R2 until another game yields a qualified improvement. See
+`PLATINUM_SUPPORTED_PASS_GATE_V36.json`, `STRATEGIES.json` and
+`NATIVE_IRQ_FUNCTIONAL_FINAL_PRESERVATION_V1.json`.

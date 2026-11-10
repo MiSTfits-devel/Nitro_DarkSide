@@ -1,48 +1,29 @@
-# NDS_MiSTfits — Nintendo DS core for MiSTer
+# NDS4MiSTer v0.9.0-rc.13
 
-An in-progress Nintendo DS core for the MiSTer FPGA platform (DE10-Nano, Cyclone V 5CSEBA6U23I7).
+[Download ZIP](https://github.com/SplashDev88/NDS4MiSTer/releases/download/v0.9.0-rc.13/NDS4MiSTer_v0.9.0-rc.13_Standalone.zip) · [Release page](https://github.com/SplashDev88/NDS4MiSTer/releases/tag/v0.9.0-rc.13)
 
-## Thesis
+Modest speed improvements for **Final Fantasy Tactics A2**, **Pokémon Platinum**, **Pokémon HeartGold** and **Pokémon SoulSilver**, including additional regional releases and ROM revisions.
 
-Robert Peip established that an NDS core is feasible — his unreleased prototype ran 2D titles
-(e.g. Kirby: Squeak Squad) correctly — and described the NDS as "roughly the GBA2P core with
-bolts on." The blockers were never correctness; they were **resources**:
+Fixes the mapped Touch button jumping to the center when using a mouse or trackball. Thanks to [@apeekaboo](https://github.com/apeekaboo) for the report and suggested fix.
 
-1. **Memory banks.** The NDS has a very large number of small, independently-addressed,
-   tightly-timed memories (9 remappable VRAM banks, shared WRAM with 4 mapping modes,
-   TCMs, per-engine palette/OAM, ARM7 WRAM…) that all want to be BRAM, on a device where
-   BRAM is the scarcest commodity.
-2. **Fitting.** Two CPUs (ARM946E-S + ARM7TDMI), two 2D engines, 16ch sound, and the card
-   interface must fit alongside the MiSTer framework.
+## Install or update
 
-This project starts from **GBA_MiSTfits**, a heavily resource-optimized fork of the GBA2P
-core. The optimization headroom won there is the budget we spend here.
+1. Exit via **System → Reboot**.
+2. Back up `Scripts/NDS4MiSTer.sh`, `Scripts/.NDS_Standalone`, `saves/NDS` and `config/NDS_storage.cfg`.
+3. Extract the ZIP to the SD-card root (including hidden files) and overwrite.
+4. Run **Scripts → NDS4MiSTer → Load *.NDS**.
 
-## Scope
+Saves and settings carry over.
 
-- **Implemented / compatibility work:** 2D games — ARM9 + ARM7, both 2D engines, VRAM
-  banking, IPC, DMA, timers, sound, card interface, touchscreen, firmware/RTC/SPI,
-  and save memory.
-- **Now on the roadmap:** the 3D geometry and rendering engines; games requiring 3D are
-  not compatible yet.
-- **Out:** wifi (stubbed), GBA-slot compatibility mode, and DSi extensions.
+## Known issues
 
-## Layout
+- Regional and revision coverage varies — see [VERSION_COVERAGE.md](docs/release/VERSION_COVERAGE_RC13.md).
+- Italian, Spanish, Japanese and Korean Platinum ports have not completed gameplay validation.
+- Slowdown and glitches are still possible in demanding scenes.
+- Save states, wireless multiplayer, DSi mode and PAL output are not supported.
 
-- `rtl/` — core RTL. NDS-specific sources are `nds_*.vhd`; shared primitives inherited
-  from GBA_MiSTfits keep their names.
-- `docs/` — architecture, the NDS→DE10 memory budget (read `MEMORY_MAP.md` first — it is
-  the load-bearing analysis), and the roadmap.
-- `sim/` — nvc-based simulation harness, same flow as GBA_MiSTfits. Run heavy benches on
-  the cluster: `build/remote-sim.sh run_<x>_tb.sh` (see `build/`; `DIRTY=1` for the
-  working tree, `ENV="OPCOUNT=..."` for generics).
-- `build/` — k8s pod driver for remote nvc runs, patterned on GBA_MiSTer's
-  `build/remote-build.sh` Quartus flow.
-- `sys/` — MiSTer framework (copied from GBA_MiSTer, unmodified).
+## Credits
 
-## Reference material
+Thanks to the MiSTer community, FPGAzumSpass, Nitro_DarkSide, melonDS, heni, InsaneFriend, Corn, skmp and apeekaboo. No ROMs, BIOS files or saves are included.
 
-- `../GBA_MiSTer` — GBA_MiSTfits fork: donor core and proving ground.
-- `../NitroSDK`, `../NitroSystem` — public reconstructions of the official SDKs; used as
-  hardware ground truth (register maps, memory maps, boot protocol) alongside GBATEK.
-
+The original Nitro_DarkSide work by Heni includes the ARM9 CPU, FPGA 2D engines, memory/VRAM fabric, DMA and system integration; SplashDev88's NDS4MiSTer adds the ARM-assisted 3D renderer and the public release line. This repository joins both histories; see [PROVENANCE.md](PROVENANCE.md).

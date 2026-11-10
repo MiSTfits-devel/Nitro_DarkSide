@@ -1,0 +1,1660 @@
+`timescale 1ps/1ps
+
+module tb_nds_h3d_plane_reader #(
+    parameter bit LATE_ADOPTION = 1'b0,
+    parameter bit REQUIRE_LATE_TEST = 1'b0
+);
+    localparam logic [28:0] CONTROL_BASE = 29'h00360000;
+    localparam logic [28:0] BANK0_BASE = 29'h00400000;
+    localparam logic [28:0] BANK1_BASE = 29'h00408000;
+    localparam logic [28:0] PUB_WORD = CONTROL_BASE + 29'd6;
+    localparam logic [28:0] ACK_WORD = CONTROL_BASE + 29'd7;
+    localparam logic [28:0] DESC_WORD = CONTROL_BASE + 29'd8;
+
+    // 60.0024 MHz and 33.5166 MHz, with unrelated initial phase.
+    logic ddr_clk = 1'b0;
+    logic pixel_clk = 1'b0;
+    initial begin
+        #1703;
+        forever #8333 ddr_clk = ~ddr_clk;
+    end
+    initial begin
+        #5111;
+        forever #14918 pixel_clk = ~pixel_clk;
+    end
+
+    logic ddr_reset = 1'b1;
+    logic pixel_reset = 1'b1;
+    logic [31:0] ddr_session = 32'h51a70001;
+    logic [31:0] pixel_session = 32'h51a70001;
+    logic external_enable = 1'b1;
+
+    logic descriptor_request = 1'b0;
+    logic descriptor_request_ready;
+    logic line_request = 1'b0;
+    logic line_request_ready;
+    logic [31:0] line_frame = 32'd0;
+    logic [7:0] line_y = 8'd0;
+    logic frame_boundary = 1'b0;
+    logic manual_switch_window = 1'b0;
+    logic window_controller_enable = 1'b0;
+    logic lcd_phase = 1'b0;
+    logic [8:0] lcd_line = 9'd0;
+    wire controlled_switch_window;
+    wire descriptor_switch_window = window_controller_enable
+        ? controlled_switch_window : manual_switch_window;
+    logic line_start = 1'b0;
+    logic line_end = 1'b0;
+    logic [31:0] merge_frame = 32'd0;
+    logic [7:0] merge_y = 8'd0;
+    logic [7:0] pixel_x = 8'd0;
+    logic line_valid;
+    logic [1:0] line_bank;
+    logic [31:0] pixel_packed;
+    logic pixel_valid;
+    logic pixel_line_missed;
+    logic [27:0] pixel_frame_diagnostic;
+
+    logic busy;
+    logic descriptor_busy;
+    logic line_fetch_busy;
+    logic descriptor_accepted;
+    logic descriptor_rejected;
+    logic line_loaded;
+    logic line_missed;
+    logic active_descriptor_valid;
+    logic [31:0] active_descriptor_sequence;
+    logic [31:0] active_descriptor_frame;
+    logic active_descriptor_bank;
+    logic pixel_descriptor_valid;
+    logic pixel_descriptor_pending;
+    logic [31:0] pixel_descriptor_sequence;
+    logic [31:0] pixel_descriptor_frame;
+    logic pixel_descriptor_bank;
+    logic full_frame_publish;
+    logic [1:0] full_frame_bank;
+    logic full_frame_screen;
+    logic manual_full_frame_adopted = 1'b0;
+    logic auto_adoption_enable = 1'b0;
+    logic auto_full_frame_adopted = 1'b0;
+    wire full_frame_adopted = auto_adoption_enable
+        ? auto_full_frame_adopted : manual_full_frame_adopted;
+    logic [31:0] console_logical_frame = 32'd0;
+    logic scanline_tick = 1'b0;
+    logic [7:0] scanline_y = 8'd0;
+    wire [31:0] latest_complete_frame = pixel_descriptor_valid
+        ? pixel_descriptor_frame : console_logical_frame;
+
+    logic ddram_active;
+    logic ddram_read;
+    logic ddram_write;
+    logic [7:0] ddram_burst_count;
+    logic [28:0] ddram_address;
+    logic [63:0] ddram_write_data;
+    logic [7:0] ddram_byte_enable;
+    logic ddram_busy;
+    logic ddram_command_accepted = 1'b0;
+    logic [63:0] ddram_read_data = 64'd0;
+    logic ddram_read_data_ready = 1'b0;
+
+    nds_h3d_adoption_window window_control (
+        .clk(pixel_clk), .reset(pixel_reset), .lcd_phase, .lcd_line,
+        .merge_start(line_start), .merge_end(line_end), .merge_y,
+        .switch_allowed(controlled_switch_window)
+    );
+
+
+    nds_h3d_plane_reader #(
+        .CONTROL_BASE_WORD(CONTROL_BASE),
+        .BANK0_BASE_WORD(BANK0_BASE),
+        .BANK1_BASE_WORD(BANK1_BASE),
+        .LATE_ADOPTION_WINDOW(LATE_ADOPTION)
+    ) dut (
+        .*
+    );
+
+    // Product-accurate composite adoption return path. The plane reader
+    // pulses full_frame_publish in the DDR domain; the island converts that
+    // to a toggle for the free-running video scanout, then converts scanout's
+    // adoption toggle back to the one-cycle pulse consumed by the reader.
+    // Keeping this chain in the integration test catches pulse-loss races at
+    // the exact module boundary used on hardware.
+    logic scanout_external_toggle = 1'b0;
+    logic [1:0] scanout_external_bank = 2'd0;
+    logic scanout_external_screen = 1'b0;
+    wire scanout_external_adopted_toggle;
+    logic [1:0] scanout_adopt_sync = 2'b00;
+    logic scanout_adopt_seen = 1'b0;
+    integer auto_adoption_count = 0;
+
+    wire [1:0] scanout_layout_active;
+    wire scanout_order_active;
+    wire [1:0] scanout_gap_active;
+    wire scanout_fps_active;
+    wire scanout_pf_tgl, scanout_pf_scr, scanout_pf_bank;
+    wire [1:0] scanout_pf_frame_bank;
+    wire [7:0] scanout_pf_line;
+    wire scanout_pf_external;
+    wire [8:0] scanout_lb_raddr;
+    wire scanout_ce, scanout_de, scanout_hs, scanout_vs;
+    wire [7:0] scanout_r, scanout_g, scanout_b;
+
+    nds_nitro_video_scanout scanout (
+        .session_reset(1'b0),
+        .clk_video(ddr_clk), .reset(ddr_reset),
+        .external_enable, .external_quiescent(),
+        .layout_select(2'd0), .screen_order_select(1'b0),
+        .gap_select(2'd1), .fps_select(1'b0),
+        .touch_pressed(1'b0), .touch_x(8'd128), .touch_y(8'd96),
+        .layout_active(scanout_layout_active),
+        .screen_order_active(scanout_order_active),
+        .gap_active(scanout_gap_active), .fps_active(scanout_fps_active),
+        .pf_tgl(scanout_pf_tgl), .pf_scr(scanout_pf_scr),
+        .pf_line(scanout_pf_line), .pf_bank(scanout_pf_bank),
+        .pf_frame_bank(scanout_pf_frame_bank),
+        .pf_external(scanout_pf_external),
+        .published_frame_toggle(1'b0), .published_frame_bank(2'd0),
+        .external_screen_toggle(scanout_external_toggle),
+        .external_screen_bank(scanout_external_bank),
+        .external_screen_select(scanout_external_screen),
+        .external_screen_adopted_toggle(
+            scanout_external_adopted_toggle),
+        .effective_3d_frame_toggle(1'b0),
+        .lb_raddr(scanout_lb_raddr), .lb_q(36'd0), .lb_valid(1'b1),
+        .ce_pixel(scanout_ce), .de(scanout_de),
+        .hsync(scanout_hs), .vsync(scanout_vs),
+        .red(scanout_r), .green(scanout_g), .blue(scanout_b)
+    );
+
+    always @(posedge ddr_clk) begin
+        if (ddr_reset) begin
+            scanout_external_toggle <= 1'b0;
+            scanout_external_bank <= 2'd0;
+            scanout_external_screen <= 1'b0;
+            scanout_adopt_sync <= 2'b00;
+            scanout_adopt_seen <= 1'b0;
+            auto_full_frame_adopted <= 1'b0;
+            auto_adoption_count <= 0;
+        end else begin
+            if (auto_adoption_enable && full_frame_publish) begin
+                scanout_external_toggle <= ~scanout_external_toggle;
+                scanout_external_bank <= full_frame_bank;
+                scanout_external_screen <= full_frame_screen;
+            end
+            scanout_adopt_sync <= {
+                scanout_adopt_sync[0], scanout_external_adopted_toggle
+            };
+            auto_full_frame_adopted <=
+                scanout_adopt_sync[1] != scanout_adopt_seen;
+            if (scanout_adopt_sync[1] != scanout_adopt_seen) begin
+                scanout_adopt_seen <= scanout_adopt_sync[1];
+                auto_adoption_count <= auto_adoption_count + 1;
+            end
+        end
+    end
+
+    // ------------------------------------------------------------------
+    // HPS descriptor and plane contents.
+    // ------------------------------------------------------------------
+    logic [31:0] publish_sequence = 32'd0;
+    logic [31:0] descriptor_sequence = 32'd0;
+    logic [31:0] descriptor_session = 32'd0;
+    logic [31:0] descriptor_frame = 32'd0;
+    logic [31:0] descriptor_bank = 32'd0;
+    logic [31:0] descriptor_format = 32'd1;
+    logic [31:0] descriptor_width_height = 32'h00c00100;
+    logic [31:0] descriptor_stride = 32'd1024;
+    logic tear_sequence = 1'b0;
+    integer sequence_read_count = 0;
+
+    function automatic logic [31:0] plane_pixel(
+        input logic bank,
+        input logic [7:0] y,
+        input logic [7:0] x
+    );
+        logic [5:0] red;
+        logic [5:0] green;
+        logic [5:0] blue;
+        logic [4:0] alpha;
+        begin
+            red = x[5:0] ^ {5'd0, bank};
+            green = (x + y + (bank ? 8'd11 : 8'd3)) & 8'h3f;
+            blue = (x * 3 + y * 5 + (bank ? 8'd19 : 8'd7)) &
+                8'h3f;
+            alpha = ((x + y + (bank ? 8'd9 : 8'd1)) % 31) + 1;
+            plane_pixel = {9'd0, alpha, blue, green, red};
+        end
+    endfunction
+
+    function automatic logic [63:0] descriptor_beat(
+        input logic [1:0] index
+    );
+        begin
+            case (index)
+                2'd0: descriptor_beat = {32'd0, descriptor_sequence};
+                2'd1: descriptor_beat = {
+                    descriptor_frame, descriptor_session
+                };
+                2'd2: descriptor_beat = {
+                    descriptor_format, descriptor_bank
+                };
+                default: descriptor_beat = {
+                    descriptor_stride, descriptor_width_height
+                };
+            endcase
+        end
+    endfunction
+
+    function automatic logic [63:0] response_word(
+        input logic [28:0] address,
+        input logic [7:0] index,
+        input logic [63:0] saved_publish
+    );
+        logic bank;
+        logic [28:0] relative_address;
+        logic [7:0] y;
+        logic [7:0] x0;
+        begin
+            response_word = 64'd0;
+            if (address == PUB_WORD) begin
+                response_word = saved_publish;
+            end else if (address == DESC_WORD) begin
+                response_word = descriptor_beat(index[1:0]);
+            end else begin
+                bank = address >= BANK1_BASE;
+                relative_address = bank
+                    ? address - BANK1_BASE : address - BANK0_BASE;
+                y = relative_address[14:7];
+                x0 = {index[6:0], 1'b0};
+                response_word = {
+                    plane_pixel(bank, y, x0 + 1'b1),
+                    plane_pixel(bank, y, x0)
+                };
+            end
+        end
+    endfunction
+
+    // ------------------------------------------------------------------
+    // Randomized DDR model.  Command acceptance and each response beat have
+    // independent delays.  A zero response_gap_override is used for the
+    // deterministic "completion in the middle of a scan line" test.
+    // ------------------------------------------------------------------
+    logic command_queued = 1'b0;
+    logic queued_read = 1'b0;
+    logic queued_write = 1'b0;
+    logic [7:0] queued_burst = 8'd0;
+    logic [28:0] queued_address = 29'd0;
+    logic [63:0] queued_write_data = 64'd0;
+    logic [7:0] queued_byte_enable = 8'd0;
+    logic [63:0] queued_publish_value = 64'd0;
+    integer accept_delay = 0;
+    logic read_inflight = 1'b0;
+    logic [7:0] response_remaining = 8'd0;
+    logic [7:0] response_index = 8'd0;
+    integer response_delay = 0;
+    integer response_gap_override = -1;
+    logic hold_line_response = 1'b0;
+    logic [15:0] lfsr = 16'h3a7d;
+
+    integer accepted_commands = 0;
+    integer accepted_line_reads = 0;
+    integer accepted_writes = 0;
+    integer busy_stall_cycles = 0;
+    integer response_gap_cycles = 0;
+    integer delivered_this_line = 0;
+    integer completed_line_beats = 0;
+    integer ack_writes = 0;
+    logic [31:0] last_ack = 32'd0;
+    logic [7:0] last_ack_be = 8'd0;
+    integer full_frame_publish_count = 0;
+    logic [1:0] last_full_frame_bank = 0;
+    logic last_full_frame_screen = 0;
+    logic full_frame_publish_q = 1'b0;
+
+    always @(posedge ddr_clk) begin
+        if (ddr_reset) begin
+            full_frame_publish_q <= 1'b0;
+        end else begin
+            if (full_frame_publish && full_frame_publish_q)
+                $fatal(1, "full_frame_publish must be a one-cycle pulse");
+            full_frame_publish_q <= full_frame_publish;
+        end
+        if (!ddr_reset && full_frame_publish) begin
+            full_frame_publish_count <= full_frame_publish_count + 1;
+            last_full_frame_bank <= full_frame_bank;
+            last_full_frame_screen <= full_frame_screen;
+        end
+    end
+
+    wire random_idle_stall = !command_queued && !read_inflight &&
+        (lfsr[2:0] == 3'b000 || lfsr[6:4] == 3'b111);
+    assign ddram_busy = command_queued || read_inflight ||
+        random_idle_stall;
+
+    // The outer fabric's deadline-priority arbiter must see a pending line
+    // request even while another owner keeps DDR busy.
+    always @(negedge ddr_clk) begin
+        if (!ddr_reset && external_enable &&
+            dut.state == dut.LINE_ISSUE && !ddram_read)
+            $fatal(1,
+                "pending plane read was hidden while DDR busy");
+    end
+
+    always @(posedge ddr_clk) begin
+        if (ddr_reset) begin
+            ddram_command_accepted <= 1'b0;
+            ddram_read_data_ready <= 1'b0;
+            ddram_read_data <= 64'd0;
+            command_queued <= 1'b0;
+            queued_read <= 1'b0;
+            queued_write <= 1'b0;
+            queued_burst <= 8'd0;
+            queued_address <= 29'd0;
+            queued_write_data <= 64'd0;
+            queued_byte_enable <= 8'd0;
+            queued_publish_value <= 64'd0;
+            accept_delay <= 0;
+            read_inflight <= 1'b0;
+            response_remaining <= 8'd0;
+            response_index <= 8'd0;
+            response_delay <= 0;
+            delivered_this_line <= 0;
+            lfsr <= 16'h3a7d;
+        end else begin
+            lfsr <= {lfsr[14:0],
+                lfsr[15] ^ lfsr[13] ^ lfsr[12] ^ lfsr[10]};
+            ddram_command_accepted <= 1'b0;
+            ddram_read_data_ready <= 1'b0;
+
+            if (ddram_active && ddram_busy)
+                busy_stall_cycles <= busy_stall_cycles + 1;
+
+            if (!command_queued && !read_inflight &&
+                !ddram_command_accepted && !ddram_busy &&
+                (ddram_read || ddram_write)) begin
+                command_queued <= 1'b1;
+                queued_read <= ddram_read;
+                queued_write <= ddram_write && !ddram_read;
+                queued_burst <= ddram_burst_count == 0
+                    ? 8'd1 : ddram_burst_count;
+                queued_address <= ddram_address;
+                queued_write_data <= ddram_write_data;
+                queued_byte_enable <= ddram_byte_enable;
+                accept_delay <= 1 + lfsr[1:0];
+                if (ddram_read && ddram_address == PUB_WORD) begin
+                    if (tear_sequence && sequence_read_count != 0)
+                        queued_publish_value <= {
+                            32'd0, publish_sequence + 32'd2
+                        };
+                    else
+                        queued_publish_value <= {
+                            32'd0, publish_sequence
+                        };
+                    sequence_read_count <= sequence_read_count + 1;
+                end
+            end
+
+            if (command_queued) begin
+                if (accept_delay > 0) begin
+                    accept_delay <= accept_delay - 1;
+                end else begin
+                    ddram_command_accepted <= 1'b1;
+                    command_queued <= 1'b0;
+                    accepted_commands <= accepted_commands + 1;
+                    if (queued_read) begin
+                        read_inflight <= 1'b1;
+                        response_remaining <= queued_burst;
+                        response_index <= 8'd0;
+                        response_delay <= 1 + lfsr[3:2];
+                        if (queued_burst == 8'd128) begin
+                            accepted_line_reads <=
+                                accepted_line_reads + 1;
+                            delivered_this_line <= 0;
+                        end
+                    end else if (queued_write) begin
+                        accepted_writes <= accepted_writes + 1;
+                        if (queued_address == ACK_WORD) begin
+                            ack_writes <= ack_writes + 1;
+                            last_ack <= queued_write_data[31:0];
+                            last_ack_be <= queued_byte_enable;
+                        end
+                    end
+                end
+            end
+
+            if (read_inflight) begin
+                if (queued_burst == 8'd128 && hold_line_response) begin
+                    response_gap_cycles <= response_gap_cycles + 1;
+                end else if (response_delay > 0) begin
+                    response_delay <= response_delay - 1;
+                    response_gap_cycles <= response_gap_cycles + 1;
+                end else begin
+                    ddram_read_data_ready <= 1'b1;
+                    ddram_read_data <= response_word(
+                        queued_address,
+                        response_index,
+                        queued_publish_value
+                    );
+                    response_index <= response_index + 1'b1;
+                    response_remaining <= response_remaining - 1'b1;
+                    if (queued_burst == 8'd128)
+                        delivered_this_line <= delivered_this_line + 1;
+                    if (response_remaining <= 1) begin
+                        if (queued_burst == 8'd128)
+                            completed_line_beats <=
+                                delivered_this_line + 1;
+                        read_inflight <= 1'b0;
+                        response_delay <= 0;
+                    end else if (response_gap_override >= 0) begin
+                        response_delay <= response_gap_override;
+                    end else begin
+                        response_delay <=
+                            (lfsr[5] && lfsr[8]) ? 2 :
+                            (lfsr[4] ? 1 : 0);
+                    end
+                end
+            end
+        end
+    end
+
+    // ------------------------------------------------------------------
+    // Scoreboards for publication completeness, tag immutability and bank
+    // ownership.  These checks observe the exact handshake state rather than
+    // relying only on the final pixel comparisons.
+    // ------------------------------------------------------------------
+    integer descriptor_accept_count = 0;
+    integer descriptor_reject_count = 0;
+    integer coalesced_descriptor_count = 0;
+    integer line_loaded_count = 0;
+    integer line_missed_count = 0;
+    integer ready_publish_count = 0;
+    logic [1:0] previous_ready_toggle = 2'b00;
+    logic [1:0] tag_owned = 2'b00;
+    logic [31:0] held_sequence [0:1];
+    logic [31:0] held_session [0:1];
+    logic [31:0] held_frame [0:1];
+    logic held_source [0:1];
+    logic [7:0] held_y [0:1];
+    integer monitor_bank;
+
+    always @(posedge ddr_clk) begin
+        #1;
+        if (ddr_reset) begin
+            previous_ready_toggle = dut.bank_ready_toggle_ddr;
+            tag_owned = 2'b00;
+        end else begin
+            if (descriptor_accepted)
+                descriptor_accept_count = descriptor_accept_count + 1;
+            if (descriptor_rejected)
+                descriptor_reject_count = descriptor_reject_count + 1;
+            if (line_loaded)
+                line_loaded_count = line_loaded_count + 1;
+            if (line_missed)
+                line_missed_count = line_missed_count + 1;
+
+            for (monitor_bank = 0; monitor_bank < 2;
+                monitor_bank = monitor_bank + 1) begin
+                if (dut.bank_ready_toggle_ddr[monitor_bank] !=
+                    previous_ready_toggle[monitor_bank]) begin
+                    if (completed_line_beats != 128)
+                        $fatal(1,
+                            "bank %0d published after %0d beats, not 128",
+                            monitor_bank, completed_line_beats);
+                    ready_publish_count = ready_publish_count + 1;
+                    tag_owned[monitor_bank] = 1'b1;
+                    held_sequence[monitor_bank] =
+                        dut.bank_tag_sequence_ddr[monitor_bank];
+                    held_session[monitor_bank] =
+                        dut.bank_tag_session_ddr[monitor_bank];
+                    held_frame[monitor_bank] =
+                        dut.bank_tag_frame_ddr[monitor_bank];
+                    held_source[monitor_bank] =
+                        dut.bank_tag_source_ddr[monitor_bank];
+                    held_y[monitor_bank] =
+                        dut.bank_tag_y_ddr[monitor_bank];
+                end else if (tag_owned[monitor_bank]) begin
+                    if (held_sequence[monitor_bank] !==
+                            dut.bank_tag_sequence_ddr[monitor_bank] ||
+                        held_session[monitor_bank] !==
+                            dut.bank_tag_session_ddr[monitor_bank] ||
+                        held_frame[monitor_bank] !==
+                            dut.bank_tag_frame_ddr[monitor_bank] ||
+                        held_source[monitor_bank] !==
+                            dut.bank_tag_source_ddr[monitor_bank] ||
+                        held_y[monitor_bank] !==
+                            dut.bank_tag_y_ddr[monitor_bank])
+                        $fatal(1,
+                            "bank %0d tag changed before acknowledge",
+                            monitor_bank);
+                end
+
+                if (tag_owned[monitor_bank] &&
+                    dut.bank_ack_sync_ddr[monitor_bank] ==
+                        dut.bank_ready_toggle_ddr[monitor_bank])
+                    tag_owned[monitor_bank] = 1'b0;
+            end
+            previous_ready_toggle = dut.bank_ready_toggle_ddr;
+        end
+    end
+
+    // A refresh queued while the descriptor link is owned must be consumed,
+    // not left in front of line work.  The producer cannot mutate its shared
+    // descriptor until the outstanding sequence is acknowledged.
+    always @(posedge ddr_clk) begin
+        if (!ddr_reset && dut.state == dut.IDLE &&
+            dut.request_read_valid && dut.request_is_descriptor &&
+            (!dut.descriptor_link_free || dut.full_ack_pending) &&
+            dut.request_read)
+            coalesced_descriptor_count = coalesced_descriptor_count + 1;
+    end
+
+    // ------------------------------------------------------------------
+    // Pixel-domain and cross-domain transaction helpers.
+    // ------------------------------------------------------------------
+    task automatic enqueue_descriptor;
+        begin
+            sequence_read_count = 0;
+            @(negedge pixel_clk);
+            descriptor_request = 1'b1;
+            while (!descriptor_request_ready)
+                @(negedge pixel_clk);
+            @(negedge pixel_clk);
+            descriptor_request = 1'b0;
+        end
+    endtask
+
+    task automatic tick_scanline(input logic [7:0] y);
+        begin
+            @(negedge pixel_clk);
+            scanline_y = y;
+            scanline_tick = 1'b1;
+            @(negedge pixel_clk);
+            scanline_tick = 1'b0;
+        end
+    endtask
+
+    task automatic descriptor_transaction(
+        input logic expect_accept
+    );
+        integer before_accept;
+        integer before_reject;
+        integer timeout;
+        begin
+            before_accept = descriptor_accept_count;
+            before_reject = descriptor_reject_count;
+            enqueue_descriptor();
+            timeout = 0;
+            while (descriptor_accept_count == before_accept &&
+                descriptor_reject_count == before_reject &&
+                timeout < 10000) begin
+                @(posedge ddr_clk);
+                timeout = timeout + 1;
+            end
+            if (timeout >= 10000)
+                $fatal(1, "descriptor transaction timed out");
+            if (expect_accept &&
+                descriptor_accept_count != before_accept + 1)
+                $fatal(1, "valid descriptor was rejected");
+            if (!expect_accept &&
+                descriptor_reject_count != before_reject + 1)
+                $fatal(1, "invalid descriptor was accepted");
+        end
+    endtask
+
+    task automatic wait_pixel_descriptor(
+        input logic [31:0] expected_sequence,
+        input logic [31:0] expected_frame,
+        input logic expected_bank
+    );
+        integer timeout;
+        begin
+            timeout = 0;
+            while ((!pixel_descriptor_valid ||
+                pixel_descriptor_sequence != expected_sequence ||
+                pixel_descriptor_frame != expected_frame ||
+                pixel_descriptor_bank != expected_bank) &&
+                timeout < 2000) begin
+                @(posedge pixel_clk);
+                timeout = timeout + 1;
+            end
+            if (timeout >= 2000)
+                $fatal(1,
+                    "descriptor did not cross: pending=%0b requested=%0b ready=%0b ack=%0b ack_sync=%0b active=%0b active_sync=%0b seen=%0b ddr_pending=%0b ddr_sequence=%0d pixel_sequence=%0d",
+                    dut.pending_descriptor_valid_pixel,
+                    dut.descriptor_activation_requested_pixel,
+                    dut.descriptor_ready_toggle_ddr,
+                    dut.descriptor_ack_toggle_pixel,
+                    dut.descriptor_ack_sync_ddr,
+                    dut.descriptor_active_toggle_ddr,
+                    dut.descriptor_active_sync_pixel,
+                    dut.descriptor_active_seen_pixel,
+                    dut.descriptor_activation_pending_ddr,
+                    dut.active_descriptor_sequence,
+                    pixel_descriptor_sequence);
+        end
+    endtask
+
+    task automatic activate_pending_descriptor;
+        integer timeout;
+        begin
+            timeout = 0;
+            while (!dut.pending_descriptor_valid_pixel && timeout < 2000) begin
+                @(posedge pixel_clk);
+                timeout = timeout + 1;
+            end
+            if (timeout >= 2000)
+                $fatal(1, "pending descriptor did not reach pixel domain");
+            @(negedge pixel_clk);
+            frame_boundary = 1'b1;
+            manual_switch_window = 1'b1;
+            @(negedge pixel_clk);
+            frame_boundary = 1'b0;
+
+        end
+    endtask
+
+    always @(negedge pixel_clk) begin
+        if (manual_switch_window && !dut.pending_descriptor_valid_pixel)
+            manual_switch_window = 1'b0;
+    end
+
+    task automatic raw_lcd_phase(input logic [8:0] y);
+        begin
+            @(negedge pixel_clk);
+            lcd_line = y;
+            lcd_phase = 1'b1;
+            @(negedge pixel_clk);
+            lcd_phase = 1'b0;
+        end
+    endtask
+
+    task automatic finish_visible_tail;
+        begin
+            @(negedge pixel_clk);
+            merge_y = 8'd191;
+            line_end = 1'b1;
+            frame_boundary = 1'b1;
+            @(negedge pixel_clk);
+            line_end = 1'b0;
+            frame_boundary = 1'b0;
+        end
+    endtask
+
+    task automatic prepare_late_descriptor(
+        input logic [31:0] sequence_value,
+        input logic [31:0] frame_value,
+        input logic [31:0] bank_value
+    );
+        integer timeout;
+        begin
+            publish_sequence = sequence_value;
+            descriptor_sequence = sequence_value;
+            descriptor_frame = frame_value;
+            descriptor_bank = bank_value;
+            descriptor_session = ddr_session;
+            descriptor_transaction(1'b1);
+            timeout = 0;
+            while (!pixel_descriptor_pending && timeout < 2000) begin
+                @(negedge pixel_clk);
+                timeout = timeout + 1;
+            end
+            if (timeout >= 2000)
+                $fatal(1, "late descriptor did not stage");
+        end
+    endtask
+
+    task automatic late_window_tests;
+        integer timeout;
+        integer ack_before;
+        begin
+            window_controller_enable = 1'b1;
+            manual_switch_window = 1'b0;
+            auto_adoption_enable = 1'b0;
+            manual_full_frame_adopted = 1'b0;
+            external_enable = 1'b1;
+            @(negedge pixel_clk); pixel_reset = 1'b1;
+            @(negedge ddr_clk); ddr_reset = 1'b1;
+            repeat (8) @(negedge ddr_clk);
+            ddr_session = ddr_session + 1;
+            pixel_session = ddr_session;
+            descriptor_session = ddr_session;
+            descriptor_format = 32'd1;
+            ddr_reset = 1'b0;
+            repeat (8) @(negedge pixel_clk);
+            pixel_reset = 1'b0;
+            raw_lcd_phase(9'd191);
+            finish_visible_tail();
+            // The descriptor arrives AFTER the old line191 pulse. No other
+            // architectural boundary is supplied; only safe blanking opens.
+            prepare_late_descriptor(32'd40, 32'd300, 32'd0);
+            if (active_descriptor_valid || pixel_descriptor_valid)
+                $fatal(1, "late plane activated before blanking");
+            raw_lcd_phase(9'd192);
+            wait_pixel_descriptor(32'd40, 32'd300, 1'b0);
+            wait_descriptor_ack(32'd40);
+            // The product reseeds rows0/1 after a commit. Exercise the actual
+            // reader and all256 pixels of both rows with the new tags.
+            line_transaction(32'd300, 8'd0, 1'b1);
+            line_transaction(32'd300, 8'd1, 1'b1);
+            raw_lcd_phase(9'd240);
+            raw_lcd_phase(9'd0);
+            wait_line_available(32'd300, 8'd0);
+            scan_line(32'd300, 8'd0, 1'b1, 1'b0);
+            wait_line_available(32'd300, 8'd1);
+            scan_line(32'd300, 8'd1, 1'b1, 1'b0);
+            wait_banks_free();
+            $display("PROOF: descriptor arriving after line191 activated during blanking; first two rows exact without another frame boundary");
+
+            // A post-cutoff descriptor is retained through visible drawing.
+            prepare_late_descriptor(32'd42, 32'd301, 32'd1);
+            repeat (200) @(negedge pixel_clk);
+            if (pixel_descriptor_sequence != 32'd40 || last_ack != 32'd40)
+                $fatal(1, "post-cutoff plane activated during visible frame");
+            raw_lcd_phase(9'd191);
+            // The architectural raster may already be blank while a late
+            // last visible merge is still running. Do not expose the new tag.
+            @(negedge pixel_clk); merge_y=8'd191; line_start=1'b1;
+            @(negedge pixel_clk); line_start=1'b0;
+            raw_lcd_phase(9'd192);
+            repeat (200) @(negedge pixel_clk);
+            if (controlled_switch_window || pixel_descriptor_sequence != 32'd40)
+                $fatal(1, "late line191 merge was not protected");
+            finish_visible_tail();
+            wait_pixel_descriptor(32'd42, 32'd301, 1'b1);
+            wait_descriptor_ack(32'd42);
+            raw_lcd_phase(9'd240);
+            $display("PROOF: closed cutoff retained old plane and a late last visible merge blocked adoption until it finished");
+
+            // A DDR burst may outlive the safe window after pixel requested
+            // activation. Let it finish during visible drawing: DDR must
+            // defer the plane switch, not merely the initial pixel request.
+            prepare_late_descriptor(32'd44, 32'd302, 32'd0);
+            hold_line_response=1'b1;
+            enqueue_line(32'd301, 8'd5);
+            timeout=0;
+            while (!read_inflight && timeout<2000) begin
+                @(negedge ddr_clk); timeout=timeout+1;
+            end
+            if (!read_inflight) $fatal(1, "late window stall did not start read");
+            raw_lcd_phase(9'd0);
+            raw_lcd_phase(9'd191); finish_visible_tail();
+            raw_lcd_phase(9'd192);
+            timeout=0;
+            while (!dut.descriptor_activation_pending_ddr && timeout<2000) begin
+                @(negedge ddr_clk); timeout=timeout+1;
+            end
+            if (!dut.descriptor_activation_pending_ddr)
+                $fatal(1, "late activation did not queue behind DDR burst");
+            raw_lcd_phase(9'd240);
+            repeat (12) @(negedge ddr_clk);
+            raw_lcd_phase(9'd0);
+            hold_line_response=1'b0;
+            wait_line_available(32'd301, 8'd5);
+            scan_line(32'd301, 8'd5, 1'b1, 1'b1);
+            repeat (200) @(negedge pixel_clk);
+            if (pixel_descriptor_sequence != 32'd42 ||
+                active_descriptor_sequence != 32'd42 || last_ack != 32'd42)
+                $fatal(1, "DDR stall committed or reclaimed a plane during visible drawing");
+            raw_lcd_phase(9'd191); finish_visible_tail();
+            raw_lcd_phase(9'd192);
+            wait_pixel_descriptor(32'd44, 32'd302, 1'b0);
+            wait_descriptor_ack(32'd44);
+            $display("PROOF: pending DDR activation survived a whole closed window and committed only in the next safe blanking interval");
+
+            // Engine B ownership return can occur outside this DS blanking
+            // window. Keep its existing scanout-adoption ACK contract.
+            raw_lcd_phase(9'd240);
+            descriptor_format=32'd3;
+            prepare_late_descriptor(32'd46, 32'd303, 32'd7);
+            raw_lcd_phase(9'd0); raw_lcd_phase(9'd191);
+            finish_visible_tail(); raw_lcd_phase(9'd192);
+            wait_pixel_descriptor(32'd46, 32'd303, 1'b1);
+            repeat (20) @(negedge ddr_clk);
+            if (!dut.full_ack_pending || last_ack != 32'd44)
+                $fatal(1, "late composite ACK preceded Engine B adoption");
+            raw_lcd_phase(9'd240); raw_lcd_phase(9'd0);
+            @(negedge ddr_clk); manual_full_frame_adopted=1'b1;
+            @(negedge ddr_clk); manual_full_frame_adopted=1'b0;
+            wait_descriptor_ack(32'd46);
+            $display("PROOF: Engine B ACK still waits for scanout adoption and is not blocked by a closed DS window");
+
+            // Reset drops an uncommitted late descriptor and closes the
+            // window. No stale activation/ownership return may cross epochs.
+            descriptor_format=32'd1;
+            prepare_late_descriptor(32'd48, 32'd304, 32'd0);
+            ack_before=ack_writes;
+            @(negedge pixel_clk); pixel_reset=1'b1;
+            @(negedge ddr_clk); ddr_reset=1'b1;
+            repeat (8) @(negedge ddr_clk);
+            ddr_session=ddr_session+1; pixel_session=ddr_session;
+            ddr_reset=1'b0;
+            repeat (8) @(negedge pixel_clk); pixel_reset=1'b0;
+            repeat (100) @(negedge pixel_clk);
+            if (pixel_descriptor_valid || pixel_descriptor_pending ||
+                controlled_switch_window || ack_writes != ack_before)
+                $fatal(1, "reset revived an uncommitted late plane");
+            $display("PROOF: reset canceled late descriptor and adoption window");
+        end
+    endtask
+
+    task automatic wait_descriptor_ack(input logic [31:0] expected_sequence);
+        integer timeout;
+        begin
+            timeout = 0;
+            while (last_ack != expected_sequence && timeout < 2000) begin
+                @(posedge ddr_clk);
+                timeout = timeout + 1;
+            end
+            if (timeout >= 2000)
+                $fatal(1, "descriptor ownership ack timed out");
+        end
+    endtask
+
+    task automatic enqueue_line(
+        input logic [31:0] frame,
+        input logic [7:0] y
+    );
+        begin
+            @(negedge pixel_clk);
+            line_frame = frame;
+            line_y = y;
+            line_request = 1'b1;
+            while (!line_request_ready)
+                @(negedge pixel_clk);
+            @(negedge pixel_clk);
+            line_request = 1'b0;
+        end
+    endtask
+
+    task automatic line_transaction(
+        input logic [31:0] frame,
+        input logic [7:0] y,
+        input logic expect_loaded
+    );
+        integer before_loaded;
+        integer before_missed;
+        integer timeout;
+        begin
+            before_loaded = line_loaded_count;
+            before_missed = line_missed_count;
+            enqueue_line(frame, y);
+            timeout = 0;
+            while (line_loaded_count == before_loaded &&
+                line_missed_count == before_missed &&
+                timeout < 20000) begin
+                @(posedge ddr_clk);
+                timeout = timeout + 1;
+            end
+            if (timeout >= 20000)
+                $fatal(1, "line transaction timed out y=%0d", y);
+            if (expect_loaded &&
+                line_loaded_count != before_loaded + 1)
+                $fatal(1, "valid line missed y=%0d", y);
+            if (!expect_loaded &&
+                line_missed_count != before_missed + 1)
+                $fatal(1, "invalid/no-space line loaded y=%0d", y);
+        end
+    endtask
+
+    task automatic wait_line_available(
+        input logic [31:0] frame,
+        input logic [7:0] y
+    );
+        integer timeout;
+        logic found;
+        begin
+            timeout = 0;
+            found = 1'b0;
+            while (!found && timeout < 2000) begin
+                @(posedge pixel_clk);
+                #1;
+                found =
+                    (dut.bank_available_pixel[0] &&
+                        dut.bank_tag_session_pixel[0] == pixel_session &&
+                        dut.bank_tag_frame_pixel[0] == frame &&
+                        dut.bank_tag_y_pixel[0] == y) ||
+                    (dut.bank_available_pixel[1] &&
+                        dut.bank_tag_session_pixel[1] == pixel_session &&
+                        dut.bank_tag_frame_pixel[1] == frame &&
+                        dut.bank_tag_y_pixel[1] == y) ||
+                    (dut.bank_available_pixel[2] &&
+                        dut.bank_tag_session_pixel[2] == pixel_session &&
+                        dut.bank_tag_frame_pixel[2] == frame &&
+                        dut.bank_tag_y_pixel[2] == y);
+                timeout = timeout + 1;
+            end
+            if (!found)
+                $fatal(1,
+                    "completed line did not cross to pixel domain y=%0d",
+                    y);
+        end
+    endtask
+
+    task automatic wait_banks_free;
+        integer timeout;
+        begin
+            timeout = 0;
+            while ((!dut.bank0_free || !dut.bank1_free ||
+                    !dut.bank2_free) &&
+                timeout < 2000) begin
+                @(posedge ddr_clk);
+                timeout = timeout + 1;
+            end
+            if (timeout >= 2000)
+                $fatal(1, "pixel ownership did not return both banks");
+        end
+    endtask
+
+    task automatic scan_line(
+        input logic [31:0] frame,
+        input logic [7:0] y,
+        input logic expected_valid,
+        input logic source_bank
+    );
+        integer x;
+            logic [1:0] held_selected_bank;
+        logic held_selected_valid;
+        logic [31:0] expected;
+        begin
+            held_selected_bank = 2'd0;
+            held_selected_valid = 1'b0;
+            for (x = 0; x < 256; x = x + 1) begin
+                @(negedge pixel_clk);
+                merge_frame = frame;
+                merge_y = y;
+                pixel_x = x;
+                line_start = (x == 0);
+                line_end = (x == 255);
+                @(posedge pixel_clk);
+                #1;
+                expected = expected_valid
+                    ? plane_pixel(source_bank, y, x) : 32'd0;
+                if (pixel_valid !== expected_valid)
+                    $fatal(1,
+                        "pixel_valid changed within line y=%0d x=%0d got=%0b expected=%0b",
+                        y, x, pixel_valid, expected_valid);
+                if (pixel_packed !== expected)
+                    $fatal(1,
+                        "pixel mismatch y=%0d x=%0d got=%08x expected=%08x",
+                        y, x, pixel_packed, expected);
+                if (x == 0) begin
+                    held_selected_bank = dut.selected_line_bank;
+                    held_selected_valid = dut.selected_line_valid;
+                    if (held_selected_valid !== expected_valid)
+                        $fatal(1,
+                            "line selection validity wrong at deadline");
+                end else if (x < 255) begin
+                    if (dut.selected_line_bank !== held_selected_bank ||
+                        dut.selected_line_valid !== held_selected_valid)
+                        $fatal(1,
+                            "selected bank/valid changed during scan line");
+                end
+                if (x < 255 && line_valid !== expected_valid)
+                    $fatal(1, "line_valid was not held for line y=%0d", y);
+            end
+            @(negedge pixel_clk);
+            line_start = 1'b0;
+            line_end = 1'b0;
+        end
+    endtask
+
+    // ------------------------------------------------------------------
+    // Directed-random integration sequence.
+    // ------------------------------------------------------------------
+    integer before_line_reads;
+    integer before_publish;
+    integer before_loaded;
+    integer before_missed;
+    integer before_adoption;
+    integer timeout;
+    logic [31:0] next_session;
+    logic [31:0] stale_colored_pixel;
+
+    initial begin
+        // Staggered deassertion proves neither domain assumes a phase or a
+        // common reset-release edge.
+        repeat (6) @(posedge ddr_clk);
+        @(negedge ddr_clk);
+        ddr_reset = 1'b0;
+        repeat (4) @(posedge pixel_clk);
+        @(negedge pixel_clk);
+        pixel_reset = 1'b0;
+        repeat (4) @(posedge pixel_clk);
+
+        // No descriptor means a complete merge line is transparent.
+        scan_line(32'd100, 8'd0, 1'b0, 1'b0);
+
+        // Bad-session and torn descriptors cannot become active or be acked.
+        publish_sequence = 32'd2;
+        descriptor_sequence = 32'd2;
+        descriptor_session = ddr_session ^ 32'd1;
+        descriptor_frame = 32'd100;
+        descriptor_bank = 32'd0;
+        descriptor_transaction(1'b0);
+        if (active_descriptor_valid || ack_writes != 0)
+            $fatal(1, "bad-session descriptor changed active state");
+
+        publish_sequence = 32'd4;
+        descriptor_sequence = 32'd4;
+        descriptor_session = ddr_session;
+        tear_sequence = 1'b1;
+        descriptor_transaction(1'b0);
+        tear_sequence = 1'b0;
+
+        // Stable descriptor crosses with a separate acknowledged bundle.
+        publish_sequence = 32'd6;
+        descriptor_sequence = 32'd6;
+        descriptor_session = ddr_session;
+        descriptor_frame = 32'd100;
+        descriptor_bank = 32'd0;
+        descriptor_transaction(1'b1);
+        if (active_descriptor_valid || pixel_descriptor_valid ||
+            ack_writes != 0)
+            $fatal(1, "descriptor activated before frame boundary");
+        activate_pending_descriptor();
+        wait_pixel_descriptor(32'd6, 32'd100, 1'b0);
+        wait_descriptor_ack(32'd6);
+        if (last_ack != 32'd6 || last_ack_be != 8'h0f)
+            $fatal(1, "descriptor ack was not a low-32-bit DDR write");
+
+        // Polling an unchanged publication must not tear down or republish
+        // the latest complete plane. A malformed refresh likewise leaves the
+        // previously verified descriptor usable.
+        descriptor_transaction(1'b1);
+        if (!active_descriptor_valid ||
+            active_descriptor_sequence != 32'd6 ||
+            !pixel_descriptor_valid ||
+            pixel_descriptor_sequence != 32'd6 ||
+            last_ack != 32'd6)
+            $fatal(1, "unchanged descriptor refresh blanked stable plane");
+        publish_sequence = 32'd8;
+        descriptor_sequence = 32'd8;
+        descriptor_session = ddr_session ^ 32'd1;
+        descriptor_transaction(1'b0);
+        if (!active_descriptor_valid ||
+            active_descriptor_sequence != 32'd6 ||
+            !pixel_descriptor_valid ||
+            pixel_descriptor_sequence != 32'd6)
+            $fatal(1, "invalid descriptor refresh blanked stable plane");
+        publish_sequence = 32'd6;
+        descriptor_sequence = 32'd6;
+        descriptor_session = ddr_session;
+
+        // Random stalls/gaps cannot alter any of the 256 registered pixels.
+        line_transaction(32'd100, 8'd5, 1'b1);
+        wait_line_available(32'd100, 8'd5);
+        scan_line(32'd100, 8'd5, 1'b1, 1'b0);
+        wait_banks_free();
+
+        // Reproduce product-side FIFO backpressure, where the scheduler must
+        // hold one ready/valid request unchanged.  Its deadline age begins
+        // when valid is first presented, not when FIFO space eventually makes
+        // ready high.  Advance two physical scanlines while ready is forced
+        // low, then accept the held request.  It is already obsolete and must
+        // be discarded without spending a 128-beat DDR burst or raising the
+        // fatal line_missed indication.
+        before_line_reads = accepted_line_reads;
+        before_loaded = line_loaded_count;
+        before_missed = line_missed_count;
+        force dut.request_write_ready = 1'b0;
+        tick_scanline(8'd70);
+        @(negedge pixel_clk);
+        line_frame = 32'd100;
+        line_y = 8'd72;
+        line_request = 1'b1;
+        repeat (2) @(posedge pixel_clk);
+        if (line_request_ready)
+            $fatal(1, "forced-full request FIFO did not backpressure line");
+        tick_scanline(8'd71);
+        tick_scanline(8'd72);
+        release dut.request_write_ready;
+        #1;
+        while (!line_request_ready)
+            @(negedge pixel_clk);
+        @(posedge pixel_clk);
+        #1;
+        line_request = 1'b0;
+        repeat (500) @(posedge ddr_clk);
+        if (accepted_line_reads != before_line_reads)
+            $fatal(1,
+                "upstream-stalled stale line consumed a DDR burst: delta=%0d",
+                accepted_line_reads - before_line_reads);
+        if (line_loaded_count != before_loaded ||
+            line_missed_count != before_missed)
+            $fatal(1,
+                "upstream-stalled stale line loaded or raised fatal miss");
+
+        // Product requests y+2 while the current and next scanline banks may
+        // both still be owned.  The third bank must let that request start
+        // and complete immediately rather than waiting for line_end and
+        // reducing the intended two-line prefetch to one line of slack.
+        wait_banks_free();
+        before_loaded = line_loaded_count;
+        line_transaction(32'd100, 8'd20, 1'b1);
+        wait_line_available(32'd100, 8'd20);
+        line_transaction(32'd100, 8'd21, 1'b1);
+        wait_line_available(32'd100, 8'd21);
+        line_transaction(32'd100, 8'd22, 1'b1);
+        wait_line_available(32'd100, 8'd22);
+        if (line_loaded_count != before_loaded + 3)
+            $fatal(1, "third prefetch bank did not absorb y+2 request");
+        scan_line(32'd100, 8'd20, 1'b1, 1'b0);
+        scan_line(32'd100, 8'd21, 1'b1, 1'b0);
+        scan_line(32'd100, 8'd22, 1'b1, 1'b0);
+        wait_banks_free();
+
+        // Start a merge line after the fetch begins but before it completes.
+        // Publication occurs around the first third of the 256-pixel scan;
+        // the selected invalid state must nevertheless remain transparent.
+        response_gap_override = 0;
+        before_publish = ready_publish_count;
+        enqueue_line(32'd100, 8'd6);
+        timeout = 0;
+        while (!line_fetch_busy && timeout < 2000) begin
+            @(posedge ddr_clk);
+            timeout = timeout + 1;
+        end
+        if (timeout >= 2000)
+            $fatal(1, "late-line fetch never started");
+        scan_line(32'd100, 8'd6, 1'b0, 1'b0);
+        if (ready_publish_count != before_publish + 1)
+            $fatal(1,
+                "late-line test did not publish during the transparent scan");
+        wait_line_available(32'd100, 8'd6);
+        scan_line(32'd100, 8'd6, 1'b1, 1'b0);
+        response_gap_override = -1;
+
+        // While the first fetch owns the DDR state machine, queue four more
+        // requests to fill every FIFO entry.  A sixth request must see real
+        // backpressure until an entry is consumed.  The queued lines must
+        // then remain ordered and wait for bank ownership rather than being
+        // converted into transparent misses.
+        wait_banks_free();
+        before_line_reads = accepted_line_reads;
+        before_loaded = line_loaded_count;
+        before_missed = line_missed_count;
+        enqueue_line(32'd100, 8'd40);
+        timeout = 0;
+        while (!line_fetch_busy && timeout < 2000) begin
+            @(posedge ddr_clk);
+            timeout = timeout + 1;
+        end
+        if (timeout >= 2000)
+            $fatal(1, "FIFO-fill test did not start first line");
+        enqueue_line(32'd100, 8'd41);
+        enqueue_line(32'd100, 8'd42);
+        enqueue_line(32'd100, 8'd43);
+        enqueue_line(32'd100, 8'd44);
+        if (line_loaded_count != before_loaded)
+            $fatal(1, "request FIFO did not hold four queued entries");
+        @(negedge pixel_clk);
+        line_frame = 32'd100;
+        line_y = 8'd45;
+        line_request = 1'b1;
+        if (line_request_ready)
+            $fatal(1, "full four-entry request FIFO did not backpressure");
+        while (!line_request_ready)
+            @(negedge pixel_clk);
+        @(negedge pixel_clk);
+        line_request = 1'b0;
+
+        for (int queued_y = 40; queued_y <= 45; queued_y++) begin
+            wait_line_available(32'd100, queued_y[7:0]);
+            scan_line(32'd100, queued_y[7:0], 1'b1, 1'b0);
+        end
+        if (line_loaded_count != before_loaded + 6 ||
+            line_missed_count != before_missed)
+            $fatal(1, "bank-backpressured lines were lost or duplicated");
+        if (accepted_line_reads != before_line_reads + 6)
+            $fatal(1, "bank-backpressured line DDR burst count changed");
+        wait_banks_free();
+
+        // Model the two-line product prefetch directly: hold one 128-beat
+        // fetch while four later raster requests queue. Once the raster has
+        // advanced to line 64, generations 61 and 62 have missed their
+        // two-line deadline and must be discarded without a DDR burst. Line
+        // 63 is only one generation old and still has one full scanline of
+        // designed slack, so it must survive alongside current line 64.
+        // Treating any generation mismatch as stale discards line 63 here and
+        // turns modest DDR arbitration delay into a transparent 3D stripe.
+        before_line_reads = accepted_line_reads;
+        before_loaded = line_loaded_count;
+        before_missed = line_missed_count;
+        response_gap_override = 20;
+        tick_scanline(8'd60);
+        enqueue_line(32'd100, 8'd60);
+        timeout = 0;
+        while (!line_fetch_busy && timeout < 2000) begin
+            @(posedge ddr_clk);
+            timeout = timeout + 1;
+        end
+        if (timeout >= 2000)
+            $fatal(1, "stale-generation test did not start first line");
+        tick_scanline(8'd61);
+        enqueue_line(32'd100, 8'd61);
+        tick_scanline(8'd62);
+        enqueue_line(32'd100, 8'd62);
+        tick_scanline(8'd63);
+        enqueue_line(32'd100, 8'd63);
+        tick_scanline(8'd64);
+        enqueue_line(32'd100, 8'd64);
+        response_gap_override = -1;
+        wait_line_available(32'd100, 8'd60);
+        scan_line(32'd100, 8'd60, 1'b1, 1'b0);
+        wait_line_available(32'd100, 8'd63);
+        scan_line(32'd100, 8'd63, 1'b1, 1'b0);
+        wait_line_available(32'd100, 8'd64);
+        scan_line(32'd100, 8'd64, 1'b1, 1'b0);
+        if (line_loaded_count != before_loaded + 3)
+            $fatal(1,
+                "scanline-age requests did not drain: loaded=%0d",
+                line_loaded_count - before_loaded);
+        if (accepted_line_reads != before_line_reads + 3)
+            $fatal(1,
+                "obsolete queued lines consumed DDR bursts: delta=%0d",
+                accepted_line_reads - before_line_reads);
+        if (line_missed_count != before_missed)
+            $fatal(1, "obsolete queued lines asserted fatal line_missed");
+        tick_scanline(8'd65);
+        wait_banks_free();
+
+        // A prefetched line whose 2D drawline is dropped never receives a
+        // merge line_start. Prove that two such completed lines no longer
+        // retain both banks forever: the next raw scanline expires them.
+        line_transaction(32'd100, 8'd50, 1'b1);
+        wait_line_available(32'd100, 8'd50);
+        line_transaction(32'd100, 8'd51, 1'b1);
+        wait_line_available(32'd100, 8'd51);
+        tick_scanline(8'd52);
+        wait_banks_free();
+
+        // Modular expiry must release line 191 after wrap at line 0 while
+        // retaining a future line 1 prefetch.
+        line_transaction(32'd100, 8'd191, 1'b1);
+        wait_line_available(32'd100, 8'd191);
+        line_transaction(32'd100, 8'd1, 1'b1);
+        wait_line_available(32'd100, 8'd1);
+        tick_scanline(8'd0);
+        repeat (8) @(posedge pixel_clk);
+        scan_line(32'd100, 8'd1, 1'b1, 1'b0);
+        wait_banks_free();
+
+        // A verified replacement remains pending for the rest of the current
+        // scanout frame. The old descriptor and its owned line stay usable
+        // until the explicit architectural frame boundary, then become stale.
+        line_transaction(32'd100, 8'd12, 1'b1);
+        wait_line_available(32'd100, 8'd12);
+        publish_sequence = 32'd8;
+        descriptor_sequence = 32'd8;
+        descriptor_frame = 32'd101;
+        descriptor_bank = 32'd1;
+        descriptor_transaction(1'b1);
+        // Model a fixed-cadence poll arriving while the verified replacement
+        // still owns the descriptor link.  It is the same immutable shared
+        // descriptor and must be coalesced instead of blocking line requests.
+        before_publish = coalesced_descriptor_count;
+        enqueue_descriptor();
+        timeout = 0;
+        while (coalesced_descriptor_count == before_publish &&
+               timeout < 2000) begin
+            @(posedge ddr_clk);
+            timeout = timeout + 1;
+        end
+        if (timeout >= 2000)
+            $fatal(1,
+                "redundant descriptor was not coalesced while link was owned");
+        if (active_descriptor_sequence != 32'd6 ||
+            pixel_descriptor_sequence != 32'd6 || last_ack != 32'd6)
+            $fatal(1, "replacement descriptor activated mid-frame");
+        timeout = 0;
+        while (!pixel_descriptor_pending && timeout < 2000) begin
+            @(posedge pixel_clk);
+            timeout = timeout + 1;
+        end
+        if (!pixel_descriptor_pending)
+            $fatal(1, "staged replacement did not suppress descriptor polling");
+        scan_line(32'd100, 8'd12, 1'b1, 1'b0);
+        // Verification is asynchronous to display VBlank.  A pending new
+        // descriptor must not stop new fetches from the old active plane for
+        // the remainder of the current scanout frame.
+        line_transaction(32'd100, 8'd13, 1'b1);
+        wait_line_available(32'd100, 8'd13);
+        scan_line(32'd100, 8'd13, 1'b1, 1'b0);
+        wait_banks_free();
+        line_transaction(32'd100, 8'd12, 1'b1);
+        wait_line_available(32'd100, 8'd12);
+        response_gap_override = 12;
+        enqueue_line(32'd100, 8'd14);
+        timeout = 0;
+        while (!line_fetch_busy && timeout < 2000) begin
+            @(posedge ddr_clk);
+            timeout = timeout + 1;
+        end
+        if (timeout >= 2000)
+            $fatal(1, "handoff test did not hold DDR reader busy");
+        activate_pending_descriptor();
+        // The VBlank pulse requests DDR activation; it must not expose the
+        // replacement immediately.  The old complete line remains valid
+        // while that request and confirmation cross the two clock domains.
+        if (!pixel_descriptor_valid || pixel_descriptor_sequence != 32'd6 ||
+                pixel_descriptor_frame != 32'd100)
+            $fatal(1, "replacement exposed before DDR activation confirmation");
+        scan_line(32'd100, 8'd12, 1'b1, 1'b0);
+        if (!pixel_descriptor_valid || pixel_descriptor_sequence != 32'd6)
+            $fatal(1, "old descriptor was not held through busy DDR handoff");
+        response_gap_override = -1;
+        wait_pixel_descriptor(32'd8, 32'd101, 1'b1);
+        if (pixel_descriptor_pending)
+            $fatal(1, "descriptor pending remained set after activation");
+        scan_line(32'd100, 8'd12, 1'b0, 1'b0);
+        wait_banks_free();
+        line_transaction(32'd101, 8'd12, 1'b1);
+        wait_line_available(32'd101, 8'd12);
+        scan_line(32'd101, 8'd12, 1'b1, 1'b1);
+        wait_banks_free();
+
+        // Change the epoch after several response beats.  The burst may
+        // finish writing unused RAM, but its ready toggle must not publish.
+        response_gap_override = 1;
+        before_publish = ready_publish_count;
+        before_missed = line_missed_count;
+        enqueue_line(32'd101, 8'd20);
+        timeout = 0;
+        while ((!line_fetch_busy || dut.fetch_beat_count < 8'd9) &&
+            timeout < 5000) begin
+            @(posedge ddr_clk);
+            timeout = timeout + 1;
+        end
+        if (timeout >= 5000)
+            $fatal(1, "session-change fetch did not return initial beats");
+        next_session = ddr_session + 32'd1;
+        @(negedge ddr_clk);
+        ddr_session = next_session;
+        @(negedge pixel_clk);
+        pixel_session = next_session;
+        timeout = 0;
+        while (line_missed_count == before_missed && timeout < 5000) begin
+            @(posedge ddr_clk);
+            timeout = timeout + 1;
+        end
+        if (timeout >= 5000 || ready_publish_count != before_publish)
+            $fatal(1, "stale mid-fetch session published a line");
+        scan_line(32'd101, 8'd20, 1'b0, 1'b1);
+        response_gap_override = -1;
+
+        // Re-establish a descriptor in the new session and prove recovery.
+        descriptor_session = next_session;
+        publish_sequence = 32'd10;
+        descriptor_sequence = 32'd10;
+        descriptor_frame = 32'd102;
+        descriptor_bank = 32'd0;
+        descriptor_transaction(1'b1);
+        activate_pending_descriptor();
+        wait_pixel_descriptor(32'd10, 32'd102, 1'b0);
+        line_transaction(32'd102, 8'd21, 1'b1);
+        wait_line_available(32'd102, 8'd21);
+        scan_line(32'd102, 8'd21, 1'b1, 1'b0);
+        wait_banks_free();
+
+        // Assert both resets in the middle of another burst, increment the
+        // session, then release the two clocks at unrelated edges.  Stale RAM
+        // contents and old toggle phases must remain invisible.
+        enqueue_line(32'd102, 8'd30);
+        timeout = 0;
+        while ((!line_fetch_busy || dut.fetch_beat_count < 8'd9) &&
+            timeout < 5000) begin
+            @(posedge ddr_clk);
+            timeout = timeout + 1;
+        end
+        if (timeout >= 5000)
+            $fatal(1, "reset test fetch did not return initial beats");
+        next_session = ddr_session + 32'd1;
+        @(negedge ddr_clk);
+        ddr_reset = 1'b1;
+        pixel_reset = 1'b1;
+        ddr_session = next_session;
+        pixel_session = next_session;
+        repeat (5) @(posedge ddr_clk);
+        @(negedge ddr_clk);
+        ddr_reset = 1'b0;
+        repeat (4) @(posedge pixel_clk);
+        @(negedge pixel_clk);
+        pixel_reset = 1'b0;
+        repeat (5) @(posedge pixel_clk);
+        scan_line(32'd102, 8'd30, 1'b0, 1'b0);
+
+        descriptor_session = next_session;
+        publish_sequence = 32'd12;
+        descriptor_sequence = 32'd12;
+        descriptor_frame = 32'd103;
+        descriptor_bank = 32'd1;
+        descriptor_transaction(1'b1);
+        activate_pending_descriptor();
+        wait_pixel_descriptor(32'd12, 32'd103, 1'b1);
+        // A synchronous console can already be two logical frames beyond a
+        // completed HPS plane.  Product wiring deliberately tags both the
+        // request and merge deadline with the accepted descriptor frame, not
+        // the newer console counter, so the latest complete plane remains
+        // visible.  x=21 on this line is an opaque, colored (not white) pixel;
+        // scan_line proves that exact A31:B6:G6:R6 value reaches the reader.
+        console_logical_frame = 32'd105;
+        if (latest_complete_frame != 32'd103 ||
+            console_logical_frame - latest_complete_frame != 32'd2)
+            $fatal(1, "latest-complete frame tag did not retain stale-by-2 descriptor");
+        stale_colored_pixel = plane_pixel(1'b1, 8'd31, 8'd21);
+        if (stale_colored_pixel[22:18] != 5'd31 ||
+            stale_colored_pixel[17:0] == 18'h3ffff)
+            $fatal(1, "stale-by-2 proof pixel is not opaque colored A31");
+        line_transaction(latest_complete_frame, 8'd31, 1'b1);
+        wait_line_available(latest_complete_frame, 8'd31);
+        scan_line(latest_complete_frame, 8'd31, 1'b1, 1'b1);
+        wait_banks_free();
+
+        // Format 2 publishes a complete ARM-rendered framebuffer bank. It
+        // does not depend on the unused local renderer's frame boundary. It
+        // must not become a 3D plane, and ownership ACK still waits for the
+        // actual video scanout. Supply no merge/window/frame-boundary event.
+        @(negedge pixel_clk);
+        manual_switch_window = 1'b0;
+        frame_boundary = 1'b0;
+        publish_sequence = 32'd14;
+        descriptor_sequence = 32'd14;
+        descriptor_frame = 32'd104;
+        descriptor_bank = 32'd3;
+        descriptor_format = 32'd2;
+        descriptor_transaction(1'b1);
+        timeout = 0;
+        while (full_frame_publish_count == 0 && timeout < 2000) begin
+            @(posedge ddr_clk);
+            timeout = timeout + 1;
+        end
+        while ((pixel_descriptor_pending || pixel_descriptor_valid) &&
+                timeout < 4000) begin
+            @(posedge pixel_clk);
+            timeout = timeout + 1;
+        end
+        if (full_frame_publish_count != 1 || timeout >= 4000 || last_full_frame_bank != 2'd3 ||
+            pixel_descriptor_valid || last_ack != 32'd12)
+            $fatal(1, "full framebuffer descriptor activated or ACKed incorrectly");
+        repeat (200) @(negedge ddr_clk);
+        if (!dut.full_ack_pending || last_ack != 32'd12 ||
+            full_frame_publish_count != 1 || descriptor_switch_window || frame_boundary)
+            $fatal(1, "complete frame ownership returned before scanout adoption");
+        @(negedge ddr_clk);
+        manual_full_frame_adopted = 1'b1;
+        @(negedge ddr_clk);
+        manual_full_frame_adopted = 1'b0;
+        wait_descriptor_ack(32'd14);
+        $display("PROOF: complete frame published with no local renderer boundary, but ownership waited for video scanout adoption");
+
+        // Format 3 atomically carries a normal 3D plane plus one independent
+        // Engine-B scanout bank. The plane activates immediately at VBlank,
+        // but HPS ownership still waits for the screen-bank adoption fence.
+        publish_sequence = 32'd16;
+        descriptor_sequence = 32'd16;
+        descriptor_frame = 32'd105;
+        descriptor_bank = 32'd7; // plane 1, B bank 1, physical screen 1
+        descriptor_format = 32'd3;
+        // Start just after a real scanout frame boundary. This guarantees the
+        // adoption event is still ahead of the line fetch below and makes the
+        // race deterministic rather than dependent on earlier test duration.
+        timeout = 0;
+        while ((scanout.hcount != 0 || scanout.vcount != 0 ||
+                scanout.pixel_divider != 0) && timeout < 1200000) begin
+            @(posedge ddr_clk);
+            timeout = timeout + 1;
+        end
+        if (timeout >= 1200000)
+            $fatal(1, "scanout did not reach deterministic frame alignment");
+        // Enable the product scanout bridge before publication so this test
+        // uses its real frame-boundary adoption event, not a hand pulse.
+        auto_adoption_enable = 1'b1;
+        hold_line_response = 1'b0;
+        descriptor_transaction(1'b1);
+        activate_pending_descriptor();
+        wait_pixel_descriptor(32'd16, 32'd105, 1'b1);
+        timeout = 0;
+        while (full_frame_publish_count < 2 && timeout < 2000) begin
+            @(posedge ddr_clk);
+            timeout = timeout + 1;
+        end
+        if (timeout >= 2000 || last_full_frame_bank != 2'd1 ||
+            last_full_frame_screen != 1'b1 || last_ack != 32'd14)
+            $fatal(1, "composite Engine-B descriptor metadata/ACK is wrong");
+        // Hardware capture 260904-EBQF1S2 stopped forever at publish 0x24 /
+        // ACK 0x22.  A composite descriptor keeps the 3D line reader active,
+        // so reproduce the exact boundary race: scanout's one-cycle Engine-B
+        // adoption pulse arrives while a 128-beat plane line is in flight.
+        // The pulse must be retained until the reader returns to IDLE and can
+        // issue the descriptor ownership ACK.
+        before_loaded = line_loaded_count;
+        enqueue_line(32'd105, 8'd32);
+        timeout = 0;
+        while ((dut.state != dut.LINE_WAIT || dut.fetch_beat_count < 8'd8) &&
+               timeout < 5000) begin
+            @(posedge ddr_clk);
+            timeout = timeout + 1;
+        end
+        if (timeout >= 5000 || !dut.full_ack_pending)
+            $fatal(1,
+                "composite adoption race did not reach an owned line fetch");
+        @(negedge ddr_clk);
+        hold_line_response = 1'b1;
+        before_adoption = auto_adoption_count;
+        timeout = 0;
+        while (auto_adoption_count == before_adoption &&
+               timeout < 1200000) begin
+            @(posedge ddr_clk);
+            timeout = timeout + 1;
+        end
+        if (timeout >= 1200000 || dut.state != dut.LINE_WAIT ||
+            !dut.full_ack_pending)
+            $fatal(1,
+                "scanout adoption did not arrive during LINE_WAIT state=%0d full_ack=%0b",
+                dut.state, dut.full_ack_pending);
+        $display(
+            "PROOF: scanout adoption arrived while the reader was in LINE_WAIT");
+        @(negedge ddr_clk);
+        hold_line_response = 1'b0;
+        timeout = 0;
+        while (line_loaded_count == before_loaded && timeout < 20000) begin
+            @(posedge ddr_clk);
+            timeout = timeout + 1;
+        end
+        if (timeout >= 20000)
+            $fatal(1, "composite adoption race line did not complete");
+        wait_line_available(32'd105, 8'd32);
+        scan_line(32'd105, 8'd32, 1'b1, 1'b1);
+        wait_banks_free();
+        wait_descriptor_ack(32'd16);
+        $display(
+            "PROOF: composite descriptor ownership ACK followed the busy-state adoption");
+
+        // Off rejects external video formats without disabling normal 3D.
+        @(negedge ddr_clk);
+        external_enable = 1'b0;
+        publish_sequence = 32'd18;
+        descriptor_sequence = 32'd18;
+        descriptor_frame = 32'd106;
+        descriptor_transaction(1'b0);
+        descriptor_format = 32'd2;
+        descriptor_bank = 32'd1;
+        descriptor_transaction(1'b0);
+        descriptor_format = 32'd1;
+        descriptor_transaction(1'b1);
+        activate_pending_descriptor();
+        wait_pixel_descriptor(32'd18, 32'd106, 1'b1);
+        wait_descriptor_ack(32'd18);
+        line_transaction(32'd106, 8'd33, 1'b1);
+        wait_line_available(32'd106, 8'd33);
+        scan_line(32'd106, 8'd33, 1'b1, 1'b1);
+        wait_banks_free();
+        if (full_frame_publish_count != 2)
+            $fatal(1, "Off published external video");
+
+        // A verified composite can be waiting for pixel VBlank when the
+        // session is withdrawn. Its 3D activation must not publish old B.
+        @(negedge ddr_clk);
+        external_enable = 1'b1;
+        publish_sequence = 32'd20;
+        descriptor_sequence = 32'd20;
+        descriptor_frame = 32'd107;
+        descriptor_format = 32'd3;
+        descriptor_bank = 32'd7;
+        descriptor_transaction(1'b1);
+        @(negedge ddr_clk);
+        external_enable = 1'b0;
+        activate_pending_descriptor();
+        wait_pixel_descriptor(32'd20, 32'd107, 1'b1);
+        repeat (20) @(negedge ddr_clk);
+        if (full_frame_publish_count != 2 || dut.full_ack_pending ||
+            last_ack != 32'd18)
+            $fatal(1, "withdrawn staged composite published or ACKed");
+
+        // New On permission alone cannot replay the canceled publication.
+        external_enable = 1'b1;
+        repeat (20) @(negedge ddr_clk);
+        if (full_frame_publish_count != 2)
+            $fatal(1, "On replayed a canceled composite");
+        publish_sequence = 32'd22;
+        descriptor_sequence = 32'd22;
+        descriptor_frame = 32'd108;
+        descriptor_transaction(1'b1);
+        activate_pending_descriptor();
+        wait_pixel_descriptor(32'd22, 32'd108, 1'b1);
+        repeat (20) @(negedge ddr_clk);
+        if (full_frame_publish_count != 3 || !dut.full_ack_pending)
+            $fatal(1, "fresh On composite did not publish");
+        auto_adoption_enable = 1'b0;
+        external_enable = 1'b0;
+        manual_full_frame_adopted = 1'b1;
+        repeat (3) @(negedge ddr_clk);
+        manual_full_frame_adopted = 1'b0;
+        if (dut.full_ack_pending || dut.full_adoption_pending ||
+            last_ack != 32'd18)
+            $fatal(1, "old adoption ACK survived session withdrawal");
+        $display("PROOF: Off rejected both external formats, kept exact 3D reads, canceled staged/awaiting-adoption B, and On required a fresh publication");
+
+        if (accepted_commands < 20 || accepted_line_reads < 10 ||
+            busy_stall_cycles < 20 || response_gap_cycles < 100 ||
+            ready_publish_count < 8)
+            $fatal(1,
+                "randomized test coverage too weak: commands=%0d lines=%0d busy=%0d gaps=%0d publishes=%0d",
+                accepted_commands, accepted_line_reads,
+                busy_stall_cycles, response_gap_cycles,
+                ready_publish_count);
+
+        if (REQUIRE_LATE_TEST) late_window_tests();
+
+        $display(
+            "PASS: dual-clock H3D bridge accepted %0d commands and %0d line bursts across unrelated clocks; %0d complete lines published only after 128 beats, tags stayed immutable until ack, no owned bank was overwritten, late/stale/reset lines stayed transparent, and every valid 256-pixel line matched",
+            accepted_commands, accepted_line_reads, ready_publish_count
+        );
+        $finish;
+    end
+
+    initial begin
+        #50000000000;
+        $fatal(1, "dual-clock H3D plane reader test timeout");
+    end
+endmodule

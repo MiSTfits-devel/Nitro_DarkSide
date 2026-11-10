@@ -1,0 +1,74 @@
+NDS4MiSTer v0.9.0-rc.9 — Standalone
+
+Corresponding source, licences and build scripts for the frozen Beta12 runtime.
+No compiled binaries were rebuilt for public packaging. Private development
+data is not a build dependency. Historical release records describe their
+named artifacts; use the Beta12 records below for this package.
+
+Source identities
+- Frozen renderer: 1d3a33361730ca0d2f9123c578378bca40463aad.
+- Host with offline RTC: db09fc5cee49ccca4e9e3b9b71e65ba303836607.
+  The tested binary retains the v0.9.0-rc.8 internal version label.
+- FPGA: 32c31cd94b5a5734b6c034e8647d2a4924e990ae plus the exact QSF
+  overrides in docs/release/BETA12_BUILD_PROVENANCE.json. Source defaults
+  leave these experiments off. Append the recorded text when rebuilding:
+    NDS_GX_SWAP_RETIREMENT_EXPERIMENT=1
+    NDS_HBLANK_RUN_QUEUE_EXPERIMENT=1
+    NDS_GX_BUSY_STATUS_EXPERIMENT=1
+- The package manifest records its exact packaging-source revision separately
+  from those component revisions. Documentation does not change the binaries.
+
+Build and validation records
+  docs/release/BETA12_FPGA_SOURCE_INPUTS.json
+  docs/release/BETA12_BUILD_SOURCE_INPUTS.json
+  docs/release/BETA12_RENDERER_SOURCE_INPUTS.json
+  docs/release/BETA12_BUILD_PROVENANCE.json
+  docs/release/BETA12_PUBLIC_TEST_QUALIFICATION.json
+  docs/release/VALIDATION_BETA12_RC9.md
+  docs/RELEASE_NOTES_V090_RC9.md
+  docs/GAME_CLOCK.md
+The original renderer inventory and reviewed inventory contain 851 entries;
+their sole difference is an unlinked test. The FPGA inventory is a historical
+1,872-file tree snapshot, not a list of 1,872 compiled HDL files. Packaging
+checks the 552 HDL/configuration entries, with the recorded QSF override.
+See validation for the two noncompiled historical inventory differences.
+Top-level SHA256SUMS covers this release source except itself. It is a release
+inventory, not an automatically updated development-branch index.
+
+Build entry points
+- FPGA: fpga/mister_nitro_console_island/NDS4MiSTer.qpf; Quartus Prime
+  17.0.2 Build 602 Lite, Cyclone V 5CSEBA6U23I7, seed 7, one processor.
+  Use the corresponding source and QSF overrides above, not the defaults alone.
+- Host: tools/standalone_host/build.sh; GCC 13.3.0, static C++17 -O2,
+  Cortex-A9 NEON hard-float. VERSION and the host menu retain v0.9.0-rc.8.
+- Renderer: tools/build_hybrid_3d_service_armhf.sh; GCC 13.3.0, static
+  Release -O3/LTO, Cortex-A9 NEON hard-float. JIT and audio mixing disabled.
+- Kernel modules: kernel/nds_mem_wc, including configuration and provenance
+  for 5.15.1-MiSTer and 6.18.38-MiSTer. The launcher selects the matching ABI.
+- Installer: tools/package_standalone_release.py. Supply the exact core,
+  host, renderer and both modules. --check-only verifies inputs and layout.
+  To reproduce the ZIP, use its packaging-source revision and pinned binaries.
+  A source archive accepts --source-revision. tools/audit_public_release.py
+  checks the resulting ZIP and sidecar against source pins and metadata.
+
+This release retains the 1 GHz ARM clock and frame skipping off. It includes
+Castlevania-specific rendering/scheduling improvements, full-rate NSMB drawing,
+offline RTC startup and the inherited save/graphics compatibility fixes. DS
+CPU execution, audio and DS timing remain in FPGA; graphics run on ARM. Separate
+analog/digital layouts and release-aware controller mapping are retained.
+
+Routing and assembly passed; static timing closure remains unresolved. No new
+timing analysis or hardware test was performed for public packaging. Earlier
+Beta12 live checks and private-kit installation smoke are inherited. The public
+layout has offline archive/merge/rollback checks, not a new physical launch.
+Long sessions, all games, physical adapters and multiple boards remain incompletely
+tested. Native analog is approximately 59.64 Hz, with no PAL 50 Hz mode. Save
+states, persistent lid-close resume, wireless, DSi and RTC alarms are unsupported.
+
+Public launch paths: Scripts/NDS4MiSTer.sh and Scripts/.NDS_Standalone.
+Merge the ZIP without deleting saved settings. No ROMs, BIOS/firmware dumps,
+saves, maps, personal settings, credentials, captures or kernel image are bundled.
+Keep all files from one release together. The install ZIP and SHA-256 companion
+are the release assets; corresponding source uses GitHub's archives at the tag.
+Retain included licences and notices, including FreeBIOS and
+tools/standalone_host/THIRD_PARTY.md.

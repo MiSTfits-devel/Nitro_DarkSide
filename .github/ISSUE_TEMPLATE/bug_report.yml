@@ -1,0 +1,51 @@
+name: Bug report
+description: Something not working? Tell us what happened.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A short description is enough to get started. Everything else is optional.
+        Please do not upload or link to ROMs, BIOS/firmware dumps, saves,
+        credentials, or private information.
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What went wrong?
+      description: Tell us what happened and what you expected. Include any error message you saw.
+      placeholder: When I..., the core... I expected...
+    validations:
+      required: true
+
+  - type: input
+    id: game
+    attributes:
+      label: Game (optional)
+      description: If this affects a game, give its title. Add the region or revision if you know it.
+      placeholder: New Super Mario Bros. (USA)
+
+  - type: input
+    id: beta
+    attributes:
+      label: NDS4MiSTer version (optional)
+      description: The release name or ZIP filename is enough. Leave blank if unsure.
+      placeholder: v0.9.0-rc.7
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce (optional)
+      description: What were you doing when it happened? Mention whether it happens every time or only sometimes, if you know.
+      placeholder: |
+        1. Launch NDS4MiSTer.
+        2. Load the game and...
+        3. ...
+
+  - type: textarea
+    id: crash_report
+    attributes:
+      label: Anything else? (optional)
+      description: Add screenshots, video, or a crash report if available. For display problems, your TV, connection, and CRT Mode setting can help. Share only what you know.
