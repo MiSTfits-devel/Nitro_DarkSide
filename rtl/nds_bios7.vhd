@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: GPL-2.0-or-later
+
 -- The file probe is elaboration-time textio; in synthesis the hex is
 
 library IEEE;
@@ -214,7 +216,6 @@ begin
          end if;
       end process;
 
-      -- Keep the HLE fallback on the same registered read path as hot_ram.
       bios_data <= hle_q when load_done = '0' else hot_q;
    end generate;
 

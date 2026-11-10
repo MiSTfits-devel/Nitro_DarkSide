@@ -1,3 +1,5 @@
+// Licensed under the repo LICENSE (see the LICENSE file at the repo root).
+
 `timescale 1ns/10ps
 module pll_video(
 	input  wire refclk,

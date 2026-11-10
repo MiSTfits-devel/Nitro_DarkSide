@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: GPL-2.0-or-later
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -658,8 +659,6 @@ begin
       VRAM_Drawer_accept   => srv_obj_accept
    );
 
-   -- M10K stores; the drawer-side reads keep their 1-cycle registered-read
-   -- these three M10Ks keep the previous game's palette and sprite table and
    p_clear : process (clk)
    begin
       if rising_edge(clk) then

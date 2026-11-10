@@ -28,7 +28,6 @@ entity nds_vram is
       cpu9_din  : in  std_logic_vector(31 downto 0);
       cpu9_dout : out std_logic_vector(31 downto 0) := (others => '0');
       cpu9_done : out std_logic := '0';
-      -- what makes it keep up: a 16-bit-per-2-cycles writer produces one word
       cpu9_wpost : in  std_logic := '0';
       cpu9_welig : out std_logic;
       cpu9_wok   : out std_logic;
@@ -648,7 +647,6 @@ begin
             end if;
             br_valid <= '0';
 
-            -- take the half that was wanted and keep the whole line for the
             if (rsp_valid = '1' and v_adcnt > 0) then
                v_slot := adq(v_adh).slot;
                if (adq(v_adh).hi = '1') then

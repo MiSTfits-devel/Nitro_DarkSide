@@ -1,3 +1,4 @@
+// Licensed under the repo LICENSE (see the LICENSE file at the repo root).
 
 module nds_audio_ddr3 #(
 	parameter [27:1] AUD_HW_BASE = 27'h7FE8000,

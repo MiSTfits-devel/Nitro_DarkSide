@@ -1,3 +1,23 @@
+//============================================================================
+//  NDS
+//  Copyright (C) 2026 NDS_MiSTfits
+//
+//  Port to MiSTer, derived from GBA_MiSTer (Robert Peip / Sorgelig)
+//
+//  This program is free software; you can redistribute it and/or modify it
+//  under the terms of the GNU General Public License as published by the Free
+//  Software Foundation; either version 2 of the License, or (at your option)
+//  any later version.
+//
+//  This program is distributed in the hope that it will be useful, but WITHOUT
+//  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+//  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+//  more details.
+//
+//  You should have received a copy of the GNU General Public License along
+//  with this program; if not, write to the Free Software Foundation, Inc.,
+//  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+//============================================================================
 
 module emu
 (
@@ -250,7 +270,6 @@ wire [15:0] joy;
 wire [21:0] gamma_bus;
 wire [15:0] joystick_analog_0;
 
-// Keep the DE10 HPS transport behind a dedicated boundary. The uio/fp command
 nds_hps_io_boundary #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 (
 	.clk_sys(clk_sys),

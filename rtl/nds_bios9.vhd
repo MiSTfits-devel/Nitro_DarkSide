@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: GPL-2.0-or-later
+
 -- The file probe is elaboration-time textio; in synthesis the hex is
 
 library IEEE;

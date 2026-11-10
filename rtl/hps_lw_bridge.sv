@@ -1,3 +1,4 @@
+// Licensed under the repo LICENSE (see the LICENSE file at the repo root).
 
 module hps_lw_bridge
 (

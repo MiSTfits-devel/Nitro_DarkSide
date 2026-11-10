@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: GPL-2.0-or-later
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -102,7 +103,6 @@ begin
       if (unsigned(gb_bus.Adr) >= ADR_BASE and unsigned(gb_bus.Adr) < ADR_BASE + 16#30#) then
          off := to_integer(unsigned(gb_bus.Adr) - ADR_BASE) / 4;
          reg_hit    <= '1';
-         -- Four channels, three words each. Keep this as the literal MMIO
          -- map so synthesis does not implement /3 and mod 3 divider trees.
          case off is
             when 0  => regsel_ch <= 0; regsel_reg <= 0;

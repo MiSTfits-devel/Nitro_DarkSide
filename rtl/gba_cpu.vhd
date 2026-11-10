@@ -1951,7 +1951,6 @@ begin
       if (decode_functions_detail = block_read or decode_functions_detail = block_write) then
          execute_RW_data <= std_logic_vector(execute_op2);
 
-         -- Supervisor writes storage nothing reads, and the live r8-r12 keep
          if (decode_block_usermoderegs = '1' and cpu_mode /= CPUMODE_USER and cpu_mode /= CPUMODE_SYSTEM and
              ((unsigned(decode_RM_op2) >= 13 and unsigned(decode_RM_op2) <= 14) or
               (unsigned(decode_RM_op2) >= 8  and unsigned(decode_RM_op2) <= 12 and cpu_mode = CPUMODE_FIQ))) then

@@ -1,4 +1,5 @@
--- escape (nds_cpu9.vhd:921, gba_cpu.vhd equivalents). Peripherals keep running
+-- SPDX-License-Identifier: GPL-2.0-or-later
+
 
 library IEEE;
 use IEEE.std_logic_1164.all;

@@ -114,7 +114,6 @@ entity nds_top is
 
       -- debug (sim monitors; unconnected in synthesis). The record-typed
       -- exports are sim-only, pragma-stripped like the CPUs' own ports
-      -- (donor gba_cpu idiom); keep plain ports after them so stripping
 -- synthesis translate_off
       dbg_export9_done : out std_logic;
       dbg_export9      : out cpu_export_type;
@@ -460,7 +459,6 @@ architecture arch of nds_top is
    signal keyinput : std_logic_vector(9 downto 0);
    signal extkeyin : std_logic_vector(7 downto 0);
 
-   -- keep several fetches in flight (see nds_vram's pipeline comment).
    signal r_bg_accept, rb_bg_accept : std_logic;
    signal r_obj_accept, rb_obj_accept : std_logic;
    signal r_bg_req, r_bg_done       : std_logic;

@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: GPL-2.0-or-later
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -380,7 +381,6 @@ begin
 
    OAM_isbitmap <= '1' when (OAMRAM_Drawer_data(OAM_MODE_HI downto OAM_MODE_LO) = "11") else '0';
 
-   -- attr0/attr1 keep their old bit positions in the widened read, so every
    OAM_attr2 <= OAMRAM_Drawer_data(47 downto 32);
 
    process (clk)
@@ -749,7 +749,6 @@ begin
                   if (v_hw <= 2046) then v_hw := v_hw + 1; end if;
                   PIXELGen <= NEXTADDR;
                elsif (Pixel_data0(OAM_AFFINE) = '1') then
-                  -- to the sum stage and keep walking. Only when the stage is
                   if (v_affpend = '0') then
                      aff_target <= x + posX;
                      aff_second <= v_second;

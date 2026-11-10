@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: GPL-2.0-or-later
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -99,7 +100,6 @@ begin
    dbg_mr <= mainram_allow & lock_pair & serving7 & req7_pending & req9_pending &
              "0" & std_logic_vector(to_unsigned(tState'pos(state), 2));
 
-   -- same reasoning as gba_mem_ewram_sdram: keep the readmux cone off the
    process (clk1x)
    begin
       if rising_edge(clk1x) then
@@ -194,7 +194,6 @@ begin
                   state <= MR_WAIT;
                end if;
 
-            -- Keep ch2 and the winning CPU reserved across the short gap
             when MR_LOCKWAIT =>
                if (reset = '1') then
                   lock_pair   <= '0';

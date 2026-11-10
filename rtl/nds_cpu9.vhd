@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: GPL-2.0-or-later
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -268,7 +269,6 @@ architecture arch of nds_cpu9 is
    signal decode_Rn_op1                   : std_logic_vector(3 downto 0) := (others => '0');
    signal decode_Rn_op1_save              : std_logic_vector(3 downto 0) := (others => '0');
    signal decode_RM_op2                   : std_logic_vector(3 downto 0) := (others => '0');
-   -- Keep only the four-bit Rn decode/execute boundary. Physical retiming moved
    attribute preserve : boolean;
    attribute preserve of decode_Rn_op1 : signal is true;
    signal decode_alu_use_immi             : std_logic := '0';
@@ -420,7 +420,6 @@ architecture arch of nds_cpu9 is
    signal execute_busaddress              : unsigned(31 downto 0);
    signal execute_busaddmod               : unsigned(31 downto 0);
    signal execute_RW_dataRead             : std_logic_vector(31 downto 0);
-   -- preserve, physical retiming removes it and rebuilds the full register-file
    attribute preserve of execute_RW_dataRead : signal is true;
    signal execute_RW_WBaddr               : unsigned(31 downto 0) := (others => '0');
 
@@ -1951,8 +1950,6 @@ begin
 
    end process;
 
-   -- so the operand crosses one 5-stage rotator and one keep/fill mux. The
-   -- rotate amount, the keep mask, which fill to use and which bit the carry
    shiftervalue <= execute_op2;
 
    process (all)
@@ -2059,7 +2056,6 @@ begin
               execute_op2 when (decode_switch_op = '0' and decode_alu_use_shift = '0') else
               execute_op1;
 
-   -- since floor((1+C)/2) is C for C in {0,1}. Keep the full 34-bit sum for
    process (all)
       variable adc_wide : unsigned(33 downto 0);
       variable sub_wide : unsigned(33 downto 0);
@@ -2343,7 +2339,6 @@ begin
          end if;
 
          if (execute_RW_State = DATARW_IDLE) then
-            -- the next beat. Immediate/base-only forms keep their old timing.
             if (decode_datatransfer_shiftval = '0') then
                execute_RW_ena <= execute_now and (not execute_skip);
             end if;
@@ -2382,7 +2377,6 @@ begin
       if (decode_functions_detail = block_read or decode_functions_detail = block_write) then
          execute_RW_data <= std_logic_vector(execute_op2);
 
-         -- writes storage nothing reads and the live r8-r12 keep stale values.
          if (decode_block_usermoderegs = '1' and cpu_mode /= CPUMODE_USER and cpu_mode /= CPUMODE_SYSTEM and
              ((unsigned(decode_RM_op2) >= 13 and unsigned(decode_RM_op2) <= 14) or
               (unsigned(decode_RM_op2) >= 8  and unsigned(decode_RM_op2) <= 12 and cpu_mode = CPUMODE_FIQ))) then
@@ -2545,7 +2539,6 @@ begin
                           execute_msr_setvalue(5) when (execute_msr_setvalue_ena = '1') else
                           thumbmode               when (decode_functions_detail = block_read and decode_block_switchmode = '1' and
                                                         execute_RW_State = DATARW_PCWRITE) else
-                          -- Keep the old-mode value through the wait and switch
                           SPSR(5)                 when (decode_functions_detail = block_read and decode_block_switchmode = '1' and
                                                         ((execute_writeback = '1' and execute_writereg = x"F") or
                                                          execute_RW_State = DATARW_READWAIT or

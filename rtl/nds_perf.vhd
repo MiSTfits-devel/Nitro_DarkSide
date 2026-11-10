@@ -1,4 +1,5 @@
--- "did the renderer keep up, on hardware, in THIS scene".
+-- SPDX-License-Identifier: GPL-2.0-or-later
+
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -51,7 +52,6 @@ begin
    gon : if ENABLE /= 0 generate
 
       process (clk)
-         -- on either; both map to the same "did not keep up" event.
          variable v_drop_a : boolean;
          variable v_drop_b : boolean;
       begin

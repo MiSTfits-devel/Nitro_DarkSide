@@ -1,4 +1,5 @@
---    after each drawn line (the drawers keep a per-line latched copy,
+-- SPDX-License-Identifier: GPL-2.0-or-later
+
 
 library IEEE;
 use IEEE.std_logic_1164.all;

@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: GPL-2.0-or-later
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -273,7 +274,6 @@ begin
    itcm_size_ovf <= '1' when (unsigned(itcm_size) > 23) else '0';
    dtcm_size_ovf <= '1' when (unsigned(dtcm_size) > 23) else '0';
 
-   -- Two things the old form did that this has to keep doing:
    process (all)
       variable a         : unsigned(32 downto 0);
       variable itcm_mask : unsigned(32 downto 0);
