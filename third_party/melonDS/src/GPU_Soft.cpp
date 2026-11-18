@@ -1109,6 +1109,11 @@ void SoftRenderer::DrawScanlineB(u32 line, u32* dst)
 void SoftRenderer::DoCapture(u32 line)
 {
     u32 captureCnt = GPU.CaptureCnt;
+    const u32 traceFrame = GPU.NDS.NumFrames;
+    const bool traceCapture = NDS4MiSTer::CaptureProvenanceEnabled();
+    NDS4MiSTer::EmitCaptureBegin(traceFrame, static_cast<u16>(line), captureCnt,
+        GPU.GPU2D_A.DispCnt, GPU.VRAMMap_LCDC,
+        static_cast<u8>((captureCnt >> 24) & 1));
 
     u32 width, height;
     u32 sz = (captureCnt >> 20) & 0x3;
@@ -1124,11 +1129,26 @@ void SoftRenderer::DoCapture(u32 line)
     }
 
     if (line >= height)
+    {
+        { u16 cf[16]; GPU.GetCaptureBlockFlags(cf);
+          NDS4MiSTer::EmitCaptureEnd(traceFrame, static_cast<u16>(line), 0, cf); }
         return;
+    }
 
     u32 dstvram = (captureCnt >> 16) & 0x3;
     if (!(GPU.VRAMMap_LCDC & (1<<dstvram)))
+    {
+        { u16 cf[16]; GPU.GetCaptureBlockFlags(cf);
+          NDS4MiSTer::EmitCaptureEnd(traceFrame, static_cast<u16>(line), 0, cf); }
         return;
+    }
+
+    std::unique_ptr<u8[]> traceBefore;
+    if (traceCapture)
+    {
+        traceBefore.reset(new u8[128 * 1024]);
+        std::memcpy(traceBefore.get(), GPU.VRAM[dstvram], 128 * 1024);
+    }
 
     u16* dst = (u16*)GPU.VRAM[dstvram];
     u32 dstaddr = (((captureCnt >> 18) & 0x3) << 14) + (line * width);
@@ -1257,6 +1277,11 @@ void SoftRenderer::DoCapture(u32 line)
         }
         break;
     }
+    if (traceCapture)
+        NDS4MiSTer::EmitCaptureDeltas(traceFrame, static_cast<u16>(line), dstvram,
+            traceBefore.get(), GPU.VRAM[dstvram], 128 * 1024);
+    { u16 cf[16]; GPU.GetCaptureBlockFlags(cf);
+       NDS4MiSTer::EmitCaptureEnd(traceFrame, static_cast<u16>(line), 1, cf); }
 }
 
 void SoftRenderer::ApplyMasterBrightness(u16 regval, u32* dst)

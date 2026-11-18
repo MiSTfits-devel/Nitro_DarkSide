@@ -1,0 +1,101 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Standalone Quartus fit of one generated Clash 3D block. Driven by
+# clash/tests/remote_quartus_block.sh, which substitutes __POD__, __REV__ and
+# __CLAIM__ before applying this file - the pod name is the only per-run
+# identifier, so never hard-code one here (two fits on the same claim would wipe
+# each other's tree at startup).
+#
+# No pins are assigned: this measures logic utilisation and register-to-register
+# Fmax of the block itself, not board timing.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: __POD__
+  labels:
+    app: __POD__
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/arch: amd64
+  containers:
+  - name: quartus
+    image: raetro/quartus:17.0
+    # plain -c: a login shell would source /etc/profile and clobber the
+    # image's PATH, which is where quartus_sh lives
+    command: ["/bin/bash", "-c"]
+    args:
+      - |
+        set -u
+        REV=__REV__
+        # /work is a REUSED claim, so the last fit's tree is still here.
+        # Clear it: a stale project file or db/ from a different tree is
+        # exactly the contamination that makes one fit disagree with the next.
+        rm -rf /work/src /work/exitcode
+        mkdir -p /work/src
+        echo "waiting for source..."
+        while [ ! -f /work/src/.ready ]; do sleep 2; done
+        cd /work/src
+        P=$(cat .parallel 2>/dev/null || echo 1)
+        # the checked-in qsf ships the driver's default; override it per run
+        sed -i "s/NUM_PARALLEL_PROCESSORS [0-9]\+/NUM_PARALLEL_PROCESSORS ${P}/" "${REV}.qsf"
+        echo "=== quartus_sh --version ==="
+        quartus_sh --version
+        echo "=== quartus_sh --flow compile ${REV} (parallel=${P}) ==="
+        quartus_sh --flow compile "$REV"
+        rc=$?
+        echo "=== flow finished, exit ${rc} ==="
+        cat "output_files/${REV}.fit.summary" 2>/dev/null || true
+        cat "output_files/${REV}.sta.summary" 2>/dev/null || true
+        # per-clock Fmax and the worst setup/hold paths (the flow's summaries
+        # only carry aggregated slack); same pattern as build/quartus-pod.yaml
+        printf '%s\n' \
+          "project_open ${REV} -revision ${REV}" \
+          "create_timing_netlist" \
+          "read_sdc" \
+          "update_timing_netlist" \
+          "report_clocks -file output_files/${REV}.clocks.rpt" \
+          "report_timing -setup -npaths 20 -detail full_path -file output_files/${REV}.paths.rpt" \
+          "report_timing -hold -npaths 20 -detail full_path -file output_files/${REV}.paths_hold.rpt" \
+          "project_close" > paths.tcl
+        quartus_sta -t paths.tcl || true
+        # one place for the driver to fetch from: the flow writes its summaries
+        # beside the project file, the timing pass writes its reports into
+        # output_files/, and four files in one directory is what the driver reads
+        rm -rf /work/out
+        mkdir -p /work/out
+        cp -f output_files/${REV}.* /work/out/ 2>/dev/null || true
+        cp -f ${REV}.fit.summary ${REV}.sta.summary /work/out/ 2>/dev/null || true
+        echo ${rc} > /work/exitcode
+        # stay alive so the driver can kubectl exec the artifacts out
+        sleep infinity
+    resources:
+      requests:
+        # cpu is compressible - reserve little, burst to the limit
+        cpu: "1"
+        memory: 8Gi
+      limits:
+        cpu: "12"
+        memory: 24Gi
+    volumeMounts:
+    - name: work
+      mountPath: /work
+  volumes:
+  - name: work
+    persistentVolumeClaim:
+      claimName: __CLAIM__
+---
+# Named claim, not an ephemeral volume: both storage classes on the cluster are
+# ReclaimPolicy=Retain, so a per-pod claim would leave its directory behind on
+# every run. Same reasoning and same layout as build/quartus-pod.yaml. The name is
+# substituted per driver invocation, so a POD= override cannot silently share the
+# claim (which would wipe the other fit's tree at pod startup).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: __CLAIM__
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 20Gi

@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nitro_DarkSide — the TARDIS frame</title>
+<style>
+  :root{
+    --bg:#06070b; --bg2:#0a0c13; --panel:#0e1119; --panel2:#131826;
+    --line:#1e2637; --ink:#e8ecf4; --mid:#a3adc2; --dim:#6d7893;
+    --c9:#67e8f9;
+    --c7:#a78bfa;
+    --gr:#4ade80;
+    --gold:#fbbf24;
+    --cy:#38bdf8;
+    --pk:#f472b6;
+    --warn:#fb7185;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --sans:ui-sans-serif,-apple-system,"Segoe UI",Inter,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:
+      radial-gradient(1100px 700px at 12% -10%, #10203a 0%, transparent 60%),
+      radial-gradient(900px 600px at 92% 0%, #2a1030 0%, transparent 55%),
+      var(--bg);
+    color:var(--ink); font-family:var(--sans); -webkit-font-smoothing:antialiased;
+    line-height:1.5;
+  }
+  .wrap{max-width:1240px;margin:0 auto;padding:0 22px 90px}
+
+  header{padding:64px 0 34px}
+  .kicker{font-family:var(--mono);font-size:11.5px;letter-spacing:.22em;text-transform:uppercase;color:var(--c9);opacity:.9}
+  h1{
+    font-size:clamp(34px,6vw,62px);line-height:1.02;margin:14px 0 0;letter-spacing:-.03em;font-weight:700;
+    background:linear-gradient(96deg,#fff 8%,var(--c9) 42%,var(--c7) 72%,var(--pk) 96%);
+    -webkit-background-clip:text;background-clip:text;color:transparent;
+  }
+  .tag{margin:16px 0 0;max-width:64ch;color:var(--mid);font-size:16.5px}
+  .meta{display:flex;flex-wrap:wrap;gap:8px;margin-top:26px}
+  .pill{font-family:var(--mono);font-size:11px;padding:6px 11px;border:1px solid var(--line);border-radius:999px;color:var(--mid);background:#0b0e15}
+  .pill b{color:var(--ink);font-weight:600}
+
+  section{margin-top:66px}
+  h2{
+    font-size:13px;font-family:var(--mono);letter-spacing:.2em;text-transform:uppercase;
+    color:var(--dim);margin:0 0 6px;display:flex;align-items:center;gap:12px
+  }
+  h2::after{content:"";flex:1;height:1px;background:linear-gradient(90deg,var(--line),transparent)}
+  h3{font-size:clamp(22px,3vw,30px);margin:6px 0 10px;letter-spacing:-.02em;font-weight:650}
+  .lede{color:var(--mid);max-width:74ch;margin:0 0 22px;font-size:15.5px}
+
+  .orient{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+  .card{
+    border:1px solid var(--line);border-radius:14px;padding:16px 18px;
+    background:linear-gradient(180deg,var(--panel2),var(--panel));
+    position:relative;overflow:hidden
+  }
+  .card::before{content:"";position:absolute;inset:0 auto 0 0;width:2px;background:var(--ac,var(--c9));opacity:.85}
+  .card .n{font-family:var(--mono);font-size:10.5px;color:var(--ac,var(--c9));letter-spacing:.14em}
+  .card p{margin:7px 0 0;font-size:14.5px;color:var(--ink)}
+  .card p em{color:var(--mid);font-style:normal}
+
+  .legend{display:flex;flex-wrap:wrap;gap:16px;margin:0 0 14px;font-family:var(--mono);font-size:11px;color:var(--mid)}
+  .legend span{display:flex;align-items:center;gap:7px}
+  .sw{width:10px;height:10px;border-radius:3px;box-shadow:0 0 10px currentColor}
+
+  figure{margin:0}
+  .scroller{
+    overflow-x:auto;border:1px solid var(--line);border-radius:18px;
+    background:linear-gradient(180deg,#0b0e16,#080a10);
+    box-shadow:0 30px 70px -40px #000, inset 0 1px 0 #ffffff08;
+  }
+  .scroller svg{display:block;width:100%;min-width:900px;height:auto}
+  figcaption{margin-top:12px;color:var(--dim);font-size:13px;font-family:var(--mono);max-width:92ch}
+  figcaption b{color:var(--mid);font-weight:500}
+
+  svg text{font-family:var(--mono)}
+  .blk{fill:#101521;stroke:var(--ac);stroke-width:1.2;filter:url(#soft)}
+  .blk.ghost{fill:#0c1019}
+  .grp{fill:#0b0f18;stroke:var(--ac);stroke-width:1.1;stroke-dasharray:5 5;opacity:.95}
+  .nm{font-size:11.5px;font-weight:700;fill:var(--ink)}
+  .nmb{font-size:13px;font-weight:700;fill:var(--ink)}
+  .sb{font-size:9.2px;fill:var(--mid)}
+  .sbd{font-size:9.2px;fill:var(--dim)}
+  .hd{font-size:10px;font-weight:700;letter-spacing:.16em;fill:var(--ac)}
+  .wire{fill:none;stroke:var(--ac);stroke-width:1.8;opacity:.9}
+  .flow{stroke-dasharray:5 9;animation:dash 1.1s linear infinite}
+  @keyframes dash{to{stroke-dashoffset:-28}}
+  @media (prefers-reduced-motion:reduce){.flow{animation:none}}
+  g.node{transition:opacity .15s}
+  svg:hover g.node{opacity:.55}
+  svg g.node:hover{opacity:1}
+
+  footer{margin-top:70px;padding-top:22px;border-top:1px solid var(--line);color:var(--dim);font-size:13px;font-family:var(--mono)}
+  footer a{color:var(--c9);text-decoration:none;border-bottom:1px dotted #67e8f955}
+  code{font-family:var(--mono);font-size:.86em;font-variant-ligatures:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="kicker">Nintendo DS · MiSTer · GPU · design note</div>
+  <h1>the TARDIS frame<br>one pass, in pixel space</h1>
+  <p class="tag">Measured bounded line reuse on a real DS trace, backed by independent pixel oracles.
+  This is measured trace replay, not a complete Nintendo DS implementation or board-performance claim.</p>
+  <div class="meta">
+    <span class="pill">frame, not scanline <b>one pass</b></span>
+    <span class="pill">cache unit <b>rendered line</b></span>
+    <span class="pill">repair <b>JIT fixup</b></span>
+    <span class="pill">planning <b>per-line trace state</b></span>
+    <span class="pill">status <b>replay measured</b></span>
+  </div>
+</header>
+
+<section>
+  <h2>measured scope</h2>
+  <p>The NTR EVA checkpoint compares frames 34, 71, 84, 87, 90, 97, 108, 116,
+  120 and 123 against independent direct melonDS frame dumps: both displays
+  passed pixel-perfect. That v11 checkpoint uses recorded 3D input and checks
+  Haskell capture writes against a separate oracle-only VRAM shadow (192
+  capture lines); it is not the Haskell-3D proof. The separate v12 M4 gate
+  replays raw GX writes through the Haskell chip: 768 cartridge 3D lines and
+  23,808 screen lines match production, as do 6,720 directed/seeded scene
+  lines. The 2D combined matrix has 1,897 valid lines exact and three explicit
+  invalid-mode rejections. See <code>clash/README.md</code> for commands,
+  finite feature coverage and artifact locations.</p>
+  <p>The cache now has 192 LRU slots, plans each line from its own state, and
+  counts evaluated prefetch plus demand renders and invalidations. Immutable
+  array and decoder-owned trace memories carry exact identities; opaque memory
+  callbacks are never reused, and a caller composing 3D supplies a per-line 3D
+  identity through <code>onePassFrameWith</code>; sprite, OBJ-window, capture
+  and display/FIFO identities are separate key tokens. On the NTR v12 trace,
+  120 of 124 frames had no 3D-active lines (768 such lines were excluded and
+  counted), and 23,040 lines were pixel-identical across OBJ, windows, mosaic,
+  brightness and capture state: the speculative path did 14,025 renders
+  instead of 23,040 and measured 6.85 s versus 10.81 s (1.58x) with a 100% hit
+  rate. Those are renderer-only wall times. The final two-engine comparison
+  instead uses independent cache/exact processes from trace-open through
+  forced pixels, including decode, Chip replay, sprites, capture, tokens,
+  keys, prefetch, cache maintenance, hashing and GC; exact skips cache-only
+  tokens. It measured <b>36.129108 s cached versus 43.973591 s exact
+  (1.21712x)</b>, with 29,586 total prefetch+demand renders versus 47,616.
+  Both variants force 768 actual Haskell Chip 3D lines. Matching cross-run
+  hash 147193483 is only a consistency check; the prior prepared-input
+  comparison proved all 47,616 lines bitwise equal, separately from the
+  independent production-renderer oracles.</p>
+  <p>This is one run per variant on one cartridge trace, with wall/GC noise;
+  prefetch remains sequential, not parallel. The old unforced 3D timer is
+  invalid and the older 1.51x figure was renderer-only, not end-to-end.
+  The 101-check cache stress suite passes. Video mode 7 fails explicitly
+  rather than being approximated. Commands and logs are in
+  <code>clash/README.md</code>.</p>
+  <p>The composed-chip gate is separate from this benchmark. Its free-running
+  transaction reference checks independently queued command/parameter and
+  geometry-event payloads, FIFO conservation and every-clock FIFO/IRQ/DMA
+  transitions, including IF/refill priority. Overlapping RAM-count reads
+  linearize to independent monotonic event-prefix states; undefined-busy
+  result RAM alone is fenced. Geometry completion uses verified progress
+  handshakes with bounded liveness, not an independent proof of exact
+  microcycle latency. Import-time hashes and later host fixes are recorded
+  separately in <code>docs/GPU3D_CLASH.md</code>; none establishes a new
+  Quartus, generated-composed-RTL or board result.</p>
+  <p>The final host chip-only gate accepted all 40 default cases (16 directed,
+    16 seeded random, 8 fuzz), with 0 mismatches across 144,401 operations,
+    116,556 GX entries, 98,634 DMA triggers, 215 frames and 10,665,984
+    compared pixel words. These are disjoint final-checker batches; only
+    the last fuzz case was rerun after correcting completed matrix-result
+    visibility during a quiescent SWAP wait. The 26-operation nonzero-result
+    regression fails twice on the old binary and passes with the fix.
+    Exact logs and import-versus-correction provenance are in
+    <code>clash/README.md</code> and <code>docs/GPU3D_CLASH.md</code>.
+    This does not establish cycle-exact geometry latency or board/Quartus
+    acceptance.</p>
+</section>
+
+<section>
+  <h2>orientation</h2>
+  <h3>Five things that make the TARDIS frame worth trying</h3>
+  <p class="lede">The idea is not "prefetch a bit harder". It is to stop treating a frame as a sequence of
+  independent scanlines and treat it as one pass with a retroactive plan.</p>
+  <div class="orient">
+    <div class="card" style="--ac:var(--c9)"><div class="n">01 · THE COST IS LUMPY</div>
+      <p>Most lines are cheap; a few are enormous — a bank of flying enemies, a scrolling 3D scene.
+      <em>Budget the expensive lines, not the average line.</em></p></div>
+    <div class="card" style="--ac:var(--gr)"><div class="n">02 · COHERENCE IS THE ASSET</div>
+      <p>Between frames the OAM, VRAM and register bytes rarely jump. <em>A rendered line stays exact until one
+      of its inputs changes.</em></p></div>
+    <div class="card" style="--ac:var(--c7)"><div class="n">03 · LOOK AHEAD, NOT BACK</div>
+      <p>The current cache keys cover the inputs of the partial 2D line model. The future plan supplies each
+      line's state. <em>Full display and unified 3D inputs are not yet keyed.</em></p></div>
+    <div class="card" style="--ac:var(--gold)"><div class="n">04 · REPAIR, DON'T REPEAT</div>
+      <p>A mid-frame write invalidates only the lines whose key changed. <em>Everything else is replayed,
+      untouched.</em></p></div>
+    <div class="card" style="--ac:var(--pk)"><div class="n">05 · 2D AND 3D ARE ONE PICTURE</div>
+      <p>The 3D layer is not a second picture glued on afterwards. <em>It is BG0's pixels in the same
+      composition, at the same priority.</em></p></div>
+  </div>
+</section>
+
+<section>
+  <h2>diagram 1 — the one-pass frame</h2>
+  <h3>The plan is made where the future meets the past</h3>
+  <p class="lede">Scanline 0 starts the pass, not the render. The frame-start pump reads the plan the
+  frame will produce, fills the line cache from it, and then each line either replays its cached pixels
+  or renders and repairs.</p>
+  <div class="legend">
+    <span style="color:var(--c9)"><i class="sw" style="background:var(--c9)"></i> demand path — the scanout line</span>
+    <span style="color:var(--c7)"><i class="sw" style="background:var(--c7)"></i> future — the frame's own plan</span>
+    <span style="color:var(--gold)"><i class="sw" style="background:var(--gold)"></i> cache — rendered lines</span>
+    <span style="color:var(--warn)"><i class="sw" style="background:var(--warn)"></i> fixup — changed inputs</span>
+  </div>
+  <figure>
+  <div class="scroller">
+  <svg viewBox="0 0 1200 470" role="img" aria-label="One-pass frame: frame-start pump reads the frame plan from the future, fills the line cache, and each demand line either replays or renders and repairs.">
+    <defs>
+      <filter id="soft" x="-20%" y="-40%" width="140%" height="180%">
+        <feDropShadow dx="0" dy="0" stdDeviation="5" flood-color="#5eead4" flood-opacity="0.10"/>
+      </filter>
+      <pattern id="d1grid" width="26" height="26" patternUnits="userSpaceOnUse">
+        <circle cx="1" cy="1" r="0.7" fill="#ffffff0d"/>
+      </pattern>
+      <marker id="a-c9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" fill="#67e8f9"/></marker>
+      <marker id="a-c7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" fill="#a78bfa"/></marker>
+      <marker id="a-gold" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" fill="#fbbf24"/></marker>
+      <marker id="a-warn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" fill="#fb7185"/></marker>
+    </defs>
+    <rect width="1200" height="470" fill="url(#d1grid)"/>
+
+    <!-- frame-start pump -->
+    <g class="node" style="--ac:var(--c9)">
+      <rect class="grp" x="60" y="40" width="280" height="130" rx="14"/>
+      <text class="hd" x="78" y="64">FRAME-START PUMP</text>
+      <text class="nm" x="78" y="86">getFuture</text>
+      <text class="sb" x="78" y="102">the frame's own plan</text>
+      <text class="sbd" x="78" y="118">every line's full key</text>
+      <text class="sbd" x="78" y="134">before line 0 starts</text>
+      <text class="sbd" x="78" y="150">prefetch → line cache</text>
+    </g>
+
+    <!-- plan written at the end -->
+    <g class="node" style="--ac:var(--c7)">
+      <rect class="grp" x="860" y="40" width="280" height="130" rx="14"/>
+      <text class="hd" x="878" y="64">FRAME END</text>
+      <text class="nm" x="878" y="86">sendFuture plan</text>
+      <text class="sb" x="878" y="102">every line's key</text>
+      <text class="sbd" x="878" y="118">the knot is explicit</text>
+      <text class="sbd" x="878" y="134">no second pass</text>
+      <text class="sbd" x="878" y="150">no extra frame buffer</text>
+    </g>
+
+    <!-- backward arrow: future plan -->
+    <path class="wire flow" d="M860 105 C760 105 760 105 700 105" marker-end="url(#a-c7)" style="--ac:var(--c7)"/>
+    <text class="sb" x="746" y="90" text-anchor="middle" style="fill:var(--c7)">future plan</text>
+    <text class="sbd" x="746" y="122" text-anchor="middle">flows backwards</text>
+
+    <!-- line rail -->
+    <text class="hd" x="60" y="230" style="--ac:var(--c9)">SCANOUT · one pass</text>
+    <line class="wire" x1="60" x2="1120" y1="258" y2="258" style="--ac:var(--c9);stroke-width:1.2;opacity:.7"/>
+
+    <g class="node" style="--ac:var(--gold)">
+      <rect class="blk" x="80" y="282" width="128" height="66" rx="9"/>
+      <text class="nm" x="94" y="306">line 0</text>
+      <text class="sb" x="94" y="322">replay</text>
+      <text class="sbd" x="94" y="338">cache hit</text>
+    </g>
+    <g class="node" style="--ac:var(--gold)">
+      <rect class="blk" x="236" y="282" width="128" height="66" rx="9"/>
+      <text class="nm" x="250" y="306">line 1</text>
+      <text class="sb" x="250" y="322">replay</text>
+      <text class="sbd" x="250" y="338">cache hit</text>
+    </g>
+    <g class="node" style="--ac:var(--warn)">
+      <rect class="blk" x="392" y="282" width="128" height="66" rx="9"/>
+      <text class="nm" x="406" y="306">line 2</text>
+      <text class="sb" x="406" y="322">render</text>
+      <text class="sbd" x="406" y="338">JIT fixup</text>
+    </g>
+    <g class="node" style="--ac:var(--gold)">
+      <rect class="blk" x="548" y="282" width="128" height="66" rx="9"/>
+      <text class="nm" x="562" y="306">line 3</text>
+      <text class="sb" x="562" y="322">replay</text>
+      <text class="sbd" x="562" y="338">cache hit</text>
+    </g>
+    <text class="sb" x="700" y="312">…</text>
+    <g class="node" style="--ac:var(--gold)">
+      <rect class="blk" x="860" y="282" width="128" height="66" rx="9"/>
+      <text class="nm" x="874" y="306">line 191</text>
+      <text class="sb" x="874" y="322">replay</text>
+      <text class="sbd" x="874" y="338">cache hit</text>
+    </g>
+
+    <!-- cache fill and repair arcs -->
+    <path class="wire" d="M200 210 C200 250 144 250 144 282" marker-end="url(#a-gold)" style="--ac:var(--gold)"/>
+    <text class="sbd" x="204" y="246" style="fill:var(--gold)">fill</text>
+    <path class="wire" d="M200 210 C200 250 300 250 300 282" marker-end="url(#a-gold)" style="--ac:var(--gold);opacity:.5"/>
+    <path class="wire" d="M1120 210 C1120 250 924 250 924 282" marker-end="url(#a-gold)" style="--ac:var(--gold)"/>
+    <text class="sbd" x="1050" y="246" style="fill:var(--gold)">fill</text>
+
+    <!-- invalidation, back into the cache -->
+    <path class="wire flow" d="M456 348 C456 410 250 410 250 348" marker-end="url(#a-warn)" style="--ac:var(--warn);stroke-dasharray:4 6"/>
+    <text class="sb" x="356" y="424" text-anchor="middle" style="fill:var(--warn)">invalidate cached lines</text>
+    <text class="sbd" x="356" y="438" text-anchor="middle">a changed key drops the stale lines</text>
+
+    <!-- cache block -->
+    <g class="node" style="--ac:var(--gold)">
+      <rect class="grp" x="60" y="190" width="240" height="26" rx="8"/>
+      <text class="sbd" x="74" y="207">line cache · 192 LRU slots</text>
+    </g>
+  </svg>
+  </div>
+  <figcaption><b>What makes it one pass:</b> the demand walk never waits for a second frame. A hit is a
+  memory replay, a miss is a render in the demand slot, and a fixup is the same render with its stale cache
+  lines dropped.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>the monad</h2>
+  <h3>A lens into the future, in pixel space</h3>
+  <p class="lede">The TARDIS monad carries two states. The past state threads forward like ordinary state;
+  the future state threads backward, so a reader at the start sees what the end of the computation writes.
+  That is the whole trick: the frame-start pump can read the plan before the frame exists.</p>
+
+  <div class="orient">
+    <div class="card" style="--ac:var(--c9)"><div class="n">PAST · forward</div>
+      <p><code>getPast</code> reads what earlier lines wrote, <code>sendPast</code> writes what later lines
+      read. The line cache is the past state.</p></div>
+    <div class="card" style="--ac:var(--c7)"><div class="n">FUTURE · backward</div>
+      <p><code>getFuture</code> reads what later lines write, <code>sendFuture</code> writes what earlier
+      lines read. The frame plan is the future state.</p></div>
+    <div class="card" style="--ac:var(--gold)"><div class="n">RUN</div>
+      <p><code>runTardis</code> ties the final future state to the initial one. The knot is the plan;
+      the gate checks that it is consistent.</p></div>
+  </div>
+
+  <p class="lede" style="margin-top:22px">The module is <code>Nds.Gpu2D.Tardis</code>. It is a small
+  reimplementation of the <code>tardis</code> package, with the same one-way reads and writes. The laws gate
+  runs before anything else.</p>
+</section>
+
+<section>
+  <h2>the frame</h2>
+  <h3>AoT plan, JIT fixup</h3>
+  <p class="lede"><code>Nds.Gpu2D.Speculate</code> is the one-pass engine. A plan is each line's visible key and its expected pixel footprint. The prefetch pump fills the cache from that plan; a line's demand
+  slot either replays the cached pixels or renders from the live state.</p>
+  <div class="orient">
+    <div class="card" style="--ac:var(--gr)"><div class="n">HIT</div>
+      <p>The line's key matches the plan and its rendered line is cached. <em>Replay, no render.</em></p></div>
+    <div class="card" style="--ac:var(--gold)"><div class="n">MISS</div>
+      <p>No cached line. <em>Render from the live state; fill the cache for the next frames.</em></p></div>
+    <div class="card" style="--ac:var(--warn)"><div class="n">FIXUP</div>
+      <p>The plan predicted a hit but a mid-frame write changed the key. <em>Render from the live state and
+      invalidate the stale slots.</em></p></div>
+  </div>
+  <p class="lede" style="margin-top:22px">The directed checks compare the cache against the same local
+  renderer and exercise per-memory identity, line replacement and total render counts. They are not an
+  independent feature oracle or a timing benchmark.</p>
+</section>
+
+<section>
+  <h2>the unified GPU</h2>
+  <h3>3D is a layer, not a later pass</h3>
+  <p class="lede">The 3D engine and the 2D engine already produce the same kind of thing: a 24-bit colour
+  and a layer flag. In melonDS, <code>DrawBG_3D</code> replaces BG0's pixel with the 3D pixel and the ordinary
+  compositor does the rest. <code>Nds.Gpu.Unified</code> is that same operation in one place.</p>
+  <div class="orient">
+    <div class="card" style="--ac:var(--gr)"><div class="n">ONE PIXEL TYPE</div>
+      <p>BG layers and OBJ produce <code>LayerPixel</code> values. The 3D layer is one more value in the
+      same list. <em>Priorities and blending are the ordinary composition.</em></p></div>
+    <div class="card" style="--ac:var(--c7)"><div class="n">ONE PASS</div>
+      <p>No second picture, no separate 3D buffer to glue. The frame is composed once in pixel space.
+      <em>The 3D frame is sampled as a layer.</em></p></div>
+  </div>
+</section>
+
+<section>
+  <h2>the gate</h2>
+  <h3>Pixel equality, not "looks plausible"</h3>
+  <p class="lede">Narrow checks observed in this work:</p>
+  <pre class="mono" style="border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:#0b0e15;color:var(--mid);overflow:auto">runghc -iclash/src clash/test/TraceCheck.hs
+NSD2 phase, delta isolation, FIFO, separate oracle, v9 compatibility: passed
+runghc -iclash/src clash/test/LineCheck.hs
+line-check: 11 cases, 0 failures
+runghc -iclash/src clash/test/SpeculateCheck.hs
+speculate-check: 10 cases, 0 failures
+runghc -iclash/src clash/test/UnifiedCheck.hs
+unified-check: 0 failures</pre>
+</section>
+
+<section>
+  <h2>what it is not</h2>
+  <h3>Scope, so a green gate is not read as more than it is</h3>
+  <div class="orient">
+    <div class="card" style="--ac:var(--dim)"><div class="n">NOT A SECOND PASS</div>
+      <p>There is no second frame pass and no extra frame buffer. The speculation lives inside the one pass;
+      a fixup is a demand line, not a replay pass.</p></div>
+    <div class="card" style="--ac:var(--dim)"><div class="n">NOT AN APPROXIMATION</div>
+      <p>A key that differs is never a tolerated miss. It invalidates and re-renders; the gate checks every pixel
+      against the reference.</p></div>
+    <div class="card" style="--ac:var(--dim)"><div class="n">NOT ALL OF 2D YET</div>
+      <p>The trace renderer now carries sprite and OBJ-window state across
+      phases, but whole-engine differential coverage, a Haskell capture
+      feedback loop and full 3D integration remain outstanding.</p></div>
+  </div>
+</section>
+
+<footer>
+  Nitro_DarkSide · a Nintendo DS core for MiSTer · this page is the design note;
+  the pure model is <code>clash/src/Nds/Gpu2D/</code> and
+  <a href="index.html">the core tour</a> starts the map.
+</footer>
+
+</div>
+</body>
+</html>

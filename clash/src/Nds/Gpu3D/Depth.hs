@@ -2,11 +2,12 @@
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveGeneric #-}
 
--- | Exact melonDS depth interpolation.
+-- | Exact melonDS depth and attribute interpolation.
 --
 -- This is the production @SoftRenderer3D::Interpolator@ math, separated from
--- colour and texture so it can be gated against the vendored class directly.
--- It is a pure model: no 'Signal', no clock, no framebuffer.
+-- the rasteriser so it can be gated against the vendored class directly:
+-- 'interpolateZ' for depth and 'interpolate' for W, vertex colour and texture
+-- coordinates. It is a pure model: no 'Signal', no clock, no framebuffer.
 module Nds.Gpu3D.Depth
   ( Interp (..)
   , setupInterp
@@ -14,6 +15,7 @@ module Nds.Gpu3D.Depth
   , setX
   , setXLinear
   , interpolateZ
+  , interpolate
   , divideZ
   , normalizedWSize
   , normalizeW
@@ -131,6 +133,27 @@ interpolateZ z0 z1 i
             | interpDir i = (prod `shiftR` 22) `shiftL` shift
             | otherwise = prod `shiftR` 13
       in base + fromIntegral adj
+
+-- | Reproduce @Interpolator::Interpolate@, used for W, vertex colour and
+-- texture coordinates. The perspective branch is unsigned 32-bit arithmetic
+-- in production (@yfactor@ is a @u32@), so it is evaluated in 'Word32' and
+-- wrapped back; the linear branch is a truncating 64-bit division.
+interpolate :: Int32 -> Int32 -> Interp -> Int32
+interpolate y0 y1 i
+  | interpXDiff i == 0 || y0 == y1 = y0
+  | not (interpLinear i) =
+      let one = 0x1 `shiftL` interpShift i :: Word32
+          yf = interpYFactor i
+          w = fromIntegral :: Int32 -> Word32
+      in if y0 < y1
+           then fromIntegral (w y0 + ((w (y1 - y0) * yf) `shiftR` interpShift i))
+           else fromIntegral (w y1 + ((w (y0 - y1) * (one - yf)) `shiftR` interpShift i))
+  | otherwise =
+      let num :: Int64
+          num | y0 < y1 = fromIntegral (y1 - y0) * fromIntegral (interpX i)
+              | otherwise = fromIntegral (y0 - y1) * fromIntegral (interpXDiff i - interpX i)
+          base = if y0 < y1 then y0 else y1
+      in base + fromIntegral (num `quot` fromIntegral (interpXDiff i))
 
 -- | Normalize W to sixteen bits, reproducing @SubmitPolygon@.
 normalizeW :: Word32 -> Int32

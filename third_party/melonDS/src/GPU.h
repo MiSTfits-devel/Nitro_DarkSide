@@ -975,6 +975,13 @@ private:
 
     u16 VRAMCaptureBlockFlags[16];
 
+public:
+    void GetCaptureBlockFlags(u16* out) const noexcept
+    {
+        for (unsigned i = 0; i < 16; i++) out[i] = VRAMCaptureBlockFlags[i];
+    }
+private:
+
     u16* VRAMCBF_ABG[0x20] {};
     u16* VRAMCBF_AOBJ[0x10] {};
     u16* VRAMCBF_BBG[0x8] {};

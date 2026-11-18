@@ -156,6 +156,17 @@ flatRaster clk rst en inp =
   in (fmap fst out, fmap snd out)
 
 -- | Concrete top entity for resource estimation and the eventual board wrapper.
+{-# ANN topEntity
+  (Synthesize
+    { t_name = "nds_gpu3d_flat"
+    , t_inputs =
+        [ PortName "CLK"
+        , PortName "RST"
+        , PortName "EN"
+        , PortProduct "" [PortName "TRI", PortName "OUT_READY"]
+        ]
+    , t_output = PortProduct "" [PortName "IN_READY", PortName "SPAN"]
+    }) #-}
 topEntity
   :: Clock System -> Reset System -> Enable System
   -> Signal System (Maybe TriIn, Bool)

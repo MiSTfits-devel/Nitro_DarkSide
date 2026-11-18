@@ -4,7 +4,15 @@
 // CPU PCs — no firmware boot, no cart emulation) and runs whole frames,
 // dumping the engine-A (top) screen after each one.
 //
-//   melonds_fbdump [--direct] <image.nds> <dump.txt> <frames> [dump_b.txt]
+//   melonds_fbdump [--direct] [--input FILE] <image.nds> <dump.txt> <frames> [dump_b.txt]
+//
+// --input polls a 16-byte little-endian control file before every frame:
+// "NDSI", u32 key mask (melonDS SetKeyMask order, active low, 12 bits),
+// u32 touch (bit 31 pressed, x bits 0-7, y bits 8-15), u32 sequence.
+// Changes are applied with SetKeyMask/TouchScreen/ReleaseScreen and logged
+// to stderr. After each frame the sequence that frame ran with is written
+// back at byte 16, so the writer (tools/hs_gpu_view/NdsView.swift) can hold
+// short taps until the emulated CPU has seen them.
 //
 // --direct uses melonDS's own cart + SetupDirectBoot path (full boot
 // environment: header copy, chip IDs, user settings, CP15 preset) for
@@ -21,14 +29,23 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <vector>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "NDS.h"
 #include "NDSCart.h"
+#ifdef NDS4MISTER_VENDORED_FORK
+#include "NDS4MiSTer_2DTrace.h"
+#endif
 #include "ARM.h"
 #include "GPU.h"
 #include "SPI_Firmware.h"
 
-// tracer.patch globals in ARM.cpp
+#ifndef NDS4MISTER_VENDORED_FORK
+// tracer.patch globals in ARM.cpp. The vendored NDS4MiSTer fork has the
+// NSD2 2D trace instead; its instruction-trace and IRQ-census hooks live in
+// the patched upstream tree, so those debug knobs compile only there.
 namespace melonDS
 {
 extern FILE* ARM9TraceFile;
@@ -53,25 +70,140 @@ static void printIrq7Census(int frame)
     fflush(stdout);
 }
 }
+#endif
 
 using namespace melonDS;
 
+static void getFramebuffers(GPU& gpu, u32*& top, u32*& bottom)
+{
+#ifdef NDS4MISTER_VENDORED_FORK
+    void* t = nullptr;
+    void* b = nullptr;
+    gpu.GetFramebuffers(&t, &b);
+    top = static_cast<u32*>(t);
+    bottom = static_cast<u32*>(b);
+#else
+    int fb = gpu.FrontBuffer;
+    top = gpu.Framebuffer[fb][0].get();
+    bottom = gpu.Framebuffer[fb][1].get();
+#endif
+}
+
+// --trace2d: write the vendored fork's packed NSD2 stream verbatim. The runner
+// never decodes records: new versioned record types must pass through unchanged.
+namespace
+{
+struct Trace2DFileState
+{
+    FILE* file = nullptr;
+    unsigned long long bytes = 0;
+    bool failed = false;
+};
+
+void trace2dSink(const void* data, size_t size, void* userdata)
+{
+    auto* state = static_cast<Trace2DFileState*>(userdata);
+    if (!state || !state->file) return;
+    if (fwrite(data, 1, size, state->file) != size)
+    {
+        state->failed = true;
+        return;
+    }
+    state->bytes += size;
+}
+
+// --input: see the file header. Short or foreign reads leave input unchanged.
+struct LiveInput
+{
+    int fd = -1;
+    u32 keys = 0xFFF;
+    u32 touch = 0;
+    u32 seq = 0;
+    u32 acked = 0;
+};
+
+void pollLiveInput(LiveInput& in, NDS& nds, int frame)
+{
+    if (in.fd < 0) return;
+    if (in.seq != in.acked && pwrite(in.fd, &in.seq, 4, 16) == 4) in.acked = in.seq;
+    unsigned char b[16];
+    if (pread(in.fd, b, sizeof b, 0) != (ssize_t)sizeof b) return;
+    auto le = [&](int o) { return (u32)b[o] | (u32)b[o+1] << 8 | (u32)b[o+2] << 16 | (u32)b[o+3] << 24; };
+    if (memcmp(b, "NDSI", 4) != 0) return;
+    u32 keys = le(4) & 0xFFF, touch = le(8), seq = le(12);
+    if (keys != in.keys)
+        nds.SetKeyMask(keys);
+    if (touch != in.touch)
+    {
+        if (touch & 0x80000000u)
+            nds.TouchScreen(touch & 0xFF, ((touch >> 8) & 0xFF) > 191 ? 191 : (touch >> 8) & 0xFF);
+        else
+            nds.ReleaseScreen();
+    }
+    if (keys != in.keys || touch != in.touch)
+        fprintf(stderr, "input frame=%d seq=%u keys=%03X touch=%s x=%u y=%u\n", frame, seq, keys,
+                (touch & 0x80000000u) ? "down" : "up", touch & 0xFF, (touch >> 8) & 0xFF);
+    in.keys = keys; in.touch = touch; in.seq = seq;
+}
+}
+
 int main(int argc, char** argv)
 {
-    int argbase = 1;
     bool direct = false;
     bool fwboot = false;
-    if (argc > 1 && strcmp(argv[1], "--direct") == 0) { direct = true; argbase = 2; }
-    else if (argc > 1 && strcmp(argv[1], "--fw") == 0) { fwboot = true; argbase = 2; }
-    if (argc < argbase + 3)
+    const char* trace2dpath = nullptr;
+    bool trace2dphase = false;
+    bool trace2dprovenance = false;
+    bool trace2draw3d = false;
+    std::vector<const char*> positional;
+    LiveInput liveInput;
+    for (int i = 1; i < argc; i++)
     {
-        fprintf(stderr, "usage: %s [--direct|--fw] <image.nds> <dump.txt> <frames> [dump_b.txt]\n", argv[0]);
+        if (strcmp(argv[i], "--direct") == 0) direct = true;
+        else if (strcmp(argv[i], "--fw") == 0) fwboot = true;
+        else if (strcmp(argv[i], "--trace2d-phase") == 0) trace2dphase = true;
+        else if (strcmp(argv[i], "--trace2d-provenance") == 0) trace2dprovenance = true;
+        else if (strcmp(argv[i], "--trace2d-raw3d") == 0) trace2draw3d = true;
+        else if (strcmp(argv[i], "--trace2d") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "--trace2d needs a file\n");
+                return 2;
+            }
+            trace2dpath = argv[++i];
+        }
+        else if (strncmp(argv[i], "--trace2d=", 10) == 0) trace2dpath = argv[i] + 10;
+        else if (strcmp(argv[i], "--input") == 0 && i + 1 < argc)
+        {
+            liveInput.fd = open(argv[++i], O_RDWR);
+            if (liveInput.fd < 0)
+            {
+                fprintf(stderr, "cannot open --input %s\n", argv[i]);
+                return 2;
+            }
+        }
+        else positional.push_back(argv[i]);
+    }
+    if ((trace2dphase || trace2dprovenance || trace2draw3d) && !trace2dpath)
+    {
+        fprintf(stderr, "--trace2d-phase/--trace2d-provenance/--trace2d-raw3d need --trace2d <file>\n");
         return 2;
     }
-    const char* ndspath  = argv[argbase];
-    const char* dumppath = argv[argbase + 1];
-    int frames = atoi(argv[argbase + 2]);
-    const char* dumppathb = (argc > argbase + 3) ? argv[argbase + 3] : nullptr;
+    if (positional.size() < 3)
+    {
+        fprintf(stderr, "usage: %s [--direct|--fw] [--input <file>] [--trace2d <file> [--trace2d-phase]]"
+                        " <image.nds> <dump.txt> <frames> [dump_b.txt]\n", argv[0]);
+        fprintf(stderr, "  --trace2d defaults to v9; --trace2d-phase selects v10; "
+                        "--trace2d-provenance selects v11 (capture Begin/Delta/End + lifecycle); "
+                        "--trace2d-raw3d selects v12 (ordered raw 3D power/XPos/abort/render-start/"
+                        "VBlank/frame-end, render-start memory and texture maps).\n");
+        return 2;
+    }
+    const char* ndspath  = positional[0];
+    const char* dumppath = positional[1];
+    int frames = atoi(positional[2]);
+    const char* dumppathb = (positional.size() > 3) ? positional[3] : nullptr;
 
     FILE* f = fopen(ndspath, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", ndspath); return 1; }
@@ -112,6 +244,62 @@ int main(int argc, char** argv)
     if (!loadBIOS("BIOS9", nds.GetARM9BIOS(), [&](const auto& v) { nds.SetARM9BIOS(v); })) return 1;
     if (!loadBIOS("BIOS7", nds.GetARM7BIOS(), [&](const auto& v) { nds.SetARM7BIOS(v); })) return 1;
     nds.Reset();
+
+    // Attach the trace immediately before the first execution. The extension
+    // mode must be selected before MakeTrace2DFileHeader and SetTrace2DSink:
+    // it changes the header version and which records the fork emits.
+#ifdef NDS4MISTER_VENDORED_FORK
+    Trace2DFileState trace2d;
+    melonDS::NDS4MiSTer::Trace2DFileHeader trace2dHeader {};
+    bool trace2dAttached = false;
+    auto attachTrace = [&]() -> bool
+    {
+        if (!trace2dpath) return true;
+        trace2d.file = fopen(trace2dpath, "wb");
+        if (!trace2d.file)
+        {
+            fprintf(stderr, "cannot open --trace2d %s\n", trace2dpath);
+            return false;
+        }
+        if (trace2draw3d && !melonDS::NDS4MiSTer::SetTrace2DRaw3DInputs(true))
+        {
+            fprintf(stderr, "--trace2d-raw3d: sink already attached\n");
+            return false;
+        }
+        if (trace2dprovenance && !melonDS::NDS4MiSTer::SetTrace2DCaptureProvenance(true))
+        {
+            fprintf(stderr, "--trace2d-provenance: sink already attached\n");
+            return false;
+        }
+        if (!trace2dprovenance && !trace2draw3d && trace2dphase
+            && !melonDS::NDS4MiSTer::SetTrace2DExtensions(true))
+        {
+            fprintf(stderr, "--trace2d-phase: sink already attached\n");
+            return false;
+        }
+        trace2dHeader = melonDS::NDS4MiSTer::MakeTrace2DFileHeader();
+        if (fwrite(&trace2dHeader, 1, sizeof(trace2dHeader), trace2d.file)
+            != sizeof(trace2dHeader))
+        {
+            fprintf(stderr, "cannot write --trace2d header\n");
+            return false;
+        }
+        melonDS::NDS4MiSTer::SetTrace2DSink(trace2dSink, &trace2d);
+        if (trace2draw3d)
+            melonDS::NDS4MiSTer::EmitTrace3DInitialState(nds.GPU);
+        trace2dAttached = true;
+        printf("trace2d: %s version %u header %u bytes\n", trace2dpath,
+               trace2dHeader.Version, trace2dHeader.HeaderSize);
+        return true;
+    };
+#else
+    auto attachTrace = [&]() -> bool
+    {
+        if (!trace2dpath) return true;
+        fprintf(stderr, "--trace2d needs a build against the vendored NDS4MiSTer fork\n");
+        return false;
+    };
+#endif
 
     // --fw: real firmware boot. No SetupDirectBoot, no section copy - both
     // BIOSes run from their reset vectors and the firmware boots the cart
@@ -159,6 +347,7 @@ int main(int argc, char** argv)
         }
         nds.SetNDSCart(std::move(cart));
         nds.Reset();
+        if (!attachTrace()) return 1;
         nds.Start();
     }
     else if (direct)
@@ -172,6 +361,7 @@ int main(int argc, char** argv)
         nds.SetNDSCart(std::move(cart));
         nds.Reset();
         nds.SetupDirectBoot("rom.nds");
+        if (!attachTrace()) return 1;
         nds.Start();
     }
     else
@@ -194,6 +384,7 @@ int main(int argc, char** argv)
 
     nds.ARM9.JumpTo(a9entry);
     nds.ARM7.JumpTo(a7entry);
+    if (!attachTrace()) return 1;
     nds.Start();
     }
 
@@ -202,6 +393,7 @@ int main(int argc, char** argv)
     // TRACE7/TRACE7MAX: same for the ARM7.
     // TRACE9STARTFRAME=<n> defers the trace to frame n (divergence hunting
     // without a multi-GB from-boot trace); same for TRACE7STARTFRAME.
+#ifndef NDS4MISTER_VENDORED_FORK
     const char* trace9path = getenv("TRACE9");
     const char* trace7path = getenv("TRACE7");
     int trace9start = 0, trace7start = 0;
@@ -219,6 +411,10 @@ int main(int argc, char** argv)
         ARM7TraceMax = tm ? strtoull(tm, nullptr, 0) : 20000000ull;
         if (trace7start == 0) ARM7TraceFile = fopen(trace7path, "w");
     }
+#else
+    if (getenv("TRACE9") || getenv("TRACE7"))
+        fprintf(stderr, "TRACE9/TRACE7 need the upstream patched melonDS tree; ignored\n");
+#endif
 
     FILE* d = fopen(dumppath, "w");
     if (!d) { fprintf(stderr, "cannot open %s\n", dumppath); return 1; }
@@ -232,17 +428,20 @@ int main(int argc, char** argv)
     const char* snapshotPrefix = getenv("SNAPSHOT_PREFIX");
     std::unique_ptr<u32[]> snapBG, snapOBJ, snapPAL, snapOAM;
     u32 snapRegs[22] = {};
-    int lastfb = 0;
+#ifndef NDS4MISTER_VENDORED_FORK
     int irq7census = 0;
     if (const char* ic = getenv("IRQ7CENSUS")) irq7census = atoi(ic);
+#endif
 
     for (int n = 0; n < frames; n++)
     {
+#ifndef NDS4MISTER_VENDORED_FORK
         if (irq7census > 0 && (n % irq7census) == 0) printIrq7Census(n);
         if (trace9path && n == trace9start && !ARM9TraceFile)
             ARM9TraceFile = fopen(trace9path, "w");
         if (trace7path && n == trace7start && !ARM7TraceFile)
             ARM7TraceFile = fopen(trace7path, "w");
+#endif
         // dump-frame -> hardware-time map: RunFrame coalesces frames while
         // the LCD is off, so dump indices are NOT 60Hz hardware frames.
         // FRAMEMAP=1 prints the game's own vblank counter per dump frame.
@@ -347,16 +546,16 @@ int main(int argc, char** argv)
             for (u32 i = 0; i <    256; i++) snapOAM[i] = nds.ARM9Read32(0x07000000 + i*4);
             for (u32 i = 0; i <     22; i++) snapRegs[i] = nds.ARM9Read32(0x04000000 + i*4);
         }
+        pollLiveInput(liveInput, nds, n);
         nds.RunFrame();
-        int fb = nds.GPU.FrontBuffer;
-        lastfb = fb;
-        u32* top = nds.GPU.Framebuffer[fb][0].get();
+        u32* top = nullptr;
+        u32* bot = nullptr;
+        getFramebuffers(nds.GPU, top, bot);
         fprintf(d, "frame %d\n", n);
         for (int i = 0; i < 256 * 192; i++)
             fprintf(d, "%08x\n", top[i]);
         if (db)
         {
-            u32* bot = nds.GPU.Framebuffer[fb][1].get();
             fprintf(db, "frame %d\n", n);
             for (int i = 0; i < 256 * 192; i++)
                 fprintf(db, "%08x\n", bot[i]);
@@ -364,8 +563,21 @@ int main(int argc, char** argv)
     }
     fclose(d);
     if (db) fclose(db);
+#ifdef NDS4MISTER_VENDORED_FORK
+    if (trace2dAttached)
+    {
+        melonDS::NDS4MiSTer::SetTrace2DSink(nullptr, nullptr);
+        if (fclose(trace2d.file) != 0) trace2d.failed = true;
+        printf("trace2d: wrote %llu record bytes, version %u (%s)\n",
+               trace2d.bytes, trace2dHeader.Version,
+               trace2d.failed ? "FAILED" : "ok");
+        if (trace2d.failed) return 1;
+    }
+#endif
+#ifndef NDS4MISTER_VENDORED_FORK
     if (ARM9TraceFile) { fclose(ARM9TraceFile); ARM9TraceFile = nullptr; }
     if (ARM7TraceFile) { fclose(ARM7TraceFile); ARM7TraceFile = nullptr; }
+#endif
 
     // NDS_MiSTfits: ARM7WRAMDUMP=<file> writes the ARM7's view of
     // 0x037F8000..0x0380FFFF, one hex word per line, so the RTL's shared/private
@@ -463,7 +675,9 @@ int main(int argc, char** argv)
         fprintf(f, "00000001\n");
         for (u32 i = 0; i < 22; i++) fprintf(f, "%08X\n", snapRegs[i]);
         for (u32 i = 22; i < 32; i++) fprintf(f, "00000000\n");
-        u32* top = nds.GPU.Framebuffer[lastfb][0].get();
+        u32* top = nullptr;
+        u32* bot = nullptr;
+        getFramebuffers(nds.GPU, top, bot);
         for (u32 i = 0; i < 256*192; i++)
         {
             u32 p = top[i];
@@ -473,7 +687,9 @@ int main(int argc, char** argv)
         fclose(f);
         printf("snapshot dumped with prefix %s\n", prefix);
     }
+#ifndef NDS4MISTER_VENDORED_FORK
     if (irq7census > 0) printIrq7Census(frames);
+#endif
     printf("dumped %d frames to %s\n", frames, dumppath);
     return 0;
 }

@@ -18,19 +18,22 @@ public:
     explicit LiveHgsEncoder(HpsGpuRing& ring) : ring_(ring) {}
 
     void feed(const void* data, std::size_t size) {
+        if (failed_) return;
         const auto* bytes=static_cast<const std::uint8_t*>(data);
         pending_.insert(pending_.end(),bytes,bytes+size);
         while (pending_.size()>=sizeof(melonDS::NDS4MiSTer::Trace2DRecordHeader)) {
             melonDS::NDS4MiSTer::Trace2DRecordHeader h{};
             std::memcpy(&h,pending_.data(),sizeof(h));
-            if (h.Size<sizeof(h) || h.Size>4096) { failed_=true; return; }
+            if (h.Size<sizeof(h) || h.Size>4096) { failed_=true; error_="invalid trace record size"; return; }
             if (pending_.size()<h.Size) return;
             encode(h,pending_.data()+sizeof(h),h.Size-sizeof(h));
+            if (failed_) return;
             pending_.erase(pending_.begin(),pending_.begin()+h.Size);
         }
     }
 
     bool finish() { return !failed_ && pending_.empty(); }
+    const char* error() const { return error_; }
     std::uint64_t input_records() const { return input_records_; }
     std::uint64_t output_records() const { return output_records_; }
     std::uint64_t skipped_records() const { return skipped_records_; }
@@ -66,6 +69,9 @@ private:
         if (type==Trace2DRecordType::GeometryFrame) { push(5,payload,size); return; }
         if (type==Trace2DRecordType::Internal2DLatch) { push(8,payload,size); return; }
         if (type==Trace2DRecordType::ExtendedPaletteMap) { push(9,payload,size); return; }
+        // The production ARM shadow is v9-only. Never forward or discard
+        // extensions whose phase, capture or 3D timing it cannot represent.
+        if (h.Type>=12) { failed_=true; error_="HGS receiver does not support NSD2 v10+ records"; return; }
         skipped_records_++;
     }
 
@@ -73,6 +79,7 @@ private:
     std::vector<std::uint8_t> pending_;
     std::array<std::uint8_t,9> last_map_{};
     bool have_map_=false,failed_=false;
+    const char* error_="incomplete trace record";
     std::uint64_t input_records_=0,output_records_=0,skipped_records_=0;
 };
 }

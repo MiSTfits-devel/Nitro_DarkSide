@@ -19,6 +19,9 @@ module Nds.Gpu3D.Slope
   , setupSlopeFlat
   , setupDummy
   , edgeParams
+  , edgeParamsWith
+  , edgeStartX
+  , edgeStartCovNumerator
   , stepSlope
   , stepSlopeDepth
   , slopeXVal
@@ -232,13 +235,21 @@ setupDummy x0 _wbuffer =
 -- (backwards) render path. Returns @(length, coverage)@ exactly as the
 -- rasteriser's fill rules consume them.
 edgeParams :: Bool -> Slope -> (Int32, Int32)
-edgeParams swapped s
-  | slopeXMajor s = edgeParamsXMajor (slopeSide s) swapped s
+edgeParams = edgeParamsWith divideByXLen
+
+-- | 'edgeParams' with @DivideByXLen@ supplied (the hardware passes the
+-- quotient its divider computed for 'edgeStartCovNumerator').
+edgeParamsWith :: (Slope -> Int32 -> Int32) -> Bool -> Slope -> (Int32, Int32)
+edgeParamsWith divide swapped s
+  | slopeXMajor s = edgeParamsXMajor divide (slopeSide s) swapped s
   | otherwise     = edgeParamsYMajor (slopeSide s) swapped s
 
-edgeParamsXMajor :: Bool -> Bool -> Slope -> (Int32, Int32)
-edgeParamsXMajor side swapped s =
-  let inc = slopeInc s
+-- | The X-major edge's @l_edgelen@ before the swapped override and its
+-- coverage start column @startx@.
+edgeStartX :: Bool -> Slope -> (Int32, Int32)
+edgeStartX swapped s =
+  let side = slopeSide s
+      inc = slopeInc s
       dx  = slopeDx s
       negative = slopeNegative s
       lenCalc
@@ -249,10 +260,17 @@ edgeParamsXMajor side swapped s =
         | otherwise = 0x0
       startx0 = dx `shiftR` 0x12
       startx1 = if negative then slopeXLen s - startx0 else startx0
-      startx = if side then startx1 - lenCalc + 0x1 else startx1
-      startcov = divideByXLen s
-        (w32 ((fromIntegral (startx `shiftL` 0xA) + 0x1FF)
-              * fromIntegral (slopeYLen s)))
+  in (lenCalc, if side then startx1 - lenCalc + 0x1 else startx1)
+
+-- | The numerator the X-major coverage start divides by the edge length.
+edgeStartCovNumerator :: Int32 -> Slope -> Int32
+edgeStartCovNumerator startx s =
+  w32 ((fromIntegral (startx `shiftL` 0xA) + 0x1FF) * fromIntegral (slopeYLen s))
+
+edgeParamsXMajor :: (Slope -> Int32 -> Int32) -> Bool -> Bool -> Slope -> (Int32, Int32)
+edgeParamsXMajor divide _side swapped s =
+  let (lenCalc, startx) = edgeStartX swapped s
+      startcov = divide s (edgeStartCovNumerator startx s)
       coverage = (0x1 `shiftL` 0x1F)
         .|. ((startcov .&. 0x3FF) `shiftL` 0xC)
         .|. (slopeXCovIncr s .&. 0x3FF)

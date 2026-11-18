@@ -161,6 +161,8 @@ void SoftRenderer2D::DrawScanline(u32 line)
         u32 fillcolor = (GPU2D.Num == 0) ? 0xFF000000 : 0xFF3F3F3F;
         for (int i = 0; i < 256; i++)
             dst[i] = fillcolor;
+        NDS4MiSTer::EmitTraceEngineScanline(GPU.NDS.NumFrames, static_cast<u16>(line),
+                                           static_cast<u8>(GPU2D.Num), dst);
 
         return;
     }
@@ -170,6 +172,8 @@ void SoftRenderer2D::DrawScanline(u32 line)
         // forced blank
         for (int i = 0; i < 256; i++)
             dst[i] = 0xFF3F3F3F;
+        NDS4MiSTer::EmitTraceEngineScanline(GPU.NDS.NumFrames, static_cast<u16>(line),
+                                           static_cast<u8>(GPU2D.Num), dst);
 
         return;
     }
@@ -178,6 +182,8 @@ void SoftRenderer2D::DrawScanline(u32 line)
 
     // render BG layers and sprites
     DrawScanline_BGOBJ(line, dst);
+    NDS4MiSTer::EmitTraceEngineScanline(GPU.NDS.NumFrames, static_cast<u16>(line),
+                                       static_cast<u8>(GPU2D.Num), dst);
 }
 
 void SoftRenderer2D::PrepareScanline()

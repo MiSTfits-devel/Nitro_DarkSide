@@ -28,6 +28,14 @@ module Nds.Gpu3D.Raster
   , setupRightFast
   , prepareRow
   , prepareRowFast
+  , RowFill
+  , rowFill
+  , SpanRule (..)
+  , spanRule
+  , spanRuleWith
+  , alwaysFilled
+  , spanPieces
+  , rightPullIn
   , rowSpans
   , renderRow
   , rasterTri
@@ -202,14 +210,19 @@ setupRightFast r y =
 
 -- | Advance the left edge cursor until it straddles @y@, then set its slope.
 setupLeft :: Raster -> Int32 -> Raster
-setupLeft r y =
+setupLeft = setupLeftW False
+
+-- | 'setupLeft' with the polygon's W-buffer flag, which decides whether the
+-- edge interpolator keeps a perspective factor for W-buffered depth.
+setupLeftW :: Bool -> Raster -> Int32 -> Raster
+setupLeftW wbuf r y =
   let tri = rasTri r
       vs = triVertices tri
       (cur', next') = advanceLeft r y
       vc = vertexAt vs cur'
       vn = vertexAt vs next'
       (x, s) = setupSlope False (vertexX vc) (vertexX vn)
-        (vertexY vc) (vertexY vn) (vertexW vc) (vertexW vn) y False
+        (vertexY vc) (vertexY vn) (vertexW vc) (vertexW vn) y wbuf
   in r { rasCurVL = cur', rasNextVL = next', rasXL = x, rasSL = s }
 
 -- | Advance the left cursor at most once per vertex. The three-vertex bound
@@ -230,14 +243,17 @@ advanceLeft r y = go (0 :: Int) r
 
 -- | Advance the right edge cursor until it straddles @y@, then set its slope.
 setupRight :: Raster -> Int32 -> Raster
-setupRight r y =
+setupRight = setupRightW False
+
+setupRightW :: Bool -> Raster -> Int32 -> Raster
+setupRightW wbuf r y =
   let tri = rasTri r
       vs = triVertices tri
       (cur', next') = advanceRight r y
       vc = vertexAt vs cur'
       vn = vertexAt vs next'
       (x, s) = setupSlope True (vertexX vc) (vertexX vn)
-        (vertexY vc) (vertexY vn) (vertexW vc) (vertexW vn) y False
+        (vertexY vc) (vertexY vn) (vertexW vc) (vertexW vn) y wbuf
   in r { rasCurVR = cur', rasNextVR = next', rasXR = x, rasSR = s }
 
 advanceRight :: Raster -> Int32 -> (Unsigned 2, Unsigned 2)
@@ -256,26 +272,27 @@ advanceRight r y = go (0 :: Int) r
 
 -- | Per-row edge preparation with the depth interpolator refreshed.
 prepareRowDepth :: Int32 -> Raster -> (Raster, Int32, Int32, Raster)
-prepareRowDepth y r0 =
+prepareRowDepth = prepareRowDepthW False
+
+-- | 'prepareRowDepth' with the polygon's W-buffer flag. Returns the raster at
+-- this row (edges advanced, interpolators at @y@), the raw span ends after
+-- the right-edge pull-in, and the raster stepped to the next row.
+prepareRowDepthW :: Bool -> Int32 -> Raster -> (Raster, Int32, Int32, Raster)
+prepareRowDepthW wbuf y r0 =
   let tri = rasTri r0
       vs = triVertices tri
       r1
         | triYTop tri /= triYBottom tri
             && y >= vertexY (vertexAt vs (rasNextVL r0))
-            && rasCurVL r0 /= triVBottom tri = setupLeft r0 y
+            && rasCurVL r0 /= triVBottom tri = setupLeftW wbuf r0 y
         | otherwise = r0
       r2
         | triYTop tri /= triYBottom tri
             && y >= vertexY (vertexAt vs (rasNextVR r1))
-            && rasCurVR r1 /= triVBottom tri = setupRight r1 y
+            && rasCurVR r1 /= triVBottom tri = setupRightW wbuf r1 y
         | otherwise = r1
       xstart = rasXL r2
-      xend0 = rasXR r2
-      xend
-        | slopeInc (rasSR r2) == 0
-            && (slopeInc (rasSL r2) /= 0 || xstart /= xend0)
-            && xend0 /= 0 = xend0 - 1
-        | otherwise = xend0
+      xend = rightPullIn (rasSL r2) (rasSR r2) xstart (rasXR r2)
       (xl, sl') = stepSlopeDepth (rasSL r2)
       (xr, sr') = stepSlopeDepth (rasSR r2)
       r' = r2 { rasXL = xl, rasXR = xr, rasSL = sl', rasSR = sr' }
@@ -403,12 +420,7 @@ prepareRow y r0 =
             && rasCurVR r1 /= triVBottom tri = setupRight r1 y
         | otherwise = r1
       xstart = rasXL r2
-      xend0 = rasXR r2
-      xend
-        | slopeInc (rasSR r2) == 0
-            && (slopeInc (rasSL r2) /= 0 || xstart /= xend0)
-            && xend0 /= 0 = xend0 - 1
-        | otherwise = xend0
+      xend = rightPullIn (rasSL r2) (rasSR r2) xstart (rasXR r2)
       (xl, sl') = stepSlope (rasSL r2)
       (xr, sr') = stepSlope (rasSR r2)
       r' = r2 { rasXL = xl, rasXR = xr, rasSL = sl', rasSR = sr' }
@@ -430,87 +442,119 @@ prepareRowFast y r0 =
             && rasCurVR r1 /= triVBottom tri = setupRightFast r1 y
         | otherwise = r1
       xstart = rasXL r2
-      xend0 = rasXR r2
-      xend
-        | slopeInc (rasSR r2) == 0
-            && (slopeInc (rasSL r2) /= 0 || xstart /= xend0)
-            && xend0 /= 0 = xend0 - 1
-        | otherwise = xend0
+      xend = rightPullIn (rasSL r2) (rasSR r2) xstart (rasXR r2)
       (xl, sl') = stepSlope (rasSL r2)
       (xr, sr') = stepSlope (rasSR r2)
       r' = r2 { rasXL = xl, rasXR = xr, rasSL = sl', rasSR = sr' }
   in (r2, xstart, xend, r')
 
+-- | The left-edge, interior and right-edge pieces of one row: inclusive X
+-- ranges clipped to @0 .. cfgWidth - 1@, 'Nothing' where a piece is empty or
+-- its edge is not filled.
+type RowFill = (Maybe (Int32, Int32), Maybe (Int32, Int32), Maybe (Int32, Int32))
+
 -- | The up-to-three filled X ranges for one row, before screen clipping.
 -- Mirrors the left-edge, interior and right-edge split of the reference fill.
-rowSpans :: RasterConfig -> Int32 -> Raster -> (((Maybe (Int32, Int32)), (Maybe (Int32, Int32)), (Maybe (Int32, Int32))), Raster)
+rowSpans :: RasterConfig -> Int32 -> Raster -> (RowFill, Raster)
 rowSpans cfg y r0 =
   let (r2, xstart, xend, r') = prepareRow y r0
-      tri = rasTri r0
+  in (rowFill cfg y r2 xstart xend, r')
+
+-- | The production fill rules for one row, given the raster at that row and
+-- the raw span ends after the right-edge pull-in (swapped when
+-- @xstart > xend@).
+rowFill :: RasterConfig -> Int32 -> Raster -> Int32 -> Int32 -> RowFill
+rowFill cfg y r2 xstart xend =
+  let tri = rasTri r2
       vs = triVertices tri
-      mk a b = if a <= b then Just (a, b) else Nothing
-      lo = 0
-      hi = cfgWidth cfg
-      clamp v = max lo (min hi v)
-      (spans, _) = if xstart > xend
-        then
-          let vlnext = vertexAt vs (rasNextVR r2)
-              vrnext = vertexAt vs (rasNextVL r2)
-              (llen, _) = edgeParams True (rasSR r2)
-              (rlen, _) = edgeParams True (rasSL r2)
-              always = alwaysFilled cfg
-              lfill = always
-                || slopeNegative (rasSR r2) || not (slopeXMajor (rasSR r2))
-                || (y == triYBottom tri - 1 && slopeXMajor (rasSR r2)
-                    && vertexX vlnext /= vertexX vrnext)
-              rfill = always
-                || (not (slopeNegative (rasSL r2)) && slopeXMajor (rasSL r2))
-                || (not (slopeNegative (rasSL r2) && slopeXMajor (rasSL r2))
-                    && slopeInc (rasSR r2) == 0)
-                || (y == triYBottom tri - 1 && slopeXMajor (rasSL r2)
-                    && vertexX vlnext /= vertexX vrnext)
-              a0 = xend
-              b0 = xstart
-              x0 = max a0 lo
-              limL = clamp (min (a0 + llen) (b0 + 1))
-              limI = clamp (min (b0 - rlen + 1) (b0 + 1))
-              x1 = limL
-              x2 = max x1 limI
-              limR = clamp (b0 + 1)
-          in ( ( (if lfill then mk x0 (limL - 1) else Nothing)
-               , mk x1 (limI - 1)
-               , (if rfill then mk x2 (limR - 1) else Nothing) )
-             , () )
-        else
-          let vlnext = vertexAt vs (rasNextVL r2)
-              vrnext = vertexAt vs (rasNextVR r2)
-              (llen, _) = edgeParams False (rasSL r2)
-              (rlen, _) = edgeParams False (rasSR r2)
-              always = alwaysFilled cfg
-              lfill = always
-                || slopeNegative (rasSL r2) || not (slopeXMajor (rasSL r2))
-                || (y == triYBottom tri - 1 && slopeXMajor (rasSL r2)
-                    && vertexX vlnext /= vertexX vrnext)
-                || (slopeInc (rasSL r2) == slopeInc (rasSR r2)
-                    && xstart + llen == xend + 1)
-              rfill = always
-                || (not (slopeNegative (rasSR r2)) && slopeXMajor (rasSR r2))
-                || slopeInc (rasSR r2) == 0
-                || (y == triYBottom tri - 1 && slopeXMajor (rasSR r2)
-                    && vertexX vlnext /= vertexX vrnext)
-              a0 = xstart
-              b0 = xend
-              x0 = max a0 lo
-              limL = clamp (min (a0 + llen) (b0 + 1))
-              limI = clamp (min (b0 - rlen + 1) (b0 + 1))
-              x1 = limL
-              x2 = max x1 limI
-              limR = clamp (b0 + 1)
-          in ( ( (if lfill then mk x0 (limL - 1) else Nothing)
-               , mk x1 (limI - 1)
-               , (if rfill then mk x2 (limR - 1) else Nothing) )
-             , () )
-  in (spans, r')
+      nextX i = vertexX (vertexAt vs i)
+  in spanPieces cfg
+       (spanRule cfg (y == triYBottom tri - 1)
+          (nextX (rasNextVL r2) /= nextX (rasNextVR r2))
+          (rasSL r2) (rasSR r2) xstart xend)
+
+-- | Production's right-edge pull-in (@RenderPolygonScanline@): a vertical
+-- right edge is drawn one pixel further left unless the span is a single
+-- column on a vertical left edge, or already at X 0.
+rightPullIn :: Slope -> Slope -> Int32 -> Int32 -> Int32
+rightPullIn sl sr xstart xend
+  | slopeInc sr == 0 && (slopeInc sl /= 0 || xstart /= xend) && xend /= 0 = xend - 1
+  | otherwise = xend
+
+-- | One row's edge rules, independent of the polygon's vertex count: the
+-- span in drawing order, each edge's 'edgeParams' (length and anti-aliasing
+-- coverage word) and whether its pixels are filled. When the edges cross
+-- (@xstart > xend@) the span is drawn from the right edge: 'srStart' is
+-- then the right edge's X and the start-edge fields come from the right
+-- slope's swapped 'edgeParams'.
+data SpanRule = SpanRule
+  { srSwapped :: !Bool
+  , srStart   :: !Int32  -- ^ first X of the span (@xstart@ after the swap)
+  , srEnd     :: !Int32  -- ^ last X, inclusive (@xend@ after the swap)
+  , srLLen    :: !Int32  -- ^ @l_edgelen@
+  , srLCov    :: !Int32  -- ^ @l_edgecov@
+  , srRLen    :: !Int32  -- ^ @r_edgelen@
+  , srRCov    :: !Int32  -- ^ @r_edgecov@
+  , srLFill   :: !Bool   -- ^ @l_filledge@
+  , srRFill   :: !Bool   -- ^ @r_filledge@
+  } deriving (Eq, Generic, Show, NFDataX)
+
+-- | The edge rules of @RenderPolygonScanline@ (and the shadow-mask
+-- scanline, which shares them). @lastRow@ is @y == YBottom - 1@;
+-- @nextXDiffer@ is whether the two edges' next vertices have different X.
+spanRule :: RasterConfig -> Bool -> Bool -> Slope -> Slope -> Int32 -> Int32 -> SpanRule
+spanRule = spanRuleWith edgeParams
+
+-- | 'spanRule' with @EdgeParams@ supplied (the hardware passes
+-- 'edgeParamsWith' and its own coverage divider).
+spanRuleWith :: (Bool -> Slope -> (Int32, Int32))
+             -> RasterConfig -> Bool -> Bool -> Slope -> Slope -> Int32 -> Int32 -> SpanRule
+spanRuleWith params cfg lastRow nextXDiffer sl sr xstart xend
+  | xstart > xend =
+      let (llen, lcov) = params True sr
+          (rlen, rcov) = params True sl
+          lfill = always
+            || slopeNegative sr || not (slopeXMajor sr)
+            || (lastRow && slopeXMajor sr && nextXDiffer)
+          rfill = always
+            || (not (slopeNegative sl) && slopeXMajor sl)
+            || (not (slopeNegative sl && slopeXMajor sl) && slopeInc sr == 0)
+            || (lastRow && slopeXMajor sl && nextXDiffer)
+      in SpanRule True xend xstart llen lcov rlen rcov lfill rfill
+  | otherwise =
+      let (llen, lcov) = params False sl
+          (rlen, rcov) = params False sr
+          lfill = always
+            || slopeNegative sl || not (slopeXMajor sl)
+            || (lastRow && slopeXMajor sl && nextXDiffer)
+            || (slopeInc sl == slopeInc sr && xstart + llen == xend + 1)
+          rfill = always
+            || (not (slopeNegative sr) && slopeXMajor sr)
+            || slopeInc sr == 0
+            || (lastRow && slopeXMajor sr && nextXDiffer)
+      in SpanRule False xstart xend llen lcov rlen rcov lfill rfill
+  where
+    always = alwaysFilled cfg
+
+-- | The three pieces production's pixel loops visit, as inclusive X ranges
+-- clipped to @0 .. cfgWidth - 1@: the start edge (when filled), the
+-- interior, and the end edge (when filled). The cursor never moves left, so
+-- an interior shorter than the start edge is empty and the end edge begins
+-- where the further of the two stopped.
+spanPieces :: RasterConfig -> SpanRule -> RowFill
+spanPieces cfg r =
+  let mk a b = if a <= b then Just (a, b) else Nothing
+      clamp v = max 0 (min (cfgWidth cfg) v)
+      a0 = srStart r
+      b0 = srEnd r
+      x0 = max a0 0
+      limL = clamp (min (a0 + srLLen r) (b0 + 1))
+      limI = clamp (min (b0 - srRLen r + 1) (b0 + 1))
+      x2 = max limL limI
+      limR = clamp (b0 + 1)
+  in ( if srLFill r then mk x0 (limL - 1) else Nothing
+     , mk limL (limI - 1)
+     , if srRFill r then mk x2 (limR - 1) else Nothing )
 
 -- | Fill one scanline and return the covered X coordinates.
 renderRow :: RasterConfig -> Int32 -> Raster -> ([Int32], Raster)

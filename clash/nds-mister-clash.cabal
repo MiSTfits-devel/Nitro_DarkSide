@@ -1,4 +1,4 @@
-cabal-version:      3.0
+cabal-version:      3.4
 name:               nds-mister-clash
 version:            0.1.0.0
 synopsis:           Clash-owned MiSTer framework boundary for NDS_MiSTfits
@@ -13,13 +13,53 @@ library
                     , Nds.Gpu3D.Flat
                     , Nds.Gpu3D.Frame
                     , Nds.Gpu3D.Raster
+                    , Nds.Gpu3D.Shade
+                    , Nds.Gpu3D.ShadePipe
                     , Nds.Gpu3D.Slope
+                    , Nds.Gpu3D.Texture
                     , Nds.Gpu3D.Top
+                    , Nds.Gpu3D.Mem
+                    , Nds.Gpu3D.Types
+                    , Nds.Gpu3D.Polygon
+                    , Nds.Gpu3D.Polygon.Clip
+                    , Nds.Gpu3D.Render
+                    , Nds.Gpu3D.Geometry
+                    , Nds.Gpu3D.Geometry.BoxTest
+                    , Nds.Gpu3D.Geometry.Lighting
+                    , Nds.Gpu3D.Geometry.Matrix
+                    , Nds.Gpu3D.GxFront
+                    , Nds.Gpu3D.GxFrontHw
+                    , Nds.Gpu3D.Chip
+                    , Nds.Gpu3D.PolyRam
+                    , Nds.Gpu3D.PolygonHw
+                    , Nds.Gpu3D.GeometryHw
+                    , Nds.Gpu3D.GeometryHw.Event
+                    , Nds.Gpu3D.RasterHw
+                    , Nds.Gpu3D.RasterHw.Types
+                    , Nds.Gpu3D.RasterHw.Setup
+                    , Nds.Gpu3D.RasterHw.Front
+                    , Nds.Gpu3D.RasterHw.Pixel
+                    , Nds.Gpu3D.RasterHw.TexCache
+                    , Nds.Gpu3D.RasterHw.Line
+                    , Nds.Gpu3D.ChipHw
+                    , Nds.Gpu3D.TraceReplay
+                    , Nds.Gpu2D.Capture
+                    , Nds.Gpu2D.Line
+                    , Nds.Gpu2D.Speculate
+                    , Nds.Gpu2D.Sprite
+                    , Nds.Gpu2D.Tardis
+                    , Nds.Gpu2D.Trace
+                    , Nds.Gpu2D.TraceRender
+                    , Nds.Gpu2D.TraceState
+                    , Nds.Gpu2D.Types
+                    , Nds.Gpu.Unified
   hs-source-dirs:     src
   build-depends:      base >=4.14 && <5
                     , clash-prelude >=1.6 && <1.11
                     , containers
-  default-language:   Haskell2010
+                    , array
+                    , bytestring
+  default-language:   GHC2021
 
 executable flat-check
   main-is:            FlatCheck.hs
@@ -27,7 +67,7 @@ executable flat-check
   build-depends:      base >=4.14 && <5
                     , nds-mister-clash
                     , containers
-  default-language:   Haskell2010
+  default-language:   GHC2021
   ghc-options:        -O2
 
 executable slope-check
@@ -35,7 +75,7 @@ executable slope-check
   hs-source-dirs:     test
   build-depends:      base >=4.14 && <5
                     , nds-mister-clash
-  default-language:   Haskell2010
+  default-language:   GHC2021
   ghc-options:        -O2
 
 executable raster-check
@@ -46,7 +86,7 @@ executable raster-check
                     , bytestring
                     , containers
                     , nds-mister-clash
-  default-language:   Haskell2010
+  default-language:   GHC2021
   ghc-options:        -O2
 
 executable flat-property
@@ -54,7 +94,7 @@ executable flat-property
   hs-source-dirs:     test
   build-depends:      base >=4.14 && <5
                     , nds-mister-clash
-  default-language:   Haskell2010
+  default-language:   GHC2021
   ghc-options:        -O2
 
 executable recip-check
@@ -62,7 +102,7 @@ executable recip-check
   hs-source-dirs:     test
   build-depends:      base >=4.14 && <5
                     , nds-mister-clash
-  default-language:   Haskell2010
+  default-language:   GHC2021
   ghc-options:        -O2
 
 executable depth-check
@@ -70,7 +110,7 @@ executable depth-check
   hs-source-dirs:     test
   build-depends:      base >=4.14 && <5
                     , nds-mister-clash
-  default-language:   Haskell2010
+  default-language:   GHC2021
   ghc-options:        -O2
 
 executable depth-pipe-check
@@ -79,7 +119,114 @@ executable depth-pipe-check
   build-depends:      base >=4.14 && <5
                     , containers
                     , nds-mister-clash
-  default-language:   Haskell2010
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable line-check
+  main-is:            LineCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable trace-check
+  main-is:            TraceCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , bytestring
+                    , directory
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable trace-compare
+  main-is:            TraceCompare.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , containers
+                    , directory
+                    , filepath
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable trace-view
+  main-is:            TraceView.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , bytestring
+                    , containers
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable trace-tardis
+  main-is:            TraceTardis.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , containers
+                    , time
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable trace-tardis-full
+  main-is:            TraceTardisFull.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , containers
+                    , time
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable sprite-check
+  main-is:            SpriteCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , array
+                    , binary
+                    , bytestring
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable capture-check
+  main-is:            CaptureCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , binary
+                    , bytestring
+                    , containers
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable tardis-check
+  main-is:            TardisCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable speculate-check
+  main-is:            SpeculateCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , containers
+                    , array
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable unified-check
+  main-is:            UnifiedCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , nds-mister-clash
+  default-language:   GHC2021
   ghc-options:        -O2
 
 executable frame-check
@@ -90,5 +237,181 @@ executable frame-check
                     , bytestring
                     , containers
                     , nds-mister-clash
-  default-language:   Haskell2010
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable attr-check
+  main-is:            AttrCheck.hs
+  other-modules:      OracleIO
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , array
+                    , bytestring
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable texel-check
+  main-is:            TexelCheck.hs
+  other-modules:      OracleIO
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , array
+                    , bytestring
+                    , containers
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable shade-check
+  main-is:            ShadeCheck.hs
+  other-modules:      OracleIO
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , array
+                    , bytestring
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable scene-check
+  main-is:            SceneCheck.hs
+  other-modules:      OracleIO
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , array
+                    , bytestring
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable shade-pipe-check
+  main-is:            ShadePipeCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , array
+                    , clash-prelude
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable polygon-check
+  main-is:            PolygonCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , bytestring
+                    , containers
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable render-check
+  main-is:            RenderCheck.hs
+  other-modules:      OracleIO
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , array
+                    , bytestring
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable geometry-check
+  main-is:            GeometryCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , array
+                    , bytestring
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable gxfront-check
+  main-is:            GxFrontCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , containers
+                    , process
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable gxfront-hw-check
+  main-is:            GxFrontHwCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , clash-prelude
+                    , containers
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable chip-arbiter-check
+  main-is:            ChipArbiterCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , clash-prelude
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable chip-check
+  main-is:            ChipCheck.hs
+  other-modules:      OracleIO
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , array
+                    , bytestring
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable polygon-hw-check
+  main-is:            PolygonHwCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , bytestring
+                    , clash-prelude
+                    , containers
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable geometry-hw-check
+  main-is:            GeometryHwCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , bytestring
+                    , clash-prelude
+                    , containers
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2 -threaded -rtsopts
+
+executable raster-hw-check
+  main-is:            RasterHwCheck.hs
+  other-modules:      OracleIO
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , array
+                    , bytestring
+                    , clash-prelude
+                    , containers
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable chip-hw-check
+  main-is:            ChipHwCheck.hs
+  other-modules:      OracleIO
+                    , ChipHwReference
+                    , ChipHwGeoSchedule
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , array
+                    , bytestring
+                    , clash-prelude
+                    , containers
+                    , nds-mister-clash
+  default-language:   GHC2021
   ghc-options:        -O2

@@ -26,8 +26,23 @@ int main() {
 
     std::thread producer([&]{ for(std::size_t p=0;p<raw.size();) { const auto n=std::min<std::size_t>(1+(p%17),raw.size()-p); encoder.feed(raw.data()+p,n); p+=n; } });
     std::array<std::uint16_t,4> expected{2,7,7,5}; std::array<std::uint8_t,4092> payload{};
-    for(std::size_t i=0;i<expected.size();) { std::uint16_t type=0,size=0; if(!ring.pop(type,payload.data(),payload.size(),size)){std::this_thread::yield();continue;} if(type!=expected[i++]) return 1; }
+    bool valid=true;
+    for(std::size_t i=0;i<expected.size();) {
+        std::uint16_t type=0,size=0;
+        if(!ring.pop(type,payload.data(),payload.size(),size)){std::this_thread::yield();continue;}
+        valid &= type==expected[i++];
+    }
     producer.join();
-    if(!encoder.finish() || encoder.input_records()!=4 || encoder.output_records()!=4 || encoder.skipped_records()!=1) return 2;
-    std::cout<<"Live HGS2 encoder test\nfragment_reassembly: passed\nmap_deduplication: passed\noracle_filtering: passed\nordering: passed\n";
+    if(!valid || !encoder.finish() || encoder.input_records()!=4 || encoder.output_records()!=4 || encoder.skipped_records()!=1) return 2;
+    nds4mister::HpsGpuRingControl rejected_control; rejected_control.capacity=4096;
+    std::vector<std::byte> rejected_storage(rejected_control.capacity);
+    nds4mister::HpsGpuRing rejected_ring(rejected_control,rejected_storage.data());
+    nds4mister::LiveHgsEncoder rejected(rejected_ring);
+    Trace2DDisplayStatePacket display{};
+    display.Record={static_cast<std::uint16_t>(Trace2DRecordType::DisplayState),static_cast<std::uint16_t>(sizeof(display))};
+    rejected.feed(&display,sizeof(display));
+    std::uint16_t type=0,size=0;
+    if (rejected.finish() || std::strcmp(rejected.error(),"HGS receiver does not support NSD2 v10+ records") ||
+        rejected_ring.pop(type,payload.data(),payload.size(),size)) return 3;
+    std::cout<<"Live HGS2 encoder test\nfragment_reassembly: passed\nmap_deduplication: passed\noracle_filtering: passed\nordering: passed\nv10_rejection: passed\n";
 }

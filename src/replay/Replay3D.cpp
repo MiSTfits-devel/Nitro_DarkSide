@@ -222,9 +222,18 @@ int main(int argc, char** argv) {
             in.open(argv[ring_mode ? 2 : 1],std::ios::binary);
             if (!read_exact(in, &file, sizeof(file))) throw std::runtime_error("bad input header");
             compact = file.Magic == 0x31534748; // HGS1
-            if ((!compact && (file.Magic != Trace2DMagic || file.Version < 6)) || (compact && (file.Version < 1 || file.Version > 2)))
+            if ((!compact && (file.Magic != Trace2DMagic || file.Version < 6 || file.Version > Trace2DRaw3DVersion)) || (compact && (file.Version < 1 || file.Version > 3)))
                 throw std::runtime_error("not a supported trace or HGS file");
         }
+        // Old NSD2/HGS streams have no sprite boundary and retain their
+        // historical draw-on-scanline behavior. New compact live streams
+        // advertise the boundary by their DisplayState extension record.
+        bool phased_2d = !compact && file.Version >= 10;
+        const bool raw_3d = !compact && file.Version >= Trace2DRaw3DVersion;
+        bool capture_open = false;
+        u32 capture_frame = 0;
+        u16 capture_line = 0;
+        u32 vblank_vertices = 0, vblank_polygons = 0;
 
         NDSArgs args; args.JIT = std::nullopt;
         auto nds = std::make_unique<NDS>(std::move(args), nullptr);
@@ -277,7 +286,7 @@ int main(int argc, char** argv) {
             if(!output_dump) throw std::runtime_error("cannot open output dump");
         }
         const bool exact_geometry_timing =
-            std::getenv("NDS_GPU_EXACT_GEOMETRY_TIMING") != nullptr;
+            raw_3d || std::getenv("NDS_GPU_EXACT_GEOMETRY_TIMING") != nullptr;
         const bool batch_geometry = !exact_geometry_timing &&
             std::getenv("NDS_GPU_BATCH_GEOMETRY") != nullptr;
         const bool external_command_replay =
@@ -398,7 +407,7 @@ int main(int argc, char** argv) {
             nds4mister::FrameTimings timings{};
             for (u32 frame=0;frame<frames;frame++) if (!backend.run_frame(timings,producer_error)) break;
             backend.set_2d_trace_sink(nullptr,nullptr);
-            if (!encoder.finish() && producer_error.empty()) producer_error="live HGS encoder ended with a partial record";
+            if (!encoder.finish() && producer_error.empty()) producer_error=encoder.error();
             producer_done.store(true,std::memory_order_release);
         });
         else if (ring_mode) producer = std::thread([&] {
@@ -412,6 +421,69 @@ int main(int argc, char** argv) {
             }
             producer_done.store(true, std::memory_order_release);
         });
+        // The legacy stream starts rendering at its geometry summary. In v12
+        // the same diagnostics run at the explicit render-start boundary.
+        auto finish_render = [&](u32 frame) -> bool {
+                dump_3d_frame(nds->GPU.GetRenderer(), frame);
+                if (geometry_dump.is_open()) {
+                    for (u32 y = 0; y < 192; ++y)
+                        geometry_dump.write(reinterpret_cast<const char*>(
+                            nds->GPU.GetRenderer().Get3DScanline(y)), 256 * sizeof(u32));
+                    if (!geometry_dump) throw std::runtime_error("3D output dump failed");
+                }
+                if (analyze_geometry_delta) {
+                    constexpr u32 BlockPixels = 16;
+                    const auto bank = rendered & 1u;
+                    auto& previous = previous_geometry_banks[bank];
+                    if (previous_geometry_bank_valid[bank]) {
+                        ++geometry_delta_frames;
+                        for (u32 y = 0; y < 192; ++y) {
+                            const u32* actual =
+                                nds->GPU.GetRenderer().Get3DScanline(y);
+                            for (u32 x = 0; x < 256; x += BlockPixels) {
+                                const auto offset = y * 256 + x;
+                                ++geometry_delta_blocks;
+                                if (std::memcmp(
+                                        actual + x, previous.data() + offset,
+                                        BlockPixels * sizeof(u32)) == 0)
+                                    ++geometry_delta_same_blocks;
+                                for (u32 lane = 0; lane < BlockPixels; ++lane) {
+                                    ++geometry_delta_pixels;
+                                    if (actual[x + lane] == previous[offset + lane])
+                                        ++geometry_delta_same_pixels;
+                                }
+                            }
+                            std::memcpy(
+                                previous.data() + y * 256, actual,
+                                256 * sizeof(u32));
+                        }
+                    } else {
+                        for (u32 y = 0; y < 192; ++y)
+                            std::memcpy(
+                                previous.data() + y * 256,
+                                nds->GPU.GetRenderer().Get3DScanline(y),
+                                256 * sizeof(u32));
+                        previous_geometry_bank_valid[bank] = true;
+                    }
+                }
+                if (verify_geometry_output) {
+                    for (u32 y = 0; y < 192; ++y)
+                        hash_append(
+                            geometry_output_hash,
+                            nds->GPU.GetRenderer().Get3DScanline(y),
+                            256 * sizeof(u32));
+                }
+                rendered++;
+                if (profile && rendered % 60 == 0) {
+                    const auto now=std::chrono::steady_clock::now();
+                    std::cerr<<"profile_window end_frame="<<frame
+                        <<" frames=60 ms="
+                        <<std::chrono::duration<double,std::milli>(
+                            now-replay_profile_checkpoint).count()<<"\n";
+                    replay_profile_checkpoint=now;
+                }
+            return max_frames && rendered >= max_frames;
+        };
 
         Trace2DRecordHeader record{};
         for (;;) {
@@ -464,6 +536,7 @@ int main(int argc, char** argv) {
                 map_vram(nds->GPU, p->VRAMCNT);
                 apply_video_maps(nds->GPU,*p);
                 nds->GPU.ScreensEnabled=p->ScreensEnabled; nds->GPU.ScreenSwap=p->ScreenSwap; nds->GPU.VCount=p->VCount;
+                if (phased_2d) nds->GPU.CaptureEnable=p->CaptureEnable;
                 nds->GPU.MasterBrightnessA=p->MasterBrightnessA; nds->GPU.MasterBrightnessB=p->MasterBrightnessB;
                 fill_engine(nds->GPU.GPU2D_A,p->Engine[0]); fill_engine(nds->GPU.GPU2D_B,p->Engine[1]);
                 std::array<ConservativeLineCacheKey,2> current_cache_keys{};
@@ -490,7 +563,7 @@ int main(int argc, char** argv) {
                 }
                 if (!skip_2d) {
                     auto profile_start=std::chrono::steady_clock::now();
-                    if (!skip_sprites) nds->GPU.GetRenderer().DrawSprites(p->Line);
+                    if (!phased_2d && !skip_sprites) nds->GPU.GetRenderer().DrawSprites(p->Line);
                     auto profile_middle=std::chrono::steady_clock::now();
                     nds->GPU.GetRenderer().DrawScanline(p->Line);
                     auto profile_end=std::chrono::steady_clock::now();
@@ -512,6 +585,7 @@ int main(int argc, char** argv) {
                 map_vram(nds->GPU,p->VRAMCNT); apply_video_maps(nds->GPU,*p); nds->GPU.ScreensEnabled=p->ScreensEnabled; nds->GPU.ScreenSwap=p->ScreenSwap;
                 nds->GPU.VCount=p->VCount;
                 nds->GPU.MasterBrightnessA=p->MasterBrightnessA; nds->GPU.MasterBrightnessB=p->MasterBrightnessB;
+                if (phased_2d) nds->GPU.CaptureEnable=p->CaptureEnable;
                 fill_engine(nds->GPU.GPU2D_A,p->Engine[0]); fill_engine(nds->GPU.GPU2D_B,p->Engine[1]);
                 std::array<ConservativeLineCacheKey,2> current_cache_keys{};
                 std::array<bool,2> current_cache_candidates{};
@@ -538,7 +612,7 @@ int main(int argc, char** argv) {
                         cache_apply_b&&current_cache_candidates[1]);
                 if (!skip_2d) {
                     auto profile_start=std::chrono::steady_clock::now();
-                    if (!skip_sprites) nds->GPU.GetRenderer().DrawSprites(p->Line);
+                    if (!phased_2d && !skip_sprites) nds->GPU.GetRenderer().DrawSprites(p->Line);
                     auto profile_middle=std::chrono::steady_clock::now();
                     nds->GPU.GetRenderer().DrawScanline(p->Line);
                     auto profile_end=std::chrono::steady_clock::now();
@@ -634,6 +708,32 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (p->Line==191) { nds->GPU.GetRenderer().SwapBuffers(); dump_frame(nds->GPU,p->Frame); }
+            } else if ((!compact && type == Trace2DRecordType::DisplayState) || (compact && record.Type == 11)) {
+                if (payload.size()!=sizeof(Trace2DDisplayStatePacket)-sizeof(record)) throw std::runtime_error("bad display state");
+                Trace2DDisplayStatePacket p{}; p.Record=record;
+                std::memcpy(reinterpret_cast<u8*>(&p)+sizeof(record),payload.data(),payload.size());
+                phased_2d=true;
+                nds->GPU.GPU2D_A.Enabled=p.EngineEnabled[0] && !disable_engine_a;
+                nds->GPU.GPU2D_B.Enabled=p.EngineEnabled[1] && !disable_engine_b;
+                nds->GPU.CaptureCnt=p.CaptureCnt;
+                nds->GPU.VRAMMap_LCDC=p.VRAMMapLCDC;
+                std::memcpy(nds->GPU.DispFIFO,p.FIFO,sizeof(p.FIFO));
+                nds->GPU.DispFIFOReadPtr=p.FIFOReadPtr;
+                nds->GPU.DispFIFOWritePtr=p.FIFOWritePtr;
+                std::memcpy(nds->GPU.DispFIFOBuffer,p.FIFOBuffer,sizeof(p.FIFOBuffer));
+            } else if ((!compact && type == Trace2DRecordType::SpritePhase) || (compact && record.Type == 10)) {
+                if (payload.size()!=sizeof(Trace2DScanlinePacket)) throw std::runtime_error("bad sprite phase");
+                const auto* p=reinterpret_cast<const Trace2DScanlinePacket*>(payload.data());
+                if (p->Line >= 192) throw std::runtime_error("bad sprite target line");
+                phased_2d=true;
+                map_vram(nds->GPU,p->VRAMCNT);
+                apply_video_maps(nds->GPU,*p);
+                nds->GPU.VCount=p->VCount;
+                nds->GPU.CaptureEnable=p->CaptureEnable;
+                fill_engine(nds->GPU.GPU2D_A,p->Engine[0]);
+                fill_engine(nds->GPU.GPU2D_B,p->Engine[1]);
+                if (!skip_2d && !skip_sprites)
+                    nds->GPU.GetRenderer().DrawSprites(p->Line);
             } else if ((!compact && record.Type == 9) || (compact && record.Type == 8)) {
                 if (payload.size()!=sizeof(Trace2DInternal2DLatchPacket)-sizeof(record)) throw std::runtime_error("bad internal 2D latch");
                 Trace2DInternal2DLatchPacket p{}; p.Record=record;
@@ -660,6 +760,53 @@ int main(int argc, char** argv) {
                 obj_input_records++;
                 oam_a_hash_mismatches += hash_bytes(nds->GPU.OAM,1024)!=p.OAMA;
                 flat_aobj_hash_mismatches += hash_bytes(nds->GPU.VRAMFlat_AOBJ,sizeof(nds->GPU.VRAMFlat_AOBJ))!=p.FlatAOBJ;
+            } else if (!compact && type == Trace2DRecordType::CaptureBegin) {
+                if (file.Version < Trace2DCaptureVersion || capture_open ||
+                    payload.size()!=sizeof(Trace2DCaptureBeginPacket)-sizeof(record) || skip_2d)
+                    throw std::runtime_error("unsupported or malformed capture begin");
+                Trace2DCaptureBeginPacket p{}; p.Record=record;
+                std::memcpy(reinterpret_cast<u8*>(&p)+sizeof(record),payload.data(),payload.size());
+                capture_open=true; capture_frame=p.Frame; capture_line=p.Line;
+            } else if (!compact && type == Trace2DRecordType::CaptureDelta) {
+                if (!capture_open || payload.size()<sizeof(Trace2DMemoryDeltaHeader)-sizeof(record))
+                    throw std::runtime_error("capture delta without begin");
+                Trace2DMemoryDeltaHeader p{}; p.Record=record;
+                std::memcpy(reinterpret_cast<u8*>(&p)+sizeof(record),payload.data(),sizeof(p)-sizeof(record));
+                const auto start=sizeof(p)-sizeof(record);
+                const auto count=payload.size()-start;
+                if (p.Frame!=capture_frame || p.Line!=capture_line || p.Region<2 || p.Region>5 || count==0 ||
+                    p.Offset>128*1024 || count>128*1024-p.Offset)
+                    throw std::runtime_error("malformed capture delta");
+                if (std::memcmp(nds->GPU.VRAM[p.Region-2]+p.Offset,payload.data()+start,count)!=0)
+                    throw std::runtime_error("capture delta does not match replayed capture");
+                memory_revisions.update(p.Region,p.Offset,count);
+            } else if (!compact && type == Trace2DRecordType::CaptureEnd) {
+                if (!capture_open || payload.size()!=sizeof(Trace2DCaptureEndPacket)-sizeof(record))
+                    throw std::runtime_error("capture end without begin");
+                Trace2DCaptureEndPacket p{}; p.Record=record;
+                std::memcpy(reinterpret_cast<u8*>(&p)+sizeof(record),payload.data(),payload.size());
+                u16 flags[16]; nds->GPU.GetCaptureBlockFlags(flags);
+                if (p.Frame!=capture_frame || p.Line!=capture_line ||
+                    std::memcmp(flags,p.Flags,sizeof(flags))!=0)
+                    throw std::runtime_error("capture end state mismatch");
+                capture_open=false;
+            } else if (!compact && (type == Trace2DRecordType::CaptureLifecycleStart ||
+                                     type == Trace2DRecordType::CaptureLifecycleEnd)) {
+                if (file.Version < Trace2DCaptureVersion || capture_open || skip_2d ||
+                    payload.size()!=sizeof(Trace2DCaptureLifecyclePacket)-sizeof(record))
+                    throw std::runtime_error("unsupported or malformed capture lifecycle");
+                Trace2DCaptureLifecyclePacket p{}; p.Record=record;
+                std::memcpy(reinterpret_cast<u8*>(&p)+sizeof(record),payload.data(),payload.size());
+                nds->GPU.CaptureCnt=p.CaptureCnt; nds->GPU.VRAMMap_LCDC=p.VRAMMapLCDC;
+                if (!nds->GPU.ApplyExternalRendererPhase(0,p.VCount,p.VCount,0,0,p.Frame,true,false,true))
+                    throw std::runtime_error("unsupported capture lifecycle phase");
+                u16 flags[16]; nds->GPU.GetCaptureBlockFlags(flags);
+                if (std::memcmp(flags,p.Flags,sizeof(flags))!=0)
+                    throw std::runtime_error("capture lifecycle state mismatch");
+            } else if (!compact && type == Trace2DRecordType::EngineScanline) {
+                // Optional v10 engine oracle, not renderer input.
+                if (payload.size()!=sizeof(Trace2DEngineScanlinePacket)-sizeof(record))
+                    throw std::runtime_error("bad engine scanline oracle");
             } else if (!compact && record.Type == 8) {
                 if (payload.size() != sizeof(Trace2DFramebufferScanlinePacket)-sizeof(record)) throw std::runtime_error("bad framebuffer oracle");
                 Trace2DFramebufferScanlinePacket p{}; p.Record=record;
@@ -696,6 +843,11 @@ int main(int argc, char** argv) {
                 if (payload.size() != sizeof(Trace2DGeometryCommandPacket) - sizeof(record)) throw std::runtime_error("bad command record");
                 Trace2DGeometryCommandPacket p{}; p.Record = record;
                 std::memcpy(reinterpret_cast<u8*>(&p)+sizeof(record), payload.data(), sizeof(p)-sizeof(record));
+                if (raw_3d) {
+                    nds->NumFrames=p.Frame; nds->ARM9Timestamp=p.Timestamp;
+                    nds->GPU.GPU3D.Run(); ++gx_commands_replayed;
+                    continue;
+                }
                 nds->NumFrames = p.Frame;
                 if (exact_geometry_timing) {
                     nds->ARM9Timestamp = p.Timestamp;
@@ -727,6 +879,12 @@ int main(int argc, char** argv) {
                 if (payload.size() != sizeof(Trace2DGeometryRegisterPacket) - sizeof(record)) throw std::runtime_error("bad register record");
                 Trace2DGeometryRegisterPacket p{}; p.Record = record;
                 std::memcpy(reinterpret_cast<u8*>(&p)+sizeof(record), payload.data(), sizeof(p)-sizeof(record));
+                if (raw_3d) {
+                    if (p.Width!=1 && p.Width!=2 && p.Width!=4) throw std::runtime_error("bad register width");
+                    nds->NumFrames=p.Frame; nds->ARM9Timestamp=p.Timestamp;
+                    nds->GPU.GPU3D.Run(); ++gx_register_writes_replayed;
+                    continue;
+                }
                 nds->NumFrames = p.Frame;
                 if (exact_geometry_timing) {
                     nds->ARM9Timestamp = p.Timestamp;
@@ -742,6 +900,74 @@ int main(int argc, char** argv) {
                 if (exact_geometry_timing)
                     ++gx_register_writes_replayed;
                 sample_gx_state();
+            } else if (!compact && type == Trace2DRecordType::Gpu3DGxWrite) {
+                if (!raw_3d || payload.size()!=sizeof(Trace2DGpu3DGxWritePacket)-sizeof(record))
+                    throw std::runtime_error("bad raw GX bus write");
+                Trace2DGpu3DGxWritePacket p{}; p.Record=record;
+                std::memcpy(reinterpret_cast<u8*>(&p)+sizeof(record),payload.data(),payload.size());
+                nds->NumFrames=p.Frame; nds->ARM9Timestamp=p.Timestamp;
+                nds->GPU.GPU3D.Run();
+                if (p.Width==1) nds->GPU.GPU3D.Write8(p.Address,static_cast<u8>(p.Value));
+                else if (p.Width==2) nds->GPU.GPU3D.Write16(p.Address,static_cast<u16>(p.Value));
+                else if (p.Width==4) nds->GPU.GPU3D.Write32(p.Address,p.Value);
+                else throw std::runtime_error("bad raw GX bus width");
+                sample_gx_state();
+            } else if (!compact && type == Trace2DRecordType::Gpu3DPower) {
+                if (!raw_3d || payload.size()!=sizeof(Trace2DGpu3DPowerPacket)-sizeof(record))
+                    throw std::runtime_error("bad 3D power record");
+                Trace2DGpu3DPowerPacket p{}; p.Record=record;
+                std::memcpy(reinterpret_cast<u8*>(&p)+sizeof(record),payload.data(),payload.size());
+                nds->NumFrames=p.Frame; nds->ARM9Timestamp=p.Timestamp;
+                nds->GPU.GPU3D.Run(); nds->GPU.GPU3D.SetEnabled(p.GeometryEnabled,p.RenderingEnabled);
+            } else if (!compact && type == Trace2DRecordType::Gpu3DXPos) {
+                if (!raw_3d || payload.size()!=sizeof(Trace2DGpu3DXPosPacket)-sizeof(record))
+                    throw std::runtime_error("bad 3D X position record");
+                Trace2DGpu3DXPosPacket p{}; p.Record=record;
+                std::memcpy(reinterpret_cast<u8*>(&p)+sizeof(record),payload.data(),payload.size());
+                nds->NumFrames=p.Frame; nds->ARM9Timestamp=p.Timestamp;
+                nds->GPU.GPU3D.Run();
+                nds->GPU.GPU3D.SetRenderXPos(p.XPos,0xffff);
+            } else if (!compact && type == Trace2DRecordType::Gpu3DAbort) {
+                if (!raw_3d || payload.size()!=sizeof(Trace2DGpu3DAbortPacket)-sizeof(record))
+                    throw std::runtime_error("bad 3D abort record");
+                Trace2DGpu3DAbortPacket p{}; p.Record=record;
+                std::memcpy(reinterpret_cast<u8*>(&p)+sizeof(record),payload.data(),payload.size());
+                nds->NumFrames=p.Frame; nds->ARM9Timestamp=p.Timestamp;
+                nds->GPU.GPU3D.Run();
+                nds->GPU.GPU3D.AbortFrame=p.Active!=0;
+            } else if (!compact && type == Trace2DRecordType::Gpu3DVBlank) {
+                if (!raw_3d || payload.size()!=sizeof(Trace2DGpu3DVBlankPacket)-sizeof(record))
+                    throw std::runtime_error("bad 3D VBlank record");
+                Trace2DGpu3DVBlankPacket p{}; p.Record=record;
+                std::memcpy(reinterpret_cast<u8*>(&p)+sizeof(record),payload.data(),payload.size());
+                nds->NumFrames=p.Frame; nds->ARM9Timestamp=p.Timestamp; nds->GPU.VCount=p.VCount;
+                nds->GPU.GPU3D.Run();
+                vblank_vertices=nds->GPU.GPU3D.NumVertices; vblank_polygons=nds->GPU.GPU3D.NumPolygons;
+                nds->GPU.GPU3D.VBlank();
+            } else if (!compact && type == Trace2DRecordType::Gpu3DRenderStart) {
+                if (!raw_3d || payload.size()!=sizeof(Trace2DGpu3DRenderStartPacket)-sizeof(record))
+                    throw std::runtime_error("bad 3D render-start record");
+                Trace2DGpu3DRenderStartPacket p{}; p.Record=record;
+                std::memcpy(reinterpret_cast<u8*>(&p)+sizeof(record),payload.data(),payload.size());
+                if (p.Flags & ~1u) throw std::runtime_error("unsupported 3D render-start flags");
+                nds->NumFrames=p.Frame; nds->ARM9Timestamp=p.Timestamp; nds->GPU.VCount=p.VCount;
+                nds->GPU.GPU3D.Run();
+                std::memcpy(nds->GPU.VRAMMap_Texture,p.VRAMMapTexture,sizeof(p.VRAMMapTexture));
+                std::memcpy(nds->GPU.VRAMMap_TexPal,p.VRAMMapTexPal,sizeof(p.VRAMMapTexPal));
+                nds->GPU.GPU3D.SetRenderXPos(p.XPos,0xffff);
+                if (!(p.Flags & 1)) {
+                    nds->GPU.GetRenderer().Start3DRendering();
+                    nds->GPU.GetRenderer().Finish3DRendering();
+                    if (finish_render(p.Frame)) break;
+                }
+            } else if (!compact && type == Trace2DRecordType::Gpu3DFrameEnd) {
+                if (!raw_3d || payload.size()!=sizeof(Trace2DGpu3DFrameEndPacket)-sizeof(record))
+                    throw std::runtime_error("bad 3D frame-end record");
+                Trace2DGpu3DFrameEndPacket p{}; p.Record=record;
+                std::memcpy(reinterpret_cast<u8*>(&p)+sizeof(record),payload.data(),payload.size());
+                nds->NumFrames=p.Frame; nds->ARM9Timestamp=p.Timestamp; nds->GPU.VCount=p.VCount;
+                nds->GPU.GPU3D.Run();
+                nds->GPU.GPU3D.AbortFrame=false;
             } else if ((!compact && type == Trace2DRecordType::GeometryFrame) || (compact && record.Type == 5)) {
                 if (payload.size() != sizeof(Trace2DGeometryFramePacket) - sizeof(record)) throw std::runtime_error("bad frame record");
                 Trace2DGeometryFramePacket p{}; p.Record = record;
@@ -753,9 +979,10 @@ int main(int argc, char** argv) {
                     replay_clock += 1u << 16;
                     nds->ARM9Timestamp = replay_clock;
                 }
-                nds->GPU.GPU3D.Run();
+                if (!raw_3d) nds->GPU.GPU3D.Run();
                 sample_gx_state();
-                geometry_count_mismatches += nds->GPU.GPU3D.NumVertices != p.Vertices || nds->GPU.GPU3D.NumPolygons != p.Polygons;
+                geometry_count_mismatches += (raw_3d ? vblank_vertices : nds->GPU.GPU3D.NumVertices) != p.Vertices ||
+                                             (raw_3d ? vblank_polygons : nds->GPU.GPU3D.NumPolygons) != p.Polygons;
                 if (oracle.frame == p.Frame) {
                     oracle_frames++;
                     for (u32 y=0; y<192; y++) if (oracle.lines[y]) {
@@ -769,71 +996,18 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
-                nds->GPU.GPU3D.VBlank();
-                nds->GPU.GetRenderer().Start3DRendering(); nds->GPU.GetRenderer().Finish3DRendering();
-                dump_3d_frame(nds->GPU.GetRenderer(), p.Frame);
-                if (geometry_dump.is_open()) {
-                    for (u32 y = 0; y < 192; ++y)
-                        geometry_dump.write(reinterpret_cast<const char*>(
-                            nds->GPU.GetRenderer().Get3DScanline(y)), 256 * sizeof(u32));
-                    if (!geometry_dump) throw std::runtime_error("3D output dump failed");
+                if (!raw_3d) {
+                    nds->GPU.GPU3D.VBlank();
+                    nds->GPU.GetRenderer().Start3DRendering(); nds->GPU.GetRenderer().Finish3DRendering();
+                    if (finish_render(p.Frame)) break;
                 }
-                if (analyze_geometry_delta) {
-                    constexpr u32 BlockPixels = 16;
-                    const auto bank = rendered & 1u;
-                    auto& previous = previous_geometry_banks[bank];
-                    if (previous_geometry_bank_valid[bank]) {
-                        ++geometry_delta_frames;
-                        for (u32 y = 0; y < 192; ++y) {
-                            const u32* actual =
-                                nds->GPU.GetRenderer().Get3DScanline(y);
-                            for (u32 x = 0; x < 256; x += BlockPixels) {
-                                const auto offset = y * 256 + x;
-                                ++geometry_delta_blocks;
-                                if (std::memcmp(
-                                        actual + x, previous.data() + offset,
-                                        BlockPixels * sizeof(u32)) == 0)
-                                    ++geometry_delta_same_blocks;
-                                for (u32 lane = 0; lane < BlockPixels; ++lane) {
-                                    ++geometry_delta_pixels;
-                                    if (actual[x + lane] == previous[offset + lane])
-                                        ++geometry_delta_same_pixels;
-                                }
-                            }
-                            std::memcpy(
-                                previous.data() + y * 256, actual,
-                                256 * sizeof(u32));
-                        }
-                    } else {
-                        for (u32 y = 0; y < 192; ++y)
-                            std::memcpy(
-                                previous.data() + y * 256,
-                                nds->GPU.GetRenderer().Get3DScanline(y),
-                                256 * sizeof(u32));
-                        previous_geometry_bank_valid[bank] = true;
-                    }
-                }
-                if (verify_geometry_output) {
-                    for (u32 y = 0; y < 192; ++y)
-                        hash_append(
-                            geometry_output_hash,
-                            nds->GPU.GetRenderer().Get3DScanline(y),
-                            256 * sizeof(u32));
-                }
-                rendered++;
-                if (profile && rendered % 60 == 0) {
-                    const auto now=std::chrono::steady_clock::now();
-                    std::cerr<<"profile_window end_frame="<<p.Frame
-                        <<" frames=60 ms="
-                        <<std::chrono::duration<double,std::milli>(
-                            now-replay_profile_checkpoint).count()<<"\n";
-                    replay_profile_checkpoint=now;
-                }
-                if (max_frames && rendered >= max_frames) break;
                 if (exact_geometry_timing)
                     ++gx_frame_records_replayed;
+            } else {
+                throw std::runtime_error("unsupported trace record type " + std::to_string(record.Type));
             }
         }
+        if (capture_open) throw std::runtime_error("unterminated capture record");
         if (pending_geometry_commands != 0)
             nds->GPU.GPU3D.Run();
         if (producer.joinable()) producer.join();

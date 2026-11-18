@@ -592,6 +592,10 @@ void GPU3D::SetEnabled(bool geometry, bool rendering) noexcept
     RenderingEnabled = rendering;
 
     if (!rendering) ResetRenderingState();
+
+    if (NDS4MiSTer::Trace2DEnabled() && NDS4MiSTer::Raw3DInputsEnabled())
+        NDS4MiSTer::EmitTrace3DPower(NDS.NumFrames, NDS.ARM9Timestamp,
+            GeometryEnabled, RenderingEnabled, NDS.PowerControl9);
 }
 
 
@@ -2948,6 +2952,8 @@ void GPU3D::SetRenderXPos(u16 xpos, u16 mask) noexcept
     if (!RenderingEnabled) return;
 
     RenderXPos = (RenderXPos & ~mask) | (xpos & mask & 0x01FF);
+    if (NDS4MiSTer::Trace2DEnabled() && NDS4MiSTer::Raw3DInputsEnabled())
+        NDS4MiSTer::EmitTrace3DXPos(NDS.NumFrames, NDS.ARM9Timestamp, RenderXPos);
 }
 
 
@@ -2982,7 +2988,17 @@ void GPU3D::WriteToGXFIFO(u32 val) noexcept
         ParamCount = 0;
         TotalParams = CmdNumParams[CurCommand & 0xFF];
 
-        if (TotalParams > 0) return;
+        if (TotalParams > 0)
+        {
+            // This word is both the command byte and its first parameter.
+            // The loop below is not reached for parameterised commands, so
+            // the command/first-parameter entry must be traced here or a
+            // normalised replay loses every multi-word command.
+            if (NDS4MiSTer::Trace2DEnabled())
+                NDS4MiSTer::EmitTrace3DCommand(NDS.NumFrames, NDS.ARM9Timestamp,
+                    CurCommand & 0xFF, val);
+            return;
+        }
     }
     else
         ParamCount++;
@@ -3238,6 +3254,8 @@ void GPU3D::Write8(u32 addr, u8 val) noexcept
 {
     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
+    if (NDS4MiSTer::Trace2DEnabled() && NDS4MiSTer::Raw3DInputsEnabled())
+        NDS4MiSTer::EmitTrace3DGxWrite(NDS.NumFrames, NDS.ARM9Timestamp, addr, val, 1);
     if (NDS4MiSTer::Trace2DEnabled())
         NDS4MiSTer::EmitTrace3DRegister(NDS.NumFrames, NDS.ARM9Timestamp, addr, val, 1);
 
@@ -3290,6 +3308,8 @@ void GPU3D::Write16(u32 addr, u16 val) noexcept
 {
     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
+    if (NDS4MiSTer::Trace2DEnabled() && NDS4MiSTer::Raw3DInputsEnabled())
+        NDS4MiSTer::EmitTrace3DGxWrite(NDS.NumFrames, NDS.ARM9Timestamp, addr, val, 2);
     if (NDS4MiSTer::Trace2DEnabled())
         NDS4MiSTer::EmitTrace3DRegister(NDS.NumFrames, NDS.ARM9Timestamp, addr, val, 2);
 
@@ -3379,6 +3399,8 @@ void GPU3D::Write32(u32 addr, u32 val) noexcept
 {
     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
+    if (NDS4MiSTer::Trace2DEnabled() && NDS4MiSTer::Raw3DInputsEnabled())
+        NDS4MiSTer::EmitTrace3DGxWrite(NDS.NumFrames, NDS.ARM9Timestamp, addr, val, 4);
     if (NDS4MiSTer::Trace2DEnabled() && !(addr >= 0x04000400 && addr < 0x040005CC))
         NDS4MiSTer::EmitTrace3DRegister(NDS.NumFrames, NDS.ARM9Timestamp, addr, val, 4);
 

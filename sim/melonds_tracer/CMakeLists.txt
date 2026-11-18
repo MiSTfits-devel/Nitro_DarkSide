@@ -28,7 +28,30 @@ target_link_libraries(melonds_tracer PRIVATE core)
 add_executable(melonds_fbdump main_fbdump.cpp Platform.cpp)
 target_compile_features(melonds_fbdump PRIVATE cxx_std_17)
 target_include_directories(melonds_fbdump PRIVATE ${MELONDS_DIR}/src)
+if(EXISTS "${MELONDS_DIR}/src/NDS4MiSTer_2DTrace.h")
+  # Vendored NDS4MiSTer fork: --trace2d and --trace2d-phase are available;
+  # the upstream tracer.patch instruction-trace hooks are not.
+  target_compile_definitions(melonds_fbdump PRIVATE NDS4MISTER_VENDORED_FORK=1)
+endif()
 target_link_libraries(melonds_fbdump PRIVATE core)
+
+# native sprite-phase oracle for the standalone Gpu2D.Sprite model
+add_executable(nds_gx2d_sprite_oracle ../../tools/gx2d_sprite_oracle.cpp Platform.cpp)
+target_compile_features(nds_gx2d_sprite_oracle PRIVATE cxx_std_17)
+target_include_directories(nds_gx2d_sprite_oracle PRIVATE ${MELONDS_DIR}/src)
+target_link_libraries(nds_gx2d_sprite_oracle PRIVATE core)
+
+# native display-capture oracle for the standalone Gpu2D.Capture model
+add_executable(nds_gx2d_capture_oracle ../../tools/gx2d_capture_oracle.cpp Platform.cpp)
+target_compile_features(nds_gx2d_capture_oracle PRIVATE cxx_std_17)
+target_include_directories(nds_gx2d_capture_oracle PRIVATE ${MELONDS_DIR}/src)
+target_link_libraries(nds_gx2d_capture_oracle PRIVATE core)
+
+# native background oracle for the standalone Gpu2D.Line BG path
+add_executable(nds_gx2d_bg_oracle ../../tools/gx2d_bg_oracle.cpp Platform.cpp)
+target_compile_features(nds_gx2d_bg_oracle PRIVATE cxx_std_17)
+target_include_directories(nds_gx2d_bg_oracle PRIVATE ${MELONDS_DIR}/src)
+target_link_libraries(nds_gx2d_bg_oracle PRIVATE core)
 
 # A9 rasterizer timing bench (sim/melonds_tracer/main_gxbench.cpp). Built for
 # armhf by build-armhf.sh and run on the DE10-Nano; builds natively too, which

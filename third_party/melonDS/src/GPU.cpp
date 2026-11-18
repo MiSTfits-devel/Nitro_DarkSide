@@ -1195,7 +1195,10 @@ void GPU::StartHBlank(u32 line) noexcept
         if (line < 192)
             Rend->DrawScanline(line);
         if (line < 191)
+        {
+            NDS4MiSTer::EmitTrace2DSpritePhase(*this, line+1);
             Rend->DrawSprites(line+1);
+        }
 #endif
 
         NDS.CheckDMAs(0, 0x02);
@@ -1203,6 +1206,9 @@ void GPU::StartHBlank(u32 line) noexcept
     else if (VCount == 215)
     {
 #if !NDS4MISTER_NO_VIDEO_RENDER && !NDS4MISTER_NO_3D_RENDER
+        if (NDS4MiSTer::Trace2DEnabled() && NDS4MiSTer::Raw3DInputsEnabled())
+            NDS4MiSTer::EmitTrace3DRenderStart(*this, NDS.NumFrames, VCount,
+                NDS.ARM9Timestamp, false);
         Rend->Start3DRendering();
 #endif
     }
@@ -1210,6 +1216,7 @@ void GPU::StartHBlank(u32 line) noexcept
     {
         // sprites are pre-rendered one scanline in advance
 #if !NDS4MISTER_NO_VIDEO_RENDER && !NDS4MISTER_NO_2D_RENDER
+        NDS4MiSTer::EmitTrace2DSpritePhase(*this, 0);
         Rend->DrawSprites(0);
 #endif
     }
@@ -1228,6 +1235,8 @@ void GPU::StartHBlank(u32 line) noexcept
 
 void GPU::FinishFrame(u32 lines) noexcept
 {
+    if (NDS4MiSTer::Trace2DEnabled() && NDS4MiSTer::Raw3DInputsEnabled())
+        NDS4MiSTer::EmitTrace3DFrameEnd(NDS.NumFrames, VCount, NDS.ARM9Timestamp);
 #if !NDS4MISTER_NO_VIDEO_RENDER
     Rend->SwapBuffers();
 #endif
@@ -1314,7 +1323,10 @@ bool GPU::ApplyExternalRendererPhase(
         else if (render && VCount == 215 && !renderer2DOnly)
         {
 #if !NDS4MISTER_NO_VIDEO_RENDER && !NDS4MISTER_NO_3D_RENDER
-            Rend->Start3DRendering();
+            if (NDS4MiSTer::Trace2DEnabled() && NDS4MiSTer::Raw3DInputsEnabled())
+            NDS4MiSTer::EmitTrace3DRenderStart(*this, NDS.NumFrames, VCount,
+                NDS.ARM9Timestamp, false);
+        Rend->Start3DRendering();
 #endif
         }
         else if (render && VCount == 262)
@@ -1350,7 +1362,11 @@ bool GPU::ApplyExternalRendererPhase(
             Rend->Finish3DRendering();
 #endif
         if (!renderer2DOnly)
+        {
+            if (NDS4MiSTer::Trace2DEnabled() && NDS4MiSTer::Raw3DInputsEnabled())
+                NDS4MiSTer::EmitTrace3DVBlank(NDS.NumFrames, VCount, NDS.ARM9Timestamp);
             GPU3D.VBlank();
+        }
         if (render)
             Rend->VBlank();
         if (CaptureEnable)
@@ -1467,6 +1483,8 @@ void GPU::StartScanline(u32 line) noexcept
         NDS.CheckDMAs(0, 0x01);
         NDS.CheckDMAs(1, 0x11);
 
+        if (NDS4MiSTer::Trace2DEnabled() && NDS4MiSTer::Raw3DInputsEnabled())
+            NDS4MiSTer::EmitTrace3DVBlank(NDS.NumFrames, VCount, NDS.ARM9Timestamp);
         GPU3D.VBlank();
 
         Rend->VBlank();
@@ -1561,7 +1579,11 @@ void GPU::SetVCount(u16 val, u16 mask) noexcept
 
     u16 nextvc = (NextVCount & ~mask) | (val & mask);
 
+    const bool abortWasSet = GPU3D.AbortFrame;
     GPU3D.AbortFrame |= NextVCount != nextvc;
+    if (!abortWasSet && GPU3D.AbortFrame && NDS4MiSTer::Trace2DEnabled()
+        && NDS4MiSTer::Raw3DInputsEnabled())
+        NDS4MiSTer::EmitTrace3DAbort(NDS.NumFrames, NDS.ARM9Timestamp, true);
     NextVCount = nextvc;
     VCountOverride = true;
 }
@@ -1772,6 +1794,11 @@ void GPU::CheckCaptureStart()
     u16 newval = CBFlag_IsCapture | dstoff | (dstbank << 2) | (len << 4) | (size << 6);
     VRAMCBFlagsSet(dstbank, dstoff, newval);
     Rend->AllocCapture(dstbank, dstoff, size);
+
+    u16 flags[16];
+    GetCaptureBlockFlags(flags);
+    NDS4MiSTer::EmitCaptureLifecycle(NDS.NumFrames, VCount, CaptureCnt,
+        VRAMMap_LCDC, flags, 1);
 }
 
 void GPU::CheckCaptureEnd()
@@ -1792,6 +1819,11 @@ void GPU::CheckCaptureEnd()
         return;
 
     VRAMCBFlagsOr(dstbank, dstoff, CBFlag_Complete);
+
+    u16 blockFlags[16];
+    GetCaptureBlockFlags(blockFlags);
+    NDS4MiSTer::EmitCaptureLifecycle(NDS.NumFrames, VCount, CaptureCnt,
+        VRAMMap_LCDC, blockFlags, 0);
 }
 
 void GPU::SyncVRAMCaptureBlock(u32 block, bool write)
