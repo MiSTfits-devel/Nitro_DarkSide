@@ -300,3 +300,26 @@ actual host transport with a **simulated** receiving FPGA. The independent
 no-cartridge melonDS reference reached the native first-settings screen from
 a privately supplied dual-header image; this does **not** establish the
 Haskell core has reached that screen on silicon.
+
+### Native board input
+
+`sim/run_hs_input_guest.sh STAGED_PROJECT` exercises the staged input cone,
+not a Linux input device or a fitted FPGA. It sends the v1.0.1 host commands
+on `HPS_BUS`: FIO4/5 upload two source-assembled BIOS programs, FIO6 uploads
+their touchscreen calibration, and ordinary UIO mounts slot 1 and releases
+native mode. No private firmware, save, or game is needed.
+
+Controller 0 uses `02` for its button bitmap and `3d` (selector 0) for its
+absolute right stick. The unchanged release mouse arbiter accepts `04` and
+gives position **and** pen state to the most recently active device. Display
+rotation does not transform the native inputs again. `BoardInput.hs` maps
+the result to DS key order and 256×192 coordinates; the cursor uses the same
+mapping. The guest samples a complete held snapshot across the clock boundary.
+The HPS input latches are not cleared by a DS reset: the host sends neutral
+levels, which continue to cross while the guest is held.
+
+The two guests read KEYINPUT and their separate KEYCNTs. ARM7 also reads
+EXTKEYIN and the calibrated SPI ADC. The fixture walks all 12 button bits and
+exercises OR/AND keypad interrupts, lid open, pen up/down, stick/mouse
+takeover, mic button and release during OSD reset. This is not a commercial
+firmware touchscreen-menu or physical-controller compatibility test.

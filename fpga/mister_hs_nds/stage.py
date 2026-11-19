@@ -60,13 +60,13 @@ def main():
     # Only modules actually emitted by the named Clash products, independently
     # checked against their build manifests. Reject data/ROM init sidecars.
     ports_by_unit={}
-    for top in ('nds_bios_peripherals','nds_bios_cpu','nds_bios_cart','nds_bios_system','nds_native_card'):
+    for top in ('nds_bios_peripherals','nds_bios_cpu','nds_bios_cart','nds_bios_system','nds_native_card','nds_board_input'):
         matches=list(a.hdl.glob('*/'+top+'.v'))
         if len(matches)!=1:raise ValueError('missing/duplicate generated '+top)
         d=matches[0].parent
         manifest=json.loads((d/'clash-manifest.json').read_bytes())
         if manifest['top_component']['name']!=top:raise ValueError('mismatched Clash manifest')
-        if top!='nds_native_card': # instantiated by the generated cart component
+        if top not in ('nds_native_card','nds_board_input'): # only SoC units participate in the internal bus
             ports_by_unit[top]={p['name']:p for p in manifest['top_component']['ports_flat']}
         if {f.stem for f in d.glob('*.v')}!=set(manifest['components']):raise ValueError('incomplete or dirty HDL closure')
         for f in d.iterdir():
