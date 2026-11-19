@@ -34,6 +34,11 @@ module sdram_model #(
 
 localparam integer WSTORE = 4096;   // tagged write store, index = ha[11:0]
 
+`ifdef VERILATOR
+// Full physical identity for long FPGA-in-loop-style simulations. Unlike
+// the compact Icarus store, writing another row can never evict live data.
+reg [15:0] written [bit [23:0]];
+`endif
 reg         wv [0:WSTORE-1];
 reg  [11:0] wt [0:WSTORE-1];
 reg  [15:0] wd [0:WSTORE-1];
@@ -78,8 +83,12 @@ endfunction
 
 function [15:0] rd_mem(input [23:0] ha);
 	begin
+`ifdef VERILATOR
+		if (written.exists(ha)) rd_mem = written[ha]; else rd_mem = sdpat(ha);
+`else
 		if (wv[ha[11:0]] && wt[ha[11:0]] == ha[23:12]) rd_mem = wd[ha[11:0]];
 		else                                           rd_mem = sdpat(ha);
+`endif
 	end
 endfunction
 
@@ -87,11 +96,15 @@ task wr_mem(input [23:0] ha, input [15:0] d, input [1:0] dqm);
 	reg [15:0] cur;
 	begin
 		cur = rd_mem(ha);
+`ifdef VERILATOR
+		written[ha] = {dqm[1] ? cur[15:8] : d[15:8], dqm[0] ? cur[7:0] : d[7:0]};
+`else
 		if (wv[ha[11:0]] && wt[ha[11:0]] != ha[23:12] && VERBOSE)
 			$display("[sdram_model] note: write store collision at index %0h", ha[11:0]);
 		wv[ha[11:0]] = 1;
 		wt[ha[11:0]] = ha[23:12];
 		wd[ha[11:0]] = {dqm[1] ? cur[15:8] : d[15:8], dqm[0] ? cur[7:0] : d[7:0]};
+`endif
 	end
 endtask
 

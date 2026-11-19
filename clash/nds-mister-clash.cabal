@@ -8,6 +8,8 @@ license:            GPL-2.0-or-later
 library
   exposed-modules:    Mister.VideoMixer
                     , Mister.HpsIoSubset
+                    , Nds.Memory.Map
+                    , Nds.Memory.Fabric
                     , Nds.Gpu3D.Depth
                     , Nds.Gpu3D.DepthPipe
                     , Nds.Gpu3D.Flat

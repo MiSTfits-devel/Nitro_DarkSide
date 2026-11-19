@@ -24,7 +24,11 @@ module sdram
 
 	parameter integer CAS_LATENCY = 2,
 
-	parameter integer TRCD_WAIT = 1
+	parameter integer TRCD_WAIT = 1,
+
+	// Number of clk cycles before refresh is due; the original 3x/4x
+	// platform defaults are unchanged. Lower this for slower controllers.
+	parameter integer REFRESH_CYCLES = 750
 )
 (
 	input             init,
@@ -83,7 +87,7 @@ localparam MODE                = {3'b000, NO_WRITE_BURST, OP_MODE, CAS_LAT_B, AC
 localparam RDLY                = CAS_LATENCY + BURST_LENGTH + DQ_PIPE;
 
 localparam sdram_startup_cycles= 14'd12100;
-localparam cycles_per_refresh  = 14'd750;
+localparam [13:0] cycles_per_refresh = REFRESH_CYCLES[13:0];
 localparam startup_refresh_max = 14'b11111111111111;
 
 wire [2:0] CMD_NOP             = 3'b111;
@@ -95,8 +99,8 @@ wire [2:0] CMD_AUTO_REFRESH    = 3'b001;
 wire [2:0] CMD_LOAD_MODE       = 3'b000;
 
 reg [13:0] refresh_count = startup_refresh_max - sdram_startup_cycles;
-reg  [2:0] command;
-reg        chip;
+reg  [2:0] command = 3'b111; // NOP before the controller's first edge
+reg        chip = 1'b1;
 
 reg        refresh_due = 0;
 

@@ -218,3 +218,83 @@ coincident with `clk1x`, so both ends agree which edge was the transfer (`NDS.sv
 The GPU dot cadence is separately ce-paced at 1-of-`GPU_CE_DIV` = 3 (`nds_top.vhd:54`), so
 relative to the CPUs a frame is 3× long; OSD `status[10]` switches it to 1-of-1 at real frame
 rate (`NDS.sv:1038`).
+
+## Clash dual-CPU / tile memory backend
+
+`Nds.Memory.Fabric` has two demand ports: an arbitrated CPU/DMA bus and an
+8-byte display-read bus. Both use ready/valid and held replies; writes also
+get one reply. An outstanding request snapshots its complete bank mask.
+Overlaps broadcast writes and OR reads; a write cannot complete until
+every selected external bank has answered. A held response on one port
+does not prevent service on the other. The CPU read returns both the
+selected aligned 32-bit word and the full aligned 64-bit burst; reusing its
+other word requires no speculative fetch. There is no MMIO prefetch, TARDIS
+address producer, private renderer backing store or DMA engine here.
+
+Physical placement follows [Splash v1.0.1](https://github.com/SplashDev88/NDS4MiSTer/tree/v1.0.1):
+A–D at module SDRAM byte `0..0x7ffff`, main RAM at `0x800000..0xbfffff`
+([main RAM base](https://github.com/SplashDev88/NDS4MiSTer/blob/v1.0.1/rtl/nds_nitro_console_top.vhd#L62)).
+E/F/G/H/I are independent 64/16/16/32/16 KiB synchronous byte-lane RAMs.
+Contents before a first write are unspecified; reset resets ownership, not
+4 MiB of data. `rtl/nds_clash_sdram.sv` adapts the existing `rtl/sdram.sv`
+ch2 only, with one pending command, CL2, DQM byte enables and ready64 on
+the final halfword. This adapter is **same clock only**, designed for
+67.027964 MHz. Its refresh threshold is 490 clocks, not the original
+100.54 MHz controller's 750. No CDC or derived graphics clock is assumed.
+
+Mapping references: [Nintendo NITRO Programming Manual v1.62 §2.2.1,
+tables 2-9–2-14](https://archive.org/stream/NitroDevDocs/NITRO%20Programming%20Manual%20v1.62_djvu.txt)
+for documented bank modes, placements and widths; `third_party/melonDS/src/GPU.cpp`
+(`MapVRAM_*`), `GPU.h` and `NDS.cpp` for aliases and implementation-defined
+combinations. Nintendo does **not** guarantee overlapping mappings or certain
+OFS choices. We implement the measured/emulated wired-OR/write-to-all
+convention and low-bit OFS aliases rather than picking one winning bank.
+ARM9 byte writes to VRAM are ignored; ARM7 byte writes to its mapped C/D
+are not. CPU apertures are not exposed in palette/texture-only modes.
+The WRAM control/status byte sharing adjacent register lanes is not VRAM.
+
+`clash/tests/run_memory_fabric_check.sh` synthesizes fresh Verilog and runs
+it against stock melonDS API calls and the module controller + pin-clocked
+SDRAM model. Tests include all physical main-RAM words, all VRAM banks,
+register byte masks, role/offset/page-edge sweeps, mirror ownership, aliased
+writes, backpressure and contended line budgets. Its scanline workloads count
+bus transfers only (not a renderer or DMA implementation). A pin-model pass
+is not a Quartus fit, signal-integrity test or physical board result.
+
+### Contention and channel choice
+
+The independent gate retains an intentionally **red** 420 × 8-byte
+display-demand benchmark, alongside the passing 140-demand scene budget.
+Each line has 4,260 master clocks. Under continuous competing seeded bus
+traffic the 420-demand workload missed all 192 deadlines even with one
+bank; the four-bank overlap is worse. These are cold bus requests, not
+drawn pixels. The gate prints the worst line, separating ACT-to-ready64
+service, pre-ACT waiting during refresh recovery, other pre-ACT waiting
+(including the grant pipeline/turnaround), and remaining logic/dispatch
+cycles. CPU-owned time overlaps those buckets.
+
+An isolated comparison uses the existing pipelined ch1 for display and ch2
+for CPU requests, in the same controller with the same refresh interval.
+**It is not connected to the board top.** The two simulations use identical
+ordered address/data streams, initial contents and per-line request counts;
+the gate compares hashes of both returned streams in addition to every
+word's oracle check. The experiment uses single-bank, independent
+VRAM/main addresses, so it does **not** demonstrate combined-core alias
+coherence for cross-channel writes/remaps. A quota limits display grants
+while the CPU has a request in flight; this is a measured scheduling
+alternative, not a new predictor.
+
+| CPU ops per 420-burst line | Ch2-only worst display (clocks, approx.) | Ch1+ch2 credit | Isolated worst display / both complete | Max CPU request→done | Max CPU ops left when display finished |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 5,074 | 4 | 3,412 / 3,413 | — | 0 |
+| 64 | 5,765 | 4 | 4,063 / 4,064 | 53 | 0 |
+| 420 | 9,403 | 4 | 4,443 / 7,520 | 53 | 316 |
+| 420 | 9,403 | 8 | 3,942 / 7,521 | 85 | 368 |
+
+At 420 CPU ops/line the credit-8 display result is **not** a system
+deadline pass: as many as 368 CPU ops are still pending, and both clients
+finish late on 192/192 lines. All CPU ops finish before the next benchmark
+line starts (no work silently lost). Reprioritizing ch2 alone cannot fix
+420 cold reads: even display alone exceeds the deadline. The distinction
+matters when comparing the real tile client's burst reuse to this
+controller-capacity experiment.
