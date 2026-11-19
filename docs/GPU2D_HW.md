@@ -217,10 +217,10 @@ TIMING=1 clash/tests/run_tilehw_check.sh
 failing-run count, whether the kirby135 capture ran, and how many mutants
 ran (`MUTANTS="name ..."` selects a subset). Scenes:
 
-- **arm9_2dk** (engines A and B, all 192 lines each): the checker assembles
-  nothing itself; the gate first checks that `sim/tests/arm9_2dk.bin` equals
-  a fresh `arm-none-eabi-as/ld/objcopy` of `arm9_2dk.s`, then the checker
-  executes that binary in a small ARM interpreter (the instructions the
+- **arm9_2dk** (engines A and B, all 192 lines each): the gate assembles
+  `sim/tests/arm9_2dk.s` with `arm-none-eabi-as/ld/objcopy` and checks the
+  SHA-256 against the verified fixture. The checker executes that binary
+  in a small ARM interpreter (the instructions the
   program uses; CP15 writes ignored; byte writes to palette/VRAM/OAM dropped
   as on the ARM9) to its `0xCAFEBABE` mailbox store, and reads back VRAMCNT
   (checked against the expected mapping), DISPCNT, BG3CNT, scroll, BLDCNT,

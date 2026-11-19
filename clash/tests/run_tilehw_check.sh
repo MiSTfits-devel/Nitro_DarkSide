@@ -8,9 +8,8 @@
 # model: Nds.Gpu2D.Line (bgLine, composeLine) and Nds.Gpu2D.Sprite
 # (drawSprites), and renderReferenceLine wherever OBJ is off.
 #
-#  0. sim/tests/arm9_2dk.bin must be what sim/tests/arm9_2dk.s assembles to
-#     (arm-none-eabi-as/ld/objcopy, as build_nds_2dk.sh), because the check
-#     derives the scene by executing that binary.
+#  0. Assemble sim/tests/arm9_2dk.s and check the fixture's SHA-256 before
+#     deriving the scene by executing the fresh binary.
 #  1. fault: every unsupported register combination is refused at line start
 #     and every unsupported sprite on the line during the OAM scan, with its
 #     fault bit, before any pixel of the line; the engine halts; a response
@@ -60,19 +59,20 @@ set -o pipefail
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 repo=$(CDPATH= cd -- "$here/.." && pwd)
-fixtures=$repo/sim/tests
+sources=$repo/sim/tests
 seed=${SEED:-1}
 scenes=${SCENES:-200}
 cosim=${COSIM:-60}
 mscenes=${MUTANT_SCENES:-60}
 rts="+RTS -M3g -RTS"
 out=${OUT:-${TMPDIR:-/tmp}/nds-gpu2d-tilehw-check}
+fixtures=$out/asm
 mkdir -p "$out"
 
 failures=0
 
 # The optional local capture: present only if all seven files are.
-kdir=${TILEHW_KIRBY_DIR:-$fixtures}
+kdir=${TILEHW_KIRBY_DIR:-$sources}
 kfound=0
 for part in bgvram pal bgep oam objvram objep frames; do
   if [ -f "$kdir/gpu2d_kirby135_$part.hex" ]; then kfound=$((kfound + 1)); fi
@@ -90,14 +90,10 @@ mutants_run=0
 
 # 0. fixture binary against its source
 mkdir -p "$out/asm"
-arm-none-eabi-as -march=armv5te -o "$out/asm/arm9_2dk.o" "$fixtures/arm9_2dk.s"
+arm-none-eabi-as -march=armv5te -o "$out/asm/arm9_2dk.o" "$sources/arm9_2dk.s"
 arm-none-eabi-ld -Ttext=0x02000000 -o "$out/asm/arm9_2dk.elf" "$out/asm/arm9_2dk.o"
 arm-none-eabi-objcopy -O binary "$out/asm/arm9_2dk.elf" "$out/asm/arm9_2dk.bin"
-if cmp -s "$out/asm/arm9_2dk.bin" "$fixtures/arm9_2dk.bin"; then
-  echo "arm9_2dk.bin: identical to a fresh assembly of arm9_2dk.s"
-else
-  echo "arm9_2dk.bin: DIFFERS from a fresh assembly of arm9_2dk.s"; failures=$((failures + 1))
-fi
+(cd "$fixtures" && printf '%s  %s\n' cef57f072432c9750c7f453b88a649bc6e7916188e9f935b783e0358aefd9f08 arm9_2dk.bin | shasum -a 256 -c -)
 
 build() {
   (cd "$1" && STACK_YAML="$here/stack.yaml" stack --resolver lts-22.43 ghc -- +RTS -M3g -RTS -O1 -rtsopts -isrc -itest \

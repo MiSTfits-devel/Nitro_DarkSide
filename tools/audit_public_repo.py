@@ -263,7 +263,7 @@ def audit_history() -> list[str]:
                     "git",
                     "grep",
                     "-I",
-                    "-n",
+                    "--name-only",
                     "-E",
                     "-e",
                     pattern.pattern.decode("ascii"),
@@ -272,13 +272,12 @@ def audit_history() -> list[str]:
                     ".",
                     ":(exclude)third_party/**",
                 ],
-                stdout=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 check=False,
             )
             if result.returncode == 0:
-                first = result.stdout.decode("utf-8", "replace").splitlines()[0]
-                failures.append(f"history contains {label}: {first[:240]}")
+                failures.append(f"history contains {label}")
             elif result.returncode not in (1,):
                 failures.append(f"history scan failed for {label}")
     return failures
@@ -337,7 +336,7 @@ def main() -> int:
         print("PUBLIC SAFETY AUDIT FAILED", file=sys.stderr)
         for failure in sorted(set(failures)):
             print(f"  - {failure}", file=sys.stderr)
-        print("Nothing was pushed. Remove the private/forbidden material and recommit.", file=sys.stderr)
+        print("Remove the flagged material from all audited revisions.", file=sys.stderr)
         return 1
 
     print("PASS: public repository safety audit")
