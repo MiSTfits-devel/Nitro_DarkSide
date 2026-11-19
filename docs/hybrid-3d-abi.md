@@ -12,6 +12,79 @@ legacy line-fetch and FPGA BG0 blend sections below describe those modes; they
 must not be used to infer the active standalone rendering split. Source contracts
 in `src/replay` and `rtl` are authoritative for optional extensions.
 
+### Haskell console, v1.0.1 matched-display endpoint
+
+[`nds_hs_h3d`](../rtl/nds_hs_h3d.sv) connects the Haskell guest to the
+[v1.0.1 release](https://github.com/SplashDev88/NDS4MiSTer/tree/v1.0.1)
+packet consumer. On this **outer physical DDR port**, addresses are full
+64-bit word addresses (`0x07f80000` for control), not the legacy relative
+address in the table below. Do not add `0x30000000` again.
+
+* A changed nonzero `requested_session` starts the control initializer even
+  with CPUs stopped. FPGA writes a fresh persistent token at `+0x70`, then
+  H3DQ; HPS destroys its old renderer and echoes the token at `+0x78`.
+  FPGA waits for video quiescence, clears old state, commits H3P1 at `+0x300`,
+  and publishes H3D1 last. Only the **helper** commits the matching H3P1 ACK
+  at `+0x340`, sets `accepted_session` and enters Ready. `console_release`
+  requires a clean header/policy sweep, and monitors faults and heartbeat.
+  A pre-media attach is **not** the game session: request a fresh epoch
+  after the cartridge is stable so the helper can select its profile.
+* `capture_ready` must gate the original architectural effects. Input
+  strobes represent already accepted ARM9 GPU/register/palette/OAM/VRAM
+  writes, ARM7 VRAM writes, each LCD HBlank and the VBlank boundary. They
+  are not scanout pixels, attempted writes, CPU-retirement samples, or
+  synthesized timing extrapolated from rendered frames. Simultaneous inputs
+  keep their source timestamp; v1.0.1 orders same-edge HBlank before writes.
+  The wrapper folds aligned halfword/word VRAM sequences using the release
+  packer, writes payload then header then slot commit, and advances `+0x10`
+  only after physical DDR acceptance. HPS owns `+0x18`.
+* [`GxLink`](../clash/src/Nds/WholeCore/GxLink.hs) accepts a write only with
+  space for its real event. A read of GXSTAT that includes test-result bits
+  or a word of the clip/vector matrices posts an ordered H3B1 fence and
+  waits for the matching H3R1 snapshot at `+0x200`. FIFO/stack/busy bits
+  come from the local normalizer. Readback is not a guessed matrix; ports
+  absent from H3R1 (e.g. polygon counts, position-test coordinates) fault.
+  DISP3DCNT readback is the local writable control, not the renderer's
+  sticky polygon/vertex RAM overflow flags. This is not a complete GX MMIO
+  implementation.
+* In matched mode the **HPS renderer**, not FPGA 2D scanout, composes both
+  screens. It publishes format 2 at `0x3fe00000 + bank*0x80000`, second
+  screen at `+0x40000`, and commits an even descriptor sequence. FPGA
+  revalidates that descriptor and requests adoption; only completed
+  physical screen-pair adoption permits advancing `+0x38`. Don't wire
+  `external_frame_adopted` to publish or to a constant. This endpoint does
+  not implement the separate optional segmented FPGA3D raster accelerator;
+  run the v1.0.1 companion with `NDS4MISTER_MATCHED_DISPLAY_TEST=1` and
+  `NDS4MISTER_FPGA3D=0`.
+
+`NDS101_SOURCE=/path/to/NDS4MiSTer-1.0.1 sim/run_hs_h3d.sh` exercises the
+transport with a public assembled program, generated Clash ARM9/display HDL,
+stalled DDR and the unmodified release `Hybrid3DService` class, using memory
+instead of `/dev/mem`. It first withholds the helper, then attaches it with
+the guest held, changes the session request, and requires destruction,
+reinitialization and fresh H3P1 acceptance before running the public guest
+in epoch 2. By default there is no scanout and **display ACK must stay
+zero**. Set `H3D_SCANOUT=1` to run the real board framebuffer,
+DDR line fetch and video scanout in simulation: the program draws an opaque
+blue triangle on red (top) with a green bottom screen. The gate checks both
+256×192 DDR images, sees all three colors on active video pins, requires
+genuine bank adoption/ACK and checks the guest's `clip[0] == 0x2400`
+readback. The default CPU test top is `H3dGuest`, not the entire console.
+`BIOS_TILE_HDL=/path/to/staged-project` instead selects `stage.py`’s
+`rtl/nds_bios_tile_soc.sv` and split CPU/peripheral `hdl/`; its public
+ARM7 program waits for bank C and issues a separately tagged VRAM write.
+This is a distinct acceptance gate: only `top=BiosTileSoc` with
+`arm7_vram_records=1` constitutes dual-CPU evidence. `top=H3dGuest` with
+`arm7_vram_records=0` proves the ARM9/renderer path only.
+The native gate passed with modeled board clocks (67.027964 MHz CPU master,
+60 MHz host): 24 accepted ARM9 writes, one tagged ARM7 VRAM write, one
+fenced matrix read, 98,304 checked framebuffer pixels, two actual scanout
+adoptions, and blue polygon pixels on the digital video pins. The CPU top
+and display clients use staged HDL only; the socket supplies the two public
+programs and services SDRAM transactions rather than modeling physical chips.
+Neither gate uses the shipped ARM executable, proves a private BIOS/game
+boot or DMA-originated traffic, or exercises physical hardware.
+
 ## Rules
 
 1. The FPGA is the time and memory authority.
