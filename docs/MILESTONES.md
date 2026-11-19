@@ -317,7 +317,8 @@ separately: source revision, generated top, target device and clock
 constraints, ALMs/LABs/registers, RAM/DSP blocks, and Fmax/setup slack.
 Standalone results do not add up to a board fit: integration has its own
 clock crossings, interfaces, resource sharing and placement. The
-[zero-ARM-graphics fit baseline](../build/zero-arm-graphics/fit-baseline.md)
+zero-ARM-graphics fit baseline (local fit data in
+`build/zero-arm-graphics/fit-baseline.md`, not tracked)
 is historical NDS4MiSTer/standalone GPU data, not a measurement of the
 proposed whole-core Haskell partitioning. This hookup adds no synthesis or
 fit result.

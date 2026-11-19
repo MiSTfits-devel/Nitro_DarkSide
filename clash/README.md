@@ -896,8 +896,8 @@ after removing the failed experiment it passed the focused service,
 repeated for that cleanup. Private ROM input was the requested
 `__AAAA01_00.nds`, 2,696,840 bytes, not the older unsupported 8 MiB summary;
 the source file was not modified.
-Current scoped-continuation ABI2 service:
-`/tmp/nds-m6-abi2.2zdPYe/gpu.dylib`, SHA256
+Current scoped-continuation ABI2 service (local run artefact, built from
+`clash/test/GpuService.hs` as `tools/hs_gpu_view/run.sh` builds it), SHA256
 `fc8f9c9a4619519b0d569d9bb3c32c845f6d1d98b23fa3ca07e2ec4daec02d70`.
 The targeted service selector also checks five admission guards and compares
 pending POS/PUSH refill flags/results with the standalone chip. Timed status
@@ -951,4 +951,3 @@ It has copied that frame's input, so clearing the viewer's short-input
 latch cannot change the emulator input until its next frame poll.
 This is a sampling acknowledgement, not completed-frame or game-response
 evidence; short taps still cannot disappear between frame polls.
-

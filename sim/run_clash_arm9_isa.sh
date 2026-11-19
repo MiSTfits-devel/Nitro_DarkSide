@@ -47,13 +47,13 @@ faults() {
         build_rom "$prefix$name" "$source" --defsym "$name=1"
         site=$(fault_site "$prefix$name")
         [[ -n $site ]] || { echo "no fault_site in $prefix$name" >&2; exit 1; }
-        add_case "$prefix$name" "$source" "${extra[@]}" --fault "${spec##*:}" "$site"
+        add_case "$prefix$name" "$source" ${extra[@]+"${extra[@]}"} --fault "${spec##*:}" "$site"
     done
 }
 offer() {
     local source=$1 name=$2; shift 2
     build_rom "$name" "$source" --defsym "$name=1"
-    add_case "$name" "$source" "${extra[@]}" --offer "$@"
+    add_case "$name" "$source" ${extra[@]+"${extra[@]}"} --offer "$@"
 }
 
 build_rom isa hs_arm9_isa

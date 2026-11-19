@@ -240,7 +240,7 @@ system time 15302 and raw ARM9 clock 30604; operations 2/2/9/9 respectively
 write `400=71`, `404=22221111`, `408=3333`, `40C=11`.
 Original bit 0/14 polling is unchanged. Final outputs
 `/tmp/m6-scen/atomic-watch.final.{out,err,txn}` match the existing independent
-`.stock.out`; retained sources/cartridge reproduce the case. M6 is accepted
+`.stock.out` (local reproducer, not in the repo). M6 is accepted
 for this host scope, not as new M7 or physical-microcycle evidence.
 
 Whole-process v5 walls (startup/output included) were 16.1 s/200 NTR and

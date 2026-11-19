@@ -35,7 +35,7 @@ case $(uname -s) in
     *) dl=(-ldl) ;;
 esac
 "${CC:-cc}" -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC \
-    "$root/sim/hs_gpu_arm9_bridge.c" -o "$out/bridge.so" "${dl[@]}"
+    "$root/sim/hs_gpu_arm9_bridge.c" -o "$out/bridge.so" ${dl[@]+"${dl[@]}"}
 
 # Use the exact CPU, cache and product-local membus sources from the MiSTer QIP.
 # The portable MEM entity is the existing host shim for the cache's dormant
