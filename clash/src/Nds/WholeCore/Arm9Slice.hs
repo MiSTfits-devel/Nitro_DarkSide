@@ -45,14 +45,15 @@ import Clash.Prelude hiding (Word, slice)
 import qualified Clash.Prelude as C
 import qualified Clash.Explicit.Prelude as E
 import Data.Maybe (fromMaybe, isJust, isNothing)
+import qualified Nds.WholeCore.Arm9Mpu as M
 
 type Word = BitVector 32
 type Width = BitVector 3
 type RamIndex = Index 1024
 
 -- | Register-file row: R0-R12 at 0-12; R13/R14 at 13/14 (User/System),
--- 17/18 (SVC), 21/22 (IRQ); SPSR_svc at 25, SPSR_irq at 26. R15 is never
--- stored: a read of R15 takes the stage's PC value.
+-- 17/18 (SVC), 21/22 (IRQ), 27/28 (ABT); SPSR_svc/irq/abt at 25/26/29.
+-- R15 is never stored: a read of R15 takes the stage's PC value.
 type Row = Index 32
 
 data SliceIn = SliceIn
@@ -104,6 +105,8 @@ data Arch = Arch
   { armV5      :: Bool
   , vectorBase :: Word
   , ioMap      :: IoMap
+  , fabricMap  :: Bool   -- ^ full external main RAM aperture; ARM7 may also access Fabric VRAM
+  , nativeBios :: Bool   -- ^ full private BIOS apertures, BIOS protection and native system IO
   }
 
 -- | The I/O spans one CPU's link owns (see 'linkOwns').
@@ -111,17 +114,19 @@ data IoMap = Arm9Map | Arm7Map
   deriving (Eq)
 
 arm9Arch, arm7Arch :: Arch
-arm9Arch = Arch { armV5 = True, vectorBase = 0xffff0000, ioMap = Arm9Map }
-arm7Arch = Arch { armV5 = False, vectorBase = 0x00000000, ioMap = Arm7Map }
+arm9Arch = Arch { armV5 = True, vectorBase = 0xffff0000, ioMap = Arm9Map, fabricMap = False, nativeBios = False }
+arm7Arch = Arch { armV5 = False, vectorBase = 0x00000000, ioMap = Arm7Map, fabricMap = False, nativeBios = False }
 
 ramBase :: Word
 ramBase = 0x02000000
 
 -- | Reset vector (the boot ROM window starts here), IRQ and SWI vectors.
-bootBase, irqVector, swiVector :: Arch -> Word
+bootBase :: Arch -> Word
 bootBase = vectorBase
-irqVector a = vectorBase a + 0x18
-swiVector a = vectorBase a + 0x08
+
+exceptionBase :: Arch -> Psr -> Word
+exceptionBase a s | fabricMap a && armV5 a = if testBit (control s) 13 then 0xffff0000 else 0
+                  | otherwise = vectorBase a
 
 -- * State
 
@@ -133,6 +138,7 @@ data Psr = Psr
   , fiqMask :: Bool           -- ^ CPSR.F (stored; there is no FIQ source)
   , thumb   :: Bool           -- ^ CPSR.T
   , mode    :: BitVector 5    -- ^ User 0x10, IRQ 0x12, SVC 0x13, System 0x1F
+  , control :: Word           -- ^ ARM946 CP15 c1, *not* part of CPSR/SPSR; reset 0x2078
   } deriving (Eq, Generic, NFDataX)
 
 -- | Identity of an instruction, carried by its token to retirement.
@@ -159,7 +165,7 @@ data IrTok = IrTok
   } deriving (Generic, NFDataX)
 
 data Cls = CDp | CMrs | CMsr | CClz | CMul | CMulLong | CBranch | CBx | CLinkOnly
-  | CSingle | CBlock | CSwi | CUndef
+  | CSingle | CBlock | CSwi | CControl | CCacheOp | CUndef
   deriving (Eq, Generic, NFDataX)
 
 -- | Decoded instruction, carried through E1 and E2.
@@ -211,7 +217,7 @@ data ShTok = ShTok
   , sD     :: Word            -- ^ store data or the SPSR of an exception return
   } deriving (Generic, NFDataX)
 
-data MPhase = MRoute | MBoot | MLocal | MRam | MOffer | MAwait | MCheck | MBeat
+data MPhase = MRoute | MBoot | MBiosProt | MLocal | MRam | MOffer | MAwait | MCheck | MBeat
   | MWriteBack | MRestore | MMulAcc | MMulHi | MSwiLink
   deriving (Eq, Generic, NFDataX)
 
@@ -248,6 +254,9 @@ data Fetch = Fetch
   , fidle  :: Bool
   } deriving (Generic, NFDataX)
 
+data Entry = EnterIrq Word | EnterAbort Bool Word -- data abort?; architectural LR
+  deriving (Generic,NFDataX)
+
 data Cpu = Cpu
   { psr       :: Psr
   , fetch     :: Fetch
@@ -257,25 +266,29 @@ data Cpu = Cpu
   , e2        :: Maybe ShTok
   , mq        :: Maybe MemSt
   , rq        :: Maybe RetTok
-  , irqEntry  :: Maybe Word                -- ^ IRQ taken last cycle: R14_irq to write
+  , entry     :: Maybe Entry
   , storeObs  :: Maybe (Word, Word)        -- ^ local RAM store written last cycle
   , faultCode :: BitVector 3
   , faultAt   :: Word
+  , mpu       :: M.Mpu
+  , execPage  :: Maybe (BitVector 20, Bool, Bool) -- virtual page, user, executable
+  , bios7Prot :: BitVector 16 -- ARM7 BIOSPROT: first nonzero write locks it until reset
   } deriving (Generic, NFDataX)
 
 -- | Reset: SVC mode, ARM state, IRQ and FIQ masked (CPSR 0x000000d3).
 initialCpu :: Arch -> Cpu
-initialCpu a = Cpu (Psr 0 True True False 0x13) (Fetch (bootBase a) False Nothing False) Nothing Nothing
-  Nothing Nothing Nothing Nothing Nothing Nothing 0 0
+initialCpu a = Cpu (Psr 0 True True False 0x13 0x2078) (Fetch (bootBase a) False Nothing False) Nothing Nothing
+  Nothing Nothing Nothing Nothing Nothing Nothing 0 0 M.resetMpu Nothing 0
 
 -- | One cycle's effects besides the next CPU state. Each RAM has one write
 -- port; the register file has two read ports.
 data Step = Step
   { stepCpu   :: Cpu
-  , ramWrite  :: Maybe (RamIndex, Word)
+  , ramWrite  :: Maybe (Word, Word)    -- ^ aligned ARM byte address; narrow only at a local block RAM
   , regWrite  :: Maybe (Row, Word)
   , readA     :: Maybe Row
   , readB     :: Maybe Row
+  , invalidateI :: Bool                -- ^ committed ARM9 MCR p15,0,Rd,c7,c5,0
   } deriving (Generic, NFDataX)
 
 -- | The pure harness models both synchronous RAMs (local RAM and its read
@@ -307,7 +320,7 @@ sliceBootAddr (SliceState s _ _ _ _ _) = romAddress s
 -- cycle (its R14_irq is written this cycle).
 sliceIrqMasked, sliceIrqEntering :: SliceState -> Bool
 sliceIrqMasked (SliceState s _ _ _ _ _) = irqMask (psr s)
-sliceIrqEntering (SliceState s _ _ _ _ _) = isJust (irqEntry s)
+sliceIrqEntering (SliceState s _ _ _ _ _) = case entry s of Just (EnterIrq _) -> True; _ -> False
 
 -- | One clock. The output depends only on the current state, so a host may
 -- feed it back combinationally into this cycle's input (Arm9Soc does). The
@@ -325,13 +338,14 @@ coreStep a (SliceState s mem readWord rf ra rb) i = (next, observe s)
  where
   next
     | clash readA || clash readB = error "Arm9Slice: register file row read and written in one cycle"
-    | otherwise = rnfX cpu' `seq` written mem' (ramWrite st) `seq` written rf' (regWrite st)
+    | otherwise = rnfX cpu' `seq` written mem' localWrite `seq` written rf' (regWrite st)
         `seq` word' `seq` ra' `seq` rb' `seq` SliceState cpu' mem' word' rf' ra' rb'
   st = transition a s i readWord ra rb
   cpu' = stepCpu st
-  mem' = maybe mem (\(addr, value) -> replace addr value mem) (ramWrite st)
+  localWrite = localRamWrite st
+  mem' = maybe mem (\(addr, value) -> replace addr value mem) localWrite
   rf' = maybe rf (\(row, value) -> replace row value rf) (regWrite st)
-  word' = mem !! ramAddress s
+  word' = mem !! localRamIndex (ramAddress s)
   ra' = rf !! port readA
   rb' = rf !! port readB
   written :: (KnownNat n, Enum k) => Vec n Word -> Maybe (k, Word) -> ()
@@ -364,10 +378,8 @@ coreExtIrqMasked (CoreExt s _ _ _) = irqMask (psr s)
 -- | The RAM read this step presents (aligned byte address), decided from
 -- the state alone: a RAM fetch or a mem-stage RAM access. Its word is the
 -- 'coreExtStep' input of the following step.
-coreExtRead :: CoreExt -> Maybe Word
-coreExtRead (CoreExt s _ _ _)
-  | memReadsRam s || fetchReadsRam s = Just (ramByteAddr (ramAddress s))
-  | otherwise = Nothing
+coreExtRead :: Arch -> CoreExt -> Maybe Word
+coreExtRead a (CoreExt s _ _ _) = externalRead a s
 
 -- | The RAM write the next step makes (aligned byte address, byte lanes, the
 -- word with the stored bytes in their lanes), given the RAM word for the
@@ -376,8 +388,7 @@ coreExtRead (CoreExt s _ _ _)
 -- computed with quiet inputs, as 'coreSliceExt' does.
 coreExtWrite :: Arch -> CoreExt -> Word -> Maybe (Word, BitVector 4, Word)
 coreExtWrite a (CoreExt s _ ra rb) readWord =
-  fmap (\(ix, v) -> (ramByteAddr ix, ramLanes s, v))
-       (ramWrite (transition a s quietIn readWord ra rb))
+  externalWrite s (transition a s quietIn readWord ra rb)
 
 -- | One step, given the RAM word for the previous step's read. The write
 -- the step actually makes must be the one 'coreExtWrite' announced; a
@@ -399,11 +410,21 @@ coreExtStep a c@(CoreExt s rf ra rb) i readWord = next
   clash f = case (f st, regWrite st) of
     (Just r, Just (w, _)) -> r == w
     _ -> False
-  write = fmap (\(ix, v) -> (ramByteAddr ix, ramLanes s, v)) (ramWrite st)
+  write = externalWrite s st
 
--- | Byte address of a RAM word index.
-ramByteAddr :: RamIndex -> Word
-ramByteAddr ix = ramBase .|. shiftL (fromIntegral ix) 2
+externalRead :: Arch -> Cpu -> Maybe Word
+externalRead a s
+  | memReadsRam s || fetchReadsRam a s = Just (ramAddress s)
+  | otherwise = Nothing
+
+externalWrite :: Cpu -> Step -> Maybe (Word, BitVector 4, Word)
+externalWrite s st = fmap (\(addr, v) -> (addr, ramLanes s, v)) (ramWrite st)
+
+localRamIndex :: Word -> RamIndex
+localRamIndex = fromIntegral . C.slice d11 d2
+
+localRamWrite :: Step -> Maybe (RamIndex, Word)
+localRamWrite = fmap (\(addr, v) -> (localRamIndex addr, v)) . ramWrite
 
 -- | Byte lanes of the mem stage's RAM store (the only RAM writer).
 ramLanes :: Cpu -> BitVector 4
@@ -418,9 +439,9 @@ romAddress s = case mq s of
 
 -- | The local RAM read port serves the mem stage while it presents an
 -- access (phase MLocal) and instruction fetch otherwise.
-ramAddress :: Cpu -> RamIndex
-ramAddress s = fromIntegral (C.slice d11 d2 (if memReadsRam s then accessAddr (maybe accessNone pending (mq s))
-                                               else fpc (fetch s)))
+ramAddress :: Cpu -> Word
+ramAddress s = (if memReadsRam s then accessAddr (maybe accessNone pending (mq s))
+                                else fpc (fetch s)) .&. complement 3
 
 memReadsRam :: Cpu -> Bool
 memReadsRam s = maybe False ((== MLocal) . mPhase) (mq s)
@@ -430,23 +451,42 @@ accessNone = Access 0 4 False False 0 0
 
 -- | Fetch presents a local-RAM read this cycle (decided from the state
 -- alone, as the RAM address is).
-fetchReadsRam :: Cpu -> Bool
-fetchReadsRam s = not (memReadsRam s) && not (fidle f) && isNothing (irqEntry s) && faultCode s == 0
-  && inRam (fpc f) && fetchAligned f
+fetchReadsRam :: Arch -> Cpu -> Bool
+fetchReadsRam a s = not (memReadsRam s) && not (fidle f) && isNothing (entry s) && faultCode s == 0
+  && inRam a (fpc f) && fetchAligned f && fetchPermission a s == Just True
  where f = fetch s
+
+-- Register execute permission for the current virtual page. The eight
+-- region comparisons are not on the RAM-grant path. Configuration writes
+-- invalidate the grant and privilege forms part of its key.
+mpuEnabled :: Arch -> Psr -> Bool
+mpuEnabled a p = fabricMap a && armV5 a && testBit (control p) 0
+
+fetchPermission :: Arch -> Cpu -> Maybe Bool
+fetchPermission a s
+  | not (mpuEnabled a (psr s)) = Just True
+  | Just (pg,u,ok) <- execPage s, pg == C.slice d31 d12 (fpc (fetch s)), u == (mode (psr s) == 0x10) = Just ok
+  | otherwise = Nothing
 
 fetchAligned :: Fetch -> Bool
 fetchAligned f = fpc f .&. (if fthumb f then 1 else 3) == 0
 
 -- * Memory helpers
 
--- 4 KiB boot ROM window at the reset vector; 4 KiB local RAM, which
--- instructions may also be fetched from.
+-- Legacy boot fixtures occupy 4 KiB. Only the real ARM7 BIOS spans 16 KiB.
 inBoot :: Arch -> Word -> Bool
-inBoot a addr = addr .&. 0xfffff000 == bootBase a
+inBoot a addr
+  | nativeBios a && not (armV5 a) = addr < 0x4000
+  | otherwise = addr .&. 0xfffff000 == bootBase a
 
-inRam :: Word -> Bool
-inRam addr = addr .&. 0xfffff000 == ramBase
+-- The Fabric, not the CPU, maps physical banks and mirrors. Keep all ARM
+-- address bits on the external port, including on instruction fetches.
+inRam :: Arch -> Word -> Bool
+inRam a addr
+  | fabricMap a = region == 0x02 || region == 0x03 || (ioMap a == Arm7Map && region == 0x06)
+  | otherwise = addr .&. 0xfffff000 == ramBase
+ where region = C.slice d31 d24 addr
+
 
 laneShift :: Word -> Int
 laneShift addr = fromIntegral (C.slice d1 d0 addr ++# (0 :: BitVector 3))
@@ -484,11 +524,10 @@ aligned a = case accessWidth a of
 -- and OAM, plus the timer, IRQ, IPC and game-card registers that devices in
 -- front of the GPU (Arm9Io, Ipc, Card) may decode. ARM7: its timers, IRQ
 -- and IPC registers. The target behind the link must reply with an error
--- for anything here it does not implement. Each access must lie wholly
--- inside one span, so a word covering VRAMCNT_G and WRAMCNT never leaves
--- the slice.
+-- for anything here it does not implement. The legacy ARM9 target excludes
+-- WRAMCNT; only the wide board glue merges WRAMCNT and VRAMCNT lanes.
 linkOwns :: Arch -> Access -> Bool
-linkOwns arch a = ipc || case ioMap arch of
+linkOwns arch a = ipc || nativeIo || case ioMap arch of
   Arm9Map -> C.slice d31 d24 addr == 0x06
     -- DISPCNT, DISPSTAT; VCOUNT (0x04000006) is read-only
     || within 0x04000000 (if accessWrite a then 0x04000006 else 0x04000008)
@@ -499,8 +538,8 @@ linkOwns arch a = ipc || case ioMap arch of
     || within 0x04000208 0x0400020c  -- IME
     || within 0x04000210 0x04000218  -- IE, IF
     || (addr == 0x04000304 && width /= 1)
-    || within 0x04000240 0x04000247
-    || within 0x04000248 0x0400024a
+    || within 0x04000240 (if fabricMap arch then 0x0400024a else 0x04000247)
+    || (not (fabricMap arch) && within 0x04000248 0x0400024a)
     || within 0x04001000 0x04001070  -- engine B display registers
     || within 0x04100010 0x04100014  -- game-card data in
     || within 0x05000000 0x05000800  -- palettes
@@ -509,6 +548,9 @@ linkOwns arch a = ipc || case ioMap arch of
     || within 0x04000208 0x0400020c  -- IME
     || within 0x04000210 0x04000218  -- IE, IF
  where
+  -- The native board's responders, not the CPU, implement system IO and
+  -- report unsupported registers. Instruction fetch never uses this link.
+  nativeIo = nativeBios arch && (within 0x04000000 0x04010000 || within 0x04100000 0x04100014)
   -- IPCSYNC, IPCFIFOCNT, IPCFIFOSEND; IPCFIFORECV
   ipc = within 0x04000180 0x0400018c || within 0x04100000 0x04100004
   addr = accessAddr a
@@ -520,7 +562,10 @@ routeTo :: Arch -> Access -> Either (BitVector 3) MPhase
 routeTo arch a
   | not (aligned a) = Left 2
   | inBoot arch addr && not (accessWrite a) = Right MBoot
-  | inRam addr = Right MLocal
+  | nativeBios arch && not (armV5 arch) && addr == 0x04000308 && accessWidth a /= 1 = Right MBiosProt
+  | inRam arch addr = Right MLocal
+  | fabricMap arch && ioMap arch == Arm7Map && (addr == 0x04000240 || addr == 0x04000241) &&
+      accessWidth a == 1 && not (accessWrite a) = Right MLocal -- VRAMSTAT/WRAMSTAT byte reads
   | linkOwns arch a = Right MOffer
   | otherwise = Left 3
  where addr = accessAddr a
@@ -532,6 +577,7 @@ blockFault :: Arch -> Bool -> Word -> BitVector 3
 blockFault arch store addr = case routeTo arch (Access addr 4 store False 0 0) of
   Left code -> code
   Right MOffer -> 3
+  Right MBiosProt -> 3
   Right _ -> 0
 
 lowestReg :: BitVector 16 -> Index 16
@@ -572,11 +618,11 @@ cpsrWord :: Psr -> Word
 cpsrWord s = flags s ++# (0 :: BitVector 20) ++# pack (irqMask s) ++# pack (fiqMask s)
   ++# pack (thumb s) ++# mode s
 
--- | Modes in the subset: User, IRQ, SVC and System. FIQ, abort and
--- undefined are not, so a CPSR naming them is refused.
-validMode, hasSpsr :: BitVector 5 -> Bool
-validMode m = m == 0x10 || m == 0x12 || m == 0x13 || m == 0x1f
-hasSpsr m = m == 0x12 || m == 0x13
+-- Abort mode is reachable only on the MPU-capable ARM9.
+validMode :: Arch -> BitVector 5 -> Bool
+validMode a m = m == 0x10 || m == 0x12 || m == 0x13 || m == 0x1f || (fabricMap a && armV5 a && m == 0x17)
+hasSpsr :: BitVector 5 -> Bool
+hasSpsr m = m == 0x12 || m == 0x13 || m == 0x17
 
 -- | R13/R14 bank: User and System share one.
 bankOf :: BitVector 5 -> Index 3
@@ -588,18 +634,19 @@ bankOf m = case m of
 regRow :: BitVector 5 -> Index 16 -> Row
 regRow m r
   | r < 13 = fromIntegral r
+  | m == 0x17 = if r == 13 then 27 else 28
   | otherwise = fromIntegral r + 4 * fromIntegral (bankOf m)
 
 spsrRow :: BitVector 5 -> Row
-spsrRow m = if m == 0x12 then 26 else 25
+spsrRow m = if m == 0x17 then 29 else if m == 0x12 then 26 else 25
 
 -- | Write a whole CPSR. The Q, J and reserved bits must be clear and the
 -- mode in the subset; T may change only on an exception return. The banks
 -- follow the mode through 'regRow'.
-setCpsr :: Bool -> Word -> Psr -> Maybe Psr
-setCpsr allowT w s
+setCpsr :: Arch -> Bool -> Word -> Psr -> Maybe Psr
+setCpsr arch allowT w s
   | C.slice d27 d8 w /= 0 || (testBit w 5 /= thumb s && not allowT) = Nothing
-  | not (validMode m) = Nothing
+  | not (validMode arch m) = Nothing
   | otherwise = Just s { flags = C.slice d31 d28 w, irqMask = testBit w 7, fiqMask = testBit w 6
                        , thumb = testBit w 5, mode = m }
  where m = C.slice d4 d0 w
@@ -850,6 +897,11 @@ classify arch th m op
   | op .&. 0x0ffffff0 == 0x012fff10 && (rm /= 15 || th) = CBx
   | op .&. 0x0ffffff0 == 0x012fff30 && rm /= 15 && armV5 arch = CBx
   | op .&. 0x0fff0ff0 == 0x016f0f10 && armV5 arch = valid (rd /= 15 && rm /= 15) CClz
+  | not th && fabricMap arch && armV5 arch && (op .&. 0x0fef0fff == 0x0e010f10 || M.isMpuTransfer op) =
+      valid (m /= 0x10 && (load || rd /= 15)) CControl
+  | not th && fabricMap arch && armV5 arch &&
+      (cpOp == 0x0e070f15 || cpOp == 0x0e070f16 || cpOp == 0x0e070f9a) =
+      valid (m /= 0x10 && rd /= 15) CCacheOp
   -- MUL/MLA: R15 operands and MUL with nonzero SBZ (Rn) fault; Rd = Rm is
   -- defined (operands are read before the result is written).
   | op .&. 0x0fc000f0 == 0x00000090 =
@@ -878,6 +930,7 @@ classify arch th m op
   -- value outside the subset faults in the ALU (see 'setCpsr').
   spsrSelected = testBit op 22
   msr = valid (C.slice d19 d16 op /= 0 && (not spsrSelected || hasSpsr m)) CMsr
+  cpOp = op .&. 0x0fff0fff
   load = testBit op 20
   preIndex = testBit op 24
   baseWrite = not preIndex || testBit op 21
@@ -989,6 +1042,7 @@ decodeStage arch m (IrTok tag op aux cond imm fault)
     CMulLong -> regSlot rm
     CMrs | spsrSelected -> spsrSlot
     CMsr | spsrSelected -> spsrSlot
+    CControl | not (testBit op 20) -> regSlot rd
     _ -> noOpnd
   -- Slot B: the shifter operand register.
   bReg = case cls of
@@ -1121,6 +1175,7 @@ immDests :: DecTok -> BitVector 16
 immDests d = case dCls d of
   CDp | C.slice d24 d23 op /= 2 && rd /= 15 -> bitReg rd
   CMrs -> bitReg rd
+  CControl | testBit op 20 && rd /= 15 -> bitReg rd
   CClz -> bitReg rd
   CLinkOnly -> bitReg 14
   CBranch | dLink d -> bitReg 14
@@ -1169,6 +1224,7 @@ flagWriter :: DecTok -> Bool
 flagWriter d = case dCls d of
   CDp -> testBit (dOp d) 20
   CMsr -> not (testBit (dOp d) 22)
+  CControl -> testBit (dOp d) 20 && C.slice d15 d12 (dOp d) == 15
   CMul -> testBit (dOp d) 20
   CMulLong -> testBit (dOp d) 20
   _ -> False
@@ -1185,6 +1241,7 @@ redirectsFetch d = case dCls d of
   CBranch -> True
   CBx -> True
   CMsr -> True
+  CCacheOp -> C.slice d3 d0 (dOp d) == 5 -- only I invalidate discards younger words
   CDp -> C.slice d15 d12 (dOp d) == 15 && C.slice d24 d23 (dOp d) /= 2
   _ -> False
 
@@ -1206,22 +1263,38 @@ data AluNext = ToRetire Word | ToMem MemSt | ToFault (BitVector 3) Word
 -- and the start of memory, multiply and SWI work. For MRS/MSR SPSR the
 -- SPSR is operand A; an exception return's SPSR and a store's data come in
 -- 'sD'. A multiply presents its accumulator rows for the mem stage.
-aluStage :: Psr -> ShTok -> (Psr, Maybe (Row, Word), Maybe Row, Maybe Row, AluNext)
-aluStage s (ShTok d a b sc pass dv)
+aluStage :: Arch -> M.Mpu -> Psr -> ShTok -> (Psr, Maybe (Row, Word), Maybe Row, Maybe Row, AluNext)
+aluStage arch protection s (ShTok d a b sc pass dv)
   | dFault d /= 0 = (s, Nothing, Nothing, Nothing, ToFault (dFault d) (tagPc tag))
   | not (condPasses (dCond d) (flags s)) = (s, Nothing, Nothing, Nothing, ToRetire next)
   | otherwise = case dCls d of
       CUndef -> faultHere
       CDp
         | testOp -> (flagged, Nothing, Nothing, Nothing, ToRetire next)
-        | rd == 15 && setFlags -> case setCpsr True dv s of
+        | rd == 15 && setFlags -> case setCpsr arch True dv s of
             Nothing -> faultHere
             Just s' -> (s', Nothing, Nothing, Nothing, ToRetire (result .&. pcMask (thumb s')))
         | rd == 15 -> (flagged, Nothing, Nothing, Nothing, ToRetire (result .&. pcMask th))
         | otherwise -> (flagged, write rd result, Nothing, Nothing, ToRetire next)
       CMrs -> (s, write rd (if spsrSelected then a else cpsrWord s), Nothing, Nothing, ToRetire next)
+      CCacheOp
+        -- All data bypasses and no data lines exist. Never acknowledge
+        -- invalidate-all in an enabled or dirty D-cache configuration.
+        | C.slice d3 d0 op == 6 && testBit (control s) 2 -> faultHere
+        -- Drain c7,c10,4: the mem stage must be empty to reach E2; external
+        -- steps cannot advance beyond the previous step until every earlier
+        -- store response arrived (DualSoc.arbStep, prevOut). No posted
+        -- write buffer exists. I invalidation also emits the commit pulse.
+        | otherwise -> (s, Nothing, Nothing, Nothing, ToRetire next)
+      CControl
+        | load && rd == 15 -> (s { flags = C.slice d31 d28 cpValue }, Nothing, Nothing, Nothing, ToRetire next)
+        | load -> (s, write rd cpValue, Nothing, Nothing, ToRetire next)
+        | C.slice d19 d16 op /= 1 -> if M.validMpuWrite op a then (s, Nothing, Nothing, Nothing, ToRetire next) else faultHere
+        -- No architectural I/D caches, big-endian bus or TCM load modes.
+        | a .&. 0x000a1084 /= 0 -> faultHere
+        | otherwise -> (s { control = (a .&. 0x000ff085) .|. 0x78 }, Nothing, Nothing, Nothing, ToRetire next)
       CMsr
-        | not spsrSelected -> case setCpsr False (merged cpsrMask (cpsrWord s) b) s of
+        | not spsrSelected -> case setCpsr arch False (merged cpsrMask (cpsrWord s) b) s of
             Nothing -> faultHere
             Just s' -> (s', Nothing, Nothing, Nothing, ToRetire next)
         | otherwise -> (s, Just (spsrRow (mode s), merged fieldMask a b), Nothing, Nothing, ToRetire next)
@@ -1243,6 +1316,7 @@ aluStage s (ShTok d a b sc pass dv)
       CMulLong -> mulStart
  where
   op = dOp d
+  cpValue = if C.slice d19 d16 op == 1 then control s else M.readMpu protection op
   tag = dTag d
   th = tagThumb tag
   next = tagPc tag + stepOf th
@@ -1305,21 +1379,21 @@ data MemOut = MemOut
   , moRetire :: Maybe RetTok
   , moFault  :: Maybe (BitVector 3, Word)
   , moReg    :: Maybe (Row, Word)
-  , moRam    :: Bool                   -- ^ write the merged store word to local RAM
   , moStore  :: Maybe (Word, Word)
   , moReadA  :: Maybe Row
   , moReadB  :: Maybe Row
   } deriving (Generic, NFDataX)
 
-memStage :: Arch -> SliceIn -> Word -> Word -> Word -> Psr -> MemSt -> MemOut
-memStage arch i ramWord portA portB s m = case mPhase m of
-  MRoute -> case routeTo arch acc of
+memStage :: Arch -> M.Mpu -> BitVector 16 -> SliceIn -> Word -> Word -> Word -> Psr -> MemSt -> MemOut
+memStage arch prot biosProt i ramWord portA portB s m = case mPhase m of
+  MRoute -> case protectedRoute acc of
     Left code -> faulted code (accessAddr acc)
     Right p -> stay m { mPhase = p }
   MBoot -> loaded
+  MBiosProt -> if accessWrite acc then complete m else loaded
   MLocal -> stay m { mPhase = MRam }
   MRam
-    | accessWrite acc -> (complete m) { moRam = True, moStore = Just (accessAddr acc .&. 0xfffffffc, stored) }
+    | accessWrite acc -> (complete m) { moStore = Just (accessAddr acc .&. 0xfffffffc, stored) }
     | otherwise -> loaded
   MOffer -> stay (if gpuReqReady i then m { mPhase = MAwait } else m)
   MAwait
@@ -1327,6 +1401,7 @@ memStage arch i ramWord portA portB s m = case mPhase m of
     | gpuReplyFault i -> faulted 4 (accessAddr acc)
     | accessWrite acc -> complete m
     | otherwise -> loaded
+  MCheck | mpuEnabled arch s -> (stay m {mPhase=MBeat}) {moReadB=beatRead (blockLeft m)}
   MCheck -> case blockFault arch (blockStore m) (checkAddr m) of
     0 -> let rest = checkLeft m .&. (checkLeft m - 1) in
       if rest == 0
@@ -1336,11 +1411,12 @@ memStage arch i ramWord portA portB s m = case mPhase m of
   MBeat ->
     let r = lowestReg (blockLeft m)
         beat = Access (blockAddr m) 4 (blockStore m) False r (if blockStore m then portB else 0)
-    in case routeTo arch beat of
+    in case protectedRoute beat of
          Left code -> faulted code (blockAddr m)
+         Right MOffer -> faulted 3 (blockAddr m) -- no block transfer to IO in this core
          Right p -> stay m { mPhase = p, pending = beat }
   MWriteBack -> (finish m { writeBack = False }) { moReg = Just (regRow (mode s) (wbReg m), wbValue m) }
-  MRestore -> case setCpsr True portA s of
+  MRestore -> case setCpsr arch True portA s of
     Nothing -> faulted 1 (tagPc (mTag m))
     Just s' -> (out s') { moRetire = Just (RetTok (mTag m) (mNext m .&. (if thumb s' then 0xfffffffe else 0xffffffff))) }
   MMulAcc ->
@@ -1361,20 +1437,29 @@ memStage arch i ramWord portA portB s m = case mPhase m of
   MMulHi -> (retireWith s) { moReg = Just (regRow (mode s) (fromIntegral (C.slice d19 d16 (mulOp m))), wbValue m) }
   MSwiLink -> (out (enterMode 0x13 s))
     { moReg = Just (regRow 0x13 14, tagPc (mTag m) + stepOf (tagThumb (mTag m)))
-    , moRetire = Just (RetTok (mTag m) (swiVector arch)) }
+    , moRetire = Just (RetTok (mTag m) (exceptionBase arch s + 8)) }
  where
   acc = pending m
+  protectedRoute x
+    | mpuEnabled arch s && not (M.allowed prot (mode s == 0x10) False (accessWrite x) (accessAddr x)) = Left 6
+    | otherwise = routeTo arch x
   stored = mergeStore acc ramWord
-  out s' = MemOut s' Nothing Nothing Nothing Nothing False Nothing Nothing Nothing
+  out s' = MemOut s' Nothing Nothing Nothing Nothing Nothing Nothing Nothing
   stay m' = (out s) { moMem = Just m' }
   faulted code addr = (out s) { moFault = Just (code, addr) }
   retireWith s' = (out s') { moRetire = Just (RetTok (mTag m) (mNext m)) }
   beatRead l = if blockStore m then Just (regRow (mode s) (lowestReg l)) else Nothing
   -- The loaded value: boot ROM, local RAM or link reply.
   raw = case mPhase m of
-    MBoot -> extract acc (bootWord i)
+    MBoot -> extract acc (if blockedBios then maxBound else bootWord i)
+    MBiosProt -> zeroExtend biosProt
     MRam -> extract acc ramWord
     _ -> gpuReplyData i
+  -- The data access belongs to the executing instruction, not the
+  -- speculative fetch PC (which may already have left the BIOS).
+  instructionPc = tagPc (mTag m) + if tagThumb (mTag m) then 4 else 8
+  blockedBios = nativeBios arch && not (armV5 arch) &&
+    (instructionPc >= 0x4000 || (accessAddr acc < zeroExtend biosProt && instructionPc >= zeroExtend biosProt))
   masked = raw .&. widthMask (accessWidth acc)
   value
     | not (accessSigned acc) = masked
@@ -1387,7 +1472,8 @@ memStage arch i ramWord portA portB s m = case mPhase m of
   loaded
     | accessReg acc /= 15 = (complete m) { moReg = Just (regRow (mode s) (accessReg acc), value) }
     | blockSpsr m = complete m { mNext = value, restore = True }
-    | armV5 arch = (complete m { mNext = value .&. 0xfffffffe }) { moPsr = s { thumb = testBit value 0 } }
+    | armV5 arch && not (fabricMap arch && testBit (control s) 15) =
+        (complete m { mNext = value .&. 0xfffffffe }) { moPsr = s { thumb = testBit value 0 } }
     | otherwise = complete m { mNext = value .&. 0xfffffffe }
   -- One beat is done: the next LDM/STM register, or the end of the transfer.
   complete m'
@@ -1405,15 +1491,25 @@ memStage arch i ramWord portA portB s m = case mPhase m of
 -- the register file: mem stage, E2 (multiply accumulators), E1, decode.
 transition :: Arch -> Cpu -> SliceIn -> Word -> Word -> Word -> Step
 transition arch s1 i ramWord portA portB
-  | faultCode s /= 0 = Step s Nothing Nothing Nothing Nothing
-  -- Second cycle of IRQ entry: R14_irq <- the interrupted instruction's
-  -- address + 4, IRQ mode, ARM state, fetch from the vector.
-  | Just lr <- irqEntry s =
-      Step s { psr = enterMode 0x12 p, irqEntry = Nothing, fetch = Fetch (irqVector arch) False Nothing False }
-        Nothing (Just (regRow 0x12 14, lr)) Nothing Nothing
+  | faultCode s /= 0 = Step s Nothing Nothing Nothing Nothing False
+  | Just ex <- entry s =
+      let (m,lr,off) = case ex of
+            EnterIrq l -> (0x12,l,0x18)
+            EnterAbort dat l -> (0x17,l,if dat then 0x10 else 0x0c)
+      in Step s { psr = enterMode m p, entry = Nothing, fetch = Fetch (exceptionBase arch p + off) False Nothing False }
+           Nothing (Just (regRow m 14, lr)) Nothing Nothing False
+  -- A denied fetch takes its exception only if its token reaches commit.
+  -- A denied data beat never reached RAM/IO. Preserve completed older
+  -- beats; no final base writeback or retirement of the faulting operation.
+  | fabricMap arch && armV5 arch, Just (c,_) <- faulted, c == 5 || c == 6 =
+      let dat = c == 6
+          pc = if dat then maybe 0 (tagPc . mTag) (mq s) else tagPc e2Tag
+      in Step s { xq=Nothing, iq=Nothing, e1=Nothing, e2=Nothing, mq=Nothing, rq=Nothing
+                , fetch=f { fram=Nothing, fidle=True }, entry=Just (EnterAbort dat (pc + if dat then 8 else 4)) }
+           Nothing (Just (spsrRow 0x17,cpsrWord p)) Nothing Nothing False
   | Just (c, addr) <- faulted =
-      Step s { faultCode = c, faultAt = addr, storeObs = mStore, rq = Nothing } Nothing Nothing Nothing Nothing
-  | otherwise = Step s' ramW regW readA' readB'
+      Step s { faultCode = c, faultAt = addr, storeObs = mStore, rq = Nothing } Nothing Nothing Nothing Nothing False
+  | otherwise = Step s' mStore regW readA' readB' invI
  where
   -- A store is observed for exactly the one cycle after its RAM write.
   s = s1 { storeObs = Nothing }
@@ -1422,23 +1518,25 @@ transition arch s1 i ramWord portA portB
   seqNext tag = tagPc tag + stepOf (tagThumb tag)
 
   -- Mem stage: the oldest instruction in flight, if any.
-  mOut = fmap (memStage arch i ramWord portA portB p) (mq s)
+  mOut = fmap (memStage arch (mpu s) (bios7Prot s) i ramWord portA portB p) (mq s)
   pM = maybe p moPsr mOut
   mRet = mOut >>= moRetire
   mStore = mOut >>= moStore
-  ramW = case (mq s, mOut) of
-    (Just m, Just o) | moRam o ->
-      Just (fromIntegral (C.slice d11 d2 (accessAddr (pending m))), mergeStore (pending m) ramWord)
-    _ -> Nothing
   -- A store into local RAM over an instruction already fetched (or being
   -- fetched) refetches everything younger after it.
-  smcHit = case ramW of
-    Just _ -> any (== Just storeWord) (map (fmap (.&. complement 3)) fetchedPcs)
+  smcHit = case mStore of
+    Just (addr, _) -> any (== Just (codeWord addr)) (map (fmap codeWord) fetchedPcs)
     Nothing -> False
-  storeWord = maybe 0 (\m -> accessAddr (pending m) .&. complement 3) (mq s)
+  -- An ARM9/ARM7 may store through a different main RAM mirror of its
+  -- own fetched instruction. VRAM bank aliases are Fabric-owned.
+  codeWord addr | fabricMap arch && C.slice d31 d24 addr == 0x02 = addr .&. 0xff3ffffc
+                -- A smaller comparison may conservatively refetch, but
+                -- never misses an alias in a 16/32/64 KiB WRAM mapping.
+                | fabricMap arch && C.slice d31 d24 addr == 0x03 = 0x03000000 .|. (addr .&. 0x3ffc)
+                | otherwise = addr .&. complement 3
   fetchedPcs = fmap (tagPc . fst) (xq s) :> fmap (tagPc . irTag) (iq s)
     :> fmap (tagPc . dTag . eDec) (e1 s) :> fmap (tagPc . dTag . sDec) (e2 s)
-    :> fram f :> (if fetchReadsRam s then Just (fpc f) else Nothing) :> Nil
+    :> fram f :> (if fetchReadsRam arch s then Just (fpc f) else Nothing) :> Nil
   mRedirect = case (mq s, mRet) of
     (Just m, Just (RetTok _ next)) | memJumps m -> Just (next, thumb pM)
     (Just m, _) | smcHit -> Just (seqNext (mTag m), tagThumb (mTag m))
@@ -1447,7 +1545,7 @@ transition arch s1 i ramWord portA portB
   -- E2: commits only with the mem stage empty; an IRQ is taken instead.
   e2Ready = isJust (e2 s) && isNothing (mq s)
   irqTake = e2Ready && irqRequest i && not (irqMask p)
-  e2Res = if e2Ready && not irqTake then fmap (aluStage p) (e2 s) else Nothing
+  e2Res = if e2Ready && not irqTake then fmap (aluStage arch (mpu s) p) (e2 s) else Nothing
   e2Fire = isJust e2Res
   e2Tag = maybe (Tag 0 0 False) (dTag . sDec) (e2 s)
   (p2, e2Write, e2ReadA, e2ReadB, e2Next) = fromMaybe (p, Nothing, Nothing, Nothing, ToRetire 0) e2Res
@@ -1456,8 +1554,14 @@ transition arch s1 i ramWord portA portB
   -- comparing the target with the next PC, so the ALU result feeds only the
   -- fetch PC (a fault outranks it).
   e2Redirect = case e2 s of
-    Just t | e2Fire && condPasses (dCond (sDec t)) (flags p) && redirectsFetch (sDec t) -> Just (e2Target, thumb p2)
+    Just t | e2Fire && condPasses (dCond (sDec t)) (flags p) && (redirectsFetch (sDec t) || syncMpu) -> Just (e2Target, thumb p2)
     _ -> Nothing
+  invI = isJust e2Redirect && maybe False ((== CCacheOp) . dCls . sDec) (e2 s)
+  cpWrite = case (e2 s,e2Next) of
+    (Just t,ToRetire _) | e2Fire && dCls (sDec t) == CControl && not (testBit (dOp (sDec t)) 20)
+                           && condPasses (dCond (sDec t)) (flags p) -> Just (dOp (sDec t), sA t)
+    _ -> Nothing
+  syncMpu = isJust cpWrite && (mpuEnabled arch p || mpuEnabled arch p2)
   e2Target = case e2Next of
     ToRetire target -> target
     _ -> 0
@@ -1530,7 +1634,7 @@ transition arch s1 i ramWord portA portB
 
   -- Fetch.
   accept = if fthumb f then isNothing (xq s) || xAdv else isNothing (iq s) || dAdv
-  presented = fetchReadsRam s
+  presented = fetchReadsRam arch s
   romFree = not (maybe False ((== MBoot) . mPhase) (mq s))
   step = stepOf (fthumb f)
   deposit a w = if fthumb f
@@ -1550,7 +1654,9 @@ transition arch s1 i ramWord portA portB
     | presented = (none, f { fram = Just (fpc f), fpc = fpc f + step })
     | fidle f = (none, f)
     | not (fetchAligned f) = if accept then (depositFault 2, f { fidle = True }) else (none, f)
-    | inRam (fpc f) = (none, f)
+    | Nothing <- fetchPermission arch s = (none,f)
+    | Just False <- fetchPermission arch s = if accept then (depositFault 5, f { fidle=True }) else (none,f)
+    | inRam arch (fpc f) = (none, f)
     | not (inBoot arch (fpc f)) = if accept then (depositFault 3, f { fidle = True }) else (none, f)
     | romFree && accept = (deposit (fpc f) (bootWord i), f { fpc = fpc f + step })
     | otherwise = (none, f)
@@ -1571,7 +1677,18 @@ transition arch s1 i ramWord portA portB
     , rq = case e2Next of
         ToRetire target | e2Fire -> Just (RetTok e2Tag target)
         _ -> mRet
-    , irqEntry = if irqTake then Just (tagPc e2Tag + 4) else Nothing
+    , entry = if irqTake then Just (EnterIrq (tagPc e2Tag + 4)) else Nothing
+    , mpu = case cpWrite of
+        Just (op,v) | fabricMap arch && armV5 arch && C.slice d19 d16 op /= 1 -> M.writeMpu (mpu s) op v
+        _ -> mpu s
+    , execPage = if syncMpu then Nothing else if mpuEnabled arch p && isNothing (fetchPermission arch s)
+        then let u=mode p==0x10; addr=fpc f
+             in Just (C.slice d31 d12 addr,u,M.allowed (mpu s) u True False addr)
+        else execPage s
+    , bios7Prot = case mq s of
+        Just m | nativeBios arch && not (armV5 arch) && mPhase m == MBiosProt && accessWrite (pending m) && bios7Prot s == 0 ->
+          C.slice d15 d0 (accessData (pending m)) .&. 0xfffe
+        _ -> bios7Prot s
     , storeObs = mStore
     }
 
@@ -1596,7 +1713,7 @@ coreSlice arch clk rst en input = qualify <$> active <*> (observe <$> state)
   ramEn = toEnable active
   state = E.register clk rst en (initialCpu arch) (stepCpu <$> next)
   next = transition arch <$> state <*> input <*> readWord <*> regA <*> regB
-  readWord = E.blockRam clk ramEn (repeat @1024 0) (ramAddress <$> state) (ramWrite <$> next)
+  readWord = E.blockRam clk ramEn (repeat @1024 0) (localRamIndex . ramAddress <$> state) (localRamWrite <$> next)
   regA = E.blockRam clk ramEn (repeat @32 0) (fromMaybe 0 . readA <$> next) (regWrite <$> next)
   regB = E.blockRam clk ramEn (repeat @32 0) (fromMaybe 0 . readB <$> next) (regWrite <$> next)
   qualify True out = out
@@ -1606,9 +1723,9 @@ coreSlice arch clk rst en input = qualify <$> active <*> (observe <$> state)
 -- | Outputs as a host sees them while the core does not step: no request,
 -- no reply taken, no store or retire pulse.
 qualifyOut :: Bool -> SliceOut -> SliceOut
-qualifyOut True out = out
-qualifyOut False out = out { gpuReqValid = False, gpuReplyReady = False
-                           , storeValid = False, retireValid = False }
+qualifyOut en out = out
+  { gpuReqValid = en && gpuReqValid out, gpuReplyReady = en && gpuReplyReady out
+  , storeValid = en && storeValid out, retireValid = en && retireValid out }
 
 -- | 'coreSlice' with the RAM window behind a port (the pure 'CoreExt'
 -- model): the register file stays in block RAM; the core steps in cycles
@@ -1619,8 +1736,8 @@ coreSliceExt
   :: KnownDomain dom
   => Arch -> Clock dom -> Reset dom -> Enable dom
   -> Signal dom SliceIn -> Signal dom Word
-  -> Signal dom (SliceOut, Maybe Word, Maybe (Word, BitVector 4, Word))
-coreSliceExt arch clk rst en input readWord = bundle (out, rd, wr)
+  -> Signal dom (SliceOut, Maybe Word, Maybe (Word, BitVector 4, Word), Bool, Bool)
+coreSliceExt arch clk rst en input readWord = bundle (out, rd, wr, not . memReadsRam <$> state, (&&) <$> active <*> (invalidateI <$> next))
  where
   active = (&&) <$> fromEnable en <*> (not <$> unsafeToActiveHigh rst)
   ramEn = toEnable active
@@ -1629,15 +1746,11 @@ coreSliceExt arch clk rst en input readWord = bundle (out, rd, wr)
   regA = E.blockRam clk ramEn (repeat @32 0) (fromMaybe 0 . readA <$> next) (regWrite <$> next)
   regB = E.blockRam clk ramEn (repeat @32 0) (fromMaybe 0 . readB <$> next) (regWrite <$> next)
   out = qualifyOut <$> active <*> (observe <$> state)
-  rd = readOf <$> state
+  rd = externalRead arch <$> state
   -- The step's RAM write does not depend on the inputs (see 'coreExtStep'),
   -- so it is computed with quiet inputs: the host can issue it before the
   -- step without a combinational path from its own outputs back to it.
-  wr = writeOf <$> state <*> (transition arch <$> state <*> pure quietIn <*> readWord <*> regA <*> regB)
-  readOf s
-    | memReadsRam s || fetchReadsRam s = Just (ramByteAddr (ramAddress s))
-    | otherwise = Nothing
-  writeOf s st = fmap (\(ix, v) -> (ramByteAddr ix, ramLanes s, v)) (ramWrite st)
+  wr = externalWrite <$> state <*> (transition arch <$> state <*> pure quietIn <*> readWord <*> regA <*> regB)
 
 -- | Inputs with no request answered, no reply and no IRQ.
 quietIn :: SliceIn

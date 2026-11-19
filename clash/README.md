@@ -937,6 +937,362 @@ Notes on the table:
     latter would rest on the `ce7` gating of the ARM7's offers, which
     needs a per-path argument.
 
+### Directed FIFO retirement boundary
+
+[`sim/run_retire_boundary.sh`](../sim/run_retire_boundary.sh) runs the public
+[`hs_retire_boundary.S`](../sim/tests/hs_retire_boundary.S) two-CPU fixture
+on both wide and instruction-line-buffered generated SoCs. It takes a directory
+containing both generated tops and never runs Clash itself. For example, from
+the repository root, generate the tops from the checkout being tested:
+
+```sh
+out=$(mktemp -d)
+(cd clash && GHCRTS=-M3g stack exec clash -- +RTS -M3g -RTS \
+  --verilog -isrc -fclash-no-escaped-identifiers -outputdir "$out" \
+  src/Nds/WholeCore/DualSoc.hs)
+sim/run_retire_boundary.sh "$out"
+```
+
+The ARM7 queues three distinct words in the real IPC FIFO. The ARM9 executes
+a condition-failed `IPCFIFORECV` load and branches over another, then consumes
+the three words. The monitor requires the failed conditional to retire without
+a pop, the skipped load never to retire, exactly three accepted receive
+requests and retirements, and all three sentinel values in order. It raises
+the external IF input once before the first receive while IRQ is masked, and
+again after the second receive is accepted. The guest enables IRQ, handles and
+acknowledges it, and records `LR_irq`; the monitor checks that the first
+exception precedes the first receive, the second follows the second receive's
+retirement, and both restart addresses are exact.
+
+The test also requires a main-RAM instruction fetch of the line containing
+the branch-skipped load before the branch retires: instruction read-ahead is
+allowed, whereas the side-effecting IPC read is not. On the retimed snapshots
+tested locally, wide and buffered both passed with one-cycle memory and with
+nine-cycle responses plus request stalls. The stalled runs saw 3,870 and 273
+held-request cycles respectively; the skipped instruction's line had four and
+two accepted fetches before branch retirement. These are directed observations,
+not a general proof of speculation or all interrupt timings; the IRQ source is
+the host's `EXT_IRQ_SET`, not a guest-programmed timer.
+
+The latest measured tops were generated from an **uncommitted** source snapshot
+including shared-WRAM, retiming, instruction/data invalidation and drain, not
+a published commit. Their SHA-256 hashes were
+`ff721dc397934d8c8556468f1aaaa0db61cf0f8983ded578786e392dd6f89fde`
+(wide) and `280308ca2ad4627616a6f22bc282ccbf92e3e615e78f0ca013326a4721118f53`
+(buffered). The command above tests the selected checkout; it does not recreate
+those hashes unless that exact source is available. Regenerate and rerun the
+gate on the eventual clean-history candidate before attributing these results
+to it.
+
+The runner builds each Verilator model serially (`-j 1`). It caps native
+process address space at 3 GiB where `RLIMIT_AS` is supported and checks the
+simulator's peak resident memory against 3 GiB. Darwin does not support that
+native address-space limit, so its compiler is not OS-capped; the peak-RSS
+check is a monitored ceiling, not a hard OS limit.
+
+### First retail direct-boot handoff: bounded Kirby probe
+
+[`sim/run_clash_direct_handoff.sh`](../sim/run_clash_direct_handoff.sh)
+runs a stock-loader start and a host-preloaded start against generated
+Verilog. The legacy `nds_dual_soc` and both stand-alone CPUs keep their
+original 4 KiB RAM windows and port contracts.
+With no arguments it needs only the redistributable assembly fixture.
+
+The local Kirby reference (`AKWE`) has these header ranges (ends exclusive):
+
+| CPU | Cartridge offset | Main RAM section | Entry |
+|---|---|---|---|
+| ARM9 | `00004000` | `02000000..021886d8` | `02000800` |
+| ARM7 | `00222a00` | `02380000..023a86a0` | `02380000` |
+
+**First divergence:** with that header at `ffff0e00`, the unmodified
+`hs_dual_boot9.S` computes and accepts the CRC, then writes **`e002`** to
+`02000008` at cycle 24,227: ARM9 ROM offset below `8000`. Neither image
+was read. This is a loader rejection, not an ISA fault. Lowering the
+guard is not sufficient: main-mode B7 redirects addresses below `8000`
+to `8000 + (address & 1ff)`. The stock loader also assumes a 1.25 KiB
+destination window per guest, and the legacy CPU RAM decoder covers only 4 KiB.
+
+**Requirement implemented in the host harness:** stage the *post-firmware*
+sections by the header's actual offsets and lengths into a 4 MiB backing
+store before releasing the CPUs, including the already-decoded ARM9 prefix.
+This is the preload boundary in `sim/tb_top_frame.vhd::preload_main`;
+melonDS [`NDS::SetupDirectBoot`](../third_party/melonDS/src/NDS.cpp)
+materializes a 2 KiB decrypted prefix, then copies the remaining raw words
+and the ARM7 section. The probe accepts an explicitly post-firmware image
+with the two marker words, rejects a missing marker, and uses **no** BIOS
+keys, KEY1 implementation, or B7 exception. The trampoline sets the visible
+entry r12/sp/lr, writes WRAMCNT=3 and uses a real MCR to set ARM9 c1 to
+`00012078` before branching. That value matches the local TRACE-enabled
+reference build; the vendored `NDS::SetupDirectBoot` uses `00052078`.
+Neither profile is a BIOS boot. The public fixture checks all 512 prefix words.
+
+**Measured intermediate frontiers:** melonDS direct-boot traces start at
+both header entries. After staging on **legacy** `nds_dual_soc`, ARM9 retired
+three guest instructions matching the reference, then faulted 1 at
+`02000a5c` (cycle 27) on its first CP15 control read. ARM7 faulted 3 at
+`02380000` (cycle 31), before retiring a guest instruction: the host had
+the bytes but the CPU could not route that address. With the wide CPU map
+and before adding private WRAM, ARM7 fetched the actual word at `02380000`,
+retired nine guest instructions and faulted 3 on `03800000` (cycle 71).
+These are instruction-level checkpoints, not a firmware boot or a frame.
+
+With a privileged ARM9 MRC/MCR c1 implementation (reset `2078`, not a
+hardwired MRC result), the measured private run reached `02000a70` after
+eight retirements: the **separate** MCR c7,c5,0 instruction-cache
+maintenance operation. Nine ARM9 reference records matched including
+the faulting word. Public controls cover writable and reserved bits,
+MRC to NZCV, condition checks, low SWI vectors, privilege, invalid register
+selects, ARM7 rejection and rejection of unsupported big-endian mode.
+Architectural I/D cache contents and TCM mapping are not implemented.
+
+MCR `p15,0,Rd,c7,c5,0` invalidates **only** the ARM9 instruction line,
+prevents older outstanding fills from reinstating it, discards younger
+fetched words and restarts at the following PC. A two-call public program
+returns to a known resident physical line: a condition-failed MCR hits;
+a condition-passed MCR causes a new demand. Independent `FetchLineCheck`
+cases cover outstanding-fill invalidations, ARM7 isolation, DMA snoops
+and reset. The following private frontier was fault 1 at `02000a74`
+(`c7,c6,0` D-cache invalidate), nine prior retirements, ten matching records.
+
+`c7,c6,0` can now retire under the explicit **D disabled, no resident
+data** invariant. Every load reads its device or memory, there is no
+dirty data to discard and `MCR c1` with C=1 faults. It does not evict the
+instruction line. `c7,c10,4` drains the write buffer: this in-order core
+has no posted writes and cannot enter commit past an unanswered store.
+Specifically the RAM arbiter waits for the ordered **response**, not the
+request grant; `Fabric` waits for the final `sdDone` on external stores.
+An I/O store must complete its reply handshake in the memory stage. A
+separate public guest delays visibility and acknowledgement of a byte
+store for 41 clocks and an I/O halfword store for 29, then checks both
+drain retirements, one write per target and a reread after an independent
+data change. Other c7 selectors remain unsupported.
+In the intermediate pre-MPU build the next fault was the MCR for
+protection region 0 (`c6,c0,0`) at `02000a80`, after 12 guest retirements.
+
+**ARM946 memory protection.** With c1.M=1, instruction, data and block
+beats are checked against the eight programmed virtual-address regions
+before issuing a request. Highest matching region wins; a miss grants
+nothing. Legacy/extended c5 I/D permissions distinguish user from
+privileged accesses. Changing active permissions or the MPU enable refetches
+younger instructions; a page execute grant never crosses a privilege change
+without rechecking. This is separate from the physical instruction-line
+buffer. Cache attributes are readable configuration, not support for
+turning on the unimplemented architectural caches. The model rejects
+unpredictable enabled descriptors rather than silently granting access.
+
+A denied fetch takes a prefetch abort only when its token reaches commit.
+A denied data beat never reaches RAM or I/O. The core saves SPSR_abt and
+banked LR_abt, enters ARM abort mode, and vectors via c1.V at offset `0c`
+or `10`. Completed earlier block beats are preserved without committing
+final writeback. [`hs_arm9_mpu.S`](../sim/tests/hs_arm9_mpu.S) checks
+overlapping regions, denied MMIO, revoking the currently executing page,
+read-only/user permissions, precise ARM/Thumb return addresses and CPSR
+restoration. `test/Arm9MpuCheck.hs` separately checks selector decoding,
+region masks, priority and the permission tables.
+Both variants now retire all eight region writes and match the first 31
+reference PC/opcodes including the rejected instruction. The **post-firmware**
+frontier is ARM9 fault 1 on the ITCM configuration write (`c9,c1,1`) at
+`02000ac8` after 30 guest retirements (cycle 191 bypass, 344 buffered).
+With the functional SWI fixture ARM7 remained fault-free at four million
+clocks: 737 entries/736 returns bypass, 694/693 buffered. These are not
+native BIOS or firmware boot results.
+
+**Wide memory configuration:** `dualWideSoc` drives the full aligned ARM
+byte address on MEM_REQ_ADDR. Both CPUs may fetch/load/store anywhere in
+`02xxxxxx`; the Fabric folds main RAM every 4 MiB. Wide WRAM occupies
+`03xxxxxx` (see below). ARM7 `06xxxxxx` and byte reads of VRAMSTAT/WRAMSTAT
+at `04000240/1` use the memory path, not the graphics link. Wider status
+reads and writes are rejected. Bank ownership and VRAM mirroring are Fabric
+decisions. MEM_ARM7 identifies
+the presented request even while stalled; MEM_FETCH marks instruction
+reads for measurement. Stores carry positioned data and byte enables. ARM9
+graphics and VRAMCNT still use the qualified IO9 link.
+The wide ARM9 link accepts VRAMCNT/WRAMCNT companion lanes through
+`04000249` inclusive; a word starting at `04000248` crosses the bound.
+
+**Instruction-line experiment.** `dualBufferedSoc` wraps the wide CPU
+port. On each accepted main-RAM demand read, the same response carries
+the aligned 8-byte line. A physical-address tag per CPU reuses both ARM
+words or four Thumb halfwords, including through 4 MiB mirrors. Data,
+WRAM, VRAM and I/O do not populate or hit the buffer. It issues no adjacent
+read. CPU stores and matching DMA write snoops invalidate partial or full
+overlaps; an invalidated outstanding fill still answers its original
+request, but does not become resident. External and CPU reset together.
+This is not an ARM946 cache timing model.
+
+**Critical-path retime.** The original worst path was `state[34]` → ARM9
+request arbitration → line lookup/ready → `en9` → device register:
+14 levels, 15.969 ns routed data delay. One non-fall-through admission
+register holds accepted address/lanes/data/owner/I-D. Resolving hits there
+removes line lookup from the CPU-enable path. This adds **one clock minimum**
+to hits and misses and caps admission at one request per two clocks. No
+register rename or reorder buffer: all stores and I/O retain program order.
+
+With the **same** shared-WRAM/CP15 public guest and six-clock ordered memory
+model, through both completion stores:
+
+| Fixed work | Bypass | Buffered before retime | Retimed |
+|---|---:|---:|---:|
+| Elapsed clocks | 97,752 | 63,748 | 68,114 |
+| Accepted main RAM instruction / data reads | 14,084 / 558 | 7,994 / 558 | 7,998 / 558 |
+| ARM9 disabled: instruction service / data service / other grant / remaining | 34,080 / 2,660 / 7,342 / 46,283 | 18,265 / 2,660 / 7,340 / 28,096 | 18,263 / 2,660 / 3,189 / 36,615 |
+| ARM7 eligible disabled, same breakdown | 14,544 / 76 / 7,100 / 19,787 | 8,686 / 76 / 3,428 / 12,317 | 11,165 / 93 / 1,670 / 13,754 |
+
+“Service” is an accepted request still awaiting its delayed answer; “other
+grant” means the CPU requested while the other CPU won. Remaining includes
+admission, backpressure and hit delivery. These are not physical SDRAM
+commands. Both CPU PC/opcode traces to their own completion stores matched
+byte-for-byte and both IF→vector→ack sequences passed. The early-finishing
+CPU keeps looping until the other finishes; its post-mailbox demand count
+can vary. The retime cost 4,366 clocks versus the first buffer while saving
+29,638 versus bypass. A separate operand witness saw only 64 missing-operand
+steps per payload versus 50.2% / 89.1% externally disabled CPU clocks:
+no register cache was added.
+
+**Fixed-time board simulation is a different denominator.** Over 10 frames
+(11,203,801 master clocks) with shared/private WRAM, the tile accelerator
+and both foregrounds in SDRAM, pin READ/WRITE commands changed from
+800,827/13,810 (bypass) to 735,413/20,712 (retimed instruction buffer).
+Each guest word write uses two WRITE commands on the 16-bit pins. ARM9/7
+retirements changed from 261,116/139,029 to 361,140/248,908; both completed
+20,082 GPU transactions, ten IPC exchanges and missed zero deadlines.
+These are pre-DQ-phase pin simulation totals under equal elapsed time,
+not commands per identical retired guest workload.
+
+The initial isolated A/B fit (`tests/fit_fetch_line.sh`, virtual pins,
+Quartus 17.0.2, Cyclone V 5CSEBA6U23I7, 14.919 ns; before WRAM/CP15)
+measured 9,268→9,296 ALMs, 4,878→5,080 registers, unchanged 4 RAM blocks
+and 6 DSP blocks. Slow 100°C setup slack was +0.842→**−1.649 ns**:
+the first buffered design **did not meet the target clock** (slow
+Fmax 71.04→60.36 MHz). Worst hold was +0.150→+0.112 ns. These figures
+are CPU probes, not full-board fits.
+
+To compare locally, pass `--postfirmware-nds /path/to/local.nds` (or
+`--postfirmware-hex /path/to/local-card-words.hex`), with `MELONDS_TRACE`
+naming the patched, `TRACE9`/`TRACE7`-capable `melonds_fbdump`. The runner
+runs stock for 16 reference frames to collect a bounded instruction trace.
+It removes private scratch images and traces at exit; it does not publish
+them. Stock BIOS code is not linked into the generated machine.
+
+### Native reset from private BIOS storage
+
+`dualFirmwareSoc clk rst en input sys7 line snoop` is a separate hardware
+configuration, not the staged cartridge experiment above. ARM9 resets to
+`ffff0000` (4 KiB private ROM), ARM7 to `00000000` (16 KiB); both start in
+ARM/SVC with I/F masked. ARM9 c1 resets to `2078`. Each read port samples
+its aligned BOOT_ADDR word index every master-clock rising edge; the CPU
+uses the returned word only after the requested index has been sampled.
+A ROM miss holds just that core: timers, pending memory responses and
+the other CPU keep running. ARM7 BIOSPROT reads/writes and protected data
+reads are CPU-local. Board integration must hold reset until private uploads
+and the native firmware lifecycle permit release; no direct header, HLE
+trampoline or substitute BIOS is selected here. Native unclaimed IO goes
+to each CPU's own external responder; IPC, interrupt and timer registers
+remain internal. There is no success/default-data responder for missing IO.
+
+Run `sim/run_clash_native_reset.sh GENERATED_HDL` on the generated
+`nds_dual_soc_firmware` to check two resets, the final instruction word
+and literal lanes of both BIOSes, ARM7's write-once protection threshold,
+and delayed independent IO replies with public assembly. For the private
+CPU-only comparison, add `--bios-bin BIOS9 BIOS7`, `NATIVE_FIRMWARE` and
+`NATIVE_REF_BUILD` (the stock tracer-patched `melonds_fbdump` build tree).
+The reference starts without a cartridge or SetupDirectBoot. Only bounded
+PC lists reach ephemeral scratch; private images and full trace records
+remain in memory. The CPU alone retires **4 ARM9 / 5 ARM7** instructions
+matching stock before both require a byte read of POSTFLG at `04000300`
+(master clocks 28/39 including reset; last PCs `ffff0118` / `00002cd8`).
+The socket stops instead of fabricating the register: this is neither a
+firmware menu nor a retail-game boot.
+
+### Wide CPU WRAM
+
+The wide and buffered CPU tops use the same [`CpuWram`](src/Nds/WholeCore/CpuWram.hs)
+between the CPU arbiter and external memory. ARM7 has 64 KiB of private
+RAM, repeated every `0x10000` from `03800000` to `03ffffff`. Both CPUs
+also address a single 32 KiB shared RAM according to the following map.
+Each bank is 16 KiB; the assigned size repeats throughout each window.
+
+| WRAMCNT (ARM9 `04000247`) | ARM9 `03000000..03ffffff` | ARM7 `03000000..037fffff` |
+| --- | --- | --- |
+| 0 (reset) | both banks: low, then high | private 64 KiB alias |
+| 1 | high bank | low bank |
+| 2 | low bank | high bank |
+| 3 (direct boot) | no bank | both banks: low, then high |
+
+Thus ARM7 `037f8000` and `037fc000` are distinct in mode 3 and mirror
+the same bank in modes 1/2. The unassigned ARM9 window ignores writes
+and reads zero, following melonDS, not an electrical open-bus model.
+ARM/Thumb fetch and data share these RAMs and four byte enables preserve
+unwritten bytes. CPU reset discards pending transactions but does not
+clear RAM. There is no WRAM backing in the host harness or narrow CPU.
+
+Only an **accepted** ARM9 link write enabling byte `247` changes the
+two-bit register. A simultaneous RAM handshake uses the pre-edge mode;
+a later grant sees the new mode. The companion VRAMCNT bytes go to the
+graphics fabric, including on mixed `244` word and `246` halfword access.
+ARM7 byte reads of `04000241` report the mode sampled at acceptance;
+`04000240` still reports VRAMSTAT. The mapping does not flush already
+prefetched instructions: branch to code after transferring ownership.
+No DMA/other-master access is claimed.
+
+`test/CpuWramCheck.hs` covers all 16,384 private and 8,192 shared words,
+mirror aliases, remaps, status snapshots and external/local reply
+ordering. `sim/run_arm7_wram_oracle.sh`
+(with `MELONDS_FBDUMP` pointing to a current `--ram-dump`-capable tracer)
+runs the public mirror/byte-lane and ARM→Thumb private-code probe on stock
+melonDS: ARM7 stored the expected `0000002B` in the main-RAM mailbox.
+`sim/run_clash_direct_handoff.sh` passed those same operations in the
+generated wide and buffered machines, retiring four ARM instructions and
+two Thumb instructions from private WRAM on each.
+
+`sim/run_shared_wram_guest.sh` runs a separate public two-CPU handshake
+on stock melonDS direct boot. ARM9 programs WRAMCNT through its byte,
+halfword and word views; ARM7 observes WRAMSTAT, patches code for ARM9
+and executes code previously installed by ARM9. Both also execute that
+code on the generated machines (six ARM9 and eight ARM7 shared-code
+retirements). Stock produced `9999CAFE` and `7777BEEF` in main RAM.
+
+**Private-only checkpoint:** the local post-firmware Kirby handoff advanced
+from ARM7 fault 3 at `03800000` after 9 guest retires to fault 3 at
+`037f8000` after **49,384** (cycle 395,207), before shared WRAM was added.
+The first 16 ARM7 retirements matched melonDS; the rest were not
+reference-traced. This is guest progress, not a game boot.
+
+**Shared WRAM exposed a missing ARM7 BIOS vector, not a bad RAM pointer.**
+On both generated machines, every one of **230,817 guest PC/opcode pairs**
+through the Thumb `SWI 03` at `03804294` matched the local melonDS
+reference. In the reference, the next instruction is the ARM SWI vector at
+`00000008`, which branches to `00001080`. In the original direct-entry
+shim, the empty vector fell through to the test-only IRQ handler: after
+retiring `0000002c`, its public instruction at `00000030` (`E58BA000`,
+`STR r10,[r11]`) attempted a store to zero. There is no displacement.
+Stock's R11 was also zero throughout those 230,817 records. A trap-only
+build now stops at vector 8 itself. Nothing special-cases address zero.
+
+**Functional service.** The default direct-entry shim handles only
+[NDS7 WaitByLoop, SWI 03](https://problemkaputt.de/gbatek-bios-misc-functions.htm).
+The core performs normal exception entry; ARM code at vector 8 dispatches
+on the service byte at `LR_svc−2` for either caller ISA. It saves SVC
+LR/SPSR and the scratch register, runs a signed decrement/branch loop in
+System mode with the caller's IRQ/FIQ masks, then restores SPSR and uses
+`MOVS pc,lr` to return. Other SWIs hit an explicit undefined-instruction
+trap. This is a functional instruction sequence, not a calibrated BIOS
+delay, a full BIOS or a firmware boot. The public shared-WRAM guest also
+calls SWI 03 from ARM and Thumb, checking flags, mode/masks, banked SP/LR,
+scratch preservation and return; the HDL monitor counts its 3+5 actual
+decrements and two exception returns.
+
+In the bounded Kirby run the first call decremented R0 **250** times and
+returned to Thumb PC `03804296`, as on stock. Both variants matched all
+230,817 guest PC/opcodes through the call and the next 32 after return;
+the different BIOS bodies were not compared. At the four-million-clock
+limit, ARM7 had **no fault**: wide retired 290,433 guest instructions and
+completed 736 calls; buffered retired 286,950 and completed 693. Both
+were executing another delay. This is not a claim that the remaining
+guest trace matches or that the cart boots. ARM9 independently stops
+at the ITCM configuration write described above.
+
 ### What separates this from booting a commercial game
 
 - **BIOS and KEY1.** No ARM9/ARM7 BIOS, no firmware boot, no KEY1/KEY2
