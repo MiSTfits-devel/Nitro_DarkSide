@@ -84,7 +84,7 @@ All ports are synchronous to `CLK`; `RST` is the Clash system reset.
 
 | port | dir | meaning |
 | --- | --- | --- |
-| `START_VALID`, `START_ENGINE`, `START_LINE` | in | line start (engine 0 = A, 1 = B; VCOUNT line), taken when `READY` is high |
+| `START_VALID`, `START_ENGINE`, `START_LINE`, `START_KIND` | in | line start (engine 0 = A, 1 = B; VCOUNT line; kind below), taken when `READY` is high |
 | `DISPCNT`, `BGCNT` (4 x 16, BG0 low), `HOFS`, `VOFS` (4 x 9, BG0 low), `BLDCNT` | in | register port, sampled only in the cycle a start is taken |
 | `READY` | out | idle (or halted): a start is taken this cycle |
 | `REQ_VALID`, `REQ_OBJ`, `REQ_ADDR` | out | registered memory request: OBJ or BG VRAM of the started engine, 8-byte word address (byte address bits 18..3) |
@@ -95,6 +95,23 @@ All ports are synchronous to `CLK`; `RST` is the Clash system reset.
 | `OAM_WR_*` (bit 9 engine, 8-2 sprite, 1-0 attribute) | in | OAM attribute 0-2 write (attribute 3, affine parameters, is not stored) |
 | `EXT_WR_*` (bit 12 engine, 11-0 entry) | in | OBJ extended palette write |
 | `FAULT` (16) | out | nonzero: halted until reset; bits above |
+
+**Job kinds** (`START_KIND`, `JobKind`), so that one engine can serve both
+screens with the DS's one-line-ahead sprites:
+
+| kind | does |
+| --- | --- |
+| 0 `JBoth` | the whole line: OAM scan and sprite pixels into the line buffer, then BG and composition out (the original single job) |
+| 1 `JBg` | BG fetch and composition out, taking the sprites from the line-buffer half of the line's parity that an earlier `JObj` drew |
+| 2 `JObj` | OAM scan and sprite pixels only, into the half of the given line's parity; no pixel out |
+| 3 `JClear` | no fetch; the output phase runs without pixels, clearing that line-buffer half (a line shown black or white still consumes its sprites) |
+
+The OBJ line buffer holds both engines and both parities (1,024 x 16;
+address: engine, line bit 0, x). A `JBg` start refuses (bit 11) if its half
+holds a semi-transparent sprite and BLDCNT has a second target, as the
+`JBoth` OAM scan does. The engine never reorders jobs: the caller (in
+`Nds.WholeCore.TileSoc`, BG A, BG B, then OBJ A, OBJ B of the next line)
+owns the schedule.
 
 The memory port never assumes a latency: requests wait for `REQ_READY`, and
 responses are matched to requests only by order. Engine B's addresses wrap at
@@ -116,10 +133,10 @@ renders a whole line from one state, and does **not** model:
 - register writes that land during the visible part of a line (on hardware a
   scroll or BGCNT write mid-line takes effect mid-line; here at the next
   start);
-- the DS's one-line-ahead sprite timing: hardware renders OBJ for line y+1
-  during line y, so an OAM write during line y shows on y+1 differently;
-  here the OAM is read when the caller starts the line, and the caller owns
-  that schedule;
+- the DS's one-line-ahead sprite timing as such: with `JObj` for line y+1
+  started after `JBg` of line y, sprites are drawn one line ahead, but the
+  OAM is read when the caller starts that job, and the caller owns that
+  schedule;
 - palette or VRAM writes during a line (they land wherever the engine is in
   its fetch or output phase);
 - the DS's per-line OBJ rendering-cycle budget [INFERENCE: GBATEK describes
@@ -143,7 +160,7 @@ renders a whole line from one state, and does **not** model:
    OAM RAM 3x256x16 ---> OAM scan (one sprite/cycle: skip, latch, or fault)
                                          |
             OBJ pixel writer (one pixel/cycle, read-modify-write of the
-            OBJ line buffer 256x16 with OAM-order priority; one-cycle
+            OBJ line buffer 1024x16 (engine x line parity x 256) with OAM-order priority; one-cycle
             write forwarding)
                                          |
    output (256 cycles): BG decode from map+row RAM, line-buffer read and
@@ -155,7 +172,7 @@ renders a whole line from one state, and does **not** model:
   constant-zero initial vector; no `blockRam1`, no initial-value file needed):
   BG map entries 64 x 16, BG rows 64 x 64, standard palette 1024 x 16 (both
   engines), OAM attributes 3 x 256 x 16 (both engines), the OBJ line buffer
-  256 x 16, sprite column descriptors 64 x 24 and rows 64 x 64, and the OBJ
+  1,024 x 16 (both engines, both line parities), sprite column descriptors 64 x 24 and rows 64 x 64, and the OBJ
   extended palettes 2 x 4096 x 16 (one per engine; a single 8192-entry RAM's
   initial-value loop would exceed Quartus 17's 5,000 iterations, the failure
   `blockRam1` hit in this repo). Registers hold only control, counters, the
@@ -173,8 +190,8 @@ renders a whole line from one state, and does **not** model:
   entry already there (opaque, priority, extended-palette flag, palette
   index). A candidate wins only if the entry is transparent or of strictly
   lower priority, which is the reference's OAM-order rule. The output phase
-  clears each entry as it reads it; a 256-cycle sweep after reset clears it
-  too.
+  (of a `JBoth`, `JBg` or `JClear` job) clears each entry of its half as it
+  reads it; a 1,024-cycle sweep after reset clears the whole buffer.
 - **Three state registers.** `Ctl` (sequencer, counters, latched line
   configuration, latched sprite), `Dp` (line-buffer read-modify-write and the
   output pipeline) and `Outs` (the request and pixel output registers) are
@@ -182,11 +199,12 @@ renders a whole line from one state, and does **not** model:
   result (`GeoMatrix`'s rule, against the sequencer-branch duplication that
   once cost that block 49 DSPs). The pure cycle step `tileStep` is the model;
   `tileHw` is it plus the RAMs, as in `Nds.Gpu3D.GeoMatrix`.
-- **Time sharing.** The line configuration is latched with an engine index,
-  and the palette, OAM and extended-palette RAMs hold both engines, so one
-  instance could serve both screens if a caller presents the selected
-  engine's registers with each start and routes the memory port. That is not
-  built or tested.
+- **Time sharing.** The line configuration is latched with an engine index
+  and a job kind, and the palette, OAM, extended-palette and line-buffer RAMs
+  hold both engines, so one instance serves both screens when the caller
+  presents the selected engine's registers with each start and routes the
+  memory port. `Nds.WholeCore.TileSoc` does exactly that (see
+  `docs/GPU2D_SOC.md`).
 
 ## Gate
 
@@ -234,7 +252,11 @@ Clash circuit under one closed-loop driver: random gaps between lines and
 palette or OAM writes, random register values on every cycle that is not a
 line start (so a late sample would show), request stalls (`REQ_READY` low in
 bursts) and in-order response latency of 1-6 cycles (70 %), 1-60 (25 %) or
-1-400 (5 %). Each line is judged as it completes: pixel for pixel against the
+1-400 (5 %). A scene's lines are started as whole-line `JBoth` jobs, as
+random mixes of `JObj`/`JBg`/`JClear`/`JBoth`, or always as `JObj` then
+`JBg` of the same line (a per-scene choice), so every job kind and the
+line-buffer halves are exercised; the timing mode uses whole lines. The
+fault cases run both as `JBoth` and as `JObj` + `JBg` (44 cases). Each line is judged as it completes: pixel for pixel against the
 reference, its request count against the expected count; the pure and Clash
 outputs are compared on every cycle. Only counts are kept, so a run's memory
 does not grow with the scene count: the checker runs under `+RTS -M3g`; run
@@ -247,9 +269,9 @@ that stream begins with a reset cycle; the Verilog's RAMs keep the previous
 scene's contents across it (the pure model's start at zero), which the
 engine must not observe.
 
-### Results, step 2 (current source: BG + OBJ)
+### Results, step 2 (current source: BG + OBJ, job kinds)
 
-Observed on 2026-11-18, `TIMING=1 clash/tests/run_tilehw_check.sh`, seed 1,
+Observed on 2026-11-19, `TIMING=1 clash/tests/run_tilehw_check.sh`, seed 1,
 200 random scenes, 60 in the Verilator replay, 60 per mutant. **This full
 run was local, with the untracked kirby135 capture present**: the rows that
 name kirby135 include it; every other row is from tracked inputs only.
@@ -257,15 +279,20 @@ name kirby135 include it; every other row is from tracked inputs only.
 | run | scope | checked | result |
 | --- | --- | --- | --- |
 | fixture binary | `arm9_2dk.bin` vs fresh assembly of `arm9_2dk.s` | byte compare | identical |
-| fault | 18 refused states (bits 0-9, 11-14) + response with nothing outstanding | fault bit, halt, no pixel, pure = Clash | 19/19 refused |
+| fault | 18 refused states (bits 0-9, 11-14), each as `JBoth` and as `JObj` + `JBg`, + response with nothing outstanding | fault bit, halt, no pixel, pure = Clash | 37/37 refused |
 | accepted near-misses | engine B bit 3; 4bpp + bit 30; no BG; affine sprite off the line; disabled sprite with bitmap/mosaic bits; OBJ-window sprite; semi-transparent with first target only | every pixel vs reference | 7/7 exact |
-| fixtures (pure + Clash), local run with the capture | arm9_2dk A, B, kirby135: 576 lines | 147,456 pixels (120,576 BG, 2,432 OBJ, 24,448 backdrop), 37,168 requests (counts exact), 425,827 cycles, 21,091 stalled request cycles, 1,544 responses later than 60 cycles | 0 failures, pure = Clash every cycle |
-| random (pure + Clash) | 200 scenes, 1,264 lines | 323,584 pixels (136,545 BG, 140,280 OBJ, 46,759 backdrop; 50,733 distinct colours), 133,547 requests, 1,980,024 cycles, 79,422 stalled cycles | 0 failures, pure = Clash every cycle |
-| Yosys (fresh Verilog `c0905042...`) | memory inference, multipliers | `proc; memory -nomap` | 11 `$mem_v2` of the expected shapes, 0 multipliers |
-| Verilator | fixtures stream (3 scenes) | 425,827 cycles, 37,168 requests (304 OBJ), 147,456 pixels (2,432 OBJ) | 0 mismatches |
-| Verilator | random stream (60 scenes) | 644,299 cycles, 45,910 requests (20,110 OBJ), 108,544 pixels (47,854 OBJ) | 0 mismatches |
+| fixtures (pure + Clash), local run with the capture | arm9_2dk A, B, kirby135: 576 lines | 147,456 pixels (120,576 BG, 2,432 OBJ, 24,448 backdrop), 37,168 requests (counts exact), 495,316 cycles, 20,895 stalled request cycles, 1,610 responses later than 60 cycles | 0 failures, pure = Clash every cycle |
+| random (pure + Clash) | 200 scenes, 1,264 lines; jobs: 907 `JBoth`, 933 `JBg`, 933 `JObj`, 455 `JClear` (fixtures and random together) | 323,584 pixels (136,545 BG, 140,280 OBJ, 46,759 backdrop; 50,733 distinct colours), 133,547 requests, 2,116,297 cycles, 78,919 stalled cycles | 0 failures, pure = Clash every cycle |
+| Yosys (fresh Verilog `acbaeb88...`) | memory inference, multipliers | `proc; memory -nomap` | 11 `$mem_v2` of the expected shapes (line buffer 1,024 x 16), 0 multipliers |
+| Verilator | fixtures stream (3 scenes) | 495,316 cycles, 37,168 requests (304 OBJ), 147,456 pixels (2,432 OBJ) | 0 mismatches |
+| Verilator | random stream (60 scenes) | 686,241 cycles, 45,910 requests (20,110 OBJ), 108,544 pixels (47,854 OBJ) | 0 mismatches |
 | Verilator negative control | one pixel colour changed in the stream | | detected (1 mismatch) |
-| mutants | 23 (11 BG, 12 OBJ), table below | pure check + fault cases | 23/23 detected |
+| mutants | 26 (11 BG, 12 OBJ, 3 job kinds), table below | pure check + fault cases | 26/26 detected |
+
+The whole run's largest child process peaked at 3.1 GB resident (macOS
+`time -l`). The paragraph below is from the previous source revision
+(`c0905042...`: one 256-entry line buffer, no job kinds, 26 fault cases and
+23 mutants); the no-capture run was not repeated after the job kinds.
 
 **Without the capture** (`TILEHW_KIRBY_DIR` pointed at an empty directory,
 `MUTANTS=hflip`, same seed and counts otherwise; the gate printed
@@ -315,8 +342,8 @@ fault cases):
 | 4bpp transparency tests the byte, not the nibble | 1,209 | 1 |
 | transparent BG pixel reads its index, not the backdrop entry | 4,702 | 1 |
 | engine B BG addresses not wrapped at 128 KiB | 28 | 0 |
-| row request issued one cycle before its map entry is written | 13,489 | 6 |
-| BG mode not refused | 0 | 1 |
+| row request issued one cycle before its map entry is written | 12,970 | 6 |
+| BG mode not refused | 0 | 2 |
 | OBJ h-flip ignored | 25,562 | 0 |
 | OBJ v-flip ignored | 26,836 | 0 |
 | OBJ 1D tile boundary ignored | 43,535 | 6 |
@@ -327,8 +354,11 @@ fault cases):
 | later sprite wins equal priority (OAM order) | 8,571 | 0 |
 | OBJ extended palette number dropped | 11,506 | 5 |
 | OBJ extended palette used with DISPCNT bit 31 clear | 14,235 | 1 |
-| line-buffer write forwarding removed | 202 | 0 |
+| line-buffer write forwarding removed | 203 | 0 |
 | semi-transparent sprite not refused with a second target | 0 | 1 |
+| line-buffer entry not cleared when read | 63,367 | 0 |
+| `JBg` does not refuse a semi-transparent sprite in its half with a second target | 0 | 1 |
+| `JObj` emits pixels | 25,949 | 6 |
 
 ### Results, step 1 (BG only; gated and fitted before step 2 was written)
 
@@ -362,7 +392,8 @@ after each fit (its claim `nitro-fit-tilehw3x-work` is kept, as the other
 | netlist | function | ALMs | registers | M10K | DSP | worst setup | worst hold |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | step 1 (`c73ca866...`) | one text BG, 4/8bpp, backdrop | 446 | 133 | 5 | 0 | +17.960 ns | +0.178 ns |
-| **step 2 (`c0905042...`, current)** | **+ regular 1D sprites, OBJ ext palettes, priority** | **775** | **305** | **28** | **0** | **+15.581 ns** | **+0.181 ns** |
+| step 2 (`c0905042...`) | + regular 1D sprites, OBJ ext palettes, priority | 775 | 305 | 28 | 0 | +15.581 ns | +0.181 ns |
+| **step 2 with job kinds (`acbaeb88...`, current)** | **+ `JBg`/`JObj`/`JClear`, 1,024 x 16 line buffer** | **797** | **315** | **29** | **0** | **+14.646 ns** | **+0.139 ns** |
 | legacy VHDL engine A (`nds_gpu2d g_gpu2d_a_slow`) | all BG modes, OBJ incl. affine/bitmap, windows, blending, mosaic, 3D BG0, ... | 3,083 | 3,712 | 7 | 17 | (whole-core fit) | (whole-core fit) |
 
 The legacy row is the hierarchy row in
@@ -376,13 +407,19 @@ extended palettes in this fit was not traced here. Of this engine's 28 M10K,
 16 should be the two engines' OBJ extended palettes (8 KiB each) and the
 rest the line state, both engines' standard palettes and OAMs [INFERENCE:
 from the RAM shapes at 512 x 16 per M10K, which add up to 28; the fit report
-was not broken down per RAM]. All slow and fast
-corner setup and hold slacks were non-negative in both fits; the step-2
-worst setup path runs from one block RAM's port-B write-enable register to
-another block RAM's address register (11.701 ns data delay, 6 logic levels,
--2.496 ns clock skew). Full netlist SHA-256: step 1
+was not broken down per RAM]. The current netlist's extra M10K is the
+line buffer growing from 256 to 1,024 entries [INFERENCE, same basis]. All
+slow and fast corner setup and hold slacks were non-negative in all three
+fits; the step-2 worst setup path runs from one block RAM's port-B
+write-enable register to another block RAM's address register (11.701 ns
+data delay, 6 logic levels, -2.496 ns clock skew); the current netlist's
+worst slow-100 °C path is register to register (13.806 ns data delay, 9
+logic levels). Inside the both-screen SoC's full MiSTer fit the same
+engine took 654 ALMs, 299 registers and 30 M10K (`docs/GPU2D_SOC.md`).
+Full netlist SHA-256: step 1
 `c73ca8664f9e3245d770cc8cc61271feab40b8fda2431467d5983d279cf6bd75`, step 2
-`c090504234cfc6bed4aa83579d4fb8f2494503c95b68eda36a5e6e9d38768aa8`.
+`c090504234cfc6bed4aa83579d4fb8f2494503c95b68eda36a5e6e9d38768aa8`,
+current `acbaeb886065a64e965e44be87acc9ec412522a21fb6bb6e8a75bfe13e1c40c6`.
 
 ## Cycles per line
 
@@ -417,11 +454,11 @@ after answering the last.
   the line), 128 sprites 8,522. So the engine misses a line when the
   sprites on it cover more than about 1,800 pixels in total (plus `2L` once
   latency dominates the BG fetch).
-- Under the check's random provider (stalls, latency up to 400) the worst
-  fixture line took 1,104 cycles (with or without the capture) and the worst
-  random-scene line 2,140, one of the lines with several large sprites; the
-  cycle count is reported, not gated, because the engine has no line
-  deadline.
+- Under the check's random provider (stalls, latency up to 400) the timing
+  mode's worst fixture line took 1,088 cycles; in the 2026-11-19 check the
+  fixture lines took 390-1,696 cycles per job and the random-scene jobs
+  261-2,605 (the longest are lines with several large sprites); the cycle
+  count is reported, not gated, because the engine has no line deadline.
 - The kirby135 column and its limits (pipelined 917, serial 28) come from
   local runs with the capture present. Without it the other columns and the
   BG-only limits (916, 27) are unchanged (observed in the run above).
@@ -434,17 +471,18 @@ after answering the last.
   windows as masks), colour effects and semi-transparent blending, mosaic,
   the 3D layer, master brightness, display capture, display modes 0/2/3.
 - Composition is for one BG and OBJ: priority among several BGs is not built.
-- No DS line timing: the caller starts lines; there is no VCOUNT, HBlank,
-  VBlank or one-line-ahead OBJ schedule, and the sampling rule above is not
-  the hardware's.
+- No DS line timing in the engine itself: the caller starts lines. The
+  VCOUNT/HBlank/VBlank schedule, the one-line-ahead OBJ jobs and Live's
+  register latching live in `Nds.WholeCore.TileSoc` (`docs/GPU2D_SOC.md`);
+  the sampling rule above is not the hardware's.
 - No per-line OBJ cycle limit; heavy sprite lines take longer than 2,130
   cycles instead (see above).
-- The memory provider here is a testbench model (in-order, random stalls and
-  latency); no SDRAM controller, arbitration with other masters or VRAM bank
-  mapping exists. Requests are 8-byte words addressed per engine space; the
-  caller maps them to banks.
-- Engine A/B time sharing is a property of the state layout only; it was not
-  built or tested.
+- The memory provider in this gate is a testbench model (in-order, random
+  stalls and latency); no SDRAM controller or arbitration with other
+  masters exists. Requests are 8-byte words addressed per engine space; the
+  caller maps them to banks (`TileSoc` does, onto M10K banks).
+- Engine A/B time sharing is tested here job by job; the both-screen
+  schedule is tested in `TileSoc`'s gate.
 - The kirby135 capture (local, when present) shows no sprite pixels (all its
   sprites are at y = 192), so the only tracked fixture sprite pixels are the
   arm9_2dk scene's.

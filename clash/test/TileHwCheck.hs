@@ -597,10 +597,14 @@ requestsOf sc y = 2 * slotsOf sc + either (const 0) (sum . map soCols) (spritesO
 data Prov = PRandom | PFixed !Int | PSerial !Int
   deriving (Eq, Show)
 
-data Act = APal !Int !Word16 | AOam !Int !Word16 | AExt !Int !Word16 | ALine !Int | AGap !Int
+data Act = APal !Int !Word16 | AOam !Int !Word16 | AExt !Int !Word16 | ALine !Int !JobKind | AGap !Int
   deriving (Eq, Show)
 
-data Run = Run { rnY :: !Int, rnStart :: !Int, rnPix :: ![PixelOut], rnCount :: !Int, rnReqs :: !Int }
+data Run = Run { rnY :: !Int, rnKind :: !JobKind, rnStart :: !Int, rnPix :: ![PixelOut], rnCount :: !Int, rnReqs :: !Int }
+
+-- | Jobs of a kind that emits pixels end a line.
+emits :: JobKind -> Bool
+emits k = case k of JBoth -> True; JBg -> True; _ -> False
 
 -- | A finished line, judged against the reference as it completes (when
 -- the driver judges); its pixels are not kept.
@@ -613,6 +617,9 @@ data D = D
   , dLoad   :: !Bool            -- load palettes and OAM at each scene start
   , dAllowF :: !Bool            -- a fault ends the run (fault cases) instead of failing it
   , dJudge  :: !Bool            -- compare finished lines with the reference
+  , dSplit  :: !Int             -- 0: one JBoth job per line; 1: random job-kind patterns; 2: always JObj then JBg
+  , dLineReqs :: !Int           -- requests of the line's pixel-less jobs so far
+  , dLineStart :: !(Maybe Int)  -- cycle the line's first job started
   , dScenes :: ![(Int, Scene)]  -- head: current scene
   , dActs   :: ![Act]
   , dCur    :: !(Maybe Act)     -- driven this cycle
@@ -636,8 +643,11 @@ data D = D
   , dFaultPix :: !Int           -- pixels of the faulting line seen
   }
 
-actsOf :: Bool -> Word64 -> Scene -> [Act]
-actsOf loadPal s sc =
+-- | Palette/OAM loads, then each line as one job ('JBoth') or, when
+-- splitting, as a random pattern: JBoth; JObj then JBg; or JClear, JObj,
+-- JBg (a clear of the half the JObj then fills), with random gaps.
+actsOf :: Bool -> Int -> Word64 -> Scene -> [Act]
+actsOf loadPal split s sc =
   (if loadPal
      then [APal k (pal16 (scPal sc) (2 * fromIntegral k)) | k <- [0 .. 1023]]
           ++ [AOam (eng * 512 + k) (oamHalf sc k) | k <- [0 .. 511], k .&. 3 /= 3]
@@ -645,18 +655,36 @@ actsOf loadPal s sc =
                 then [AExt (eng * 4096 + k) (pal16 (scExt sc) (2 * fromIntegral k)) | k <- [0 .. 4095]]
                 else [])
      else [])
-  ++ concat [[AGap (fromIntegral (g `mod` 5)), ALine y] | (y, g) <- zip (scLines sc) (rnds s)]
-  where eng = scEng sc
+  ++ concat [ AGap (fromIntegral (g `mod` 5)) : pattern y g | (y, g) <- zip (scLines sc) (rnds s) ]
+  where
+    eng = scEng sc
+    gap g k = AGap (fromIntegral ((g `shiftR` (8 + 3 * k)) `mod` 4))
+    pattern y g
+      | split == 0 = [ALine y JBoth]
+      | split == 2 = [ALine y JObj, gap g 0, ALine y JBg]
+      | otherwise = case (g `shiftR` 20) `mod` 4 of
+          1 -> [ALine y JObj, gap g 0, ALine y JBg]
+          2 -> [ALine y JClear, gap g 1, ALine y JObj, gap g 2, ALine y JBg]
+          _ -> [ALine y JBoth]
 
 newDriver :: Word64 -> Prov -> Bool -> [Scene] -> D
 newDriver seed prov loadPal scs = D
   { dCyc = 0, dRng = seed * 0x2545F4914F6CDD1D + 7, dProv = prov, dLoad = loadPal, dAllowF = False, dJudge = True
+  , dSplit = 1, dLineReqs = 0, dLineStart = Nothing
   , dScenes = zip [0 ..] scs
-  , dActs = case scs of (sc : _) -> actsOf loadPal seed sc; [] -> []
+  , dActs = case scs of (sc : _) -> actsOf loadPal 1 seed sc; [] -> []
   , dCur = Nothing, dRun = Nothing, dRdy = False, dResp = Nothing, dJunk = junkRegs 1 2
   , dQ = Seq.empty, dLast = 0, dRes = [], dCov = M.empty, dNObj = 0, dNBack = 0, dNPix = 0, dCols = IS.empty
   , dErr = [], dDone = False, dStalls = 0, dLong = 0
   , dFault = 0, dFaultPix = 0 }
+
+-- | The same driver with every line one 'JBoth' job (timing mode).
+wholeLines :: D -> D
+wholeLines d = withSplit 0 d
+
+-- | The same driver with the given split mode.
+withSplit :: Int -> D -> D
+withSplit m d = d { dSplit = m, dActs = case dScenes d of ((_, sc) : _) -> actsOf (dLoad d) m 3 sc; [] -> [] }
 
 curScene :: D -> Maybe Scene
 curScene d = case dScenes d of ((_, sc) : _) -> Just sc; [] -> Nothing
@@ -664,10 +692,10 @@ curScene d = case dScenes d of ((_, sc) : _) -> Just sc; [] -> Nothing
 inputsOf :: D -> TileIn
 inputsOf d = TileIn
   { tiStart = case (dCur d, curScene d) of
-      (Just (ALine y), Just sc) -> Just (LineReq (fromIntegral (scEng sc)) (fromIntegral y))
+      (Just (ALine y k), Just sc) -> Just (LineReq (fromIntegral (scEng sc)) (fromIntegral y) k)
       _ -> Nothing
   , tiRegs = case (dCur d, curScene d) of
-      (Just (ALine _), Just sc) -> regsOf sc
+      (Just (ALine _ _), Just sc) -> regsOf sc
       _ -> dJunk d
   , tiReqReady = dRdy d
   , tiResp = fromIntegral <$> dResp d
@@ -710,9 +738,9 @@ cycleStep d o = d3
     (q1, last1) = case reqAcc of
       Just (obj, a) -> let due = max (dLast d + 1) (n + lat) in (q0 |> (due, obj, a), due)
       Nothing -> (q0, dLast d)
-    startAcc = case dCur d of Just (ALine _) -> toReady o; _ -> False
+    startAcc = case dCur d of Just (ALine _ _) -> toReady o; _ -> False
     run1 = case dRun d of
-      _ | startAcc, Just (ALine y) <- dCur d -> Just (Run y n [] 0 0)
+      _ | startAcc, Just (ALine y k) <- dCur d -> Just (Run y k n [] 0 0)
       Just r -> Just r { rnPix = maybe (rnPix r) (: rnPix r) (toPixel o)
                        , rnCount = rnCount r + (if isJust (toPixel o) then 1 else 0)
                        , rnReqs = rnReqs r + (if isJust reqAcc then 1 else 0) }
@@ -727,17 +755,29 @@ cycleStep d o = d3
         ++ [ "cycle " ++ show n ++ ": line " ++ show (rnY r) ++ " running for " ++ show (n - rnStart r) ++ " cycles"
            | Just r <- [dRun d], n - rnStart r > 200000 ]
     finishedRun = case run1 of
-      Just r | rnCount r == 256 && toReady o && not startAcc -> Just r
+      Just r | toReady o && not startAcc && (if emits (rnKind r) then rnCount r == 256 else n > rnStart r) -> Just r
       _ -> Nothing
     run2 = if isJust finishedRun then Nothing else run1
+    lineStart = case (startAcc, dLineStart d) of
+      (True, Nothing) -> Just n
+      (_, s) -> s
+    -- a pixel-less job adds its requests to the line; a pixel job ends it
+    lineDone = case finishedRun of Just r -> emits (rnKind r); Nothing -> False
+    quietErrs = [ "cycle " ++ show n ++ ": " ++ show (rnKind r) ++ " job emitted " ++ show (rnCount r) ++ " pixels"
+                | Just r <- [finishedRun], not (emits (rnKind r)), rnCount r /= 0 ]
     judged = case (finishedRun, curScene d) of
-      (Just r, Just sc) -> Just (judgeLine (dJudge d) sc r (n - rnStart r))
+      (Just r, Just sc) | emits (rnKind r) ->
+        Just (judgeLine (dJudge d) sc r { rnReqs = rnReqs r + dLineReqs d } (n - fromMaybe (rnStart r) lineStart))
       _ -> Nothing
+    lineReqs' = case finishedRun of
+      Just r | emits (rnKind r) -> 0
+             | otherwise -> dLineReqs d + rnReqs r
+      Nothing -> dLineReqs d
     res2 = case judged of
       Just (lr, _) -> lr : dRes d
       Nothing -> dRes d
     curDone = case dCur d of
-      Just (ALine _) -> startAcc
+      Just (ALine _ _) -> startAcc
       _ -> True
     -- next action
     (cur2, acts2, scenes2) =
@@ -748,7 +788,7 @@ cycleStep d o = d3
                         | otherwise -> (Nothing, rest, dScenes d)
         (a : rest) -> (Just a, rest, dScenes d)
         [] -> case dScenes d of
-          (_ : more@((_, sc) : _)) | Seq.null q1 -> (Nothing, actsOf (dLoad d) (r1 + fromIntegral n) sc, more)
+          (_ : more@((_, sc) : _)) | Seq.null q1 -> (Nothing, actsOf (dLoad d) (dSplit d) (r1 + fromIntegral n) sc, more)
           (_ : more) | Seq.null q1 -> (Nothing, [], more)
           sc -> (Nothing, [], sc)
     (r2, rdyR) = rnd r1
@@ -766,13 +806,17 @@ cycleStep d o = d3
     faultEnd = faulted && dAllowF d
     d3 = d { dCyc = n + 1, dRng = r4, dScenes = scenes2, dActs = acts2, dCur = cur2, dRun = run2
            , dRdy = rdy, dResp = resp, dJunk = junkRegs j1 j2, dQ = q1, dLast = last1
-           , dRes = res2, dErr = if null errs then dErr d else errs ++ dErr d
-           , dCov = maybe (dCov d) (\(_, j) -> foldl' (\m (k, v) -> M.insertWith (+) k v m) (dCov d) (jKeys j)) judged
+           , dLineReqs = lineReqs', dLineStart = if lineDone then Nothing else lineStart
+           , dRes = res2, dErr = if null errs && null quietErrs then dErr d else errs ++ quietErrs ++ dErr d
+           , dCov = (case dCur d of
+                       Just (ALine _ k) | startAcc -> M.insertWith (+) ("jobs of kind " ++ show k) 1
+                       _ -> id)
+                    (maybe (dCov d) (\(_, j) -> foldl' (\m (k, v) -> M.insertWith (+) k v m) (dCov d) (jKeys j)) judged)
            , dNObj = dNObj d + maybe 0 (jObj . snd) judged
            , dNBack = dNBack d + maybe 0 (jBack . snd) judged
            , dNPix = dNPix d + maybe 0 (jPix . snd) judged
            , dCols = maybe (dCols d) (IS.union (dCols d) . jCols . snd) judged
-           , dDone = finished || not (null errs) || faultEnd
+           , dDone = finished || not (null errs) || not (null quietErrs) || faultEnd
            , dStalls = dStalls d + (if stalled then 1 else 0)
            , dLong = dLong d + (if isJust reqAcc && lat > 60 then 1 else 0)
            , dFault = if dFault d == 0 then toFault o else dFault d
@@ -1113,14 +1157,14 @@ faultMode dir = do
         , ("disabled sprite with bitmap/mosaic bits", spr0 0x1E18)
         , ("OBJ window sprite on the line", spr0 0x0818)
         , ("semi-transparent sprite, 1st target only", (spr0 0x0418) { scBld = 0x003F }) ]
-  bads <- forM cases $ \(name, sc0, b) -> do
+  bads <- forM [ (cs, m) | cs <- cases, m <- [0, 2] ] $ \((name, sc0, b), m) -> do
     let sc = sc0 { scLines = [30] }   -- sprite 0 covers lines 24-39
         want = 2 ^ b :: BitVector 16
-        d0 = (newDriver 9 PRandom True [sc]) { dAllowF = True }
+        d0 = withSplit m ((newDriver 9 PRandom True [sc]) { dAllowF = True })
         t = compareRuns (runPure d0) (Just (runClash d0))
         dEnd = fromMaybe d0 (tLast t)
         ok = tMism t == 0 && dFault dEnd == want && dFaultPix dEnd == 0 && null (dRes dEnd) && null (dErr dEnd)
-    printf "fault %-46s bit %2d: %s\n" (name :: String) b
+    printf "fault %-46s bit %2d, %s: %s\n" (name :: String) b (if m == 0 then "JBoth" else "JObj+JBg" :: String)
       (if ok then "refused, halted, no pixel" else "WRONG (fault " ++ showHex (dFault dEnd) "" ++ ", "
          ++ show (dFaultPix dEnd) ++ " pixels, " ++ show (length (dRes dEnd)) ++ " lines, pure/Clash mismatches "
          ++ show (tMism t) ++ " " ++ show (take 2 (dErr dEnd)) ++ ")")
@@ -1128,11 +1172,11 @@ faultMode dir = do
   -- a response with nothing outstanding (after the reset sweep)
   let regs = regsOf good
       idleIn = TileIn Nothing regs True Nothing Nothing Nothing Nothing
-      inputs = replicate 300 idleIn ++ [idleIn { tiResp = Just 0x1234 }]
-               ++ replicate 300 (TileIn (Just (LineReq 0 20)) regs True (Just 0) Nothing Nothing Nothing)
+      inputs = replicate 1100 idleIn ++ [idleIn { tiResp = Just 0x1234 }]
+               ++ replicate 300 (TileIn (Just (LineReq 0 20 JBoth)) regs True (Just 0) Nothing Nothing Nothing)
       pureL = reverse (snd (foldl' (\(pm, acc) i -> let (pm', o) = pureStep pm i in (pm', o : acc)) (pmInit, []) inputs))
       clashL = sampleN' (length inputs) (tileHw systemClockGen systemResetGen enableGen (fromListS (inputs ++ repeat (last inputs))))
-      protoOk = all (\o -> toFault o == 2 ^ faultProtocol) (drop 302 pureL)
+      protoOk = all (\o -> toFault o == 2 ^ faultProtocol) (drop 1102 pureL)
                 && all (\o -> isNothing (toPixel o) && isNothing (toReq o)) pureL && pureL == clashL
   printf "fault %-46s bit %2d: %s\n" ("response with nothing outstanding" :: String) faultProtocol
     (if protoOk then "refused, halted, no pixel" else "WRONG" :: String)
@@ -1148,7 +1192,7 @@ faultMode dir = do
        else "WRONG " ++ show (take 2 (dErr dEnd ++ concatMap lrMsgs (dRes dEnd) ++ tFirst t)))
     pure (if ok then 0 else 1 :: Int)
   let total = sum bads + sum pbads + (if protoOk then 0 else 1)
-  printf "tilehw fault: %d cases, %d wrong\n" (length cases + 1 + length accepted) total
+  printf "tilehw fault: %d cases, %d wrong\n" (2 * length cases + 1 + length accepted) total
   when (total /= 0) exitFailure
 
 fromListS :: [a] -> Signal C.System a
@@ -1166,7 +1210,7 @@ hexN w v = let s = showHex v "" in replicate (w - length s) '0' ++ s
 
 traceLine :: (D, TileOut, D) -> String
 traceLine (d, o, _) = unwords
-  [ hexN 2 (fromIntegral flags), hexN 2 (fromIntegral line), hexN 8 (fromIntegral (rDispCnt r))
+  [ hexN 2 (fromIntegral flags), hexN 2 (fromIntegral line), hexN 1 (fromIntegral kind), hexN 8 (fromIntegral (rDispCnt r))
   , hexN 16 (packV 16 (map fromIntegral (C.toList (rBgCnt r))))
   , hexN 9 (packV 9 (map fromIntegral (C.toList (rHofs r))))
   , hexN 9 (packV 9 (map fromIntegral (C.toList (rVofs r))))
@@ -1183,7 +1227,9 @@ traceLine (d, o, _) = unwords
     i = inputsOf d
     r = tiRegs i
     b c k = if c then 2 ^ (k :: Int) else 0 :: Int
-    (eng, line) = maybe (0, 0) (\(LineReq e l) -> (fromIntegral e :: Int, fromIntegral l :: Int)) (tiStart i)
+    (eng, line, kind) = maybe (0, 0, 0)
+      (\(LineReq e l k) -> (fromIntegral e :: Int, fromIntegral l :: Int, case k of JBoth -> 0; JBg -> 1; JObj -> 2; JClear -> 3 :: Int))
+      (tiStart i)
     flags = b (dCyc d == 0) 0 + b (isJust (tiStart i)) 1 + b (eng == 1) 2 + b (tiReqReady i) 3
           + b (isJust (tiResp i)) 4 + b (isJust (tiPalWr i)) 5 + b (isJust (tiOamWr i)) 6 + b (isJust (tiExtWr i)) 7
     oflags = b (toReady o) 0 + b (isJust (toReq o)) 1 + b (isJust (toPixel o)) 2 + b (maybe False rqObj (toReq o)) 3
@@ -1237,7 +1283,7 @@ timeMode dir = do
       noBg = (noObj a2dk) { scDisp = scDisp a2dk .&. complement 0xF00 .&. complement 0x1000, scLines = [0, 1] }
       kbOk = fmap (\kb -> kb { scLines = [y | y <- [0 .. 191], either (const False) (const True) (spritesOn kb y)] }) kbM
       kbCol l = maybe "-" (\kb -> show (maxOf (PFixed l) [kb])) kbOk
-      measure prov scs = let d0 = (newDriver 3 prov True scs) { dJudge = False }
+      measure prov scs = let d0 = wholeLines ((newDriver 3 prov True scs) { dJudge = False })
                              t = compareRuns (runPure d0) Nothing
                              dEnd = fromMaybe d0 (tLast t)
                          in if null (dErr dEnd) then reverse (dRes dEnd) else error (show (dErr dEnd))

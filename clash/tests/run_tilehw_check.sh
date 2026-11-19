@@ -29,8 +29,9 @@
 #     every cycle.
 #  3. Fresh Clash Verilog: Yosys must infer exactly the eleven memories as
 #     $mem_v2 (BG map 64x16, BG rows 64x64, palette 1024x16, OAM 3 x 256x16,
-#     OBJ line buffer 256x16, column descriptors 64x24, OBJ rows 64x64, OBJ
-#     extended palettes 2 x 4096x16) and find no multiplier. Verilator
+#     OBJ line buffer 1024x16 (both engines x two lines, for sprites drawn one
+#     line ahead), column descriptors 64x24, OBJ rows 64x64, OBJ extended
+#     palettes 2 x 4096x16) and find no multiplier. Verilator
 #     replays the pure model's run of both check groups cycle by cycle
 #     (tests/tilehw_cosim.cpp): every request space and address, every
 #     pixel, ready and fault. A corrupted trace must fail.
@@ -99,7 +100,7 @@ else
 fi
 
 build() {
-  (cd "$1" && STACK_YAML="$here/stack.yaml" stack --resolver lts-22.43 ghc -- -O1 -rtsopts -isrc -itest \
+  (cd "$1" && STACK_YAML="$here/stack.yaml" stack --resolver lts-22.43 ghc -- +RTS -M3g -RTS -O1 -rtsopts -isrc -itest \
       -outputdir "$2/obj" test/TileHwCheck.hs -o "$2/tilehw-check" >/dev/null)
 }
 build "$here" "$out"
@@ -114,7 +115,7 @@ fi
 
 # 3. fresh Verilog, memory inference, multipliers, cycle replay
 rm -rf "$out/hdl"
-(cd "$here" && stack exec clash -- --verilog -isrc -fclash-no-escaped-identifiers \
+(cd "$here" && stack exec clash -- +RTS -M3g -RTS --verilog -isrc -fclash-no-escaped-identifiers \
     -outputdir "$out/hdl" src/Nds/Gpu2D/TileHw.hs >/dev/null)
 v=$(find "$out/hdl" -name nds_gpu2d_tilehw.v)
 [ -n "$v" ] || { echo "no generated nds_gpu2d_tilehw.v" >&2; exit 1; }
@@ -129,7 +130,7 @@ shapes=$(awk '/cell \$mem_v2/ { inmem = 1; w = ""; s = "" }
 yosys -p "read_verilog -sv $v; hierarchy -top nds_gpu2d_tilehw; proc; stat -width" > "$out/yosys-raw.log" 2>&1
 muls=$(awk '$2 ~ /^\$mul/ { n += $1 } END { print n + 0 }' "$out/yosys-raw.log")
 echo "yosys: $mems inferred memories (${shapes% }); $muls multipliers"
-[ "$mems" = 11 ] && [ "$shapes" = "1024x16 256x16 256x16 256x16 256x16 4096x16 4096x16 64x16 64x24 64x64 64x64 " ] \
+[ "$mems" = 11 ] && [ "$shapes" = "1024x16 1024x16 256x16 256x16 256x16 4096x16 4096x16 64x16 64x24 64x64 64x64 " ] \
   && [ "$muls" = 0 ] || failures=$((failures + 1))
 
 rm -rf "$out/vobj"
@@ -147,7 +148,7 @@ for t in fixtures random; do
 done
 # negative control: one pixel colour changed in the expected stream
 if "$chk" dump "$fixtures" "$seed" "$cosim" fixtures $rts 2>/dev/null \
-   | awk 'BEGIN { done = 0 } !done && $15 ~ /^[4-7c-f]$/ && NR > 5000 { $18 = ($18 == "0000") ? "0001" : "0000"; done = 1 } { print }' \
+   | awk 'BEGIN { done = 0 } !done && $16 ~ /^[4-7c-f]$/ && NR > 5000 { $19 = ($19 == "0000") ? "0001" : "0000"; done = 1 } { print }' \
    | "$sim" - > "$out/cosim-corrupt.log"; then
   echo "verilog corrupted stream: NOT detected"; failures=$((failures + 1))
 else
@@ -207,6 +208,10 @@ mutant obj-ext-palette-number 's/(if ext then dsPal ds else 0) ++# c8/(0 :: BitV
 mutant obj-ext-enable 's/spExt = is256 \&\& cExtOn c/spExt = is256/'
 mutant obj-rmw-forwarding 's/Just (lx, le) | lx == x -> le/Just (lx, le) | False \&\& lx == x -> le/'
 mutant obj-semitrans-not-refused 's/mode == 1 \&\& cBld2 c = FaultSpr/mode == 1 \&\& False = FaultSpr/'
+# job kinds (A/B sharing, one-line-ahead sprites)
+mutant lb-not-cleared-on-read 's/else if reading then Just (lbAddrOf/else if False then Just (lbAddrOf/'
+mutant jbg-semitrans-not-refused 's/JBg -> sSemi \&\& /JBg -> False \&\& /'
+mutant jobj-emits-output 's/PFetch | fetchDone -> case cKind c of JObj -> PIdle; _ -> POut/PFetch | fetchDone -> POut/'
 
 if [ -n "${MUTANTS:-}" ]; then
   set -- $MUTANTS

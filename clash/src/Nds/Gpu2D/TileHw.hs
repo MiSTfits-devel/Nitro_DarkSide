@@ -78,6 +78,8 @@ module Nds.Gpu2D.TileHw
   ( -- * Ports
     Regs (..)
   , LineReq (..)
+  , JobKind (..)
+  , LbAddr
   , TileIn (..)
   , TileOut (..)
   , PixelOut (..)
@@ -134,6 +136,10 @@ type ExtAddr = Unsigned 13
 -- OBJ row RAMs (sprite tile column, modulo 64).
 type Slot = Unsigned 6
 
+-- | OBJ line-buffer entry: bit 9 the engine, bit 8 the half (line bit 0),
+-- bits 7-0 the x.
+type LbAddr = Unsigned 10
+
 -- | Requests and responses of one line (at most 66 BG and 1,024 OBJ).
 type Count = Unsigned 11
 
@@ -146,10 +152,25 @@ data Regs = Regs
   , rBldCnt  :: !(BitVector 16)
   } deriving (Eq, Show, Generic, NFDataX)
 
--- | A line request: engine (0 = A, 1 = B) and VCOUNT line.
+-- | What a job does. 'JBoth' renders a whole line in one job (sprites for
+-- line y into its OBJ line-buffer half, then BG and composition reading
+-- it). The split kinds let a caller follow the DS's one-line-ahead sprite
+-- timing and time-share one engine between engines A and B: 'JObj' renders
+-- the sprites of line y into half y&1 of that engine's OBJ line buffer and
+-- emits no pixel; 'JBg' fetches line y's BG and composes it with half y&1
+-- (reading and clearing it); 'JClear' only clears half y&1, emitting no
+-- pixel (for a line whose BG is not drawn). A half must be clear when a
+-- 'JObj' or 'JBoth' writes it: every half written is consumed by exactly
+-- one 'JBg', 'JBoth' or 'JClear' of the same line before it is written
+-- again.
+data JobKind = JBoth | JBg | JObj | JClear
+  deriving (Eq, Show, Generic, NFDataX)
+
+-- | A line request: engine (0 = A, 1 = B), VCOUNT line and job kind.
 data LineReq = LineReq
   { lqEngine :: !Bit
   , lqLine   :: !(Unsigned 8)
+  , lqKind   :: !JobKind
   } deriving (Eq, Show, Generic, NFDataX)
 
 -- | Inputs other than the RAM read data.
@@ -222,8 +243,8 @@ data RamOps = RamOps
   , opPalWr  :: !(Maybe (PalAddr, BitVector 16))
   , opOamRd  :: !(Unsigned 8)
   , opOamWr  :: !(Vec 3 (Maybe (Unsigned 8, BitVector 16)))
-  , opLbRd   :: !(Unsigned 8)
-  , opLbWr   :: !(Maybe (Unsigned 8, BitVector 16))
+  , opLbRd   :: !LbAddr
+  , opLbWr   :: !(Maybe (LbAddr, BitVector 16))
   , opDescRd :: !Slot
   , opDescWr :: !(Maybe (Slot, Desc))
   , opObjRd  :: !Slot
@@ -260,7 +281,9 @@ data Spr = Spr
 -- latched at line start.
 data Ctl = Ctl
   { cPhase  :: !Phase
+  , cKind   :: !JobKind
   , cEng    :: !Bit
+  , cHalf   :: !Bit              -- ^ OBJ line-buffer half (line bit 0)
   , cY      :: !(Unsigned 8)
   , cBgOn   :: !Bool             -- ^ a background is enabled (else backdrop only)
   , cBg     :: !(Index 4)
@@ -272,10 +295,13 @@ data Ctl = Ctl
   , cFineY  :: !(Unsigned 3)
   , cScroll :: !(Unsigned 9)
   , cN      :: !Slot             -- ^ BG tile slots this line: 32, 33, or 0 without a BG
-  , cObjOn  :: !Bool
+  , cScanOn :: !Bool             -- ^ the OAM scan runs (OBJ on, 'JBoth' or 'JObj')
+  , cObjOn  :: !Bool             -- ^ composition reads the OBJ line buffer (OBJ on, 'JBoth' or 'JBg')
+  , cOut    :: !Bool             -- ^ pixels are emitted ('JBoth' or 'JBg')
   , cExtOn  :: !Bool             -- ^ DISPCNT bit 31
   , cBound  :: !(Unsigned 2)     -- ^ 1D tile boundary
-  , cBld2   :: !Bool             -- ^ BLDCNT has a second target
+  , cBld2   :: !Bool             -- ^ BLDCNT has a second target (never for 'JObj')
+  , cSemi   :: !(Vec 4 Bool)     -- ^ per engine and half: a semi-transparent sprite was drawn into it
   , cLoaded :: !Count            -- ^ requests loaded into the request register
   , cRcv    :: !Count            -- ^ responses received
   , cRdT    :: !Slot             -- ^ map RAM entry on the read port
@@ -288,7 +314,7 @@ data Ctl = Ctl
   , cPixOn  :: !Bool             -- ^ the writer is inside column cWr
   , cPix    :: !(Unsigned 3)     -- ^ ... at this pixel
   , cOutK   :: !(Unsigned 9)     -- ^ next output pixel to read (256: all read)
-  , cClr    :: !(Unsigned 8)     -- ^ reset sweep position
+  , cClr    :: !LbAddr           -- ^ reset sweep position
   , cFault  :: !(BitVector 16)
   } deriving (Eq, Show, Generic, NFDataX)
 
@@ -314,9 +340,11 @@ data St = St { sC :: !Ctl, sD :: !Dp, sO :: !Outs }
 
 stInit :: St
 stInit = St
-  (Ctl { cPhase = PClear, cEng = 0, cY = 0, cBgOn = False, cBg = 0, cBgPrio = 0, cIs256 = False
+  (Ctl { cPhase = PClear, cKind = JBoth, cEng = 0, cHalf = 0, cY = 0, cBgOn = False, cBg = 0
+       , cBgPrio = 0, cIs256 = False
        , cWide = False, cMapRow = 0, cTiles = 0, cFineY = 0, cScroll = 0, cN = 0
-       , cObjOn = False, cExtOn = False, cBound = 0, cBld2 = False
+       , cScanOn = False, cObjOn = False, cOut = False, cExtOn = False, cBound = 0, cBld2 = False
+       , cSemi = repeat False
        , cLoaded = 0, cRcv = 0, cRdT = 0, cRdV = False
        , cScan = 0, cScanV = False, cSpr = Nothing, cWr = 0, cWrV = False, cPixOn = False, cPix = 0
        , cOutK = 0, cClr = 0, cFault = 0 })
@@ -387,22 +415,37 @@ selBg d
   | testBit d 10 = 2
   | otherwise = 3
 
--- | The line configuration latched at start, counters cleared.
-configOf :: Bit -> Unsigned 8 -> Regs -> Ctl
-configOf eng y r = Ctl
-  { cPhase = PFetch, cEng = eng, cY = y, cBgOn = bgOn, cBg = n, cBgPrio = unpack (slice d1 d0 cnt)
+-- | The line configuration latched at start, counters cleared. The job
+-- kind decides what runs: the BG fetch ('JBoth', 'JBg'), the OAM scan
+-- ('JBoth', 'JObj'; only with DISPCNT bit 12), composition with the OBJ
+-- line buffer ('JBoth', 'JBg'; only with bit 12) and the pixel output
+-- ('JBoth', 'JBg'). 'JClear' runs the output phase without emitting pixels.
+configOf :: Bit -> Unsigned 8 -> JobKind -> Regs -> Ctl
+configOf eng y kind r = Ctl
+  { cPhase = PFetch, cKind = kind, cEng = eng, cHalf = lsb y, cY = y, cBgOn = bgOn, cBg = n
+  , cBgPrio = unpack (slice d1 d0 cnt)
   , cIs256 = testBit cnt 7, cWide = wide
   , cMapRow = mapBase + rowOff, cTiles = dispChar + charBase
   , cFineY = resize yoff, cScroll = hofs
   , cN = if not bgOn then 0 else if resize hofs == (0 :: Unsigned 3) then 32 else 33
-  , cObjOn = testBit d 12, cExtOn = testBit d 31, cBound = unpack (slice d21 d20 d)
-  , cBld2 = slice d13 d8 (rBldCnt r) /= 0
+  , cScanOn = objEn && scans, cObjOn = objEn && composes, cOut = composes
+  , cExtOn = testBit d 31, cBound = unpack (slice d21 d20 d)
+  -- a JObj job never refuses a semi-transparent sprite: the JBg job that
+  -- composes it does, against BLDCNT at its own start (see 'tileStep')
+  , cBld2 = slice d13 d8 (rBldCnt r) /= 0 && not objOnly
+  , cSemi = repeat False
   , cLoaded = 0, cRcv = 0, cRdT = 0, cRdV = False
   , cScan = 0, cScanV = False, cSpr = Nothing, cWr = 0, cWrV = False, cPixOn = False, cPix = 0
   , cOutK = 0, cClr = 0, cFault = 0 }
   where
     d = rDispCnt r
-    bgOn = slice d11 d8 d /= 0
+    objEn = testBit d 12
+    (fetchesBg, scans, composes, objOnly) = case kind of
+      JBoth -> (True, True, True, False)
+      JBg -> (True, False, True, False)
+      JObj -> (False, True, False, True)
+      JClear -> (False, False, False, False)
+    bgOn = fetchesBg && slice d11 d8 d /= 0
     n = selBg d
     cnt = rBgCnt r !! n
     hofs = rHofs r !! n
@@ -578,6 +621,10 @@ objPixel ds w cur = (opaque, pack opaque ++# pack (dsPrio ds) ++# pack ext ++# i
       | ds256 ds = (c8 /= 0, (if ext then dsPal ds else 0) ++# c8)
       | otherwise = (nib /= 0, (0 :: BitVector 4) ++# dsPal ds ++# nib)
 
+-- | Index of an engine's half in 'cSemi'.
+semiIx :: Bit -> Bit -> Index 4
+semiIx e h = fromIntegral (unpack (pack e ++# pack h) :: Unsigned 2)
+
 entryPrio :: BitVector 16 -> Unsigned 2
 entryPrio e = unpack (slice d14 d13 e)
 
@@ -599,10 +646,19 @@ tileStep (St c d o) inp q = (St c' d' o', out, ops)
     eng = cEng c
 
     -- line start: the only cycle the register port is sampled
-    LineReq sEng sY = fromMaybe (LineReq 0 0) (tiStart inp)
+    LineReq sEng sY sKind = fromMaybe (LineReq 0 0 JBoth) (tiStart inp)
     begin = idle && isJust (tiStart inp)
-    faults = faultOf sEng (tiRegs inp)
-    cfg = configOf sEng sY (tiRegs inp)
+    sRegs = tiRegs inp
+    sSemi = cSemi c !! semiIx sEng (lsb sY)
+    -- a JBg job composes a half its JObj job filled: it refuses a
+    -- semi-transparent sprite in it when BLDCNT now has a second target
+    composeSemi = case sKind of
+      JBg -> sSemi && testBit (rDispCnt sRegs) 12 && slice d13 d8 (rBldCnt sRegs) /= 0
+      _ -> False
+    faults = faultOf sEng sRegs .|. (if composeSemi then bit faultSemiTrans else 0)
+    cfg = configOf sEng sY sKind sRegs
+    scansKind = case sKind of JBoth -> True; JObj -> True; _ -> False
+    lbAddrOf x = unpack (pack eng ++# pack (cHalf c) ++# pack x) :: LbAddr
 
     -- request port: BG map and row requests, then sprite columns
     n1 = resize (cN c) :: Count
@@ -641,7 +697,7 @@ tileStep (St c d o) inp q = (St c' d' o', out, ops)
     rdV' = fetching && loaded' >= n1 && loaded' < n2 && cRcv c > loaded' - n1
 
     -- OAM scan: the sprite on the read port is skipped, latched or refused
-    scanning = fetching && cObjOn c && cScanV c && cScan c < 128 && isNothing (cSpr c)
+    scanning = fetching && cScanOn c && cScanV c && cScan c < 128 && isNothing (cSpr c)
     (consume, latched, sprFault)
       | not scanning = (False, Nothing, 0)
       | otherwise = case evalSprite c (qOam q) of
@@ -649,6 +705,7 @@ tileStep (St c d o) inp q = (St c' d' o', out, ops)
           FaultSpr f -> (False, Nothing, f)
           DrawSpr s -> (True, Just s, 0)
     scan' = cScan c + (if consume then 1 else 0)
+    semiSpr = isJust latched && slice d11 d10 (qOam q !! (0 :: Int)) == 1
     spr' = case latched of
       Just s -> Just s
       Nothing -> case cSpr c of
@@ -680,7 +737,7 @@ tileStep (St c d o) inp q = (St c' d' o', out, ops)
     -- end of the fetch phase: every BG response in, and with OBJ on, the
     -- scan finished, every column written and no write pending
     bgDone = rcv' >= n2
-    objDone = not (cObjOn c)
+    objDone = not (cScanOn c)
       || (loaded' >= n2 && scan' >= 128 && isNothing spr' && wr' == loaded' - n2 && isNothing w1')
     fetchDone = fetching && bgDone && objDone
 
@@ -699,14 +756,15 @@ tileStep (St c d o) inp q = (St c' d' o', out, ops)
                  | otherwise -> PClear
           PIdle | begin -> if faults /= 0 then PHalt else PFetch
                 | otherwise -> PIdle
-          PFetch | fetchDone -> POut
+          PFetch | fetchDone -> case cKind c of JObj -> PIdle; _ -> POut
                  | otherwise -> PFetch
           POut | outDone -> PIdle
                | otherwise -> POut
           PHalt -> PHalt
 
     -- control register
-    c' | begin = cfg { cPhase = phase', cFault = faults }
+    c' | begin = cfg { cPhase = phase', cFault = faults
+                     , cSemi = if scansKind then replace (semiIx sEng (lsb sY)) False (cSemi c) else cSemi c }
        | otherwise = c
            { cPhase = phase'
            , cLoaded = loaded'
@@ -722,6 +780,7 @@ tileStep (St c d o) inp q = (St c' d' o', out, ops)
            , cPix = if writing && not wLast then cur + 1 else 0
            , cOutK = cOutK c + (if reading then 1 else 0)
            , cClr = cClr c + (if clearing then 1 else 0)
+           , cSemi = if semiSpr then replace (semiIx eng (cHalf c)) True (cSemi c) else cSemi c
            , cFault = cFault c .|. newFault }
 
     -- datapath registers
@@ -742,7 +801,7 @@ tileStep (St c d o) inp q = (St c' d' o', out, ops)
     d' = Dp
       { dW1 = w1'
       , dLastW = rmwWrite
-      , dS1 = if reading then Just (resize (cOutK c), resize sx) else Nothing
+      , dS1 = if reading && cOut c then Just (resize (cOutK c), resize sx) else Nothing
       , dS2 = case dS1 d of
           Just (x, _) -> Just (x, layer, useExt)
           Nothing -> Nothing }
@@ -782,10 +841,10 @@ tileStep (St c d o) inp q = (St c' d' o', out, ops)
       , opPalWr = tiPalWr inp
       , opOamRd = unpack (pack eng ++# slice d6 d0 (pack scan'))
       , opOamWr = oamWr 0 :> oamWr 1 :> oamWr 2 :> Nil
-      , opLbRd = if outputting then resize (cOutK c) else if writing then wx else 0
+      , opLbRd = if outputting then lbAddrOf (resize (cOutK c)) else if writing then lbAddrOf wx else 0
       , opLbWr = if clearing then Just (cClr c, 0)
-                 else if reading then Just (resize (cOutK c), 0)
-                 else rmwWrite
+                 else if reading then Just (lbAddrOf (resize (cOutK c)), 0)
+                 else fmap (\(x, e) -> (lbAddrOf x, e)) rmwWrite
       , opDescRd = resize wr'
       , opDescWr = if objLoad then Just (resize objIss, colDesc) else Nothing
       , opObjRd = resize wr'
@@ -803,7 +862,7 @@ sprNone = Spr 0 0 0 0 0 0 False False 0 False False 0 0
 
 -- | The engine with its block RAMs: BG map entries (64 x 16) and tile rows
 -- (64 x 64), standard palette (1024 x 16, both engines), OAM attributes 0-2
--- (3 x 256 x 16, both engines), the OBJ line buffer (256 x 16), sprite
+-- (3 x 256 x 16, both engines), the OBJ line buffer (2 engines x 2 halves x 256 x 16), sprite
 -- column descriptors (64 x 24) and rows (64 x 64), and the OBJ extended
 -- palettes (2 x 4096 x 16, one per engine: a single 8192-entry RAM's
 -- initial-value loop exceeds Quartus 17's 5,000 iterations).
@@ -824,7 +883,7 @@ tileHw clk rst en inp = out
     palQ = blockRam clk en (replicate (SNat @1024) 0) (opPalRd <$> ops) (opPalWr <$> ops)
     oamRam i = blockRam clk en (replicate (SNat @256) 0) (opOamRd <$> ops) ((!! i) . opOamWr <$> ops)
     oamQ = bundle (oamRam (0 :: Int) :> oamRam 1 :> oamRam 2 :> Nil)
-    lbQ = blockRam clk en (replicate (SNat @256) 0) (opLbRd <$> ops) (opLbWr <$> ops)
+    lbQ = blockRam clk en (replicate (SNat @1024) 0) (opLbRd <$> ops) (opLbWr <$> ops)
     descQ = blockRam clk en (replicate (SNat @64) (unpack 0)) (opDescRd <$> ops) (opDescWr <$> ops)
     objQ = blockRam clk en (replicate (SNat @64) 0) (opObjRd <$> ops) (opObjWr <$> ops)
     extRam i = blockRam clk en (replicate (SNat @4096) 0) (opExtRd <$> ops) ((!! i) . opExtWr <$> ops)
@@ -848,7 +907,7 @@ data TopOut = TopOut
     { t_name = "nds_gpu2d_tilehw"
     , t_inputs =
         [ PortName "CLK", PortName "RST", PortName "EN"
-        , PortName "START_VALID", PortName "START_ENGINE", PortName "START_LINE"
+        , PortName "START_VALID", PortName "START_ENGINE", PortName "START_LINE", PortName "START_KIND"
         , PortName "DISPCNT", PortName "BGCNT", PortName "HOFS", PortName "VOFS", PortName "BLDCNT"
         , PortName "REQ_READY", PortName "RESP_VALID", PortName "RESP_DATA"
         , PortName "PAL_WR_VALID", PortName "PAL_WR_ADDR", PortName "PAL_WR_DATA"
@@ -861,7 +920,7 @@ data TopOut = TopOut
     }) #-}
 tileHwTopEntity
   :: Clock System -> Reset System -> Enable System
-  -> Signal System Bool -> Signal System Bit -> Signal System (Unsigned 8)
+  -> Signal System Bool -> Signal System Bit -> Signal System (Unsigned 8) -> Signal System (BitVector 2)
   -> Signal System (BitVector 32) -> Signal System (BitVector 64)
   -> Signal System (BitVector 36) -> Signal System (BitVector 36) -> Signal System (BitVector 16)
   -> Signal System Bool -> Signal System Bool -> Signal System (BitVector 64)
@@ -869,15 +928,16 @@ tileHwTopEntity
   -> Signal System Bool -> Signal System (Unsigned 10) -> Signal System (BitVector 16)
   -> Signal System Bool -> Signal System (Unsigned 13) -> Signal System (BitVector 16)
   -> Signal System TopOut
-tileHwTopEntity clk rst en sv se sl dc bc hs vs bl rr rv rd pv pa pd ov oa od xv xa xd =
+tileHwTopEntity clk rst en sv se sl sk dc bc hs vs bl rr rv rd pv pa pd ov oa od xv xa xd =
   top <$> tileHw clk rst en inp
   where
-    start v e l = if v then Just (LineReq e l) else Nothing
+    start v e l k = if v then Just (LineReq e l (kindOf k)) else Nothing
+    kindOf k = case k of 0 -> JBoth; 1 -> JBg; 2 -> JObj; _ -> JClear
     regs dcv bcv hsv vsv blv = Regs dcv (reverse (unpack bcv)) (map unpack (reverse (unpack hsv)))
                                     (map unpack (reverse (unpack vsv))) blv
     opt v x = if v then Just x else Nothing
     wr v a x = if v then Just (a, x) else Nothing
-    inp = TileIn <$> (start <$> sv <*> se <*> sl) <*> (regs <$> dc <*> bc <*> hs <*> vs <*> bl)
+    inp = TileIn <$> (start <$> sv <*> se <*> sl <*> sk) <*> (regs <$> dc <*> bc <*> hs <*> vs <*> bl)
                  <*> rr <*> (opt <$> rv <*> rd) <*> (wr <$> pv <*> pa <*> pd)
                  <*> (wr <$> ov <*> oa <*> od) <*> (wr <$> xv <*> xa <*> xd)
     top x = TopOut (toReady x) (isJust (toReq x)) (maybe False rqObj (toReq x)) (maybe 0 rqAddr (toReq x))
