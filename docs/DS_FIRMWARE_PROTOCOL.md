@@ -207,3 +207,96 @@ physical touch calibration remain outside the supported implementation.
 
 Private dumps, saved profiles and oracle inputs are excluded from public source
 and release packages.
+
+## NDSHaskell companion (v1.0.1 host ABI)
+
+This is a sibling target, **not** SplashDev88's NDS core. The source of the
+launcher contract is the [v1.0.1 release](https://github.com/SplashDev88/NDS4MiSTer/tree/v1.0.1/tools/standalone_host)
+(`043de1f64e1c0f7e02c1981997e6d975820ada42`). Its `Scripts/NDS.sh` and
+hidden `.NDS` installation are hash-pinned and take no alternate-RBF argument.
+[`tools/haskell_host/stage.py`](../tools/haskell_host/stage.py) builds a
+separate `Scripts/NDSHaskell.sh` plus `.NDSHaskell/` manifest, supervisor and
+Cortex-A9 host from the exact release sources. It does not install anything.
+No existing executable, core, original BIOS, ROM, save or preference is
+packaged or replaced. The two launchers must not run simultaneously.
+
+- The sibling uses the installed `.NDS` renderer/service, module, settings,
+  button maps, touch, left/right or stacked display layouts, RTC, Recent Files
+  and browser. Its own core, strict SPI-owner check, menu footer and recovery
+  target explicitly say `NDSHaskell`. The temporary bootstrap config for
+  that core name has a separate journal, not a second saved settings tree.
+  Stock timeouts, exclusive SPI lock and return to Main are retained. The HPS
+  renders; the optional segmented FPGA 3D accelerator is **not** requested.
+  Before stopping Main, the supervisor requires a **new**, fault-free FPGA
+  session and real matching `H3D1` Ready/accepted-session + `H3P1` policy ACK.
+  It reads, never initializes the renderer control page. Attachment isn't a
+  guest frame or gameplay proof.
+- **Boot DS firmware** reads `bios7.bin` (16 KiB), `bios9.bin` (4 KiB) and
+  `firmware.bin` (256 KiB) together; the BIOS pair and both profiles are
+  validated before CPU hold. `config/NDS_storage.cfg` remembers the selected
+  volume/directory separately from games. On first use the firmware picker
+  uses the games folder; a missing remembered device falls back to browsing
+  already-mounted SD/USB/network roots. Select the exact `firmware.bin` entry.
+  Native op 2 uploads BIOS7/9 via wide FIO 4/5 and the 120-byte profile via
+  FIO 6. The entire firmware is served in 512-byte sectors on SD slot 1 from
+  `saves/NDS/firmware.bin` (existing working copy wins, locked, `.previous`
+  retained on atomic commit). A previous copy isn't a second source directory.
+- In stock **Load \*.NDS**, direct boot uses built-in FreeBIOS, **not** those
+  originals. ROM data goes through the release HPS DDR map/envelope, not as
+  BIOS ioctl words. FIO 7 carries personal settings, FIO 8 the save profile;
+  saves are `saves/NDS/<rom-stem>.sav`, slot 0. The companion must explicitly
+  advertise implemented direct mode (sibling FW flags bit 15) before any ROM
+  mount/hold/save write. The native-only wrapper leaves this bit **clear**.
+  Booting original firmware does not establish cartridge or game support.
+
+**Native media:** The stock loader expects the chip-size nibble at `0x14` to
+be 2 and both compressed boot sources to start beyond the 512-byte header.
+These are not universal bootability tests. The sibling additionally recognizes
+the dual-header layout documented in [DeSmuME `CFIRMWARE::unpack`](https://github.com/TASEmulators/desmume/blob/master/desmume/src/firmware.cpp);
+see the [GBATEK header map](https://problemkaputt.de/gbatek-ds-firmware-header.htm).
+For this layout, a zero size nibble alone is never sufficient. It checks the
+physical 256 KiB length; expected native BIOS identities; primary and selected
+secondary tables, boot address ranges and nonoverlap; bounded KEY1 decryption
+using the runtime ARM7 BIOS; LZ streams and joined decoded primary boot CRC;
+and both secondary LZ streams, size and DS RAM destinations. Wi-Fi CRC, user
+area, per-copy CRC/selection and touch calibration checks remain in force.
+The secondary header repeats the **primary** CRC, not an independent checksum
+of every secondary instruction. These are structural checks, not a firmware
+signature or proof every accepted file runs. Nothing repairs or normalizes
+the dump. The unmodified stock host will still reject this layout.
+
+**Reproduce locally** (new output directories, public source only):
+
+```sh
+d=$(mktemp -d)
+curl -fL https://codeload.github.com/SplashDev88/NDS4MiSTer/tar.gz/refs/tags/v1.0.1 -o "$d/source.tgz"
+python3 tools/haskell_host/stage.py "$d/source.tgz" "$d/src" sources
+h="$d/src/tools/standalone_host"
+python3 -B tools/haskell_host/test_renderer_gate.py
+c++ -std=c++17 -O2 -iquote "$h" tools/haskell_host/test_flash_boot.cpp -o "$d/check"
+"$d/check"                             # source-generated alternate firmware
+# Linux with evdev headers; source-generated native FIO/slot protocol test:
+c++ -std=c++17 -O2 -pthread "$h/test_host_firmware.cpp" -o "$d/check-host"
+"$d/check-host"
+# Optional, entirely local. Mount only the three owner files read-only; use a
+# private tmpfs /tmp for check-host's throwaway SD root (no real save paths).
+"$d/check" /owner
+"$d/check-host" /owner
+```
+
+Only after an independently accepted fit and assembly, stage a distributable
+companion using the digest **from that fit**, not a hash auto-enrolled on the
+board. Packaging requires an ARM hard-float static C++ compiler; no gameplay
+or media is compiled into the RBF or launcher.
+
+```sh
+python3 tools/haskell_host/stage.py "$d/source.tgz" "$d/distribution" package \
+  /path/to/NDSHaskell.rbf "$QUALIFIED_RBF_SHA256" --cxx arm-linux-gnueabihf-g++
+```
+
+`Scripts/NDSHaskell.sh --validate-only` checks both pinned packages without
+claiming the board or opening a game. Firmware picker tests observe the
+actual host transport with a **simulated** receiving FPGA. The independent
+no-cartridge melonDS reference reached the native first-settings screen from
+a privately supplied dual-header image; this does **not** establish the
+Haskell core has reached that screen on silicon.

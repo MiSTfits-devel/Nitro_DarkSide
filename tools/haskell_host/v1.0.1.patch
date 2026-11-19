@@ -1,0 +1,472 @@
+--- a/Kickstart.sh
++++ b/Kickstart.sh
+@@ -19,7 +19,7 @@
+     fi
+ fi
+ 
+-kit_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
++kit_dir=/media/fat/Scripts/.NDS
+ if [ -n "$test_root" ]; then
+     support_dir=${test_root}/media/fat/Scripts/.NDS_Standalone/support
+ else
+@@ -284,7 +284,7 @@
+     {
+         core_line=
+         IFS= read -r core_line || [ -n "$core_line" ] || return 1
+-        [ "$core_line" = NDS ] || return 1
++        [ "$core_line" = NDSHaskell ] || return 1
+         core_tail=
+         while IFS= read -r core_tail || [ -n "$core_tail" ]; do
+             [ -z "$core_tail" ] || return 1
+--- a/core_menu.h
++++ b/core_menu.h
+@@ -5,7 +5,7 @@
+ struct CoreOption { unsigned shift, width, count; const char *label; std::array<const char *, 5> values; };
+ inline constexpr const char *LOAD_LABEL = "Load *.NDS";
+ inline constexpr unsigned LOAD_RECENT_INDEX = 3; // FS3 in CONF_STR
+-inline constexpr const char *CORE_VERSION = "NDS4MiSTer v1.0.1";
++inline constexpr const char *CORE_VERSION = "NDSHaskell (v1.0.1 host ABI)";
+ inline constexpr std::array<CoreOption, 8> CORE_OPTIONS{{
+   {5, 2, 4, "Video Layout", {"Left/Right", "Top/Bottom", "Left Only", "Right Only"}},
+   {11, 2, 3, "Video Rotation", {"Off", "90 CCW", "90 CW"}},
+--- a/host.cpp
++++ b/host.cpp
+@@ -118,7 +118,7 @@
+     std::ifstream core("/tmp/CORENAME");
+     std::string core_name;
+     std::getline(core, core_name);
+-    require(core_name == "NDS", "NDS FPGA must be loaded before taking SPI");
++    require(core_name == "NDSHaskell", "NDSHaskell FPGA must be loaded before taking SPI");
+     require(!live_main(), "MiSTer must be stopped before taking SPI");
+     fd = open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
+     require(fd >= 0, "/dev/mem");
+@@ -1389,7 +1389,7 @@
+     neutralInput();
+   }
+   void reset() {
+-    requireHostSaveProfile();
++    if (!native_firmware) requireDirectBoot();
+     firmwareControl(1);
+     clearConsoleInputs();
+     flushFirmware();
+@@ -2014,6 +2014,10 @@
+       return result;
+     } catch (...) { spi.end(); throw; }
+   }
++  void requireDirectBoot() {
++    if (!(firmwareControl().flags & 0x8000))
++      throw std::runtime_error("NDSHaskell does not support direct cartridge boot. Use Boot DS firmware.");
++  }
+   void requireHostSaveProfile() {
+     if (!(firmwareControl().flags & 0x400))
+       throw std::runtime_error("This host requires the matching ARM-area FPGA core. Load the host and core from the same beta kit.");
+@@ -2292,7 +2296,7 @@
+   }
+   void bootFirmware() {
+     ensureFirmware(); // All native source/storage validation precedes CPU hold.
+-    requireHostSaveProfile();
++    firmwareControl(); // Native no-cart mode needs the firmware ABI, not a cartridge save profile.
+     firmwareControl(1);
+     clearConsoleInputs();
+     drain(450);
+@@ -3097,6 +3101,7 @@
+   void load(const std::string &path) {
+     log("loading " + path);
+     require(!live_main(), "another MiSTer process started");
++    requireDirectBoot(); // Before file preparation, CPU hold, mapping or opening a save.
+     beginLoading(fs::path(path).filename().string());
+     loading_started = ms();
+     clearConsoleInputs();
+--- a/supervisor.py
++++ b/supervisor.py
+@@ -7,11 +7,16 @@
+ import argparse, fcntl, hashlib, json, os, signal, subprocess, sys, time, shutil, tempfile, struct
+ from video_target import restore_bootstrap, stage_bootstrap, startup_menu, save_target
+ 
+-KIT = Path(__file__).resolve().parent
++from renderer_gate import prior_token, wait_for_renderer
++
++TARGET = Path(__file__).resolve().parent
++KIT = Path("/media/fat/Scripts/.NDS")
++sys.path.append(str(KIT))
++PACKAGE = json.loads((TARGET / "manifest.json").read_text())
+ LEASE = Path("/tmp/nds-standalone-lease.json")
+ BEAT = Path("/tmp/nds-standalone-heartbeat")
+-KICK = str(KIT / "Kickstart.sh")
+-CORE = KIT / "NDS_Standalone.rbf"
++KICK = str(TARGET / "Kickstart.sh")
++CORE = TARGET / "NDSHaskell.rbf"
+ RUNTIME = Path("/tmp/nds-standalone")
+ EXPECTED_WC_618 = "c613e032ff795422453178d58bc89f5c282f3681ef0c5ecf303cb39807f81fe3"
+ EXPECTED_CLOCK = "1ff17e6b13f0fa1013ef9a7e1325f27572049b5dccf4b77da081e03181aaa46f"
+@@ -34,8 +39,10 @@
+     "ConsoleMode/MiSTer_ConsoleMode",
+ )
+ EXPECTED_HELPER = "3834859ec6550b005d2f98c5e5255154a86aad0354669e30ad4895d09d2f4af9"
+-EXPECTED_CORE = "1f7809747e255074be986204ee27aa8a456af4d0397f70f5d5450786a50dae65"
+-EXPECTED_KICKSTART = "f034ccdf9fa70d01f0cc0c43c23fe60d488c6483e2908500b0b55c725046d18e"
++STOCK_CORE = "1f7809747e255074be986204ee27aa8a456af4d0397f70f5d5450786a50dae65"
++STOCK_KICKSTART = "f034ccdf9fa70d01f0cc0c43c23fe60d488c6483e2908500b0b55c725046d18e"
++EXPECTED_CORE = PACKAGE["files"]["NDSHaskell.rbf"]
++EXPECTED_KICKSTART = PACKAGE["files"]["Kickstart.sh"]
+ EXPECTED_SPEED_ENV = {
+     "NDS4MISTER_PARALLEL_CLEAR": "0",
+     "NDS4MISTER_PARALLEL_FINAL_PASS": "1",
+@@ -237,7 +244,7 @@
+         control = Path(state.get("graphics_control", ""))
+         if control.parent == RUNTIME and control.name.startswith("nds-graphics-"):
+             control.unlink(missing_ok=True)
+-        restore_bootstrap(KIT, SD_ROOT)
++        restore_bootstrap(TARGET, SD_ROOT)
+         started_main = not mains()
+         if started_main:
+             # Old leases predate executable recording and used stock Main.
+@@ -245,7 +252,7 @@
+                 "exe", str(SD_ROOT.resolve() / "MiSTer")))
+             with open(RUNTIME / "recovery-main.log", "wb", buffering=0) as log:
+                 subprocess.Popen(
+-                    [str(executable), str(CORE) if core_name() == "NDS" else "menu.rbf"],
++                    [str(executable), str(CORE) if core_name() == "NDSHaskell" else "menu.rbf"],
+                     cwd=str(SD_ROOT),
+                     stdin=subprocess.DEVNULL,
+                     stdout=log,
+@@ -265,7 +272,7 @@
+                  and len(mains()) == 1, 45)
+         print("Normal MiSTer menu restored", flush=True)
+         target = selected_core(state.get("selected_core")) if state.get("done") and state.get("host_returncode") == 0 else None
+-        if target and target.suffix.lower() == ".rbf" and target.stem.upper().startswith("NDS") and sha(target) != EXPECTED_CORE:
++        if target and target.suffix.lower() == ".rbf" and target.stem.upper().startswith("NDS") and sha(target) != STOCK_CORE:
+             state["selected_core_rejected"] = str(target)
+             state["selected_core_message"] = (
+                 "This NDS core requires its matching helper. Normal MiSTer has been restored. "
+@@ -277,9 +284,10 @@
+             # Only our exact FPGA may run with this package's renderer.
+             # Other cores use Main alone; do not leave an NDS helper waiting.
+             if target.suffix.lower() == ".rbf" and target.stem.upper().startswith("NDS"):
+-                assert sha(HELPER) == EXPECTED_HELPER and sha(Path(KICK)) == EXPECTED_KICKSTART
++                stock_kick = KIT / "Kickstart.sh"
++                assert sha(HELPER) == EXPECTED_HELPER and sha(stock_kick) == STOCK_KICKSTART
+                 env = {k: v for k, v in os.environ.items() if not k.startswith(("NDS", "H3D_"))}
+-                subprocess.run(["sh", KICK, "start"], check=True, env=env,
++                subprocess.run(["sh", str(stock_kick), "start"], check=True, env=env,
+                                stdout=subprocess.DEVNULL, timeout=15)
+             previous_main = mains()[0]
+             cmd("load_core " + str(target), 30)
+@@ -459,9 +467,10 @@
+                            (KIT / "clock_control.py", EXPECTED_CLOCK), wc_module()):
+         prerequisite(path.is_file() and sha(path) == expected,
+                      "Package checksum mismatch or missing file: " + path.name)
+-    manifest = json.loads((KIT / "manifest.json").read_text())
+-    host = KIT / "nds_standalone_host"
+-    prerequisite(host.is_file() and sha(host) == manifest["host_sha256"],
++    prerequisite(not (KIT / "bootstrap-video-restore.json").exists(),
++                 "Stock NDS recovery pending; restore its session before starting NDSHaskell")
++    host = TARGET / "nds_standalone_host"
++    prerequisite(host.is_file() and sha(host) == PACKAGE["files"]["nds_standalone_host"],
+                  "Standalone menu checksum mismatch")
+     prerequisite(os.access(host, os.X_OK) and os.access(HELPER, os.X_OK),
+                  "Standalone executables are not executable")
+@@ -530,7 +539,7 @@
+     lock = open("/tmp/nds-standalone-supervisor.lock", "w")
+     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+     preflight()
+-    restore_bootstrap(KIT, SD_ROOT)
++    restore_bootstrap(TARGET, SD_ROOT)
+     from install_layout import migrate_legacy_settings
+     migrate_legacy_settings(KIT, SD_ROOT)
+     initialize_settings()
+@@ -544,8 +553,8 @@
+     ), "Standalone core/helper mismatch; nothing changed"
+     assert sha(Path(KICK)) == EXPECTED_KICKSTART, "Standalone Kickstart mismatch; nothing changed"
+     assert (
+-        sha(KIT / "nds_standalone_host")
+-        == json.loads((KIT / "manifest.json").read_text())["host_sha256"]
++        sha(TARGET / "nds_standalone_host")
++        == PACKAGE["files"]["nds_standalone_host"]
+     ), "Host mismatch"
+     original_main = require_main()
+     assert not Path(
+@@ -605,8 +614,7 @@
+         texture_choice = os.environ.get("NDS4MISTER_TEXTURE_HISTORY", "1")
+         assert texture_choice in ("0", "1"), "Invalid texture-history choice"
+         env["NDS4MISTER_TEXTURE_HISTORY"] = texture_choice
+-        fpga3d_choice = os.environ.get("NDS4MISTER_FPGA3D", "1")
+-        assert fpga3d_choice in ("0", "1"), "Invalid FPGA3D choice"
++        fpga3d_choice = "0"  # Matched HPS renderer; no segmented FPGA raster accelerator.
+         env["NDS4MISTER_FPGA3D"] = fpga3d_choice
+         for option in ("NDS4MISTER_SOLID_SPANS",
+                        "NDS4MISTER_APPROX_FACTORS",
+@@ -652,26 +660,20 @@
+         assert actual_env.get("NDS4MISTER_TEXTURE_HISTORY") == texture_choice
+         assert actual_env.get("NDS4MISTER_FPGA3D") == fpga3d_choice
+         state["renderer_environment"] = actual_env
+-        state["release"] = json.loads((KIT / "manifest.json").read_text())["version"]
++        state["release"] = PACKAGE["target"]
+         write()
+         stage("load standalone core")
+-        stage_bootstrap(KIT, SD_ROOT, validate_settings().read_bytes())
++        stage_bootstrap(TARGET, SD_ROOT, validate_settings().read_bytes())
+         state["bootstrap_video"] = "single-screen-240p"
+         write()
+         previous = mains()[0]
++        old_token = prior_token()
+         cmd("load_core " + str(CORE))
+-        wait_for(lambda: core_name() == "NDS" and not alive(previous))
+-        time.sleep(3)
+-        stage("normal NDS core loaded, inspecting renderer")
++        wait_for(lambda: core_name() == "NDSHaskell" and not alive(previous))
++        stage("await fresh NDSHaskell H3D1/H3P1 renderer acknowledgment")
+         hp = int(Path("/tmp/nds-hybrid-3d-service.pid").read_text())
+         assert sha(Path("/proc/%d/exe" % hp)) == EXPECTED_HELPER
+-        # Record the shared header before takeover to separate reload failures
+-        # from frontend failures. This is not proof of visible gameplay.
+-        import mmap
+-        with open("/dev/mem", "rb", buffering=0) as memory:
+-            with mmap.mmap(memory.fileno(), 4096, flags=mmap.MAP_SHARED,
+-                           prot=mmap.PROT_READ, offset=0x3fc00000) as page:
+-                state["before_takeover_header"] = list(struct.unpack("<32I",page[:128]))
++        state["renderer_epoch"] = wait_for_renderer(old_token)
+         write()
+         owned = mains()
+         assert len(owned) == 1
+@@ -708,13 +710,13 @@
+         stage("stop normal Main")
+         kill(owned[0])
+         assert not mains()
+-        restore_bootstrap(KIT, SD_ROOT)
++        restore_bootstrap(TARGET, SD_ROOT)
+         state["bootstrap_settings_restored"] = True
+         write()
+         hlog = open(RUNTIME / "host.log", "wb", buffering=0)
+         host = subprocess.Popen(
+             [
+-                str(KIT / "nds_standalone_host"),
++                str(TARGET / "nds_standalone_host"),
+                 str(KIT),
+                 "/media/fat/games/NDS",
+                 a.rom or "-",
+--- a/test_host_firmware.cpp
++++ b/test_host_firmware.cpp
+@@ -34,7 +34,7 @@
+     struct Request { unsigned slot, op; uint32_t lba; nds_firmware::Sector data; };
+     Host &host;
+     std::deque<Request> requests;
+-    uint16_t flags = 0x420, sequence = 7, error = 0, operation = 0;
++    uint16_t flags = 0x8420, sequence = 7, error = 0, operation = 0;
+     uint16_t index = 0;
+     nds_firmware::Bytes asset, profile, game_pages, save_profile;
+     unsigned durable_acks = 0, clock_seeds = 0;
+@@ -175,6 +175,7 @@
+     sources(sd/"games/NDS");
+     const auto original=readBytes(sd/"games/NDS/firmware.bin");
+     FakeFirmware device(host);
++    device.flags &= ~0x8400; // Native no-cart target: no direct boot or cart-save capabilities.
+     host.spi.history.clear();bootFromMenu(host);
+     assert(host.native_firmware && !host.menu && host.firmware_slot_mounted);
+     assert(!host.firmware_error_dialog && host.firmware->image() == original);
+@@ -195,11 +196,30 @@
+     assert(device.profile[0] == 0 && device.profile[1] == 0xfe && device.profile[2] == 3);
+     assert(std::equal(original.begin() + user, original.begin() + user + 0x70, device.profile.begin() + 8));
+     std::vector<uint16_t> indices;
++    std::array<nds_firmware::Bytes, 2> transferred;
+     for (const auto &t : host.spi.history) if (t.select == Spi::FIO) {
+       if (t.command == 0x55) indices.push_back(t.words.at(0));
+       if (t.command == 0x53 && t.words[0]) assert(t.words == std::vector<uint16_t>({1, 0, 0}));
++      if (t.command == 0x54 && (indices.back() == 4 || indices.back() == 5))
++        for (uint16_t word : t.words) {
++          transferred[indices.back() - 4].push_back(uint8_t(word));
++          transferred[indices.back() - 4].push_back(uint8_t(word >> 8));
++        }
+     }
+     assert(indices == std::vector<uint16_t>({4, 5, 6}));
++    assert(transferred[0] == readBytes(sd/"games/NDS/bios7.bin"));
++    assert(transferred[1] == readBytes(sd/"games/NDS/bios9.bin"));
++    host.spi.history.clear();
++    bool rejected = false;
++    try { host.load((sd/"games/NDS/unsupported.nds").string()); }
++    catch (const std::runtime_error& e) { rejected = std::string(e.what()).find("does not support direct") != std::string::npos; }
++    assert(rejected && host.native_firmware && !fs::exists(sd/"saves/NDS/unsupported.sav"));
++    assert(host.spi.history.size() == 1 && host.spi.history[0].select == Spi::IO &&
++           host.spi.history[0].command == 0x45 && host.spi.history[0].words[0] == 0);
++    assert(readBytes(host.firmwarePath()) == original);
++    std::cout << "PASS NDSHaskell no-cart picker transferred all 16384+4096 source-marker BIOS bytes;"
++                 " unsupported direct boot refused before file I/O, hold or save mount\n";
++    device.flags |= 0x8400; // Exercise upstream regression cases with a *simulated* direct-capable FPGA.
+     // Diagnostics off: explicit video metadata never adds a firmware query.
+     host.spi.history.clear(); framebuffer_metadata_requested = 1;
+     host.serviceFramebufferMetadataRequest();
+@@ -498,10 +518,41 @@
+     nds_storage::test_volumes.clear();
+     std::cout << "PASS first-use browser, silent remembered firmware boot after restart/USB renumbering, cancellation, missing-file and missing-drive browser fallback without CPU hold or saved-data changes\n";
+   }
++  static void nativeSource(const fs::path& root, const fs::path& source) {
++    const auto sd=root/"sd", kit=root/"kit", games=sd/"games/NDS";
++    fs::create_directories(kit); fs::create_directories(games);
++    nds_storage::test_volumes={{sd,"sd","SD"}, {source,"uuid:read-only-fixture","External"}};
++    Host host(kit.string(),games.string(),sd); FakeFirmware device(host); device.flags &= ~0x8400;
++    host.cursor=1;host.action(2);finishStorage(host);
++    host.browseGames(source);finishStorage(host);
++    const auto entry=std::find_if(host.roms.begin(),host.roms.end(),[](const auto&e){return e.name=="firmware.bin";});
++    assert(entry!=host.roms.end());host.cursor=int(entry-host.roms.begin());host.spi.history.clear();
++    host.action(2);finishStorage(host);assert(host.native_firmware && host.firmware_slot_mounted && !host.menu);
++    std::array<nds_firmware::Bytes,2> tx;
++    uint16_t index=0;
++    for(const auto&t:host.spi.history) if(t.select==Spi::FIO) {
++      if(t.command==0x55) index=t.words.at(0);
++      if(t.command==0x54 && (index==4||index==5)) for(auto word:t.words) {
++        tx[index-4].push_back(uint8_t(word));tx[index-4].push_back(uint8_t(word>>8));
++      }
++    }
++    assert(tx[0]==readBytes(source/"bios7.bin") && tx[1]==readBytes(source/"bios9.bin"));
++    const auto original=readBytes(source/"firmware.bin");
++    for(unsigned lba=0;lba<512;++lba){
++      nds_firmware::Sector expected;std::copy_n(original.data()+512*lba,512,expected.begin());
++      device.requests.push_back({1,1,lba,expected});assert(host.sector() && device.requests.empty());
++    }
++    assert(readBytes(host.firmwarePath())==original && device.durable_acks==0);
++    std::cout<<"PASS native picker/FIO4+5 byte equality and all 512 slot-1 read sectors; no guest writes\n";
++  }
+ };
+-int main() {
++int main(int argc, char** argv) {
+   char name[] = "/tmp/nds-host-firmware-XXXXXX";
+   const auto root = mkdtemp(name); assert(root);
+-  try { HostTest::run(root); HostTest::relocatedSources(root); HostTest::directIsolation(root); HostTest::rememberedBoot(root); fs::remove_all(root); }
++  try {
++    if(argc==2) HostTest::nativeSource(root,fs::canonical(argv[1]));
++    else {assert(argc==1);HostTest::run(root);HostTest::relocatedSources(root);HostTest::directIsolation(root);HostTest::rememberedBoot(root);}
++    fs::remove_all(root);
++  }
+   catch (...) { fs::remove_all(root); throw; }
+ }
+--- a/video_target.py
++++ b/video_target.py
+@@ -84,7 +84,7 @@
+     applied = bytes.fromhex(record["applied"])
+     if len(applied) != 16 or (original is not None and len(original) != 16):
+         raise RuntimeError("Invalid bootstrap settings backup; recovery retained")
+-    path = Path(sd_root) / "config/NDS_v1.CFG"
++    path = Path(sd_root) / "config/NDSHaskell_v1.CFG"
+     if path.is_symlink():
+         raise RuntimeError("NDS config is a symbolic link; bootstrap backup retained")
+     current = path.read_bytes() if path.exists() else None
+@@ -105,7 +105,7 @@
+     journal = Path(kit) / JOURNAL
+     if journal.exists():
+         raise RuntimeError("Previous bootstrap settings backup needs recovery")
+-    path = Path(sd_root) / "config/NDS_v1.CFG"
++    path = Path(sd_root) / "config/NDSHaskell_v1.CFG"
+     if path.is_symlink():
+         raise RuntimeError("NDS config is a symbolic link; nothing overwritten")
+     original = path.read_bytes() if path.exists() else None
+--- a/firmware_media.h
++++ b/firmware_media.h
+@@ -4,6 +4,8 @@
+ // https://mgba-emu.github.io/gbatek/#ds-firmware-header
+ // https://mgba-emu.github.io/gbatek/#ds-firmware-user-settings
+ // Personal dumps are runtime inputs, never generated or redistributed assets.
++#include "flash_boot.h"
++#include <optional>
+ #include <algorithm>
+ #include <array>
+ #include <cerrno>
+@@ -73,14 +75,14 @@
+   bool nonadjacent_counters = false;
+   CalibrationAxis x, y;
+ };
+-inline uint32_t validateHeader(const Bytes &bytes) {
++inline uint32_t validateHeader(const Bytes &bytes, const Bytes *nativeBios7 = nullptr) {
+   if (bytes.size() != image_size)
+     throw std::runtime_error("Firmware must be a 256 KiB Nintendo DS/DS Lite image");
+   if (bytes[8] != 'M' || bytes[9] != 'A' || bytes[10] != 'C' ||
+       (bytes[0x1d] != 0xff && bytes[0x1d] != 0x20))
+     throw std::runtime_error("Unsupported firmware: Nintendo DS/DS Lite image required");
+   const uint16_t shifts = le16(bytes.data() + 0x14);
+-  if ((shifts >> 12) != 2)
++  if ((shifts >> 12) != 2 && !nativeBios7)
+     throw std::runtime_error("Firmware header does not describe a 256 KiB chip");
+   const uint32_t user = uint32_t(le16(bytes.data() + 0x20)) * 8;
+   if (user < 0x200 || (user & 0xff) || user > image_size - 0x200)
+@@ -93,18 +95,22 @@
+       uint32_t(le16(bytes.data() + 0xc)) << (2 + (shifts & 7)),
+       uint32_t(le16(bytes.data() + 0x10)) << (2 + ((shifts >> 6) & 7)),
+       uint32_t(le16(bytes.data() + 0x16)) * 8}};
+-  for (auto location : locations)
+-    if (location < 0x200 || location >= user)
+-      throw std::runtime_error("Firmware code/data pointer is outside the image");
++  if ((shifts >> 12) == 2) {
++    for (auto location : locations)
++      if (location < 0x200 || location >= user)
++        throw std::runtime_error("Firmware code/data pointer is outside the image");
++  } else {
++    nds_flash_boot::verify(bytes, *nativeBios7);
++  }
+   const auto wifi_length = le16(bytes.data() + 0x2c);
+   if (wifi_length < 2 || wifi_length > 0x200 - 0x2c ||
+       crc16(bytes.data() + 0x2c, wifi_length, 0) != le16(bytes.data() + 0x2a))
+     throw std::runtime_error("Firmware Wi-Fi calibration checksum is invalid");
+   return user;
+ }
+-inline Profile inspectProfile(const Bytes &bytes) {
++inline Profile inspectProfile(const Bytes &bytes, const Bytes *nativeBios7 = nullptr) {
+   Profile profile;
+-  profile.user_offset = validateHeader(bytes);
++  profile.user_offset = validateHeader(bytes, nativeBios7);
+   std::array<bool, 2> valid{};
+   std::array<uint16_t, 2> count{};
+   for (unsigned i = 0; i < 2; ++i) {
+@@ -155,6 +161,7 @@
+   };
+   struct Identity { dev_t device; ino_t inode; };
+   Bytes bios7_, bios9_, image_;
++  mutable std::optional<Profile> checked_profile_;
+   fs::path working_;
+   std::vector<Identity> sources_;
+   Fd lock_, directory_;
+@@ -340,7 +347,7 @@
+           "bios9.bin is not the supported native Nintendo DS BIOS");
+     if (originals.identities.size() != 3)
+       throw std::runtime_error("Incomplete original firmware identities");
+-    (void)inspectProfile(originals.firmware);
++    (void)inspectProfile(originals.firmware, &originals.bios7);
+   }
+   static Originals readOriginals(const fs::path &sourceDirectory) {
+     Media reader;
+@@ -372,6 +379,7 @@
+     }
+     bios7_ = std::move(originals.bios7);
+     bios9_ = std::move(originals.bios9);
++    checked_profile_.reset();
+   }
+   static Media open(const fs::path &sourceDirectory, const fs::path &workingPath
+ #ifdef STANDALONE_FIRMWARE_TEST
+@@ -417,7 +425,7 @@
+     if (exists(media.working_)) {
+       media.safeDestination(media.working_);
+       media.image_ = media.readFile(media.working_, image_size, false);
+-      (void)inspectProfile(media.image_); // No silent reseed or repair.
++      (void)media.profile(); // No silent reseed or repair.
+     } else {
+       // A previous image with missing current data is a recovery case, not a
+       // first installation. Preserve it and require an explicit decision.
+@@ -432,7 +440,11 @@
+   const Bytes &bios7() const { return bios7_; }
+   const Bytes &bios9() const { return bios9_; }
+   const Bytes &image() const { usable(); return image_; }
+-  Profile profile() const { usable(); return inspectProfile(image_); }
++  const Profile &profile() const {
++    usable();
++    if (!checked_profile_) checked_profile_ = inspectProfile(image_, &bios7_);
++    return *checked_profile_;
++  }
+   Sector readSector(uint32_t lba) const {
+     usable();
+     if (lba >= image_size / sector_size)
+@@ -458,6 +470,7 @@
+       atomicWrite(working_.string() + ".previous", image_, false, "backup-write", backupInstalled);
+       atomicWrite(working_, next, false, "current-write", installed);
+       image_.swap(next); // Durable completion; caller may now acknowledge commit.
++      checked_profile_.reset();
+     } catch (...) {
+       // A rename followed by a failed directory sync has uncertain durability.
+       // Freeze this instance; reopen explicitly to select the actual on-disk copy.
