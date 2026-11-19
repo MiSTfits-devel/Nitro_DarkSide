@@ -19,13 +19,13 @@ phaseOBJRead p n = memoryRead (phaseOBJMemory p n)
 phaseOAMRead :: Phase -> Int -> Word32 -> Word8
 phaseOAMRead p n = memoryRead (phaseOAMMemory p n)
 
--- The A-OBJ extension map uses bits 4/5 for banks F/G respectively.
+-- Map bits are physical bank indices (A=0); trace regions 0/1 are palette/OAM.
 phaseOBJExtRead :: Phase -> Int -> Word32 -> Word8
 phaseOBJExtRead p n addr =
   let ExtendedPaletteMap mappings = phaseExtendedPaletteMap p
       mapping = word32At mappings (if n == 0 then 16 else 36)
-      bank bit region = if testBit mapping bit then readRegion8 (phaseMemory p) region (fromIntegral (addr .&. 0x1fff)) else 0
-  in if n == 0 then bank 4 7 .|. bank 5 8 else bank 8 10
+      bank b = if testBit mapping b then readRegion8 (phaseMemory p) (b+2) (fromIntegral (addr .&. 0x1fff)) else 0
+  in if n == 0 then bank 5 .|. bank 6 else bank 8
 
 -- | Resolve the latched vertical/horizontal window state in the same order as
 -- CalculateWindowMask. OBJ window is produced at the prior sprite phase.

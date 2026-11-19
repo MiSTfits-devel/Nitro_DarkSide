@@ -51,6 +51,15 @@ mode-7 rejections. Gates: `clash/tests/run_bg_check.sh`,
 in [clash/README.md, v12 raw 3D replay](../clash/README.md#v12-raw-3d-replay-and-composition).
 Finite directed/seeded coverage, not every register history.
 
+The original sprite matrix checks OBJ indices before palette lookup; the
+1,897 composed lines had no A-OBJ extended palette mapped. The M1 trace also
+had a zero A-OBJ extended map on all 23,808 scanlines. Neither could detect
+the subsequently corrected F/G bank selection. The compose gate now includes
+an 8bpp OBJ with a single palette bank (A:F, A:G, B:I), checking literal
+colours and production melonDS output. Overlapping F+G uses the bitwise OR
+in Haskell; vendored melonDS's multi-bank fallback reads only G in this case
+and is not an oracle for it. These cases extend M2, not the M6 cartridge run.
+
 ## M3: 3D chip hardware model (done, host only)
 
 Final chip-only acceptance: **40/40 default cases (16 directed, 16 seeded

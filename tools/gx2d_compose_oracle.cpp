@@ -69,6 +69,7 @@ struct Case
     u32 lcdc = 0, captureCnt = 0, fifoSeed = 0;
     u32 craftBG = 0;     // bit n: craft solid 4bpp text rows for engine n
     int spriteSet = -1;  // -1 none, 0 normal, 1 translucent, 2 OBJ window
+    int objExtBank = -1; // single physical palette bank, independent of tile VRAM
 };
 
 u16 palWord(u32 seed, u32 i)
@@ -269,6 +270,24 @@ void applyCase(GPU& gpu, SoftRenderer& parent, GPU2D& eA, GPU2D& eB,
                 if (cfg.layerEnable & (1u << bg))
                     craftText(gpu, n, cfg, int(c.line), bg);
         craftSprites(gpu, n, c, int(c.line));
+    }
+
+    if (c.objExtBank >= 0)
+    {
+        // One 8bpp 8x8 OBJ at x=40, palette 3, tile filled with index 0x11.
+        // Switch the actual VRAMCNTs, not the flat renderer palette or its mask.
+        const int bank = c.objExtBank, engine = bank == 8;
+        gpu.MapVRAM_FG(5, bank == 5 ? 0x85 : 0);
+        gpu.MapVRAM_FG(6, bank == 6 ? 0x85 : 0);
+        gpu.MapVRAM_I(8, bank == 8 ? 0x83 : 0);
+        u8* oam = gpu.OAM + engine * 0x400;
+        for (int i = 1; i < 128; ++i) setOAM(oam, i, 0x0200, 0, 0, 0);
+        setOAM(oam, 0, u16(0x2000 | c.line), 40, 0x3000, 0);
+        for (int i = 0; i < 64; ++i) writeFlat(gpu, engine, i, 0x11);
+        const u16 color = bank == 5 ? 0x001f : bank == 6 ? 0x03e0 : 0x7c00;
+        const int entry = 2 * (3 * 256 + 0x11);
+        gpu.VRAM[bank][entry] = u8(color);
+        gpu.VRAM[bank][entry + 1] = u8(color >> 8);
     }
 
     for (int bank = 0; bank < 9; bank++)
@@ -921,6 +940,19 @@ std::vector<Case> buildCases()
         addFixed(c, "invalid video mode 7", 500);
     }
 
+    // Append so seed, frame and line identities of the historic matrix are unchanged.
+    for (int bank : {5, 6, 8})
+    {
+        Case c;
+        c.objExtBank = bank;
+        c.line = 40;
+        auto& e = c.eng[bank == 8];
+        e.dispcnt = 0x80011010; // OBJ ext palette, normal display, OBJ enabled, 1D
+        e.layerEnable = 0x10;
+        e.objEnable = 1;
+        add(c, bank == 5 ? "A OBJ palette F" : bank == 6 ? "A OBJ palette G" : "B OBJ palette I", 501 + bank);
+    }
+
     return cases;
 }
 }
@@ -964,6 +996,21 @@ int main(int argc, char** argv)
         parent.DrawSprites(c.line);
         NDS4MiSTer::EmitTrace2DScanline(gpu, c.line);
         parent.DrawScanline(c.line);
+        if (c.objExtBank >= 0)
+        {
+            // Independent literal check: the eight sprite pixels must not
+            // silently compare equal as backdrop/black on both renderers.
+            u32 *top, *bottom;
+            parent.GetRenderedScanlines(c.line, &top, &bottom);
+            const u32* line = c.objExtBank == 8 ? top : bottom;
+            const u32 expected = c.objExtBank == 5 ? 0xfffb0000 : c.objExtBank == 6 ? 0xff00fb00 : 0xff0000fb;
+            for (int x = 40; x < 48; ++x)
+                if (line[x] != expected)
+                {
+                    fprintf(stderr, "%s x=%d got %08x expected %08x\n", c.name.c_str(), x, line[x], expected);
+                    return 1;
+                }
+        }
         fprintf(g_cases, "%u %u %u %s\n", c.frame, c.line, c.kind, c.name.c_str());
     }
 
