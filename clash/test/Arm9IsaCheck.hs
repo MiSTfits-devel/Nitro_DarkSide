@@ -1,11 +1,13 @@
 -- SPDX-License-Identifier: GPL-3.0-or-later
--- CPU-only ISA fixture: run the production sliceStep on an assembled image
--- and compare ordered mailbox stores against hand-derived expectations.
--- Mailbox slot k is RAM word k; with --scratch N, word indices N and above
--- are free scratch (results must be read back into the mailbox). No store
--- of any kind may follow the last mailbox word. The GPU link is never ready;
--- after the mailbox the run must stay quiet, fault exactly (--fault CODE
--- ADDR) or hold one exact link offer (--offer R|W WIDTH ADDR DATA).
+-- CPU-only ISA fixture: run the production core (the ARM9 build, or with
+-- --arm7 the ARMv4T ARM7 build whose boot ROM is at 0) on an assembled
+-- image and compare ordered mailbox stores against hand-derived
+-- expectations. Mailbox slot k is RAM word k; with --scratch N, word
+-- indices N and above are free scratch (results must be read back into the
+-- mailbox). No store of any kind may follow the last mailbox word. The GPU
+-- link is never ready; after the mailbox the run must stay quiet, fault
+-- exactly (--fault CODE ADDR) or hold one exact link offer (--offer R|W
+-- WIDTH ADDR DATA).
 module Main (main) where
 
 import Control.Monad (unless, when)
@@ -38,9 +40,13 @@ main = do
   (romPath, expectPath, rest) <- case args of
     r : e : more -> pure (r, e, more)
     _ -> fail usage
-  (scratch, modeArgs) <- case rest of
+  let (arch, rest') = case rest of
+        "--arm7" : more -> (arm7Arch, more)
+        _ -> (arm9Arch, rest)
+      base = fromIntegral (vectorBase arch) :: Word32
+  (scratch, modeArgs) <- case rest' of
     "--scratch" : n : more -> (\n' -> (fromIntegral n', more)) <$> hexWord n
-    _ -> pure (64 :: Int, rest)
+    _ -> pure (64 :: Int, rest')
   want <- case modeArgs of
     [] -> pure Quiet
     ["--fault", c, a] -> Fault <$> hexWord c <*> hexWord a
@@ -52,8 +58,8 @@ main = do
   check "mailbox overlaps scratch" (length expected <= scratch)
   let total = length expected
       fetch addr
-        | addr >= 0xffff0000 && addr < 0xffff0000 + 4 * fromIntegral (length rom) =
-            rom !! fromIntegral ((addr - 0xffff0000) `div` 4)
+        | addr >= base && addr - base < 4 * fromIntegral (length rom) =
+            rom !! fromIntegral ((addr - base) `div` 4)
         | otherwise = 0xe7f000f0
       loop :: Int -> Int -> Int -> Maybe Int -> SliceState -> IO ()
       loop tick stores retired doneAt state = do
@@ -62,7 +68,7 @@ main = do
             input = SliceIn { bootWord = fromIntegral (fetch (addr - addr `mod` 4))
                             , gpuReqReady = False, gpuReplyValid = False
                             , gpuReplyData = 0, gpuReplyFault = False, irqRequest = False }
-            (state', out) = sliceStep state input
+            (state', out) = coreStep arch state input
             code = fromIntegral (fault out) :: Word32
             faultAddress = fromIntegral (faultAddr out) :: Word32
             reqAddr = fromIntegral (gpuReqAddr out) :: Word32
@@ -100,6 +106,6 @@ main = do
             when (want /= Quiet) (fail "expected fault/offer did not occur")
             printf "PASS: %d mailbox stores, %d retired instructions, no GPU access\n" total retired'
           _ -> loop (tick + 1) stores' retired' doneAt' state'
-  loop 0 0 0 Nothing initialSlice
+  loop 0 0 0 Nothing (initialCore arch)
  where
-  usage = "usage: arm9-isa-check ROM.hex EXPECTED [--scratch N] [--fault CODE ADDR | --offer R|W WIDTH ADDR DATA]"
+  usage = "usage: arm9-isa-check ROM.hex EXPECTED [--arm7] [--scratch N] [--fault CODE ADDR | --offer R|W WIDTH ADDR DATA]"

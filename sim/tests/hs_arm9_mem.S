@@ -14,7 +14,9 @@
 .arm
 .text
 
-.equ ROM, 0xffff0000            @ load address of .text
+.ifndef ROM
+.equ ROM, 0xffff0000            @ load address of .text (ARM7 build: --defsym ROM=0)
+.endif
 .set slot, 0
 .macro put reg
     str     \reg, [r11, #slot*4]
@@ -381,6 +383,15 @@ fault_site:
 .ifdef OFFER_OAM
     mov     r0, #0x07000000
     str     r1, [r0]                @ W4 07000000 0000005a
+.endif
+.ifdef OFFER_IPCSYNC
+    mov     r0, #0x04000000
+    add     r0, r0, #0x180
+    strh    r1, [r0]                @ W2 04000180 0000005a
+.endif
+.ifdef OFFER_IPCRECV
+    mov     r0, #0x04100000
+    ldr     r1, [r0]                @ R4 04100000
 .endif
 done:
     b       done

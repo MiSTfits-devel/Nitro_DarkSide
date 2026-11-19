@@ -328,6 +328,8 @@ linkOwns a = C.slice d31 d24 addr == 0x06
   || within 0x04100010 0x04100014  -- game-card data in
   || within 0x05000000 0x05000800  -- palettes
   || within 0x07000000 0x07000800  -- OAM
+  || within 0x04000180 0x0400018c  -- IPCSYNC, IPCFIFOCNT, IPCFIFOSEND
+  || within 0x04100000 0x04100004  -- IPCFIFORECV
  where
   addr = accessAddr a
   width = resize (accessWidth a) :: Word

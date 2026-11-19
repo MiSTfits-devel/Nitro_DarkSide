@@ -1,8 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// CPU-only Verilator host for the generated Clash ARM9 slice: same contract
+// CPU-only Verilator host for the generated Clash CPU slice: same contract
 // as clash/test/Arm9IsaCheck.hs (ordered mailbox stores, then quiet, an
 // exact fault, or one exact held GPU offer). The GPU link is never ready.
+// Built for nds_arm9_slice (boot ROM at 0xFFFF0000), or with -DARM7_SLICE
+// for nds_arm7_slice (boot ROM at 0).
+#ifdef ARM7_SLICE
+#include "Vnds_arm7_slice.h"
+typedef Vnds_arm7_slice Top;
+static const uint32_t romBase = 0x00000000u;
+#else
 #include "Vnds_arm9_slice.h"
+typedef Vnds_arm9_slice Top;
+static const uint32_t romBase = 0xffff0000u;
+#endif
 #include "verilated.h"
 #include <cstdint>
 #include <cstdio>
@@ -15,7 +25,7 @@
 static void require(bool ok, const char *message) {
     if (!ok) { std::fprintf(stderr, "Clash RTL ISA: %s\n", message); std::exit(1); }
 }
-static void clock(Vnds_arm9_slice &top) {
+static void clock(Top &top) {
     top.CLK = 1; top.eval(); top.CLK = 0; top.eval();
 }
 // First token of each line; '#' starts a comment.
@@ -60,7 +70,7 @@ int main(int argc, char **argv) {
     const std::vector<uint32_t> expected = readWords(argv[2]);
     require(!rom.empty() && !expected.empty() && expected.size() <= scratch, "invalid input");
     Verilated::commandArgs(argc, argv);
-    Vnds_arm9_slice top;
+    Top top;
     top.CLK = 0; top.RST = 1; top.EN = 1; top.BOOT_WORD = 0;
     top.GPU_REQ_READY = 0; top.GPU_REPLY_VALID = 0;
     top.GPU_REPLY_DATA = 0; top.GPU_REPLY_FAULT = 0; top.IRQ = 0;
@@ -70,8 +80,8 @@ int main(int argc, char **argv) {
     int doneAt = -1;
     for (int tick = 0; tick < 40000; ++tick) {
         const uint32_t addr = top.BOOT_ADDR & ~3u;
-        const size_t index = (addr - 0xffff0000u) / 4;
-        top.BOOT_WORD = addr >= 0xffff0000u && index < rom.size() ? rom[index] : 0xe7f000f0u;
+        const size_t index = (addr - romBase) / 4;
+        top.BOOT_WORD = addr >= romBase && index < rom.size() ? rom[index] : 0xe7f000f0u;
         top.eval();
         if (top.STORE_VALID) {
             require(stores < expected.size(), "store after the mailbox");

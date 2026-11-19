@@ -74,10 +74,10 @@ LDM/POP `{.., pc}` take the state from bit 0 (an ARM target must then be
 word-aligned or the fetch faults 2); ARM `BLX <imm>` always enters Thumb
 (H selects the halfword), a Thumb BLX suffix always enters ARM at
 `(LR + offset) & ~3`; BL/BLX links in Thumb carry bit 0. The ARMv5-only
-behaviours (BLX forms, CLZ, interworking loads) and the vector base sit
-behind one switch, `Arch` in `Arm9Slice` (`armV5`, `vectorBase`), so an
-ARMv4T/ARM7TDMI configuration with vectors at 0 can reuse the slice; only
-the ARMv5/high-vector configuration is built or tested.
+behaviours (BLX forms, CLZ, interworking loads), the vector base and the I/O
+map sit behind one record, `Arch` in `Arm9Slice` (`armV5`, `vectorBase`,
+`ioMap`): `arm9Arch` is this slice, and `arm7Arch` is the ARMv4T/ARM7TDMI
+configuration of the [two-CPU system](#two-cpu-system-arm7-ipc-and-shared-ram).
 
 Multiplies read every operand before writing any result, so Rd = Rm (Thumb
 `MUL r0, r0`) and Rm overlapping RdLo/RdHi give the product, as on the
@@ -144,15 +144,18 @@ VCOUNT (`0x04000006-07`, reads only), the engine A background, scroll,
 window and blend registers (`0x04000008-6F`), TM0CNT-TM3CNT (`0x04000100-0F`),
 AUXSPICNT (`0x040001A0-A1`), ROMCTRL and the game-card command bytes
 (`0x040001A4-AF`), IME (`0x04000208-0B`), IE and IF (`0x04000210-17`),
-POWCNT1 halfword/word, entirely GPU-owned VRAMCNT byte spans, the engine B
-display registers (`0x04001000-6F`), the game-card data port
-(`0x04100010-13`), palettes (`0x05000000-7FF`) and OAM (`0x07000000-7FF`);
-every access must lie wholly inside one span. Timers, IME/IE/IF and the game-card registers are not GPU
-registers: they are routed for the devices `Arm9Soc` puts in front of the
-GPU, and a target that does not implement an address must reply with an
-error (the [CPU + VRAM display prototype](../fpga/mister_hs_gfx_slice/README.md)
-replies fault to all of them, to DISPSTAT, and to the engine A/B registers,
-palettes and OAM, which its gate checks). LDM/STM never use the link:
+IPCSYNC, IPCFIFOCNT and IPCFIFOSEND (`0x04000180-8B`), POWCNT1
+halfword/word, entirely GPU-owned VRAMCNT byte spans, the engine B
+display registers (`0x04001000-6F`), IPCFIFORECV (`0x04100000-03`), the
+game-card data port (`0x04100010-13`), palettes (`0x05000000-7FF`) and OAM
+(`0x07000000-7FF`); every access must lie wholly inside one span. Timers,
+IME/IE/IF, IPC and the game-card registers are not GPU registers: they are
+routed for the devices `Arm9Soc` and `DualSoc` put in front of the GPU, and
+a target that does not implement an address must reply with an error (the
+[CPU + VRAM display prototype](../fpga/mister_hs_gfx_slice/README.md)
+replies fault to all of them and to DISPSTAT, the engine A/B registers,
+palettes and OAM; its gate checks those four kinds and IPCSYNC/IPCFIFORECV).
+LDM/STM never use the link:
 every beat is route-checked before the first one issues, and a block with a
 beat outside the boot ROM (reads) or local RAM faults 3 at that beat's
 address with nothing transferred, so no burst or GXFIFO-style atomic scope
@@ -636,6 +639,338 @@ running it through a local `stack` wrapper that adds the same flags.
 `GfxSliceCheck` forces its per-tick state and log lines (strictness only).
 Unforced, it ran out of a 3 GB heap even on the earlier slice; forced, its
 peak residency was 126 MB.
+
+## Two-CPU system: ARM7, IPC and shared RAM
+
+This is a finite gate on the way to milestone M7, which stays **not
+accepted**: a second CPU and the first two-processor system. It runs two
+synthetic guests, not a game.
+
+### The ARM7 configuration
+
+`arm7Arch` (ARMv4T, ARM7TDMI) differs from `arm9Arch` in exactly these
+points, all behind the `Arch` record:
+
+- **No ARMv5 instructions.** BLX register and immediate, Thumb `BLX Rm`,
+  the Thumb BLX suffix (`H = 01`) and CLZ fault 1, as undefined
+  instructions.
+- **No interworking loads.** LDR pc, LDM `{.., pc}` and Thumb POP `{pc}`
+  keep the state and clear bit 0, as melonDS's `A_LDR`, `A_LDM` and `T_POP`
+  do for the ARM7. In ARM state a target with bit 1 set then faults 2 at
+  fetch. BX still interworks. Thumb BL is the v4T prefix/suffix pair.
+- **Vectors at 0.** Reset is at 0x00000000, SWI at 0x08 and IRQ at 0x18;
+  the 4 KiB boot ROM window starts at 0.
+- **I/O map (`Arm7Map`).** The link carries the ARM7's timers, IME/IE/IF
+  and IPC. DISPSTAT, VRAM, palettes, OAM, the engine registers and the
+  game card are ARM9-only and fault 3.
+- **Multiply flags.** MULS keeps C, as the product `gba_cpu` does
+  (`mulboth`). melonDS clears C on the ARM7, and ARMv4 leaves C
+  unpredictable, so no fixture reads C after an ARM7 multiply.
+
+Everything else is shared with the ARM9: pipeline, register file, modes,
+IRQ and SWI entry, fault codes, and unaligned accesses failing closed with
+fault 2. [`Nds.WholeCore.Arm7Slice`](src/Nds/WholeCore/Arm7Slice.hs)
+(`nds_arm7_slice`) has the same ports as `nds_arm9_slice`; `Arm9Slice`,
+`Arm9Soc` and `Arm9Io` keep their ports.
+
+**ARM9 unchanged by the split.** The `nds_arm9_slice` netlists from just
+before and just after the split were run in lockstep under Verilator on
+identical random inputs. The inputs were the seven ARM9 fixture images and
+their 73 `.ifdef` variants, two seeds each, with random link timing, data
+and faults, random IRQ, EN and resets, and every output was compared every
+cycle. Over 160 runs (57.8 million cycles, 16.0 million retired
+instructions, 52,997 link transfers, 2.57 million stores, 34,616 faults,
+each followed by a reset) no output ever differed. This is a co-simulation
+argument, not a proof: a yosys `equiv_simple` run, with the block RAMs
+abstracted to ports, did not finish within 50 minutes.
+
+The one deliberate ARM9 behaviour change in this step is the IPC spans in
+the link map (above). Because of it the graphics prototype now replies
+fault 4 to IPCSYNC and IPCFIFORECV, which two new negatives in
+`sim/run_clash_gfx_soc.sh` check.
+
+**ARM7 verification** (`sim/run_clash_arm7_isa.sh`):
+
+- **Fixtures, three models.** Each runs on the product `gba_cpu` (with the
+  product `nds_membus7`, `sim/tb_arm7_isa_oracle.vhd`), on the pure
+  `sliceStep7` and on fresh `nds_arm7_slice` Verilog:
+  - `hs_arm7_v4t.S`, 18 hand-derived words: SWI from ARM and Thumb landing
+    at 0x08, LDR pc and LDM `{pc}` with bit 0 set staying in ARM, POP
+    `{pc}` with bit 0 clear staying in Thumb, BX both ways, the Thumb BL
+    pair and Thumb MOV pc;
+  - `hs_arm9_mem.S` built with `--defsym ROM=0`, 46 words;
+  - the register-bank fixture, 14 words.
+- **Negative builds.** Five builds (BLX register, BLX immediate, CLZ,
+  Thumb BLX register, Thumb BLX suffix) must fault 1 at the instruction,
+  on the pure core and the RTL.
+- **Link offers on the ARM7 map.** IPCSYNC, IPCFIFORECV, a timer and IE are
+  offered on the link; DISPSTAT, VRAM `06800010` and OAM fault 3.
+- **Differential run.** `sim/tests/hs_arm7_v4t_gen.py` generates 40 seeded
+  programs that mix the v4T/v5 differences with ordinary ARM and Thumb
+  code. The product `gba_cpu`'s mailbox for each program is the
+  expectation, independent of this decoder. The pure core and the RTL equal
+  it on all 40. The same programs on the ARMv5 slice fail all 40: every
+  program's first case separates v4T from v5 by construction.
+
+Mutants of `arm7Arch`, each a single change, were run against the v4T
+fixture, the five negative builds and 20 generated seeds:
+
+| Mutant | v4T fixture | Negatives faulting | Generated seeds failing |
+| --- | --- | --- | --- |
+| ARM LDR/LDM pc interworks | killed | 5/5 | 20/20 |
+| Thumb POP pc interworks | killed | 5/5 | 19/20 |
+| reset vector high | killed | 5/5 | 20/20 |
+| SWI vector high | killed | 5/5 | 0/20 |
+| Thumb BL suffix decoded as BLX | killed | 5/5 | 19/20 |
+| BLX register allowed | passes | 2/5 (killed) | 0/20 |
+| BLX immediate allowed | passes | 1/5 (killed) | 0/20 |
+| CLZ allowed | passes | 1/5 (killed) | 0/20 |
+| Thumb BLX suffix allowed | passes | 1/5 (killed) | 0/20 |
+
+All nine are killed. "Negatives faulting" below 5/5 kills the mutant,
+because each negative build must fault.
+
+### `Nds.WholeCore.DualSoc`
+
+[`DualSoc`](src/Nds/WholeCore/DualSoc.hs) (`nds_dual_soc`) puts the two
+cores side by side, each with its own I/O router (timers and IME/IE/IF from
+`Arm9Io`, so each CPU has its own IE/IF/IME). The two routers share
+[`Nds.WholeCore.Ipc`](src/Nds/WholeCore/Ipc.hs). The game card sits on the
+ARM9 side, and both cores reach one main RAM port.
+
+**Clocking.** There is one 67.03 MHz clock. The ARM9 may step every cycle;
+the ARM7 steps only on `ce7`, a phase bit that toggles every cycle, which
+gives a fixed 2:1 ratio and 33.51 MHz. Both routers, the IPC block and the
+arbiter run every cycle. Both CPUs' timers tick on `ce7`: melonDS runs the
+ARM9's timers from `ARM9Timestamp >> ARM9ClockShift` with
+`ARM9ClockShift = 1` on the DS (`NDS::RunTimers`), so they count at
+33.51 MHz too. (`Arm9Soc` on its own is unchanged and still ticks every
+cycle.)
+
+Why one clock: the DS derives both CPU clocks from one oscillator at a
+fixed 2:1, so there is no clock-domain crossing to model. One clock also
+keeps the whole system a single pure step function, which the checker, the
+generated Verilog and the arbiter's wait bound all rely on. The cost is
+timing: ARM7 paths are timed at 14.9 ns, not 29.8 ns (see the fits below).
+
+**Main RAM port and arbiter.** The memory sits outside the SoC behind one
+port: `MEM_REQ_{VALID,WRITE,ADDR,LANES,DATA}` / `MEM_REQ_READY` for
+requests and `MEM_RESP_{VALID,DATA}` for responses.
+
+- A core issues at most two transactions per step, its read and then its
+  write, and only after every transaction of its earlier steps has been
+  answered.
+- One request is granted per cycle. A request offered and not accepted is
+  held unchanged until accepted. On contention the core not granted last
+  wins (round robin), so a waiting core sees at most one grant to the
+  other.
+- Responses come back in order, at least one cycle later; a 4-entry queue
+  tracks which core and kind each belongs to.
+- Writes carry byte lanes. A byte or halfword store reads the word in one
+  step and writes only its lanes in the next, so the other CPU's bytes in
+  that word survive.
+- Main RAM is 4 KiB at 0x02000000; any other address faults 3.
+- Not provided: cross-CPU code coherence (one CPU rewriting code the other
+  is running), and atomics (SWP faults 1 on both CPUs).
+
+**IPC.** `Ipc` implements IPCSYNC, IPCFIFOCNT, IPCFIFOSEND and IPCFIFORECV
+for both CPUs, with two 16-word FIFOs, the empty/full/error flags, and the
+IRQs IF.16 (sync), IF.17 (send FIFO empty) and IF.18 (receive FIFO not
+empty).
+
+- **References.** It follows melonDS (`NDS::ARM9IOWrite16` and
+  `ARM7IOWrite16` at 0x180 and 0x184, `ARM9IOWrite32` and `ARM7IOWrite32`
+  at 0x188, `ARM9IORead16` and `ARM7IORead16` at 0x184, `ARM9IORead32` and
+  `ARM7IORead32` at 0x4100000, `FIFO<u32,16>` in `FIFO.h`) and GBATEK ("DS
+  Inter Process Communication").
+- **Where they differ, GBATEK wins.** An empty receive returns the last
+  received word, or 0 after the other side clears its FIFO; melonDS
+  returns `FIFO::Peek()`. Clearing a non-empty send FIFO while CNT.2 is
+  already set raises IF.17 by the edge rule; melonDS raises it only when
+  the same write sets CNT.2.
+- **Accesses with no defined result.** Byte accesses, and halfword
+  accesses to SEND or RECV, get an error reply (fault 4) rather than a
+  guess.
+- **Same-cycle accesses.** When both CPUs access IPC in one cycle, the
+  ARM9's access takes effect first.
+
+`sim/run_clash_ipc_check.sh` compares `ipcStep` with the product `nds_ipc`
+on random operation streams from both sides: 40 seeds, 54,746 operations,
+no difference. It steers
+around four documented differences:
+
+- the product sets the error flag on a send while the FIFO is disabled;
+- after a clear, an empty read on the product returns the last popped
+  word;
+- an ARM9 read while the FIFO is disabled presents the last popped word;
+- a clear that turns the send-empty IRQ off in the same write still raises
+  IF.17 on the product.
+
+### Guests, oracle and results
+
+`sim/run_clash_dual_soc.sh` builds a synthetic DS image
+(`sim/tests/hs_dual_oracle.py image`) holding two binaries:
+
+- the ARM9 guest `hs_dual_arm9.S`, at ROM 0x8000 and RAM 0x02000400;
+- the ARM7 guest `hs_dual_arm7.S`, at RAM 0x02000900.
+
+Boot runs through the card path:
+
+1. The ARM9 boot ROM `hs_dual_boot9.S` checks the header CRC16 and fields
+   (handed over at 0xFFFF0E00, as in the single-CPU loader).
+2. It copies both binaries through the card with B7 reads.
+3. It stores the ARM7 entry at 0x02000F00 and handshakes over IPCSYNC with
+   the ARM7 boot ROM `hs_dual_boot7.S` at 0.
+4. Both CPUs jump to their guests. IRQs dispatch through the RAM words
+   0x02000F08 (ARM9) and 0x02000F04 (ARM7).
+
+Each phase starts when the other CPU's IPCSYNC output reaches an agreed
+value, so every recorded word is independent of memory timing:
+
+- **A:** IPCSYNC IRQs both ways.
+- **B:** 16 words ARM9 → ARM7 with the receiver's IRQ off, giving FIFO
+  full; a 17th send sets the error flag. The ARM7 then drains under the
+  receive IRQ, and the ARM9's send-empty IRQ fires.
+- **C:** 8 words ARM7 → ARM9 drained under IRQ. An empty read sets the
+  error flag, and a cleared FIFO reads 0.
+- **D:** a 32-word buffer through shared RAM, then concurrent byte stores
+  to the same words.
+- **E:** a 64-word stream with flow control on the full flag.
+- **F:** both CPUs increment their own byte of the same two words at once,
+  with no handshake. A variable delay on the ARM9 sweeps their relative
+  phase. Without it, the round-robin arbiter locks the two loops into a
+  phase where no store's read-to-write window ever holds the other CPU's
+  write.
+
+The oracle is the Python script's own model of IPC (GBATEK rules) and of
+the phases; it does not use the Clash code. It expects 27 ARM9 and 15 ARM7
+mailbox words.
+
+`clash/test/DualSocCheck.hs` (pure) and `sim/clash_dual_soc.cpp` (fresh
+Verilog) each supply the memory with random latency and stalls. Both
+assert:
+
+- the memory protocol;
+- bounded wait: at most one grant to the other core while one waits;
+- mailbox order;
+- that at least one byte write carried stale bytes outside its lanes, so
+  the lane merge was really exercised;
+- that the guests keep making progress.
+
+Results on the final guests (`sim/run_clash_dual_soc.sh`). The pure
+checker and fresh `nds_dual_soc` Verilog give identical cycle, step and
+request counts in every setting:
+
+| Memory setting | Cycles | ARM9 / ARM7 steps | Requests | Stale-byte writes kept |
+| --- | --- | --- | --- | --- |
+| latency 1 | 79,812 | 60,459 / 39,515 | 39,573 | 3 |
+| latency 1–4, 30 % stalls | 110,614 | 59,256 / 39,581 | 37,370 | 5 |
+| latency 2–12, 50 % stalls | 207,692 | 58,573 / 41,558 | 35,906 | 3 |
+| latency 8–30, 60 % stalls | 439,195 | 58,239 / 48,151 | 35,333 | 5 |
+
+Every run: 27 ARM9 and 15 ARM7 mailbox words equal the oracle, and at most
+1 grant to the other core while one waited.
+
+**melonDS as a second oracle.** `sim/melonds_tracer/main_dual.cpp`
+(`melonds_dual`) installs the two boot ROMs as melonDS's BIOS images, so
+IRQs dispatch through them. It places both binaries as the loader would
+leave them and runs the system with melonDS's own scheduler. ARM9 slots
+6–26 and ARM7 slots 0–14 equal the oracle. The card loader itself is not
+run under melonDS: melonDS models the real cartridge protocol, not this
+fixture's direct-boot strap.
+
+**Mutants**, each a one-line change to the Clash source, under the pure
+checker at latency 1 and at random latency 2–12 with stalls:
+
+| Mutant | Change | Latency 1 | Random latency |
+| --- | --- | --- | --- |
+| arbiter starvation | contention always goes to the ARM9 | killed: the ARM7 waited through 2 ARM9 grants | killed (same) |
+| lost FIFO word | a push into an IPC FIFO holding 5 words is not stored | killed: ARM7 slot 5 | killed: ARM7 slot 5 |
+| wrong IRQ source | receive-not-empty raises IF.17, not IF.18 | killed: no progress, ARM9 11/27, ARM7 3/15 | killed (same) |
+| stale shared-RAM read | each core takes its latched word instead of the response arriving that cycle | killed: ARM9 fault 1 at 0xFFFF0E04 | killed (same) |
+| whole-word writes | stores ignore byte lanes | killed: ARM9 slot 22 (phase F) | killed: ARM7 slot 13 |
+
+### Fits
+
+These are scratch-copy fits with `clash/tests/remote_quartus_block.sh`
+(5CSEBA6U23I7, isolated blocks with virtual pins, not a board build).
+"Slow" is the 1100 mV model; the two numbers are 100 °C / −40 °C.
+
+| Block | Clock | ALMs | Registers | M10K | DSP | Setup slack, slow (ns) | Hold slack (ns) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `nds_arm7_slice` | 33.51 MHz | 3,253 | 1,358 | 6 | 3 | +10.255 / +10.543 | +0.146 |
+| `nds_arm7_slice` | 67.03 MHz | 3,291 | 1,358 | 6 | 3 | +1.307 / +1.266 | +0.156 |
+| `nds_dual_soc` | 33.51 MHz | 9,060 | 4,878 | 4 | 6 | +10.079 / +9.972 | +0.163 |
+| `nds_dual_soc` | 67.03 MHz (DS clocks) | 9,169 | 4,878 | 4 | 6 | +0.934 / +0.881 | +0.158 |
+| product ARM7 `gba_cpu` (integrated product fit) | — | 2,952 | | | | | |
+
+Notes on the table:
+
+- **The ARM7's M10K** are its register file (2) and its 4 KiB local RAM
+  (4). In the dual SoC main RAM is outside the block, so its 4 M10K are the
+  two register files.
+- **Virtual pins.** The dual SoC's ALMs include 597 that hold its 1,192
+  virtual pins, which are mostly observation ports. Its registers include
+  both IPC FIFOs, 1,024 bits held in flip-flops.
+- **Against the product ARM7.** The Clash ARM7 is about 300–340 ALMs
+  larger than `gba_cpu`. That figure includes its link, local-RAM and
+  boot-ROM logic.
+- **Critical paths at 67.03 MHz.**
+  - Dual SoC: the worst path (11 levels, +0.934 ns) runs from the ARM9
+    core's state through its IPC offer and the IPC accept (`take9`) into a
+    FIFO entry. The worst ARM7 paths (+0.984 ns) run from the ARM7 core's
+    state into the router/IPC reply registers.
+  - ARM7 alone: the worst path (9 levels, +1.307 ns) is the pipeline's
+    issue logic, state to state.
+- **The ARM7 as timed.** In the dual SoC the ARM7 is timed at the 67.03 MHz
+  period, 14.9 ns, though it steps only every other cycle. It closes there
+  alone (+1.27 ns) and in the system (+0.98 ns on its worst paths).
+- **What a multicycle constraint on `ce7` would be worth** (not applied).
+  - A 2-cycle exception is valid only from `ce7`-enabled ARM7 registers to
+    `ce7`-enabled ARM7 registers, on paths that do not pass through
+    full-rate state (the arriving memory word, router replies). On those
+    paths it adds one period, 14.9 ns of budget: the standalone ARM7 timed
+    at 29.8 ns closes with +10.3 ns.
+  - It would not raise the dual SoC's worst slack. None of the 20 worst
+    paths is ARM7-internal: they are ARM9 paths, or ARM7 paths into
+    registers that capture every cycle (router/IPC replies). Relaxing the
+    latter would rest on the `ce7` gating of the ARM7's offers, which
+    needs a per-path argument.
+
+### What separates this from booting a commercial game
+
+- **BIOS and KEY1.** No ARM9/ARM7 BIOS, no firmware boot, no KEY1/KEY2
+  card encryption or secure area. The loader is a stand-in that reads a
+  direct-boot synthetic image.
+- **Bus and memory maps.** No full DS bus. Missing: shared WRAM and WRAMCNT
+  banking, ARM7 WRAM, the VRAM banks the ARM7 can map, the full I/O maps of
+  both CPUs, EXMEMCNT card/slot ownership, and the GBA slot. Main RAM is
+  4 KiB, not 4 MiB, with no mirrors.
+- **Real memory.** No SDRAM/DDR controller, no DS access timings or wait
+  states, and no caches or CP15 on the ARM9.
+- **DMA.** No DMA on either CPU.
+- **Sound.** No sound channels, capture or mixer.
+- **SPI.** No SPI bus: no firmware flash, touchscreen or power management;
+  no card backup SPI.
+- **RTC.** No real-time clock.
+- **Input, display.** No KEYINPUT/EXTKEYIN and no DS LCD schedule in this
+  system (the GPU rows above are separate gates).
+- **Unaligned accesses on both CPUs.** These fail closed with fault 2. On
+  hardware an unaligned LDR returns the aligned word rotated right by
+  8 × (address & 3), and STR, STRH, LDM and STM ignore the low address
+  bits. An unaligned LDRH is force-aligned on the ARM9 but rotated on the
+  ARM7, and the ARM7's LDRSH at an odd address acts as LDRSB. Code written
+  for the hardware may depend on any of these.
+- **Missing ISA and exceptions.** No SWP/SWPB (atomics), no FIQ, abort or
+  undefined-instruction exceptions, and no ARMv5TE DSP extensions,
+  LDRD/STRD, PLD or coprocessor instructions on the ARM9.
+- **Coherence.** No cross-CPU code coherence.
+
+Reproduce with `sim/run_clash_arm7_isa.sh`, `sim/run_clash_dual_soc.sh`
+(with `MELONDS_DUAL=sim/melonds_tracer/build-vendored/melonds_dual` for the
+second oracle), `sim/run_clash_ipc_check.sh` and
+`sim/run_clash_gfx_soc.sh`. All of them compile with `+RTS -M3g`.
+`DualSocCheck` forces its state every cycle (peak residency about 5 MB).
 
 ## 3D inversion
 

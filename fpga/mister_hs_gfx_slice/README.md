@@ -27,6 +27,7 @@ silently different result:
 | DISPCNT_A | display mode 0 (white) and 2 (VRAM, bank A–D select) | display mode 1/3, BG mode 7 |
 | DISPSTAT/VCOUNT | — | every read (no DS-timed LCD here) |
 | engine A BG/scroll/window/blend (`0x04000008-6F`), engine B registers (`0x04001000-6F`), palettes (`0x05xxxxxx`), OAM (`0x07xxxxxx`) | — | every access (the ARM9 slice routes them to the link) |
+| IPCSYNC/IPCFIFOCNT/IPCFIFOSEND (`0x04000180-18B`), IPCFIFORECV (`0x04100000-03`) | — | every access (the slice routes them to the link for `Nds.WholeCore.DualSoc`'s IPC block; this SoC has no second CPU) |
 | VRAM `0x06xxxxxx` | engine-A BG and LCDC apertures incl. mirrors; ARM9 byte writes ignored; overlapping banks OR on read, broadcast on write; unmapped reads 0 | — |
 
 Top LCD: black with the LCDs off; engine B (fixed display mode 0, white) unless
@@ -74,9 +75,10 @@ EVIDENCE_DIR=$(mktemp -d) bash sim/run_clash_gfx_soc.sh
    the first full 640x480 frame after the halt must be black outside the
    picture, uniform 2x2 per LCD pixel, and equal to the service's frame.
 3. The same runs for the unchanged `hs_gpu_arm9.S` witness (bank B, LCDC/BG
-   remap, aliases), and seven negatives (`UNSUPPORTED_MODE`, `_BANK`,
-   `_STATUS`, `_ENGINE_A`, `_ENGINE_B`, `_PALETTE`, `_OAM`) that must stop on
-   the same GPU reply fault, at the access the service would have accepted.
+   remap, aliases), and nine negatives (`UNSUPPORTED_MODE`, `_BANK`,
+   `_STATUS`, `_ENGINE_A`, `_ENGINE_B`, `_PALETTE`, `_OAM`, `_IPC_SYNC`,
+   `_IPC_RECV`) that must stop on the same GPU reply fault, at the access the
+   service would have accepted.
 4. The witness reruns with a `0101…` init file: its read of a never-written
    VRAM halfword must return `0x5555`, proving the power-up contents come from
    the staged file rather than a simulator default.

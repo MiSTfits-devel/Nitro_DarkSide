@@ -57,6 +57,16 @@
     ldr     r2, [r3]            @ OAM is not implemented
     b       .
 .endif
+.ifdef UNSUPPORTED_IPC_SYNC
+    add     r3, r0, #0x180
+    strh    r1, [r3]            @ IPCSYNC: no second CPU behind this link
+    b       .
+.endif
+.ifdef UNSUPPORTED_IPC_RECV
+    mov     r3, #0x04100000
+    ldr     r2, [r3]            @ IPCFIFORECV
+    b       .
+.endif
 
     /* Edge E(P) = (P.x-a.x)*(b.y-a.y) - (P.y-a.y)*(b.x-a.x) for the
      * triangle (140,14) (30,178) (232,150); each is 0..30048 inside. */

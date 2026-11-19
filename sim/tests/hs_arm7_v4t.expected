@@ -1,0 +1,18 @@
+00000000  # 0  ARM SWI: R14_svc - swi_ret (next instruction)
+00000012  # 1  ARM SWI comment field (low 24 bits of the SWI word)
+00000093  # 2  handler CPSR & 0x9f: I set, ARM, SVC
+600000df  # 3  SPSR_svc = caller CPSR: Z, C, I, F, ARM, System
+600000df  # 4  MOVS pc, lr restored the System CPSR
+00000011  # 5  LDR pc = ldr_target | 1 ran ldr_target in ARM (ARMv5 would switch to Thumb)
+0000001f  # 6  still ARM, System
+00000022  # 7  LDM {pc} = ldm_target | 1 ran ldm_target in ARM
+02000100  # 8  SP back at the top of scratch after STMDB/LDMIA
+00000033  # 9  Thumb POP {pc} = pop_even (bit 0 clear) stayed in Thumb (ARMv5 would switch to ARM)
+00000008  # 10 POP {pc} = pop_odd | 1 stayed in Thumb; BL t_add3 added 3 to 5
+00000000  # 11 LR inside t_add3 - (bl_next | 1)
+00000044  # 12 Thumb MOV pc, r3 stayed in Thumb
+0000001f  # 13 BX r6 returned to ARM, System
+00000000  # 14 Thumb SWI: R14_svc - thumb_swi_ret (next halfword)
+00000034  # 15 Thumb SWI comment field (low 8 bits)
+00000093  # 16 handler CPSR & 0x9f: T cleared on entry
+0000003f  # 17 SPSR_svc & 0x3f: Thumb, System

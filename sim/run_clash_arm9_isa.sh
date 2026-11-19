@@ -83,6 +83,8 @@ offer hs_arm9_mem OFFER_ENGINE_A W 2 0400006e 0000005a
 offer hs_arm9_mem OFFER_ENGINE_B R 4 0400106c 00000000
 offer hs_arm9_mem OFFER_PALETTE W 1 050007ff 0000005a
 offer hs_arm9_mem OFFER_OAM W 4 07000000 0000005a
+offer hs_arm9_mem OFFER_IPCSYNC W 2 04000180 0000005a
+offer hs_arm9_mem OFFER_IPCRECV R 4 04100000 00000000
 
 run_cases() {
     local runner=$1 name source extra
