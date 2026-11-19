@@ -29,8 +29,8 @@ assemble() {
 assemble stock9 hs_dual_boot9; assemble stock7 hs_dual_boot7
 for side in 9 7; do
     flag=(); if [[ $side == 7 ]]; then flag=(--defsym ARM7=1); fi
-    assemble "entry$side" hs_direct_entry "${flag[@]}"
-    assemble "guest$side" hs_direct_payload "${flag[@]}"
+    assemble "entry$side" hs_direct_entry ${flag[@]+"${flag[@]}"}
+    assemble "guest$side" hs_direct_payload ${flag[@]+"${flag[@]}"}
 done
 assemble swi-bad hs_direct_entry --defsym ARM7=1 --defsym BAD_SWI=1
 unknown7=$(arm-none-eabi-nm "$out/tmp.o" | awk '$3=="unknown_swi7"{print $1}')
@@ -130,7 +130,7 @@ PY
     assemble entry7-trap hs_direct_entry --defsym ARM7=1 --defsym TRAP_ALL_SWI=1
     for variant in wide buffered; do
         runner=$out/$variant/Vnds_dual_soc_$variant
-        "$runner" kirby-vector "$image" "$out/stock9.bin" "$out/stock7.bin" "$out/entry9.bin" "$out/entry7-trap.bin" "${trace[@]}"
-        run kirby "$image" "${trace[@]}"
+        "$runner" kirby-vector "$image" "$out/stock9.bin" "$out/stock7.bin" "$out/entry9.bin" "$out/entry7-trap.bin" ${trace[@]+"${trace[@]}"}
+        run kirby "$image" ${trace[@]+"${trace[@]}"}
     done
 fi

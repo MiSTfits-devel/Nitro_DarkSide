@@ -8,7 +8,7 @@ out=$(mktemp -d "${TMPDIR:-/tmp}/nds-shared-wram.XXXXXX")
 trap 'rm -rf "$out"' EXIT
 for side in 7 9; do
     flag=(); if [[ $side == 7 ]]; then flag=(--defsym ARM7=1); fi
-    arm-none-eabi-as -EL "${flag[@]}" -o "$out/$side.o" "$tests/hs_shared_wram.S"
+    arm-none-eabi-as -EL ${flag[@]+"${flag[@]}"} -o "$out/$side.o" "$tests/hs_shared_wram.S"
     arm-none-eabi-objcopy -j .text -O binary "$out/$side.o" "$out/$side.bin"
 done
 python3 -B - "$out" <<'PY'

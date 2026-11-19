@@ -15,7 +15,7 @@ test -f "$file" || { echo 'expected one generated native CPU top' >&2; exit 1; }
 for cpu in 9 7; do
     flag=(); base=0xffff0000
     if [[ $cpu == 7 ]]; then flag=(--defsym ARM7=1); base=0; fi
-    arm-none-eabi-as -EL "${flag[@]}" -o "$out/$cpu.o" "$root/sim/tests/hs_native_reset.S"
+    arm-none-eabi-as -EL ${flag[@]+"${flag[@]}"} -o "$out/$cpu.o" "$root/sim/tests/hs_native_reset.S"
     arm-none-eabi-ld -EL -Ttext="$base" -e start -o "$out/$cpu.elf" "$out/$cpu.o"
     arm-none-eabi-objcopy -j .text -O binary "$out/$cpu.elf" "$out/$cpu.bin"
     pass+=("0x$(arm-none-eabi-nm "$out/$cpu.elf" | awk '$3=="passed"{print $1}')")
