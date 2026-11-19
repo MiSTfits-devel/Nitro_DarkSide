@@ -153,6 +153,12 @@
   The 101-check cache stress suite passes. Video mode 7 fails explicitly
   rather than being approximated. Commands and logs are in
   <code>clash/README.md</code>.</p>
+  <p>Those M5 figures are historical, before M6's full-region immutable-memory
+  equality correction, not a remeasurement of the current tree. The existing
+  M5 cache/store APIs remain. A new case in the repository's 11-case checker
+  seeds that real cache from one palette branch, then checks independently
+  rendered changed pixels from a different branch of the same parent; equal
+  stream/revision labels alone cannot prove equal bytes.</p>
   <p>The composed-chip gate is separate from this benchmark. Its free-running
   transaction reference checks independently queued command/parameter and
   geometry-event payloads, FIFO conservation and every-clock FIFO/IRQ/DMA
@@ -163,6 +169,40 @@
   microcycle latency. Import-time hashes and later host fixes are recorded
   separately in <code>docs/GPU3D_CLASH.md</code>; none establishes a new
   Quartus, generated-composed-RTL or board result.</p>
+  <p><b>M6 is a different execution path:</b> the native launcher now pairs
+  melonDS CPUs/non-GPU peripherals with authoritative Haskell GPU MMIO,
+  memory, capture, timing and IRQ/DMA effects. Its independent v5 direct
+  comparisons matched 200 NTR both-screen frames plus 4 MiB main RAM, and
+  120 actively changing real-ARM palette frames. Whole process walls,
+  including startup/output, were 16.1 s and 4.6 s; the internal producer
+  totals 15.91488 s/about 4.55 s are not full process timings.</p>
+  <p>A new live-cache experiment was slower (18.6 s/6.6 s whole process) and
+  was removed completely, not retained behind an unused flag. Original M5
+  TARDIS is intact. Linear compositor/3D-row construction fixes remain.
+  The real native active-input path without PNG/clock/profile diagnostics
+  measured 40 frames in 3.582 s (about 11.2 fps), with observed touch
+  press/drag/release input-sampling ACK latencies 67.464/191.405/128.511 ms
+  in one same-source own-window AppKit fixture, not physical cartridge/display
+  response measurements. The headless active scene's
+  roughly 26 fps is <em>not</em> a native-GUI claim. PNG publication is
+  now explicit opt-in, not work performed every normal display frame.
+  No 60 fps, physical-controller press, exhaustive timing or board claim
+  follows. Final scope and artifacts are in <code>docs/MILESTONES.md</code>.</p>
+  <p>The final scoped-continuation correction uses ABI2 without retiming the
+  interpreter: only the same ARM9 handler and raw core clock whose ordinary
+  command write actually asserted stall can append its remaining words to the
+  existing pending FIFO. Ordinary/DMA guards remain. Timed status preserves
+  newly asserted refill flags as well as retiring-command flags, with the
+  standalone counter semantics unchanged. The throughput measurements above
+  predate this narrow correction; they were not rerun.</p>
+  <p>The final ABI2 real ARM STM/SWAP regression passed with its original
+  test/push-bit polling unchanged: all 44 RAM words stock-equal, exact
+  nonzero POS results and one matrix push. An independent ARM7 VCOUNT64
+  observation proves ARM9 did not retire the next instruction during the
+  stall. All four beats keep one scope and raw instruction clock, using
+  ordinary/ordinary/continuation/continuation operations. This targeted proof,
+  recorded in <code>docs/MILESTONES.md</code>, is separate from the prior
+  v5 cartridge and speed measurements; M7 remains unaccepted.</p>
   <p>The final host chip-only gate accepted all 40 default cases (16 directed,
     16 seeded random, 8 fuzz), with 0 mismatches across 144,401 operations,
     116,556 GX entries, 98,634 DMA triggers, 215 frames and 10,665,984

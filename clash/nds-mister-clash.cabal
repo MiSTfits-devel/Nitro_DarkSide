@@ -53,6 +53,11 @@ library
                     , Nds.Gpu2D.TraceState
                     , Nds.Gpu2D.Types
                     , Nds.Gpu.Unified
+                    , Nds.Gpu.Live
+                    , Nds.Gpu.Live2D
+                    , Nds.Gpu.LiveMemory
+                    , Nds.Gpu3D.Timed
+                    , Nds.WholeCore.Arm9Slice
   hs-source-dirs:     src
   build-depends:      base >=4.14 && <5
                     , clash-prelude >=1.6 && <1.11
@@ -157,6 +162,33 @@ executable trace-view
   build-depends:      base >=4.14 && <5
                     , bytestring
                     , containers
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable gpu-service-check
+  main-is:            GpuServiceCheck.hs
+  other-modules:      GpuService
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2 -threaded
+
+executable timed-check
+  main-is:            TimedCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , nds-mister-clash
+  default-language:   GHC2021
+  ghc-options:        -O2
+
+executable live-authority-check
+  main-is:            LiveAuthorityCheck.hs
+  hs-source-dirs:     test
+  build-depends:      base >=4.14 && <5
+                    , array
+                    , bytestring
                     , nds-mister-clash
   default-language:   GHC2021
   ghc-options:        -O2

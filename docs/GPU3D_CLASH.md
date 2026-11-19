@@ -154,6 +154,109 @@ Both produce hash `147193483`, which alone is not pixel-exact proof.
 The earlier 1.51x number times rendering only; the lazy 0.000023 s 3D timer
 and the shared-preparation 1.20271 estimate are not valid end-to-end timings.
 Wall/GC noise and the single-trace/single-run scope remain explicit.
+These measurements predate M6's full-region `TraceMemory` equality
+correction and have not been rerun on the current tree. The existing M5
+`TraceViewKey` really uses this equality: same-parent pure memory forks must
+not reuse different palette pixels. The 11-case repository cache checker
+now covers that actual consumer; the original M5 cache/store is unchanged.
+
+## M6 closed-loop host pairing
+
+The normal native launcher now uses the real bidirectional GPU service,
+not `TraceView` as a display-only substitute. Haskell owns GPU MMIO/results,
+FIFO/PIPE state, physical VRAM/palette/OAM and mapping, capture, LCD/geometry
+deadlines, IRQ/DMA effects and both screens. The C++ side retains melonDS
+CPUs and non-GPU peripherals; stock GPU runtime entry points are guarded.
+Independent stock execution remains an oracle only. ABI2 is specified in
+`sim/melonds_tracer/HsGpuAbi.h`; implementation is `GpuService.hs`,
+`Nds.Gpu.{Live,Live2D,LiveMemory}`, `Nds.Gpu3D.Timed` and the melonDS
+`HsGpu`/coordinator hooks.
+
+`Timed` ports the functional command/pipeline cycle schedule instead of
+calling the unbounded `chipRun` at each register access. The coordinator
+orders actual interpreter instruction timestamps and DMA accesses, drains
+each exact deadline before a same-time access, and preserves separate
+coincident GX/LCD effects. System timestamps are 33,513,982-Hz cycles;
+reset is the only rewind. Borrowed frames/errors are copied before
+reentrant effects. This is an explicit timed-functional host contract,
+not physical sub-instruction bus timing, an exhaustive independent geometry
+microcycle oracle, RTL simulation or board proof.
+
+ABI2 keeps the eight/sixteen-word layout and carries `instructionScope`.
+An ordinary ARM9 handler command write must actually assert stall before
+same-handler, same-raw-core-clock word continuations can use operation 9.
+The service separately checks the matching observed scope/system time and
+active stall. The existing pending command FIFO receives those writes;
+ordinary stall guards, DMA exclusion and next-instruction blocking remain.
+No interpreter retiming or separate spill queue/capacity is introduced.
+Stock counts pending test/PUSH entries only when FIFO refill admits them.
+The timed executor retains the OR of pre-pop delayed-clear and post-pop
+newly asserted flags; the standalone chip's counter semantics are unchanged.
+
+Observed finite authority proof:
+
+- 69 independently executed production-C++ register/memory/latch/timing
+  records equal Haskell, including widths, overlap/aliases, ARM7 VRAM bytes,
+  power, affine reloads, delayed DISPCNT, windows and mosaic.
+- Independent LCD/IRQ/capture histories and four complete both-screen frames
+  equal; a late capture request survives line192 and actually writes
+  `0x801F` on the following line0. The permanent real-service check also
+  covers GX/LCD time1584, CPU status, IRQ/DMA and terminal/reset behavior.
+- v5 direct execution: 200 NTR frames, both screens and all 4 MiB main RAM
+  equal the stock-GPU interleaved control; the control equals original
+  stock scheduling. Thirty-two directed real ARM bus/DMA/ARM7 variants
+  match. A real VBlank-driven palette-changing cartridge matches for
+  120 frames and reaches CPU counter120.
+- Native AX plus actual bitmap, real keyboard A/release and input-sampling
+  acknowledgement observed. Same-source own-window AppKit touch
+  press/drag/release reaches the actual producer and is acknowledged.
+  No current GameController was detected; no physical pad-button claim.
+  A truncated status-0 terminal produces the actual stopped-error surface
+  while preserving all 98,304 RGB pixels of its last real frame.
+
+Logs are `/tmp/nds-m6-state-oracle/`, `/tmp/m6-final/`,
+`/tmp/nds-m6-ui-final/`, `/tmp/nds-m6-ui-terminal/` and
+`/tmp/nds-m6-ui-touch-direct/`. The v5 comparison library SHA256 is
+`f4283979e59f50fcac8eb821871d2d56f096d22df9b1d84651cac85df98ad664`;
+the pre-continuation cleanup ABI1 service is
+`d80dd4d25a2432d07922e5560ec9fe1c02a9b4883c0cccb92e079bf1e5361c7b`.
+The stock binary preserved from pre-M6 `5ce43e2b` has SHA256
+`bc2a59d8d8527177c020057c75d04b2bae6c3eb0707b526bdfd531891266d5e9`.
+These new host modules/hooks are not part of the M0 import manifest above;
+import-time hashes remain import-time provenance, not hashes of M6 changes.
+Current scoped-continuation ABI2 library (local run artefact, built from
+`clash/test/GpuService.hs` as `tools/hs_gpu_view/run.sh` builds it), SHA256
+`fc8f9c9a4619519b0d569d9bb3c32c845f6d1d98b23fa3ca07e2ec4daec02d70`.
+The focused continuation selector checks ordinary admission guards,
+same-scope queueing, standalone/timed refill busy bits and exact POS/stack
+results. No old pixel/chip/200-frame gate was repeated. The timing numbers
+below precede this narrow ABI2 correction and were not rebenchmarked.
+The final unchanged real ARM STM witness under pending SWAP passes on this
+ABI2 library: all 44 RAM words equal stock control, pre/post GXSTAT
+`09000000`/`06000100`, POS_RESULT `1111,2222,3333,1000`, one matrix push.
+ARM7 VCOUNT 64 observed the post-STM marker still 0 plus `DECAFBAD`, with
+post-VBlank markers present later. All four beats retain scope 263,
+system time 15302 and raw ARM9 clock 30604; operations 2/2/9/9 respectively
+write `400=71`, `404=22221111`, `408=3333`, `40C=11`.
+Original bit 0/14 polling is unchanged. Final outputs
+`/tmp/m6-scen/atomic-watch.final.{out,err,txn}` match the existing independent
+`.stock.out`; retained sources/cartridge reproduce the case. M6 is accepted
+for this host scope, not as new M7 or physical-microcycle evidence.
+
+Whole-process v5 walls (startup/output included) were 16.1 s/200 NTR and
+4.6 s/120 active frames; the internal producer totals 15.91488 s/about 4.55 s
+are not end-to-end process walls. Native active-input streaming without
+continuous PNG/log diagnostics measured 3.582 s/40 frames, about 11.2 fps,
+with 67–191 ms event-to-observed-input-sampling-ACK latency in that one run,
+not a physical cartridge/display response measurement.
+The slower experimental live cache was removed; original M5 remains.
+Linear compositor and 3D-row construction changes are retained, with
+29 independent layered/window lines and duplicate/transparent/OOB-point
+regressions passing. This is usable diagnostic interaction, not a 60 fps or
+all-games promise. The existing NTR FARCLIP `018/058 RESULT:FAIL TOTAL:FAIL`
+is visible and unchanged, not suppressed. M7/HDL/Quartus/board acceptance
+and full diagnostic progression remain separate.
+
 
 
 ## Why native first

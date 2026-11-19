@@ -45,6 +45,333 @@ Differential fuzzers (deterministic, `SEED`-driven):
 The isolated dirty-tree Quartus integration build is
 `clash/tests/remote_quartus_integration.sh` (default pod: `nds-quartus-clash-9`).
 
+## Whole-core ARM9 boot witness
+
+[`Nds.WholeCore.Arm9Slice`](src/Nds/WholeCore/Arm9Slice.hs) is the first
+synthesizable CPU/bus slice, not a replacement for the shipping ARM9. It
+executes the unchanged [`hs_gpu_arm9.S`](../sim/tests/hs_gpu_arm9.S) image
+from `0xFFFF0000`. It decodes ARM and ARMv5T Thumb state with architected
+predication: all fifteen conditions against NZCV, and a condition-failed
+instruction retires with no register, flag, link or bus effect whatever its
+encoding (only the `cond = 1111` space, apart from `BLX <imm>`, faults
+before predication). Executed ARM forms: all sixteen data-processing
+opcodes with rotated-immediate, immediate-shift (including `LSR/ASR #32`
+and RRX) and register-shift operands and their shifter carry-out; Rd = PC
+without S as a branch; MRS and MSR (see below); B, BL, BX, BLX register and
+immediate; MUL, MLA, UMULL, UMLAL, SMULL and SMLAL; CLZ; SWI; single
+transfers; and LDM/STM. Every ARMv5T Thumb format executes: the branch
+formats (B<cond>, B, the BL/BLX prefix and suffix) are decoded directly and
+every other format, Thumb SWI and BX/BLX Rm included, is rewritten into the
+equivalent AL-condition ARM opcode for the one shared execute stage, with
+R15 reading as pc + 4 (word-aligned for the PC-relative LDR and ADD). Thumb
+therefore inherits the ARM flag, link, LDM/STM precheck and fault rules,
+plus Thumb-only ones: LDMIA with its base in the list does not write back,
+a hi-register ADD/CMP/MOV naming two low registers, BX/BLX with nonzero SBZ
+bits, `BLX pc`, a BLX suffix with offset bit 0 set, BKPT, the undefined
+B<cond> space and ARMv6 encodings fault 1. ADD/MOV to PC stay in Thumb with
+bit 0 dropped. Interworking follows ARMv5: BX/BLX register, LDR pc,
+LDM/POP `{.., pc}` take the state from bit 0 (an ARM target must then be
+word-aligned or the fetch faults 2); ARM `BLX <imm>` always enters Thumb
+(H selects the halfword), a Thumb BLX suffix always enters ARM at
+`(LR + offset) & ~3`; BL/BLX links in Thumb carry bit 0. The ARMv5-only
+behaviours (BLX forms, CLZ, interworking loads) and the vector base sit
+behind one switch, `Arch` in `Arm9Slice` (`armV5`, `vectorBase`), so an
+ARMv4T/ARM7TDMI configuration with vectors at 0 can reuse the slice; only
+the ARMv5/high-vector configuration is built or tested.
+
+Multiplies read every operand before writing any result, so Rd = Rm (Thumb
+`MUL r0, r0`) and Rm overlapping RdLo/RdHi give the product, as on the
+ARM946E-S. S sets N and Z from the 32- or 64-bit result and keeps C and V
+(ARMv5). An R15 operand, RdHi = RdLo, or nonzero SBZ bits fault 1. All
+forms share one 33x33 multiplier and one 64-bit accumulate adder.
+
+Modes and exceptions: reset is SVC, ARM state, IRQ and FIQ masked (CPSR
+`0xD3`). The modes are User, System, SVC and IRQ, with three R13/R14 banks
+(User/System share one) and SPSR_svc and SPSR_irq. MRS reads T and the
+mode. A privileged MSR may switch among the four modes and set or clear I
+and F; in User mode an MSR to the CPSR writes only NZCV (other fields are
+ignored, as architected). A CPSR write naming FIQ, abort, undefined or any
+other mode, changing T, or setting Q/J or reserved bits faults, as does an
+MSR with an empty field mask and any SPSR access in User or System mode.
+The `IRQ` input is a level, sampled only at an instruction boundary: when
+it is high and CPSR.I is clear, the CPU enters IRQ mode instead of fetching
+(SPSR_irq <- CPSR, ARM state, I set, F kept, R14_irq <- next instruction +
+4 in either state, PC <- `0xFFFF0018`, the DS high vector). An instruction
+whose bus access or LDM/STM beats are in flight always completes first (a
+Thumb BL prefix and suffix are separate instructions; the IRQ may come
+between them, as on hardware), and an MSR or exception return that clears
+I lets a pending IRQ in at the very next boundary. SWI (ARM or Thumb)
+retires into SVC: SPSR_svc <- CPSR, ARM state, I set, F kept, R14_svc <-
+the next instruction, PC <- `0xFFFF0008`. Exception returns are any
+data-processing S form with Rd = PC (`SUBS pc, lr, #4`, `MOVS pc, lr`) and
+`LDM {.., pc}^`, in SVC or IRQ mode, copying that mode's SPSR to the CPSR,
+T included (bit 0 of a Thumb target is dropped); an SPSR outside the subset
+faults there. There is no FIQ input and no undefined-instruction, abort or
+FIQ exception: those encodings and modes fault 1.
+
+Single transfers are LDR/STR, LDRB/STRB, LDRH/STRH, LDRSB and LDRSH with an
+immediate or register offset (word/byte: any immediate shift, RRX taking C),
+added or subtracted, pre-indexed with or without writeback or post-indexed.
+A word LDR to R15 is an ARMv5 interworking branch. LDM/STM cover IA, IB, DA
+and DB with or without writeback, in ascending register order; LDM with R15
+returns the same way (so PUSH/POP `{.., pc}` work), and STM! that names its
+base as the lowest register stores the original base. Writeback is applied
+when the instruction completes. Faults with code 1 at the instruction, never
+a chosen UNPREDICTABLE behaviour: writeback with Rn = R15 or Rn = Rd, Rm =
+R15, writeback with Rm = Rn, LDRT/STRT, LDRD/STRD, nonzero SBZ bits, STR of
+R15, byte or halfword loads to R15, LDM/STM
+with an empty list, R15 base or STM of R15, LDM! with its base in the
+list and STM! whose base is not the lowest register. Also not executed:
+S with Rd = PC outside SVC/IRQ mode, user-bank LDM/STM `^`, register shifts
+naming R15, and swaps. Unaligned single transfers fault 2 rather than
+rotate.
+
+Boot ROM fetch and literal reads share a 4 KiB external ROM window; supply
+the aligned little-endian word combinationally from `BOOT_ADDR & ~3`. A
+local 4 KiB block RAM begins at `0x02000000` and is also executable: a
+fetch from it presents the address on the RAM's one synchronous port for a
+cycle and decodes the word returned, so instructions are exactly the bytes
+the guest stored (no separate instruction memory or cache; while a RAM
+fetch runs `BOOT_ADDR` shows the RAM PC and is ignored). `STORE_VALID` reports the aligned
+RAM address and full post-write word once per RAM store, including each STM
+beat; `RETIRE_VALID` reports the instruction address (not pipeline-visible
+R15) and opcode once per instruction, condition-failed ones included.
+Neither output requires an acknowledgement.
+
+The blocking link (the `GPU_*` ports) carries only single transfers. It
+owns the `0x06xxxxxx` VRAM aperture, DISPCNT and DISPSTAT (`0x04000000-05`),
+VCOUNT (`0x04000006-07`, reads only), TM0CNT-TM3CNT (`0x04000100-0F`),
+AUXSPICNT (`0x040001A0-A1`), ROMCTRL and the game-card command bytes
+(`0x040001A4-AF`), IME (`0x04000208-0B`), IE and IF (`0x04000210-17`),
+POWCNT1 halfword/word, entirely GPU-owned VRAMCNT byte spans and the
+game-card data port (`0x04100010-13`); every access must lie wholly inside
+one span. Timers, IME/IE/IF and the game-card registers are not GPU
+registers: they are routed for the devices `Arm9Soc` puts in front of the
+GPU, and a target that does not implement an address must reply with an
+error (the [CPU + VRAM display prototype](../fpga/mister_hs_gfx_slice/README.md)
+replies fault to all of them and to DISPSTAT). LDM/STM never use the link:
+every beat is route-checked before the first one issues, and a block with a
+beat outside the boot ROM (reads) or local RAM faults 3 at that beat's
+address with nothing transferred, so no burst or GXFIFO-style atomic scope
+is implied. A request holds its original byte address, byte count, lane mask
+and right-justified data until `GPU_REQ_VALID && GPU_REQ_READY`; only one
+beat may be in flight. The target holds its right-justified reply until
+`GPU_REPLY_VALID && GPU_REPLY_READY`; a write must also return a reply.
+Transfers and observation pulses count only with `EN` high and `RST` low.
+Reset clears CPU/link state, not RAM. Any adapter must discard pre-reset
+replies before the next request. `FAULT` is sticky until reset:
+1 = unsupported opcode (instruction address), 2 = alignment (including a
+misaligned branch target, reported at fetch, and an unaligned LDM/STM base),
+3 = unrouted address (including VCOUNT writes and link addresses in
+LDM/STM), 4 = link reply error. WRAMCNT is never sent on the link.
+
+Generate the isolated top with Stack and Clash 1.8.4:
+
+```sh
+cd clash
+out=$(mktemp -d)
+stack exec clash -- --verilog -isrc -fclash-no-escaped-identifiers \
+  -outputdir "$out" -fclash-hdldir "$out/hdl" src/Nds/WholeCore/Arm9Slice.hs
+```
+
+Run `sim/run_clash_arm9_witness.sh` from the repository root. The generated
+`nds_arm9_slice` and the pure `sliceStep` share CPU/router logic; both execute
+the assembled witness against the same authoritative Haskell GPU service
+used by the [product RTL witness](../docs/MILESTONES.md#m7-executable-reference-product-arm9-rtl-to-the-haskell-gpu).
+The comparison is of ordered GPU accesses and committed RAM words, not
+instruction/pipeline cycles. The GPU service itself is not generated HDL.
+The slice has no ARM7, LCD schedule, DMA, CP15, cartridge boot, or board
+integration; its IRQ input is tied low in this witness.
+
+`sim/run_clash_arm9_isa.sh` is the CPU-only ISA check for two assembled
+fixtures. [`hs_arm9_isa.S`](../sim/tests/hs_arm9_isa.S) stores 54 mailbox
+words that must equal the hand-derived
+[`hs_arm9_isa.expected`](../sim/tests/hs_arm9_isa.expected): a full
+condition/NZCV truth table, arithmetic and shifter flags, loops, signed and
+unsigned branches, BL/BLX/BX and MOV PC returns, a PC-relative jump table,
+and condition-failed stores, loads (including unrouted and misaligned ones),
+unimplemented forms and links that must leave no trace.
+[`hs_arm9_mem.S`](../sim/tests/hs_arm9_mem.S) stores 46 words that must equal
+[`hs_arm9_mem.expected`](../sim/tests/hs_arm9_mem.expected): every offset and
+indexing form above, signed loads, LDM/STM in all four modes (base in the
+list, STM! of its own base, a block ending at the top of RAM, a block from
+the boot ROM), a recursive PUSH/POP subroutine, `LDR pc` returns and jumps,
+and condition-failed transfers (including UNPREDICTABLE encodings) that
+leave no register, memory or PC trace. It uses RAM words `0x30-0x3F` as
+scratch and reads every scratch result back into the mailbox. The
+independent oracle is the product `nds_cpu9` with only boot ROM and main RAM
+attached ([`tb_arm9_isa_oracle.vhd`](../sim/tb_arm9_isa_oracle.vhd)); for
+the ISA fixture it runs a `PRODUCT_ORACLE` build without one
+condition-failed `MOVSNE pc, lr`, which the product core mishandles (r14_svc
+reads 0 afterwards). The pure `sliceStep` and freshly generated Verilog run
+those builds, the full ISA build, 25 variants that must fault exactly (each
+hazard above, NV condition, misaligned PC and LDM base, SWP,
+VCOUNT write, LDM/STM past RAM, into the link or onto the ROM) with no store
+after the mailbox, and 7 that must hold one exact link offer (DISPCNT write,
+VCOUNT read, post-index and register-writeback transfers, a timer write, an
+IE read, a DISPSTAT write).
+
+`sim/run_clash_arm9_irq.sh` checks IRQ exceptions on the composed
+[`Nds.WholeCore.Arm9Soc`](src/Nds/WholeCore/Arm9Soc.hs), where
+`Nds.WholeCore.Arm9Io`'s IME && (IE & IF) level drives the CPU's IRQ input.
+The assembled [`hs_arm9_irq.S`](../sim/tests/hs_arm9_irq.S) stores 48
+mailbox words that must equal the hand-derived
+[`hs_arm9_irq.expected`](../sim/tests/hs_arm9_irq.expected): SVC/IRQ banking
+of R13/R14 across MSR mode switches; a timer 0 overflow latched in IF but
+held off by CPSR.I, then by IME and by IE; entries from a real timer chain
+returning with `SUBS pc, lr, #4` and, for five free-running overflows,
+`LDM {r0-r3, pc}^`; CPSR/SPSR seen in the handler and restored after it;
+entry at the first boundary after the MSR that clears I with F kept; and
+external IF sources raised by the harness while an LDR on the link waits
+and at the first beat of an STM, both taken only after the instruction
+completed. The independent oracle is the product `nds_cpu9` with the
+product `gba_timer` and `nds_irq` on its I/O bus at half rate
+([`tb_arm9_isa_oracle.vhd`](../sim/tb_arm9_isa_oracle.vhd) with `IRQ_IO`),
+running a `PRODUCT_ORACLE` build that stops after the first 34 words. Its
+handler-CPSR slots mask F and its first entry is checked only to resume
+the right instruction within one instruction of the MSR, because the
+product executes one more instruction after an MSR that clears I and, on
+exception entry, loads the CPSR flags and F from the old SPSR of the target
+mode instead of keeping them (seen directly for SWI in the Thumb gate
+below; `nds_cpu9` sets the entered CPSR from that SPSR for IRQ too). The
+pure `socStep` and fresh Verilog of `nds_arm9_soc` run the full build and
+nine builds that must fault 1 at the instruction (SUBS pc and MRS SPSR in
+System mode, MSR to FIQ mode, T, Q or an empty mask, user-bank LDM/STM `^`
+in IRQ mode, and an exception return from an SPSR naming FIQ mode). The
+harness raises its external IF sources only where the runner asks
+(`--link-read`, `--store-irq ADDR MASK`, `--retire-irq PC MASK`) and fails
+unless each one fired.
+
+`sim/run_clash_arm9_thumb.sh` checks Thumb, interworking, multiplies, SWI
+and the modes with three assembled fixtures and hand-derived mailboxes.
+[`hs_arm9_thumb.S`](../sim/tests/hs_arm9_thumb.S) (46 words, CPU only):
+every Thumb format with its flags (read by `BLX` to an ARM helper), MUL
+with Rd = Rm, hi-register ops and `ADD pc`, PC-relative loads at both
+halfword alignments, register/immediate/SP-relative transfers, STMIA/LDMIA
+(base in the list), BL and `POP {.., pc}`.
+[`hs_arm9_interwork.S`](../sim/tests/hs_arm9_interwork.S) (50 words, CPU
+only): BX/BLX register both ways, ARM `BLX <imm>` with H = 0 and 1, Thumb
+`BLX <imm>` from both halfword alignments (one whose computed target has
+bit 1 set), `BX pc`, LDR pc/LDM/POP state switches, `MOVS pc, lr` into
+Thumb through SPSR.T, all six multiplies with C/V kept and overlapping
+operands, CLZ, SWI from ARM (comment field read back through R14_svc),
+System and Thumb, the shared User/System bank and User-mode MSR.
+[`hs_arm9_thumb_irq.S`](../sim/tests/hs_arm9_thumb_irq.S) (12 words, on
+`Arm9Soc` with real timer 0 overflows): an IRQ pending at an exception
+return into Thumb is taken before the first Thumb instruction (R14_irq =
+next + 4, SPSR.T), a timer IRQ in a Thumb loop returns by `LDM {.., pc}^`,
+and an IF bit the harness raises when a Thumb BL prefix retires is taken
+between prefix and suffix, after which the suffix still links and lands
+correctly. The product `nds_cpu9` (no I/O for the first two, timers and
+`nds_irq` for the third) matches all 46 Thumb words, all 50 interwork
+words of a `PRODUCT_ORACLE` build that first copies the CPSR into SPSR_svc
+(the entry deviation above would otherwise show in the handler CPSR), and
+the first 7 Thumb-IRQ words (it has no harness IRQ source); its handler
+branches rather than using a condition-failed `SUBS pc`, which corrupts
+the product's banks (the known `MOVSNE pc, lr` deviation). The pure model
+and fresh Verilog of `nds_arm9_slice`/`nds_arm9_soc` run every image in
+full plus 18 builds that must fault exactly (BKPT, undefined B<cond>,
+two-low-register hi op, BX SBZ, `BLX pc`, odd BLX suffix, empty LDMIA,
+STMIA base not lowest, an ARMv6 encoding, POP to a misaligned ARM target;
+MRS SPSR and `MOVS pc, lr` in User mode, MUL to PC, MUL SBZ, UMULL with
+RdHi = RdLo, SMLAL to PC, CLZ to PC, user-bank LDM `^` in SVC). Seventeen
+CPU mutants (Thumb PC alignment, BL and Thumb BLX-register link bit 0,
+ARM `BLX <imm>` ignoring H, Thumb BLX keeping bit 1, no load interworking,
+returns ignoring SPSR.T, exception entry keeping T, MUL clearing C/V,
+unsigned SMULL, Rd = Rm faulting, ARM-step SWI link, wrong Thumb IRQ link,
+User MSR writing control bits, System with its own bank, LDMIA base
+writeback, CLZ off by one) each fail the pure fixtures.
+
+Size (Yosys 0.71 generic synthesis of the generated `nds_arm9_slice`:
+`hierarchy; proc; flatten; opt; memory -nomap; opt; techmap; opt -fast;
+abc; stat`, the 4 KiB RAM kept as one memory): 49,746 cells and 991
+flip-flops before this Thumb/mode/multiply work, 99,644 cells and 1,156
+flip-flops after; about 8,900 of the new cells are the 33x33 multiplier,
+which an FPGA maps to DSP blocks. The extra flip-flops are the R13/R14
+banks, SPSR_svc, T and the mode field.
+
+`sim/run_clash_arm9_card.sh` checks the read-only NTR game-card slot,
+[`Nds.WholeCore.Card`](src/Nds/WholeCore/Card.hs), which `Arm9Soc` puts
+behind the router for `0x040001A0-A1`, `0x040001A4-AF` and `0x04100010`
+(card requests never appear on the GPU outputs), with its transfer-done
+pulse on IF bit 19. Register and command semantics follow melonDS
+(`NDSCart.cpp`, `NDSCart/CartCommon.cpp`): AUXSPICNT and ROMCTRL masks,
+cart reset held until ROMCTRL bit 29 after a raw power-up, block sizes 0,
+4 and 0x100 << n bytes, a two-word FIFO behind ROMCTRL bit 23. Raw mode
+answers 9F, 00 (header words at (addr + 4k) & 0xFFF) and 90; with
+`CARD_DIRECT_BOOT` the slot powers up as melonDS's direct boot leaves it
+(AUXSPICNT 0x8000, bit 29 set, main data mode) and answers B7 (address
+masked to the image, below 0x8000 redirected to 0x8000 + (addr & 0x1FF),
+wrapping inside its 4 KiB page) and B8. The image lives outside, behind a
+one-request ready/valid word port (`CARD_ROM_*`), with the chip ID and
+image mask as straps. Fail closed, as a link reply error: starts with the
+slot disabled, in SPI mode, with ROMCTRL bit 30, with no cart or the cart
+in reset, any other command (including the KEY1 entry 3C, which needs BIOS
+keys) or an unaligned address; ROMCTRL writes during a transfer;
+command-byte reads; data-port writes, non-word reads and reads with no
+word ready. Not modelled: KEY1/KEY2 (KEY2 is transparent to software),
+backup SPI, card writes, card DMA, ARM7 slot ownership (EXMEMCNT) and
+cart-bus timing.
+
+The assembled [`hs_arm9_card.S`](../sim/tests/hs_arm9_card.S) runs in a raw
+build (reset release, 9F with the IRQ exception, a size-0 transfer, the
+header, the chip ID, a header read wrapping at 4 KiB) and a direct-boot
+build (B7 reads with the IRQ exception, redirected, mirrored, 0x400 bytes,
+one wrapping at 4 KiB, B8). Its expected mailboxes
+([raw](../sim/tests/hs_arm9_card_raw.expected),
+[direct](../sim/tests/hs_arm9_card_direct.expected)) and image-address
+streams come from [`hs_arm9_card_oracle.py`](../sim/tests/hs_arm9_card_oracle.py),
+which also builds the synthetic 64 KiB test image (ASCII title, arithmetic
+filler, no commercial data) and shares no code with the Clash model. The
+product `nds_cpu9` with the product `nds_card`, timers and `nds_irq` on its
+I/O bus (`nds_card` and `nds_irq` at the full clock, as
+`nds_nitro_console_top` runs them) matches the words before the first
+slice-only check (15 raw, 17 direct). Observed differences after that: its
+00 ignores the header address and its direct-boot power-up AUXSPICNT reads
+0; its source also reads B7 contiguously, without the 4 KiB page wrap,
+which this gate does not exercise on it. The pure `socStep` and
+fresh `nds_arm9_soc` Verilog match every word (19 and 22) and the oracle's
+image-address streams (256 and 516 words) under image-store backpressure,
+and 15 builds that must fault exactly.
+
+`sim/run_clash_arm9_boot.sh` is the card-boot gate: the boot-ROM loader
+[`hs_arm9_boot.S`](../sim/tests/hs_arm9_boot.S) runs a synthetic DS image's
+ARM9 binary from RAM after copying it there through the game-card
+registers. The image comes from
+[`hs_arm9_boot_oracle.py`](../sim/tests/hs_arm9_boot_oracle.py): a
+standard-layout cartridge header (title, game code, ARM9 ROM offset 0x8000,
+entry, RAM address 0x02000400 and size at 0x020-0x02C, ARM7 fields empty,
+Nintendo logo area and logo CRC zero, header CRC16 at 0x15E) and, as ARM9
+binary, the assembled position-independent
+[`hs_arm9_boot_payload.S`](../sim/tests/hs_arm9_boot_payload.S). The
+launcher handoff is how the loader learns the header in main data mode,
+where B7 cannot read it (it redirects below 0x8000): the launcher places
+the image's own 0x200-byte header in the boot ROM at `0xFFFF0E00`, the role
+a real BIOS plays by copying the header to `0x027FFE00`; no other image byte
+is preloaded. With `CARD_DIRECT_BOOT` the loader checks that header's CRC16
+and its fields against its limits (ROM offset >= 0x8000 in whole 0x200-byte
+blocks, binary inside `0x02000400-0x02000FFF`, entry inside the binary),
+copies the binary with B7 block reads (words past its end are drained, not
+stored) and `BX`es to the entry with r0 = RAM address, r1 = size, r2 = CRC.
+A raw-power-up build reads the header from the card itself with command 00,
+checks its CRC16 and compares it word by word with the boot-ROM copy; there
+is no raw-to-data mode transition (that needs KEY1). From the image bytes
+alone the oracle derives each build's mailbox, the image addresses the slot
+fetches and the exact sequence of instructions retired from RAM (the
+binary's words from the entry to its first `b .`, which then repeats). The
+pure `socStep` and fresh `nds_arm9_soc` Verilog match all of them under
+image-store backpressure; the harnesses also require every word of the
+binary to be stored before the first RAM retirement and every RAM
+instruction to be the word the guest last stored at that address, and a
+header with a bad CRC or an entry outside the binary must be rejected with
+nothing run from RAM. This is a finite loader test, not a BIOS boot: no
+KEY1 secure area, no ARM7 binary, no firmware, no game.
+
+Today's observed slice gates (ISA, link reset, native `Nds.Gpu.Live` frames,
+generated CPU + VRAM graphics) and their limits are listed in the
+[M7 ledger](../docs/MILESTONES.md#m7-finite-slice-gates-observed-2026-11-18-not-acceptance);
+M7 remains not accepted.
+
 ## 3D inversion
 
 The 3D path is moving into Clash and the 2D path is moving to the ARM; see
@@ -118,7 +445,7 @@ oracle from the vendored headers so layout constants cannot be retyped wrong.
 
 ## 2D trace checkpoint
 
-Milestone status (M0-M5 evidence, M6/M7 remaining work) is tracked in
+Milestone status (M0–M6 host evidence and the separate M7 boundary) is tracked in
 [`docs/MILESTONES.md`](../docs/MILESTONES.md).
 
 `Nds.Gpu2D.Trace` replays ordered NSD2 input snapshots and memory deltas;
@@ -141,7 +468,7 @@ sim/melonds_tracer/build-fbdump-vendored.sh
 mkdir -p /tmp/nds-v11-capture
 sim/melonds_tracer/build-vendored/melonds_fbdump --direct \
   --trace2d /tmp/nds-v11-capture/ntr-v11.nsd2 --trace2d-provenance \
-  <path to your NTR test cart>.nds \
+  '<path to your NTR test cart>.nds' \
   /tmp/nds-v11-capture/top.txt 124 /tmp/nds-v11-capture/bottom.txt \
   2>&1 | tee /tmp/nds-v11-capture/run.log
 runghc -iclash/src clash/test/TraceCheck.hs
@@ -428,59 +755,200 @@ older 1.51x is renderer-only, and shared-preparation arithmetic was not an
 end-to-end measurement. No Quartus fit, regenerated composed HDL or board
 result is established by these host checks.
 
-## Visible host viewer (live stream, open loop)
+These are **historical, pre-M6 measurements**, not a remeasurement of the
+current tree. M6 corrected `TraceMemory` equality to compare complete immutable
+regions after its identity fast filter: two `applyDelta` branches of one
+parent must not alias an existing M5 `MemoryKey`. The original M5 cache/store
+APIs remain; the current 11-case `SpeculateCheck` includes a red/blue palette
+fork through the actual cached-pixel consumer. The benchmark was not rerun.
 
-`tools/hs_gpu_view/run.sh CART.nds [FRAMES]` opens a macOS window that shows
-the cartridge as rendered by the Haskell models. The pipeline is:
+## Visible host viewer (closed-loop Haskell GPU)
 
-```text
-melonds_fbdump --direct --input CTRL --trace2d /dev/fd/3 --trace2d-raw3d CART /dev/null FRAMES
-  -> pipe (NSD2 v12) -> trace-view (clash/test/TraceView.hs)
-  -> nds-view (tools/hs_gpu_view/{NdsView,main}.swift)
+```sh
+tools/hs_gpu_view/run.sh CART.nds [FRAMES]
+# Optional continuous diagnostic PNG, not enabled by default:
+NDS_VIEW_SNAPSHOT=/tmp/hs-shown.png tools/hs_gpu_view/run.sh CART.nds
 ```
 
-- melonDS runs the ARM9/ARM7, memory and cartridge, plus its own GPU, which is
-  what the emulated CPU reads back (GXSTAT, capture, etc.). `trace-view`
-  renders every displayed pixel from the streamed inputs with
-  `Nds.Gpu3D.Chip` (through `TraceReplay`) and the `Nds.Gpu2D`
-  compositor. melonDS's own screen records are only *counted*: the status line
-  shows how many lines are bit-identical.
-- **Open loop.** The Haskell GPU never feeds back into the emulated CPU. This
-  is a live streamed renderer, not a closed-loop console or a replacement for
-  melonDS's GPU. The pipe throttles melonDS to the renderer's speed (a few
-  frames per second). `FRAMES` defaults to 1,000,000.
-- **Fails closed.** Any of these stops the stream with an explicit
-  frame/line error: a 3D, sprite, render or capture model error; a GX event
-  before the first render-start snapshot; a normalized type-5/7 GX record
-  without the raw type-26 stream; or a frame without exactly lines 0-191.
-  Only complete frames are emitted. `trace-view` ends with a terminal record
-  (end of stream, or the error). The window then keeps the last actual frame
-  and is marked `STOPPED, NOT LIVE` (red for an error); it never shows the
-  frame as live after that.
-- `run.sh --replay TRACE.nsd2` shows a recorded v12 trace instead (no input).
-- Logs: `$TMPDIR/nds-hsview/{melonds,trace-view,nds-view,build}.log`.
-  Stdout carries only frame and terminal records. `shown.png` is the exact
-  bitmap last handed to the window. Closing the window ends the pipeline.
+The default is **closed-loop Haskell GPU; melonDS CPUs/non-GPU peripherals**,
+not a standalone Haskell SoC. `FRAMES` defaults to 1,000,000. The pipeline is:
 
-Controls (input is sent to melonDS through the `--input` control file):
+```text
+melonDS ARM interpreters / DMA / non-GPU peripherals
+  <-> synchronous ABI2 <-> Nds.Gpu.Live / Gpu3D.Timed / Chip / Gpu2D
+  -> actual Haskell pixels (NDSF/NDSE) -> native nds-view
+```
 
-- Game controller (GameController framework; the name is shown in the
-  window): east/south/north/west face buttons = DS A/B/X/Y (Nintendo layout),
-  LB/LT = L, RB/RT = R, Menu = Start, Options = Select, d-pad or left stick =
-  directions.
-- Keyboard, an extra to the pad (same keys as the standalone host):
-  arrows, X = A, Z = B, S = X, A = Y, Q = L, W = R, Return = Start,
-  right Shift = Select.
-- Mouse = touchscreen. A left press on the bottom screen touches at the
-  aspect-fit pixel (0-255, 0-191). Drags clamp to that screen. Releasing the
-  button, leaving the view, the window losing focus or closing all release the
-  touch. Clicks on the top screen are ignored.
+Haskell owns GPU registers/results, FIFO/PIPE progress, GXSTAT/RAM_COUNT,
+LCD/geometry deadlines, IRQ/DMA effects, all physical GPU memory and VRAM
+mapping, palette/OAM, capture/FIFO and both displays. C++ GPU accesses route
+to that authority; runtime guards reject stock GPU execution in this mode.
+The independent stock renderer is an oracle in separate runs only.
 
-Control file (16 bytes, little endian): `"NDSI"`, a 12-bit key mask in
-`SetKeyMask` order (active low), touch (bit 31 pressed, x in bits 0-7, y in
-bits 8-15) and a sequence number. melonds_fbdump applies changes before each
-frame through `SetKeyMask`/`TouchScreen`/`ReleaseScreen` and logs them as
-`input frame=...` on stderr. After each frame it writes back, at byte 16, the
-sequence that frame ran with. The viewer holds a press or touch that is
-shorter than one emulated frame until that acknowledgement arrives, so quick
-taps reach the game.
+`Gpu3D.Timed` is a timed **functional** executor, not `chipRun` drained at
+each MMIO operation and not synthesized `ChipHw`. The host orders the two
+interpreters' actual reported instruction timestamps and DMA accesses.
+ABI timestamps are 33,513,982-Hz system cycles; every due deadline is serviced
+at its exact timestamp before a same-time access. Coincident GX/LCD
+deadlines require separate calls at the same time. Borrowed pixels/errors
+are copied before applying potentially reentrant DMA effects.
+Contract: [`sim/melonds_tracer/HsGpuAbi.h`](../sim/melonds_tracer/HsGpuAbi.h).
+This is not a physical sub-instruction bus or independently exhaustive
+geometry-microcycle proof, generated HDL or board acceptance.
+
+ABI2 retains the eight-word request/sixteen-word reply and uses the last
+request word as `instructionScope`. A real ARM9 handler's ordinary word
+command write must first cause the observed stall. Only its remaining word
+GX writes, with that same scope and exact raw core clock, can use operation 9
+`IO_CONTINUE` at the unchanged instruction timestamp. Entries join the existing
+front-end pending FIFO; register writes retain their normal decoder effects.
+DMA/new instructions cannot use it, and ordinary stalled writes still fail.
+The handler finishes before the next instruction is blocked; no new CPU
+microcycle model, retiming, spill capacity or per-MMIO drain is introduced.
+
+Closed-loop frames have **no inline oracle comparison**; the window says
+Haskell is authoritative, never that `0/0` lines prove equality. Explicit
+diagnostics remain separate:
+
+- `run.sh --open-loop CART.nds [FRAMES]`: old raw NSD2 stream through
+  `TraceView`; the CPU sees the stock GPU. Not closed loop.
+- `run.sh --replay TRACE.nsd2`: recorded input, input disabled, not live.
+
+The launcher builds the service at a distinct path per launch, never
+overwrites a mapped library, and fails on build/service/protocol errors.
+Unsupported modes (including JIT, DSi, firmware execution, savestates and
+sleep) fail explicitly rather than selecting a stock-GPU fallback.
+Only complete actual frames are emitted. A fatal or missing/truncated
+terminal record, including an invalid UTF-8 terminal message, leaves the
+last actual frame visible as **STOPPED, NOT LIVE / STOPPED (ERROR)**.
+Closing the window ends the producer; its resulting broken-pipe diagnostic
+is not a GPU-model failure.
+
+Use `OUT=/tmp/hs-live` to choose the launcher's build/log directory.
+It contains `build.log`, `melonds.log`, `nds-view.log` and
+`service-path.txt` (plus `trace-view.log` in diagnostics).
+Continuous PNG encoding/writing and CPU clock logs are **not** normal-viewer
+work: PNG publication is opt-in through the existing `NDS_VIEW_SNAPSHOT`
+environment variable; timing fixtures invoke `melonds_fbdump --clock-log`
+explicitly. `FBDUMP` and `HS_GPU_LIBRARY` can select already built binaries.
+
+### M6 observed scope
+
+Independent state-authority fixtures match 69 stock-C++ records, then actual
+LCD/IRQ/capture histories and four complete both-screen frames. A capture
+request written after line0 survives line192 and really writes `0x801F` to
+CPU-visible VRAM on the next frame, not merely a register-bit check.
+The real service regression covers coincident GX/LCD time1584, CPU
+GXSTAT/DISPSTAT/VCOUNT, IRQ/DMA, that late capture, and terminal/reset errors.
+
+The v5 direct path compared 200 NTR frames (both screens) and all 4 MiB main
+RAM with an independent stock-GPU control, with zero differences; that
+control also matched the original stock schedule. A real ARM cartridge
+alternating palette red/green every VBlank matched for 120 frames and its
+CPU counter reached 120. Thirty-two directed real ARM bus/DMA/ARM7 variants
+also matched. These are finite comparisons, not all cartridges or all
+timing histories. Artifacts: `/tmp/m6-final/`, `/tmp/m6-run/`,
+`/tmp/nds-m6-state-oracle/`; final scope is in
+[`docs/MILESTONES.md`](../docs/MILESTONES.md#m6-closed-loop-pairing).
+
+Whole-process timing in `/tmp/m6-final/drive.out` includes startup/output:
+NTR 200: **16.1 s**; active-cart 120: **4.6 s** (about 26 fps).
+The producer's internal totals were 15.91488 s and about 4.55 s; those are
+not the complete process wall. NTR frame phases were approximately 64–91 ms
+and the headless active scene approximately 36 ms/frame.
+The slower new live-cache experiment (18.6 s / 6.6 s whole process) was
+deleted, not shipped as an unused switch; original M5 TARDIS remains.
+The retained improvement is linear line composition/3D-row construction.
+No 60 fps or universal-gameplay claim follows from these measurements.
+
+Actual native AX and the app-produced bitmap showed NTR
+`PROGRESS[018/058]`, `[07-01] 3D ATTR FARCLIP`, `RESULT:FAIL TOTAL:FAIL`,
+bottom white: the existing independent baseline failure was not hidden.
+Native keyboard X (DS A) reached the real CPU input API as `FFE` at frame 1770,
+then release `FFF` at 1772, acknowledged sequence 4.
+A same-source own-window AppKit event fixture also drove touch
+press (64,48), drag (192,144), release through a **single** production
+`InputChannel` writer and the real closed-loop producer, with sequences 2/4/6
+all acknowledged. This is programmatic event evidence, not a physical
+pointer/DS4-button claim. Current GameController enumeration was
+**no game controller detected**; existing mapping/notification code is
+preserved. The normal-status-0 stream with its final message byte removed
+produced an actual `STOPPED (ERROR)` window; all 98,304 visible RGB pixels
+still equalled its last real frame 5.
+
+The normal native active-input fixture, with no PNG/clock/profile/frame-file
+diagnostics, completed 40 frames in **3.582 s** including startup and display
+transport (about **11.2 fps**). Press/drag/release input-sampling ACKs were
+67.464/191.405/128.511 ms, observed by a 10 ms polling fixture. With continuous
+PNG plus clock diagnostics the earlier run was 3.74 s, with 162–168 ms
+acknowledgements. These single runs do not establish a statistical speedup
+or a PNG-root-cause claim; **27 fps is not a native-GUI measurement**.
+Logs: `/tmp/nds-m6-ui-touch-direct/{harness,producer,wall}.log`.
+These are producer sampling/apply acknowledgements, not measured physical
+cartridge or visible-screen response latency.
+
+The complete cartridge/performance runs used immutable v5
+`f4283979e59f50fcac8eb821871d2d56f096d22df9b1d84651cac85df98ad664`
+(direct, cache off). The pre-continuation cleanup ABI1 service is
+`d80dd4d25a2432d07922e5560ec9fe1c02a9b4883c0cccb92e079bf1e5361c7b`;
+after removing the failed experiment it passed the focused service,
+11-case M5/fork and native/input checks. The 200/120-frame gates were not
+repeated for that cleanup. Private ROM input was the requested
+`__AAAA01_00.nds`, 2,696,840 bytes, not the older unsupported 8 MiB summary;
+the source file was not modified.
+Current scoped-continuation ABI2 service:
+`/tmp/nds-m6-abi2.2zdPYe/gpu.dylib`, SHA256
+`fc8f9c9a4619519b0d569d9bb3c32c845f6d1d98b23fa3ca07e2ec4daec02d70`.
+The targeted service selector also checks five admission guards and compares
+pending POS/PUSH refill flags/results with the standalone chip. Timed status
+preserves both retiring-command flags and newly asserted refill flags; shared
+standalone counters still increment only when pending entries reach FIFO/PIPE.
+The throughput figures above predate this narrow ABI2 correction; they were
+not rebenchmarked.
+
+Final ABI2 real-instruction proof: unchanged
+`/tmp/m6-scen/atomic-watch.nds` crosses the full FIFO under SWAP with one STM.
+Its original bit 0/14 polling remains. **Exit 0, all 44 RAM words stock-equal**:
+GXSTAT `09000000` before / `06000100` settled; POS_RESULT
+`1111,2222,3333,1000`; one matrix push. ARM7's VCOUNT 64 observer records
+post-STM marker 0 plus `DECAFBAD`, then post-VBlank markers appear.
+The four beats retain scope 263 / system 15302 / raw ARM9 clock 30604:
+ordinary `400=71`, ordinary `404=22221111` asserts stall, authenticated
+continuations `408=3333`, `40C=11`. No dropped/duplicated beat, new-instruction
+retirement during stall, or instruction retiming is hidden by the witness.
+Actual `/tmp/m6-scen/atomic-watch.final.{out,err,txn}` compares with
+`atomic-watch.stock.out`; sources `atomic.s`/`atomic-watch7.s` are retained.
+This is the new targeted ABI2 proof, separate from the prior v5 200-frame run.
+
+Rebuild/run only the narrow permanent scope/refill/standalone guard check:
+
+```sh
+cd clash
+mkdir -p /tmp/hs-continuation-check
+stack --resolver lts-22.43 ghc -- -O2 -dynamic -fPIC -threaded -isrc -itest \
+  -outputdir /tmp/hs-continuation-check test/GpuServiceCheck.hs \
+  -o /tmp/hs-continuation-check/check
+/tmp/hs-continuation-check/check --continuation-only
+```
+
+
+### Controls and acknowledgement
+
+- GameController pad: east/south/north/west = DS A/B/X/Y (Nintendo layout),
+  LB/LT = L, RB/RT = R, Menu = Start, Options = Select, d-pad/left stick =
+  directions. The connected name/profile is shown in the window.
+- Keyboard: arrows, X=A, Z=B, S=X, A=Y, Q=L, W=R, Return=Start,
+  right Shift=Select.
+- Mouse on the bottom screen = touch, aspect-fit pixels0–255/0–191.
+  Drags clamp; release, view exit, focus loss and closing release touch.
+  Top-screen clicks are ignored.
+
+The 16-byte little-endian control record is `"NDSI"`, active-low 12-bit
+`SetKeyMask` keys, touch (bit 31 pressed, x bits 0–7, y bits 8–15), sequence.
+The producer calls actual `SetKeyMask`/`TouchScreen`/`ReleaseScreen` before
+each frame, then acknowledges the latched/applied sequence at byte 16.
+It has copied that frame's input, so clearing the viewer's short-input
+latch cannot change the emulator input until its next frame poll.
+This is a sampling acknowledgement, not completed-frame or game-response
+evidence; short taps still cannot disappear between frame polls.
+
