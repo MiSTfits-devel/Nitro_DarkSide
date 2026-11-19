@@ -1,0 +1,38 @@
+name: Developer Certificate of Origin
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened, synchronize, edited]
+
+# This public repository needs no token to fetch Git objects.
+permissions: {}
+
+jobs:
+  dco:
+    name: DCO
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check only commits introduced by this PR
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          repo="$RUNNER_TEMP/dco.git"
+          git init --bare "$repo"
+          cd "$repo"
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          # The base repository exposes this ref for fork PRs too. Get complete
+          # commit ancestry, not candidate worktrees, blobs, submodules or hooks.
+          git fetch --no-tags --no-recurse-submodules --filter=tree:0 origin \
+            "$BASE:refs/dco/base" "refs/pull/$PR/head:refs/dco/head"
+          if [[ $(git rev-parse refs/dco/head) != "$HEAD" ]]; then
+            echo 'PR head moved; the synchronize run must check the new head.' >&2
+            exit 1
+          fi
+          # Materialize exactly one file, from the immutable trusted base only.
+          git show "$BASE:tools/check_dco.py" > "$RUNNER_TEMP/check_dco.py"
+          python3 -I "$RUNNER_TEMP/check_dco.py" "$BASE" "$HEAD"
