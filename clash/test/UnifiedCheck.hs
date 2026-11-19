@@ -25,6 +25,12 @@ main = do
       flatLine = unifiedLine no3d 40
       withChar = unifiedLine opaque3d 40
       transLine = unifiedLine transparent3d 40
+      repeated = unifiedLine (UnifiedInput es
+        [ (17,40,0x1f010203), (42,40,0x1f22333f)
+        , (-1,40,0x1f101010), (17,41,0x1f112233)
+        , (17,40,0x0000ffff), (300,40,0x1f202020)
+        , (17,40,0x1f0a0b0c), (17,40,0x00ffffff)
+        , (42,39,0x1f010101) ]) 40
       failures = concat
         [ [ "no 3D differs from the reference at line " ++ show y
           | (y, a, b) <- zip3 [0 ..] flat flatRef
@@ -37,6 +43,11 @@ main = do
           | transLine /= flatLine ]
         , [ "unified frame lost pixel positions"
           | any ((/= 256) . length) flat ]
+        , [ "unordered/duplicate sparse 3D lost last opaque position"
+          | repeated !! 17 /= Just (Pixel 0x0a0b0c L3D)
+            || repeated !! 42 /= Just (Pixel 0x22333f L3D) ]
+        , [ "out-of-bounds/wrong-line 3D changed another position"
+          | or [a/=b | (x,a,b) <- zip3 [0..] flatLine repeated, x/=17, x/=42] ]
         ]
       changed =
         [ x | (x, a, b) <- zip3 [0 ..] flatLine withChar

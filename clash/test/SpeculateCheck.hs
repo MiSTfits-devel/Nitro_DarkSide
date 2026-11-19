@@ -2,13 +2,18 @@
 module Main (main) where
 
 import Data.Array.Unboxed (UArray, listArray)
+import qualified Data.ByteString as B
 import Data.Word (Word8, Word32)
 import System.Exit (exitFailure)
 import Nds.Gpu2D.Speculate
 import Nds.Gpu2D.Types
+import Nds.Gpu2D.Trace
 
 main :: IO ()
 main = do
+  parent <- newTraceMemory
+  branchA <- either fail pure (applyDelta parent 0 0 (B.pack [0x1f,0]))
+  branchB <- either fail pure (applyDelta parent 0 0 (B.pack [0,0x7c]))
   let base = state
       frame = FrameInput emptyCache (replicate 192 base)
       cold = onePassFrame frame
@@ -29,6 +34,15 @@ main = do
         , base { esEva = 1 }, base { esEvb = 1 }, base { esEvy = 1 }
         , base { esDispCnt = 1 }
         ] ++ [base { esBgMosaicLine = n } | n <- [2..33]]
+      zeroLatch = EngineLatch 0 0 0 0 0 0 0 0 0 0
+      paletteView memory = phasePaletteMemory (Phase ScanlinePhase B.empty
+        (Latch zeroLatch zeroLatch) (ExtendedPaletteMap B.empty) Nothing memory Nothing)
+      forkStateA = state { esPalette = paletteView branchA }
+      forkStateB = state { esPalette = paletteView branchB }
+      forkA = onePassFrame (FrameInput emptyCache (replicate 192 forkStateA))
+      forkFrameB = FrameInput (foCache forkA) (replicate 192 forkStateB)
+      forkB = onePassFrame forkFrameB
+      forkExpected = referenceFrame forkFrameB
       checks =
         [ ("cold total renders", totalRenders (foStats cold) == 192)
         , ("cold output", foLines cold == foLines (referenceFrame frame))
@@ -40,6 +54,8 @@ main = do
         , ("line belongs to key", lineKey base 38 /= originalKey)
         , ("opaque callbacks cannot be cached", lineKey callback 37 == Nothing && stDemandRenders (foStats untrusted) == 192)
         , ("opaque callbacks render correctly", foLines untrusted == foLines (referenceFrame (FrameInput emptyCache (replicate 192 callback))))
+        , ("same-parent palette fork changes cached consumer pixels",
+           foLines forkB == foLines forkExpected && foLines forkA /= foLines forkExpected)
         ]
       failures = [name | (name,ok) <- checks, not ok]
   mapM_ (putStrLn . ("FAIL " ++)) failures

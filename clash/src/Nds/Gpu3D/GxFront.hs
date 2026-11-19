@@ -41,8 +41,9 @@
 -- pop drains them (@CmdFIFORead@'s stall-queue refill). That is the real DS
 -- behaviour and the shape of upstream melonDS's 64-entry stall queue; the
 -- NDS4MiSTer fork's 16384-entry queue and @ExternalOverflow@ only exist for
--- its hybrid replay. Because the bus is held, the queue never holds more
--- than the four entries one packed write can produce.
+-- its hybrid replay. Ordinary writes stop at the stall; an authenticated
+-- same-clock continuation of the current atomic ARM9 interpreter handler may
+-- append its remaining entries to this same queue before the next instruction.
 module Nds.Gpu3D.GxFront
   ( -- * Boundary
     Size (..)

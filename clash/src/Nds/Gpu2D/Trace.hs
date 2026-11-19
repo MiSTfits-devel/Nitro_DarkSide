@@ -5,7 +5,7 @@
 -- The immutable, copy-on-write pages preserve earlier phase snapshots when a
 -- later delta changes VRAM.  Missing pages have the trace's initial zero value.
 module Nds.Gpu2D.Trace
-  ( TraceMemory, readRegion8
+  ( TraceMemory, newTraceMemory, readRegion8, applyDelta, applyCaptureWrites
   , PhaseKind(..), Phase(..), DisplayState(..), Latch(..), EngineLatch(..)
   , ExtendedPaletteMap(..), OracleEvent(..), OracleLine(..), OracleEngineLine(..)
   , CaptureEvent(..), CaptureWrite, GeometryEvent(..), replayTrace, replayTraceGeometry
@@ -24,17 +24,21 @@ import System.IO (Handle, IOMode(ReadMode), withBinaryFile)
 -- end at any byte and can cross page boundaries.
 data TraceMemory = TraceMemory !(M.IntMap (M.IntMap B.ByteString)) !Unique !Integer
 
--- Only the decoder creates snapshots; its stream identity and monotonically
--- increasing revision cannot be supplied or forged by a renderer caller.
+-- Stream/revision is only a conservative fast filter: pure delta application
+-- may fork one parent into different contents at the same revision. Equality
+-- must also compare every immutable region/page byte.
 instance Eq TraceMemory where
-  TraceMemory _ streamA revisionA == TraceMemory _ streamB revisionB =
-    streamA == streamB && revisionA == revisionB
+  TraceMemory regionsA streamA revisionA == TraceMemory regionsB streamB revisionB =
+    streamA == streamB && revisionA == revisionB && regionsA == regionsB
 
 instance Show TraceMemory where
   show (TraceMemory _ _ revision) = "TraceMemory revision " ++ show revision
 
 regionSizes :: [Int]
 regionSizes = [2048,2048,131072,131072,131072,131072,65536,16384,16384,32768,16384,262144,131072]
+
+newTraceMemory :: IO TraceMemory
+newTraceMemory = (\stream -> TraceMemory M.empty stream 0) <$> newUnique
 
 readRegion8 :: TraceMemory -> Int -> Int -> Word8
 readRegion8 (TraceMemory regions _ _) region offset

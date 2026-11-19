@@ -39,8 +39,9 @@
 --
 -- Outputs: 'chipRead' values, 'chipGetLine' lines, the 'Drain' report of a
 -- run (entries taken, GXFIFO DMA triggers), 'chipIrq' (IF bit 21),
--- 'chipDmaRequest' (the GXFIFO DMA level), 'chipStalled' (the ARM9 bus is
--- held by a full FIFO; no ARM9 access may be issued until it clears).
+-- 'chipDmaRequest' (the GXFIFO DMA level), 'chipStalled' (ordinary ARM9 bus
+-- accesses are held until it clears; authenticated atomic-handler writes use
+-- the separate 'chipWriteContinuation' entry point).
 --
 -- GXSTAT is composed at the chip level: the geometry engine is reported busy
 -- (bit 27) while a @SWAP_BUFFERS@ waits for VBlank, as melonDS's @GXStat@
@@ -58,6 +59,7 @@ module Nds.Gpu3D.Chip
   , Drain (..)
   , chipStep
   , chipWrite
+  , chipWriteContinuation
   , chipRead
   , chipRun
   , chipRunOne
@@ -221,16 +223,27 @@ alignAddr sz a = case sz of
 -- register write applies to geometry state directly.
 chipWrite :: Size -> Word32 -> Word32 -> Chip -> Chip
 chipWrite sz a0 v ch
-  | stalled gf = error "Nds.Gpu3D.Chip.chipWrite: the ARM9 bus is held by a GX FIFO stall"
-  | otherwise =
-      let a = alignAddr sz a0
-          act = writeAction (gfGeomEn gf) (gfRendEn gf) sz a (truncateWrite sz v)
-          (gf', fx) = mmioWrite sz a v gf
-          geo1 = if wfAck fx then fst (Geo.step (chGeo ch) Geo.AckStackError) else chGeo ch
-          geo2 = case act of
-            WaZeroDot z -> fst (Geo.step geo1 (Geo.SetZeroDotW z))
-            _ -> geo1
-      in ch { chFront = gf', chGeo = geo2 }
+  | stalled (chFront ch) = error "Nds.Gpu3D.Chip.chipWrite: the ARM9 bus is held by a GX FIFO stall"
+  | otherwise = writeRegister sz a0 v ch
+
+-- | Authenticated remaining word write of the same atomic ARM9 handler.
+-- Admission belongs to the live service; preserve the existing register
+-- decoder, geometry effects and front-end pending FIFO.
+chipWriteContinuation :: Word32 -> Word32 -> Chip -> Chip
+chipWriteContinuation a v ch
+  | not (stalled (chFront ch)) = error "Nds.Gpu3D.Chip.chipWriteContinuation: no active GX FIFO stall"
+  | otherwise = writeRegister S32 a v ch
+
+writeRegister :: Size -> Word32 -> Word32 -> Chip -> Chip
+writeRegister sz a0 v ch =
+  let a = alignAddr sz a0
+      act = writeAction (gfGeomEn gf) (gfRendEn gf) sz a (truncateWrite sz v)
+      (gf', fx) = mmioWrite sz a v gf
+      geo1 = if wfAck fx then fst (Geo.step (chGeo ch) Geo.AckStackError) else chGeo ch
+      geo2 = case act of
+        WaZeroDot z -> fst (Geo.step geo1 (Geo.SetZeroDotW z))
+        _ -> geo1
+  in ch { chFront = gf', chGeo = geo2 }
   where
     gf = chFront ch
 

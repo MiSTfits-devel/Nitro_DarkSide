@@ -11,7 +11,7 @@ module Nds.Gpu.Unified
   ) where
 
 import Data.Bits ((.&.), shiftR, testBit)
-import Data.List (foldl')
+import qualified Data.Array as A
 import Data.Word (Word8, Word32)
 
 import Nds.Gpu2D.Line
@@ -56,15 +56,14 @@ unifiedLineWindowed ui y masks sprites = composeWindowedLine es masks [Bg 0, Bg 
       ]
 
 row3d :: UnifiedInput -> Int -> [Maybe LayerPixel]
-row3d ui y = foldl' insert (replicate screenWidth Nothing) (ui3d ui)
+row3d ui y = A.elems (A.accumArray place Nothing (0,screenWidth-1)
+  [(x,c) | (x,py,c) <- ui3d ui, py==y, x>=0, x<screenWidth])
   where
-    insert rows (x, py, c)
-      | py /= y = rows
-      | x < 0 || x >= screenWidth = rows
-      | otherwise =
-          case threeDPixel c of
-            Nothing -> rows
-            Just p -> take x rows ++ [Just p] ++ drop (x + 1) rows
+    -- Preserve sparse-stream order: the last nontransparent point wins.
+    -- Build all 256 positions once rather than copying every list prefix.
+    place old c = case threeDPixel c of
+      Nothing -> old
+      pixel -> pixel
 
 -- | One whole unified frame. The 3D line is simply part of the 2D
 -- composition; there is no second picture and no later glue pass.

@@ -396,22 +396,34 @@ composeLine es layers rows = composeWindowedLine es (replicate screenWidth 0xff)
 
 -- | Mask bits select visible layers and permit ordinary colour effects.
 composeWindowedLine :: EngineState -> [Word8] -> [Layer] -> [[Maybe LayerPixel]] -> [Maybe Pixel]
-composeWindowedLine es masks _ rows = map composeAt [0 .. screenWidth - 1]
+composeWindowedLine es masks _ rows = walk screenWidth masks rows
   where
+    -- Advance each linked list once per pixel. Re-indexing every row with
+    -- (!!) made a fixed-width line quadratic even when only backdrop is on.
+    walk 0 _ _ = []
+    walk n (mask:remainingMasks) remainingRows =
+      let (values,tails) = advanceRows remainingRows
+      in composeAt mask values : walk (n-1) remainingMasks tails
+    walk _ [] _ = error "composeWindowedLine: short window mask"
+    advanceRows [] = ([],[])
+    advanceRows ((value:rest):remainingRows) =
+      let (values,tails) = advanceRows remainingRows
+      in (value:values,rest:tails)
+    advanceRows ([]:_) = error "composeWindowedLine: short layer row"
     backdrop = LayerPixel (expandColor15 (bgPaletteEntry es 0)) 4 LBackdrop 0
     rank p = case lpLayer p of
       LObj -> 0 :: Int
       Bg n -> n + 1
       L3D -> 1
       LBackdrop -> 5
-    candidates i = [lp | row <- rows, Just lp <- [row !! i], fromIntegral (masks !! i) .&. target (lpLayer lp) /= 0] ++ [backdrop]
-    composeAt i =
-      case sortOn (\lp -> (lpPrio lp, rank lp)) (candidates i) of
+    candidates mask values = [lp | Just lp <- values, fromIntegral mask .&. target (lpLayer lp) /= 0] ++ [backdrop]
+    composeAt mask values =
+      case sortOn (\lp -> (lpPrio lp, rank lp)) (candidates mask values) of
         w : rest ->
           let under = case rest of
                 u : _ -> Just u
                 [] -> Nothing
-          in Just (Pixel (blendPixel (masks !! i) w under) (lpLayer w))
+          in Just (Pixel (blendPixel mask w under) (lpLayer w))
         [] -> Just (Pixel (lpRgb backdrop) LBackdrop)
     target layer = case layer of
       LObj -> 0x10
