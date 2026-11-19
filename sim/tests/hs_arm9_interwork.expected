@@ -1,0 +1,50 @@
+0000005a  # 0  set in Thumb after ARM BX r0 (bit 0 set); back by Thumb BX r2 (bit 0 clear)
+000000d3  # 1  CPSR back in ARM: T clear, SVC, I = F = 1
+0000002a  # 2  ARM BLX r3 to Thumb t_double: 21 * 2
+00000000  # 3  LR from ARM BLX register = blx_ret (bit 0 clear)
+0000002b  # 4  ARM BLX <imm> with H = 1 to t_inc_h (pc % 4 == 2)
+00000056  # 5  ARM BLX <imm> with H = 0 to t_double
+00000022  # 6  Thumb BLX r3 to ARM a_add16 (+16), Thumb BLX r3 to Thumb t_shl1 (*2): (1 + 16) * 2
+00000042  # 7  two Thumb BLX <imm> to ARM a_add16, at pc % 4 == 0 and 2 (target + 2 rounded down)
+00000000  # 8  LR in a_add16 after the second = after_odd | 1
+00000077  # 9  ARM LDR pc to Thumb (bit 0 set), Thumb POP {pc} back to ARM (bit 0 clear)
+000000d3  # 10 CPSR low byte after POP {pc}: ARM state
+00000034  # 11 ARM LDM {r2, pc} to Thumb (bit 0 set): 0x33 + 1
+200000f3  # 12 MSR/MRS SPSR_svc = C, I, F, T, SVC
+00000066  # 13 MOVS pc, lr with SPSR.T: executed in Thumb at t_ret
+200000d3  # 14 CPSR = the SPSR (C kept by MOVS r0, #imm), then BX pc to ARM clears T
+242d2080  # 15 MULS 0x12345678 * 0x9abcdef0, low word
+300000d3  # 16 N = Z = 0; C, V from MSR kept
+242d2180  # 17 MLA + 0x100
+0000002a  # 18 MUL r4, r4, r5 (Rd = Rm): 7 * 6
+242d2080  # 19 UMULLS low
+0b00ea4e  # 20 UMULLS high
+300000d3  # 21 N from bit 63 clear; C, V kept
+242d2180  # 22 UMLAL + (1 << 32 | 0x100), low
+0b00ea4f  # 23 high
+242d2080  # 24 SMULL 0x12345678 * -0x65432110, low
+f8cc93d6  # 25 high
+242d207f  # 26 SMLALS + -1, low
+f8cc93d6  # 27 high
+b00000d3  # 28 N from bit 63; C, V kept
+d0369cd0  # 29 UMULL r0, r1, r0, r2 (RdLo = Rm): 3 * 0x9abcdef0, low
+00000001  # 30 high
+ffffffc5  # 31 SMLAL r2, r3, r3, r4 (RdHi = Rm): (-4 << 32 | 5) + -4 * 16, low
+fffffffb  # 32 high
+700000d3  # 33 MULS by 0: Z; C, V kept
+0f001f20  # 34 CLZ 0, 1, 0x80000000, 0x10000 = 32, 31, 0, 15 packed by byte
+00123456  # 35 ARM SWI from SVC: comment field read through R14_svc - 4
+400000d3  # 36 SPSR_svc = CPSR at the SWI (Z from MSR)
+400000d3  # 37 CPSR in the handler: SVC, I set, F kept, ARM
+00000000  # 38 R14_svc = swi_ret
+400000df  # 39 SWI from System mode: SPSR_svc
+400000df  # 40 MOVS pc, lr restored System mode
+00003000  # 41 R13_sys + R14_sys kept (0x1000 + 0x2000)
+00000000  # 42 R14_svc = sys_ret, read after MSR to SVC
+00003000  # 43 User mode sees the System R13/R14
+600000d0  # 44 User MSR cpsr_c ignored; MSR cpsr_fc writes only NZCV
+600000d0  # 45 SWI from User: SPSR_svc
+600000d3  # 46 handler continued in SVC: I set, F kept, flags from its CMP (Z, C)
+00000012  # 47 Thumb SWI: comment byte read through R14_svc - 2
+000000f3  # 48 SPSR_svc: T, SVC, I = F = 1, flags clear
+00000000  # 49 R14_svc = t_swi_ret (no bit 0); returned to Thumb by MOVS pc, lr

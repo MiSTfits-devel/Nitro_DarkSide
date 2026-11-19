@@ -1,0 +1,48 @@
+000000d2  # 0  MRS CPSR after MSR cpsr_c, #0xd2: IRQ mode, I = F = 1
+000000d3  # 1  back in SVC
+00001000  # 2  SVC R13 untouched by the IRQ-mode write
+00002000  # 3  SVC R14 untouched
+00000100  # 4  IRQ R13 (minus 0x02000000) read back in IRQ mode
+00003000  # 5  IRQ R14 read back in IRQ mode
+00000008  # 6  IF: timer 0 overflow latched while CPSR.I masks the IRQ
+00000000  # 7  no IRQ taken while masked
+a0000053  # 8  after SUBS pc, lr, #4: CPSR = SPSR (N, C, SVC, I clear)
+00000001  # 9  execution resumed and ran MOV r8, #1
+00001000  # 10 SVC R13 kept across the exception
+00002000  # 11 SVC R14 kept
+00000001  # 12 log: one IRQ
+60000092  # 13 log: handler CPSR without F (IRQ, I = 1; Z, C from CMP r10, #0)
+a0000053  # 14 log: SPSR = interrupted CPSR
+00000008  # 15 log: IF & IE acknowledged = timer 0
+00000000  # 16 return address - irq_point = 4 * interrupted R8 (resumes the right instruction)
+00003000  # 17 log: interrupted R1
+00000100  # 18 log: IRQ R13 at entry
+00000001  # 19 taken no later than one instruction after the MSR
+00000001  # 20 IME = 0 masks a pending enabled source
+00000008  # 21 IF still pending with IE = timer 1 only
+00000001  # 22 IE masks it
+00000008  # 23 enabling IE = timer 0 takes the IRQ; handler acknowledged bit 3
+00000000  # 24 IF clear
+00000007  # 25 five more IRQs from the free-running timer
+00000000  # 26 TM0CNT_H: handler stopped the timer on IRQ 7
+00000000  # 27 IF clear
+00000092  # 28 handler CPSR mode/I byte without F
+00000053  # 29 SPSR mode/mask byte: interrupted SVC with I clear
+00000100  # 30 IRQ R13 back at its top after LDM {r0-r3, pc}^ returns
+00000053  # 31 SVC, I clear after the last return
+00001000  # 32 SVC R13 kept
+00002000  # 33 SVC R14 kept
+00000000  # 34 return address = msr_point: taken at the first boundary after the MSR
+00000000  # 35 interrupted R8: MOV r8, #1 not executed
+000000d2  # 36 handler CPSR byte: entry keeps F = 1
+00000009  # 37 external VBlank IRQ raised while LDR from the link waited
+00000001  # 38 IF & IE acknowledged = VBlank
+00000000  # 39 return address = load_done: the load finished first
+13579bdf  # 40 interrupted R1 = the link's reply
+00000007  # 41 interrupted R8: MOV r8, #2 not yet executed
+0000000a  # 42 external HBlank IRQ raised at the first STM beat
+00000002  # 43 IF & IE acknowledged = HBlank
+00000000  # 44 return address = stm_done: all three beats first
+5ca1ab1e  # 45 S8
+a35e54e1  # 46 S9
+00000033  # 47 S10

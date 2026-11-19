@@ -1,0 +1,12 @@
+60000033  # 0  A: SPSR_irq = the CPSR restored by MOVS pc, lr (Z, C, Thumb, SVC, I = F = 0)
+00000004  # 1  R14_irq - t_a: taken before the first Thumb instruction, next + 4
+00000011  # 2  SUBS pc, lr, #4 resumed in Thumb at t_a
+00000001  # 3  one IRQ
+00000002  # 4  B: second IRQ, taken in the Thumb loop
+00000033  # 5  SPSR_irq low byte: Thumb, SVC, I = F = 0
+00000001  # 6  handler returned by LDM {pc}^ into the Thumb loop
+00000008  # 7  C: BL with an IRQ between prefix and suffix still reached t_add3: 5 + 3
+00000033  # 8  SPSR_irq low byte: Thumb, SVC
+00000006  # 9  R14_irq - bl_prefix: suffix address + 4
+00000000  # 10 LR in t_add3 = bl_done | 1 (the prefix's partial LR kept in R14_svc)
+00000003  # 11 three IRQs

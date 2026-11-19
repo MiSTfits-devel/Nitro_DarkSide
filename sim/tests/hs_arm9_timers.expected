@@ -1,0 +1,11 @@
+00000000 # initial IF
+00000018 # IE
+00000001 # IME
+00000018 # timer 0 and cascaded timer 1 overflow IF
+0000ffff # timer 0 count
+0000ffff # timer 1 count
+00000000 # timer 0 stopped control
+00000018 # byte write to IF ignored on ARM9
+00000010 # halfword W1C clears only timer 0
+00000000 # word W1C clears timer 1
+00000000 # byte write disables IME

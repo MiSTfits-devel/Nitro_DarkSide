@@ -1,0 +1,8 @@
+000091ce  # 0  CRC16 of the header, computed
+000091ce  # 1  header CRC16 field (0x15E)
+00008000  # 2  ARM9 ROM offset
+02000420  # 3  ARM9 entry
+02000400  # 4  ARM9 RAM address
+000000ac  # 5  ARM9 size
+424e5348  # 6  game code 'HSNB'
+00000000  # 7  words differing from the boot-ROM handoff copy

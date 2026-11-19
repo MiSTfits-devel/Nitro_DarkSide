@@ -1,0 +1,46 @@
+81000000  # 0  LSLS r1, r0(0x81), #24
+800000d3  # 1  CPSR via BLX helper: N; C = r0[8] = 0; SVC, I = F = 1, ARM in the helper
+00000040  # 2  LSRS #25
+f8100000  # 3  ASRS #4
+00000000  # 4  LSRS #32 (encoded #0)
+600000d3  # 5  Z, C = r1[31]
+fffffffe  # 6  SUBS r1, r0, #7: 5 - 7
+00000003  # 7  ADDS r2, r1, r0
+200000d3  # 8  C from the wrapping add
+7fffffff  # 9  SUBS #1 from 0x80000000
+300000d3  # 10 C (no borrow), V
+900000d3  # 11 ADDS #1 back to 0x80000000: N, V
+000f000f  # 12 ANDS 0x0f0f00ff, 0x00ff0f0f
+0ff00ff0  # 13 EORS
+0f0000f0  # 14 BICS
+0fff0fff  # 15 ORRS
+e01fe1e1  # 16 RORS 0x00ff0f0f by register 3
+787807f8  # 17 LSLS 0x0f0f00ff by register 3
+fc03fc3c  # 18 ASRS 0xe01fe1e1 by register 3
+fffffff7  # 19 NEGS 3, then MULS by 3: -9
+00000009  # 20 MULS r2, r2, r2 (Rd = Rm): 3 * 3
+0000000a  # 21 CMP 10, 3 (C); ADCS 10+3+1 = 14 (C clear); SBCS 14-3-1
+200000d3  # 22 C (no borrow)
+0fffffff  # 23 MVNS 3, then LSRS by register 4
+600000d3  # 24 CMN 0xfffffffc, 4: Z, C
+200000d3  # 25 TST 0x0fffffff, 4: Z clear, C kept
+04000000  # 26 MOV r8, r7; ADD r8, r8; MOV r0, r8
+200000d3  # 27 CMP r8, r1(4): C
+11223344  # 28 LDR literal at pc % 4 == 0
+55667788  # 29 LDR literal at pc % 4 == 2
+55667788  # 30 ADR (ADD Rd, PC) then LDR
+020000fc  # 31 SUB sp, #16; ADD r0, sp, #12
+020000f8  # 32 ADD sp, #8; MOV r1, sp
+cdefef00  # 33 S1 = 0; STRH 0xcdef at +6; STRB 0xef at +5 (register offset)
+ffffffef  # 34 LDRSB byte 5
+ffff89ab  # 35 LDRSH halfword at +2 (high half of S0 = 0x89abcdef)
+00cd89ab  # 36 LDRH reg 0x89ab | LDRB imm byte 7 (0xcd) << 16
+00cdcdef  # 37 STR reg to S2, STRH reg 0xcdef over its low half, LDR reg
+00ef00cd  # 38 LDRB reg (0xef) << 16 | LDRH imm high half of S2; via STR/LDR [sp, #4]
+0000000f  # 39 loop 5+4+3+2+1 with SUBS/BNE; BGT and the skipped B not taken
+00000016  # 40 BL add_seven: 15 + 7, returned by POP {r4, pc}
+00000044  # 41 r4 restored by POP
+00000000  # 42 LR in the callee = after_bl | 1
+020000cc  # 43 STMIA r6!, {r0-r2}; SUBS #12; LDMIA r6!, {r3-r5}: base after writeback
+00000321  # 44 r3 | r4 << 4 | r5 << 8 = 1, 2, 3
+00000032  # 45 LDMIA r6, {r1, r6} from S1: r6 loaded (3), no writeback, r1 = 2

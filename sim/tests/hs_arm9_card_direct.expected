@@ -1,0 +1,22 @@
+0000c000  # 0  AUXSPICNT after writing C000
+70862200  # 1  B7 8000 x 0x200 bytes: checksum
+5e240000  # 2  word at 8000
+5e269200  # 3  word 64 at 8100
+a2211e48  # 4  word at 81FC
+00000001  # 5  IRQ handler entered once for that transfer
+00080000  # 6  handler's IF & IE: card transfer done
+5e240000  # 7  B7 200 redirects to 8000
+a2211e48  # 8  B7 1FFC redirects to 81FC
+5e269200  # 9  B7 10100 mirrors to 100, redirects to 8100
+5fc38000  # 10 B7 1C000 mirrors to C000
+a89b4000  # 11 B7 C000 x 0x400 bytes: checksum
+a3d94648  # 12 word at C3FC
+a7800000  # 13 B8 chip ID: ROMCTRL busy, word ready, size 7, bit 29
+00001fc2  # 14 B8 chip ID
+00080000  # 15 IF bit 19 after the chip-ID transfer
+27000000  # 16 ROMCTRL after it: busy and ready clear
+00008000  # 17 AUXSPICNT at power-up after direct boot [slice only]
+20000000  # 18 ROMCTRL at power-up after direct boot [slice only]
+ef36da00  # 19 B7 AF00 x 0x200 bytes: checksum (wraps inside 4 KiB) [slice only]
+5e164000  # 20 word 64 wraps to A000 [slice only]
+a210cc48  # 21 last word at A0FC [slice only]

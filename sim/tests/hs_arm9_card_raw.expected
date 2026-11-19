@@ -1,0 +1,19 @@
+0000c000  # 0  AUXSPICNT after writing C000
+20000000  # 1  ROMCTRL after releasing cart reset (bit 29)
+ffffffff  # 2  9F x 0x200 bytes: AND of all words
+00000080  # 3  9F words read
+00000001  # 4  IRQ handler entered once for the 9F transfer
+00080000  # 5  handler's IF & IE: card transfer done
+00080000  # 6  size-0 9F transfer: IF bit 19 after busy clears
+3db44798  # 7  00 header at 0, 0x200 bytes: checksum
+494e5348  # 8  header word 0: 'HSNI'
+544e5348  # 9  header word 3: game code 'HSNT'
+3b16f1cc  # 10 header word at 0x1FC
+a7800000  # 11 90 chip ID: ROMCTRL busy, word ready, size 7, bit 29
+00001fc2  # 12 90 chip ID
+00080000  # 13 IF bit 19 after the chip-ID transfer
+27000000  # 14 ROMCTRL after it: busy and ready clear
+ded60e18  # 15 00 header at F00: checksum (wraps inside 4 KiB) [slice only]
+5efa9200  # 16 word at F00 [slice only]
+494e5348  # 17 word 64 wraps to 000 [slice only]
+e6c19c77  # 18 last word at 0FC [slice only]
