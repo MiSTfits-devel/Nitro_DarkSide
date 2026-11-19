@@ -72,12 +72,13 @@ p="$root/third_party/Nitro_DarkSide/d2dabe/rtl"
 echo "product: $(grep -F 'PASS:' "$out/product.log" | sed 's/.*PASS:/PASS:/')"
 
 # (2) Pure Arm9Soc.
-(cd "$root/clash" && stack --resolver lts-22.43 ghc -- -O1 -isrc -itest \
-    -outputdir "$out/ghc" test/Arm9IrqCheck.hs -o "$out/irq-check")
+# Every GHC/Clash process and every built checker is capped at a 3 GB heap.
+(cd "$root/clash" && stack --resolver lts-22.43 ghc -- +RTS -M3g -RTS -rtsopts -with-rtsopts=-M3g \
+    -O1 -isrc -itest -outputdir "$out/ghc" test/Arm9IrqCheck.hs -o "$out/irq-check")
 run_cases "$out/irq-check"
 
 # (3) Fresh Clash Verilog of nds_arm9_soc.
-(cd "$root/clash" && stack exec clash -- --verilog -isrc \
+(cd "$root/clash" && stack exec clash -- +RTS -M3g -RTS --verilog -isrc \
     -fclash-no-escaped-identifiers -outputdir "$out/hdl" src/Nds/WholeCore/Arm9Soc.hs)
 topfile=$(find "$out/hdl" -name nds_arm9_soc.v -print)
 [[ -n $topfile && $(printf '%s\n' "$topfile" | wc -l | tr -d ' ') = 1 ]] || {

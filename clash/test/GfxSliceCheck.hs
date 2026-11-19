@@ -9,7 +9,7 @@
 -- (one RRGGBB per line) and a PPM to OUTDIR for the generated-HDL compare.
 module Main (main) where
 
-import Clash.Prelude (BitVector, Vec(..))
+import Clash.Prelude (BitVector, Vec(..), rnfX)
 import qualified Clash.Prelude as C
 import Control.Exception (bracket)
 import Control.Monad (unless, when)
@@ -100,7 +100,15 @@ runModel rom = go 0 initialSlice initialGpu IM.empty (C.repeat 0) Nothing []
         in case stop of
              Just 0 -> (reverse ("HALT" : acc'), tick, g', mem')
              Just _ -> (reverse acc', tick, g', mem')
-             Nothing -> go (tick + 1) s' g' mem' rw' held'' acc'
+             -- Force the per-tick state and the new log lines so the pure
+             -- run holds one state, not thunks that keep every old slice
+             -- and GPU state alive (evaluation order only; no check).
+             Nothing -> rnfX g' `seq` mem' `seq` rnfX rw' `seq` held'' `seq` forceLines (opEvents ++ cpu) `seq`
+               go (tick + 1) s' g' mem' rw' held'' acc'
+
+-- | Fully evaluate log lines (strictness only).
+forceLines :: [String] -> ()
+forceLines = foldr (\l r -> length l `seq` r) ()
 
 lookupHalf :: Mem -> Int -> Int -> Int -> BitVector 16
 lookupHalf mem bank lane addr = IM.findWithDefault 0 (((bank * 2 + lane) `shiftL` 15) + addr) mem
@@ -159,7 +167,7 @@ runOracle gpu rom opLimit = go 0 initialSlice Nothing [] 0
         case stop of
           Just 0 -> pure (reverse ("HALT" : acc'), tick)
           Just _ -> pure (reverse acc', tick)
-          Nothing -> go (tick + 1) s' pending' acc' ops'
+          Nothing -> pending' `seq` ops' `seq` forceLines (cpu ++ opEvents) `seq` go (tick + 1) s' pending' acc' ops'
 
 oracleFrame :: Ptr () -> Int -> IO [Word32]
 oracleFrame gpu tick = do

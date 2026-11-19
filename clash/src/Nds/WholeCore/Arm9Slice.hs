@@ -8,6 +8,22 @@
 -- and SWI exception entry/return, plus a boot ROM port, a 4 KiB
 -- byte-enabled local RAM that code can execute from, and a blocking GPU bus
 -- master.
+--
+-- Microarchitecture. The general registers, the banked R13/R14 and the two
+-- SPSRs live in a 32-row register file held in two block RAMs (one write
+-- port, two synchronous read ports); the PC and CPSR fields are registers.
+-- An instruction is a token that moves through stages, each a function
+-- from its own input record to its own output record with a valid bit:
+--
+--   fetch -> [expand, Thumb only] -> decode -> shift -> alu -> [mem] -> retire
+--
+-- Decode classifies the (Thumb-expanded) ARM opcode and presents register
+-- reads; shift runs the one barrel shifter on operand 2; alu runs the one
+-- adder/logic unit, the condition check, flags and the register write, and
+-- starts the memory, multiply-accumulate, writeback or exception-link work
+-- that the mem stage sequences. This revision runs exactly one token at a
+-- time (fetch waits for the pipe to drain), so there is no forwarding or
+-- hazard logic; no stage reads another stage's pipeline register.
 module Nds.WholeCore.Arm9Slice
   ( SliceState, SliceIn(..), SliceOut(..)
   , initialSlice, resetSlice, sliceBootAddr, sliceStep, slice, arm9SliceTopEntity
@@ -17,10 +33,16 @@ import Prelude ()
 import Clash.Prelude hiding (Word, slice)
 import qualified Clash.Prelude as C
 import qualified Clash.Explicit.Prelude as E
+import Data.Maybe (fromMaybe, isJust)
 
 type Word = BitVector 32
 type Width = BitVector 3
 type RamIndex = Index 1024
+
+-- | Register-file row: R0-R12 at 0-12; R13/R14 at 13/14 (User/System),
+-- 17/18 (SVC), 21/22 (IRQ); SPSR_svc at 25, SPSR_irq at 26. R15 is never
+-- stored: a read of R15 takes the stage's PC value.
+type Row = Index 32
 
 data SliceIn = SliceIn
   { bootWord      :: Word
@@ -50,10 +72,6 @@ data SliceOut = SliceOut
   , retireOpcode  :: Word
   } deriving (Eq, Show, Generic, NFDataX)
 
-data Phase = Fetch | FetchRam | FetchWord | Decode | BlockCheck | BlockBeat | BootLoad
-  | LocalRead | RamAccess | Offer | Await | Retire | Halted
-  deriving (Eq, Generic, NFDataX)
-
 data Access = Access
   { accessAddr   :: Word
   , accessWidth  :: Width
@@ -61,36 +79,6 @@ data Access = Access
   , accessSigned :: Bool
   , accessReg    :: Index 16
   , accessData   :: Word
-  } deriving (Generic, NFDataX)
-
-data Cpu = Cpu
-  { phase      :: Phase
-  , pc         :: Word
-  , opcode     :: Word          -- ^ ARM word, or a Thumb halfword zero-extended
-  , regs       :: Vec 16 Word   -- ^ current mode's view: R13/R14 are the active bank
-  , flags      :: BitVector 4
-  , irqMask    :: Bool          -- ^ CPSR.I
-  , fiqMask    :: Bool          -- ^ CPSR.F (stored; there is no FIQ source)
-  , thumb      :: Bool          -- ^ CPSR.T
-  , mode       :: BitVector 5   -- ^ CPSR mode: User 0x10, IRQ 0x12, SVC 0x13, System 0x1F
-  , banks      :: Vec 3 (Word, Word)  -- ^ R13/R14 of the inactive banks (usr/sys, svc, irq)
-  , spsrSvc    :: Word
-  , spsrIrq    :: Word
-  , pending    :: Access
-  , nextPc     :: Word
-  , lastStore  :: Bool
-  , fullWord   :: Word
-  , faultCode  :: BitVector 3
-  , faultAt    :: Word
-  , blockLeft  :: BitVector 16  -- ^ LDM/STM registers still to transfer, current beat included
-  , blockAddr  :: Word          -- ^ address of the current LDM/STM beat
-  , blockStore :: Bool
-  , blockSpsr  :: Bool          -- ^ LDM {.., pc}^: copy SPSR to CPSR when PC is loaded
-  , checkLeft  :: BitVector 16  -- ^ LDM/STM beats still to route-check
-  , checkAddr  :: Word
-  , writeBack  :: Bool          -- ^ base writeback applied when the instruction completes
-  , wbReg      :: Index 16
-  , wbValue    :: Word
   } deriving (Generic, NFDataX)
 
 -- | The one architecture switch. This slice is built as the DS ARM9
@@ -114,41 +102,191 @@ ramBase = 0x02000000
 irqVector = vectorBase arch + 0x18
 swiVector = vectorBase arch + 0x08
 
+-- * State
+
+-- | Architectural registers kept in flip-flops: PC (the next instruction to
+-- fetch) and the CPSR fields.
+data Psr = Psr
+  { pc      :: Word
+  , flags   :: BitVector 4    -- ^ NZCV
+  , irqMask :: Bool           -- ^ CPSR.I
+  , fiqMask :: Bool           -- ^ CPSR.F (stored; there is no FIQ source)
+  , thumb   :: Bool           -- ^ CPSR.T
+  , mode    :: BitVector 5    -- ^ User 0x10, IRQ 0x12, SVC 0x13, System 0x1F
+  } deriving (Generic, NFDataX)
+
+-- | Identity of an instruction, carried by its token to retirement.
+data Tag = Tag
+  { tagPc    :: Word
+  , tagOp    :: Word          -- ^ ARM word, or the Thumb halfword zero-extended
+  , tagThumb :: Bool
+  } deriving (Generic, NFDataX)
+
+-- | Thumb forms that are not rewritten into an ARM opcode, plus the
+-- PC-relative forms whose R15 reads word-aligned.
+data Aux = AuxArm | AuxWordPc | AuxBranch | AuxBlPrefix | AuxBlSuffix | AuxBlxSuffix | AuxUndef
+  deriving (Eq, Generic, NFDataX)
+
+-- | Fetch/expand -> decode token.
+data IrTok = IrTok
+  { irTag  :: Tag
+  , irOp   :: Word            -- ^ ARM opcode (Thumb: the equivalent ARM opcode)
+  , irAux  :: Aux
+  , irCond :: BitVector 4
+  , irImm  :: Word            -- ^ Thumb branch offset
+  } deriving (Generic, NFDataX)
+
+data Cls = CDp | CMrs | CMsr | CClz | CMul | CMulLong | CBranch | CBx | CLinkOnly
+  | CSingle | CBlock | CSwi | CUndef
+  deriving (Eq, Generic, NFDataX)
+
+-- | Decode -> shift token.
+data DecTok = DecTok
+  { dTag    :: Tag
+  , dOp     :: Word
+  , dCls    :: Cls
+  , dCond   :: BitVector 4
+  , dPcRead :: Word           -- ^ value of R15 as an operand
+  , dImm    :: Word           -- ^ immediate operand 2 (before shifting)
+  , dBImm   :: Bool           -- ^ operand 2 is 'dImm'
+  , dA15    :: Bool           -- ^ operand 1 is 'dPcRead'
+  , dB15    :: Bool           -- ^ operand 2 register is R15
+  , dLink   :: Bool           -- ^ branch writes R14
+  , dSetT   :: Maybe Bool     -- ^ branch sets T (Nothing: keeps it)
+  , dAlign4 :: Bool           -- ^ branch target rounded to a word (Thumb BLX suffix)
+  } deriving (Generic, NFDataX)
+
+-- | Shift -> ALU token.
+data ShTok = ShTok
+  { sDec   :: DecTok
+  , sA     :: Word
+  , sB     :: Word
+  , sCarry :: Bool            -- ^ shifter carry-out
+  } deriving (Generic, NFDataX)
+
+data MPhase = MRoute | MBoot | MLocal | MRam | MOffer | MAwait | MCheck | MBeat
+  | MWriteBack | MRestore | MMulAcc | MMulHi | MSwiLink
+  deriving (Eq, Generic, NFDataX)
+
+-- | Mem stage: everything after the ALU that takes more than one cycle.
+data MemSt = MemSt
+  { mPhase     :: MPhase
+  , mTag       :: Tag
+  , mNext      :: Word          -- ^ next PC (a load to R15 replaces it)
+  , pending    :: Access
+  , blockLeft  :: BitVector 16  -- ^ LDM/STM registers still to transfer, current beat included
+  , blockAddr  :: Word
+  , blockStore :: Bool
+  , checkLeft  :: BitVector 16  -- ^ LDM/STM beats still to route-check
+  , checkAddr  :: Word
+  , writeBack  :: Bool          -- ^ base writeback when the transfer completes
+  , wbReg      :: Index 16
+  , wbValue    :: Word          -- ^ also the high word of a long multiply
+  , blockSpsr  :: Bool          -- ^ LDM {.., pc}^
+  , restore    :: Bool          -- ^ CPSR <- SPSR once PC is loaded
+  , mulOp      :: Word          -- ^ multiply opcode (destinations, S, long)
+  , mulProd    :: BitVector 64
+  } deriving (Generic, NFDataX)
+
+data RetTok = RetTok { rTag :: Tag, rNext :: Word }
+  deriving (Generic, NFDataX)
+
+data FPhase = FIdle | FRam | FWord | FIrqLink
+  deriving (Eq, Generic, NFDataX)
+
+data Cpu = Cpu
+  { psr       :: Psr
+  , fphase    :: FPhase
+  , xq        :: Maybe Tag                 -- ^ Thumb halfword awaiting expansion
+  , iq        :: Maybe IrTok               -- ^ awaiting decode
+  , dq        :: Maybe DecTok              -- ^ awaiting shift
+  , shLatch   :: Maybe (Word, BitVector 8) -- ^ register shift: Rn and Rs read in the first shift cycle
+  , sq        :: Maybe ShTok               -- ^ awaiting ALU
+  , mq        :: Maybe MemSt
+  , rq        :: Maybe RetTok
+  , storeObs  :: Maybe (Word, Word)        -- ^ local RAM store written last cycle
+  , faultCode :: BitVector 3
+  , faultAt   :: Word
+  } deriving (Generic, NFDataX)
+
 -- | Reset: SVC mode, ARM state, IRQ and FIQ masked (CPSR 0x000000d3).
 initialCpu :: Cpu
-initialCpu = Cpu Fetch bootBase 0 (repeat 0) 0 True True False 0x13 (repeat (0, 0)) 0 0
-  (Access 0 4 False False 0 0) 0 False 0 0 0 0 0 False False 0 0 False 0 0
+initialCpu = Cpu (Psr bootBase 0 True True False 0x13) FIdle Nothing Nothing Nothing Nothing
+  Nothing Nothing Nothing Nothing 0 0
 
--- The pure harness models the synchronous RAM port; the generated top uses
--- blockRam. Both call the same CPU/router transition and observer.
-data SliceState = SliceState Cpu (Vec 1024 Word) Word
+-- | One cycle's effects besides the next CPU state. Each RAM has one write
+-- port; the register file has two read ports.
+data Step = Step
+  { stepCpu   :: Cpu
+  , ramWrite  :: Maybe (RamIndex, Word)
+  , regWrite  :: Maybe (Row, Word)
+  , readA     :: Maybe Row
+  , readB     :: Maybe Row
+  } deriving (Generic, NFDataX)
+
+-- | The pure harness models both synchronous RAMs (local RAM and its read
+-- register; register file and its two read registers); the generated top
+-- uses block RAMs. Both call the same transition and observer. Both
+-- register-file copies power up zero.
+data SliceState = SliceState Cpu (Vec 1024 Word) Word (Vec 32 Word) Word Word
   deriving (Generic, NFDataX)
 
 initialSlice :: SliceState
-initialSlice = SliceState initialCpu (repeat 0) 0
+initialSlice = SliceState initialCpu (repeat 0) 0 (repeat 0) 0 0
 
--- | CPU/link reset does not clear initialized block RAM. Reset both endpoints
--- of the GPU link together; a reply from before reset must not be re-presented.
+-- | CPU/link reset does not clear block RAM (local RAM or register file).
+-- Reset both endpoints of the GPU link together; a reply from before reset
+-- must not be re-presented.
 resetSlice :: SliceState -> SliceState
-resetSlice (SliceState _ mem _) = SliceState initialCpu mem 0
+resetSlice (SliceState _ mem _ rf _ _) = SliceState initialCpu mem 0 rf 0 0
 
 sliceBootAddr :: SliceState -> Word
-sliceBootAddr (SliceState s _ _) = romAddress s
+sliceBootAddr (SliceState s _ _ _ _ _) = romAddress s
 
+-- | One clock. The output depends only on the current state, so a host may
+-- feed it back combinationally into this cycle's input (Arm9Soc does). The
+-- next state is strict: matching it (the following call) checks that the
+-- register file was not read and written at the same row in this cycle
+-- (the block RAM's read-during-write result is then irrelevant; a
+-- violation is a model error and fails every pure gate) and forces the CPU
+-- record, the written RAM words and the read registers, so a long pure run
+-- holds one state, not a chain of unevaluated 'replace's.
 sliceStep :: SliceState -> SliceIn -> (SliceState, SliceOut)
-sliceStep (SliceState s mem readWord) i =
-  (SliceState s' mem' (mem !! ramAddress s), observe s)
+sliceStep (SliceState s mem readWord rf ra rb) i = (next, observe s)
  where
-  (s', wr) = transition s i readWord
-  mem' = case wr of
-    Nothing -> mem
-    Just (addr, value) -> replace addr value mem
+  next
+    | clash readA || clash readB = error "Arm9Slice: register file row read and written in one cycle"
+    | otherwise = rnfX cpu' `seq` written mem' (ramWrite st) `seq` written rf' (regWrite st)
+        `seq` word' `seq` ra' `seq` rb' `seq` SliceState cpu' mem' word' rf' ra' rb'
+  st = transition s i readWord ra rb
+  cpu' = stepCpu st
+  mem' = maybe mem (\(addr, value) -> replace addr value mem) (ramWrite st)
+  rf' = maybe rf (\(row, value) -> replace row value rf) (regWrite st)
+  word' = mem !! ramAddress s
+  ra' = rf !! port readA
+  rb' = rf !! port readB
+  written :: (KnownNat n, Enum k) => Vec n Word -> Maybe (k, Word) -> ()
+  written v = maybe () (\(k, _) -> (v !! k) `seq` ())
+  port f = fromMaybe 0 (f st)
+  clash f = case (f st, regWrite st) of
+    (Just r, Just (w, _)) -> r == w
+    _ -> False
 
 romAddress :: Cpu -> Word
-romAddress s = if phase s == BootLoad then accessAddr (pending s) else pc s
+romAddress s = case mq s of
+  Just m | mPhase m == MBoot -> accessAddr (pending m)
+  _ -> pc (psr s)
 
+-- | The local RAM port serves a RAM fetch and the mem stage.
 ramAddress :: Cpu -> RamIndex
-ramAddress = fromIntegral . C.slice d11 d2 . accessAddr . pending
+ramAddress s = fromIntegral (C.slice d11 d2 addr)
+ where
+  addr = case (fphase s, mq s) of
+    (FRam, _) -> pc (psr s)
+    (_, Just m) -> accessAddr (pending m)
+    _ -> pc (psr s)
+
+-- * Memory helpers
 
 -- 4 KiB boot ROM window; 4 KiB local RAM, which instructions may also be
 -- fetched from.
@@ -212,6 +350,28 @@ linkOwns a = C.slice d31 d24 addr == 0x06
   width = resize (accessWidth a) :: Word
   within lo hi = addr >= lo && addr <= hi - width
 
+-- | Fault code, or the mem phase that serves the access.
+routeTo :: Access -> Either (BitVector 3) MPhase
+routeTo a
+  | not (aligned a) = Left 2
+  | inBoot addr && not (accessWrite a) = Right MBoot
+  | inRam addr = Right MLocal
+  | linkOwns a = Right MOffer
+  | otherwise = Left 3
+ where addr = accessAddr a
+
+-- | LDM/STM beats serve only the boot ROM and local RAM. The link stays
+-- single-transfer: a block whose beat would reach it faults 3 at that beat's
+-- address, like any other address with no route, before the first beat.
+blockFault :: Bool -> Word -> BitVector 3
+blockFault store addr = case routeTo (Access addr 4 store False 0 0) of
+  Left code -> code
+  Right MOffer -> 3
+  Right _ -> 0
+
+lowestReg :: BitVector 16 -> Index 16
+lowestReg l = maybe 0 id (findIndex id (reverse (unpack l :: Vec 16 Bool)))
+
 observe :: Cpu -> SliceOut
 observe s = SliceOut
   { bootAddr = romAddress s
@@ -221,39 +381,29 @@ observe s = SliceOut
   , gpuReqWidth = if offer then accessWidth a else 0
   , gpuReqLanes = if offer then byteLanes a else 0
   , gpuReqData = if offer then accessData a else 0
-  , gpuReplyReady = phase s == Await
-  , storeValid = stored
-  , storeAddr = if stored then accessAddr a .&. 0xfffffffc else 0
-  , storeData = if stored then fullWord s else 0
+  , gpuReplyReady = phaseIs MAwait
+  , storeValid = isJust (storeObs s)
+  , storeAddr = maybe 0 fst (storeObs s)
+  , storeData = maybe 0 snd (storeObs s)
   , fault = faultCode s
   , faultAddr = faultAt s
-  , retireValid = retired
-  , retirePc = if retired then pc s else 0
-  , retireOpcode = if retired then opcode s else 0
+  , retireValid = isJust (rq s)
+  , retirePc = maybe 0 (tagPc . rTag) (rq s)
+  , retireOpcode = maybe 0 (tagOp . rTag) (rq s)
   }
  where
-  a = pending s
-  offer = phase s == Offer
-  retired = phase s == Retire
-  -- A local RAM store is reported once, in the cycle after it is written:
-  -- at retirement, or at the next beat of an STM.
-  stored = lastStore s && (retired || phase s == BlockBeat)
+  phaseIs p = maybe False ((== p) . mPhase) (mq s)
+  offer = phaseIs MOffer
+  a = maybe (Access 0 4 False False 0 0) pending (mq s)
 
-stop :: BitVector 3 -> Word -> Cpu -> Cpu
-stop code addr s = s { phase = Halted, faultCode = code, faultAt = addr }
+-- * Modes and the register file
 
--- | Instruction size in the current state.
-step :: Cpu -> Word
-step s = if thumb s then 2 else 4
-
-finish :: Cpu -> Cpu
-finish s = s { phase = Retire, nextPc = pc s + step s, lastStore = False }
-
-writeReg :: Index 16 -> Word -> Cpu -> Cpu
-writeReg rd value s = s { regs = replace rd value (regs s) }
+-- | Instruction size in a state.
+stepOf :: Bool -> Word
+stepOf t = if t then 2 else 4
 
 -- | CPSR as MRS reads it: NZCV, I, F, T and the mode.
-cpsrWord :: Cpu -> Word
+cpsrWord :: Psr -> Word
 cpsrWord s = flags s ++# (0 :: BitVector 20) ++# pack (irqMask s) ++# pack (fiqMask s)
   ++# pack (thumb s) ++# mode s
 
@@ -270,121 +420,30 @@ bankOf m = case m of
   0x12 -> 2
   _ -> 0
 
-currentSpsr :: Cpu -> Word
-currentSpsr s = if mode s == 0x12 then spsrIrq s else spsrSvc s
+regRow :: BitVector 5 -> Index 16 -> Row
+regRow m r
+  | r < 13 = fromIntegral r
+  | otherwise = fromIntegral r + 4 * fromIntegral (bankOf m)
 
-writeSpsr :: BitVector 5 -> Word -> Cpu -> Cpu
-writeSpsr m w s = if m == 0x12 then s { spsrIrq = w } else s { spsrSvc = w }
-
--- | Change mode, swapping R13/R14 banks when the bank changes.
-setMode :: BitVector 5 -> Cpu -> Cpu
-setMode m s
-  | new == old = s { mode = m }
-  | otherwise = s { regs = replace (13 :: Index 16) sp (replace (14 :: Index 16) lr (regs s))
-                  , banks = replace old (regs s !! (13 :: Index 16), regs s !! (14 :: Index 16)) (banks s)
-                  , mode = m }
- where
-  new = bankOf m
-  old = bankOf (mode s)
-  (sp, lr) = banks s !! new
+spsrRow :: BitVector 5 -> Row
+spsrRow m = if m == 0x12 then 26 else 25
 
 -- | Write a whole CPSR. The Q, J and reserved bits must be clear and the
--- mode in the subset; T may change only on an exception return.
-setCpsr :: Bool -> Word -> Cpu -> Maybe Cpu
+-- mode in the subset; T may change only on an exception return. The banks
+-- follow the mode through 'regRow'.
+setCpsr :: Bool -> Word -> Psr -> Maybe Psr
 setCpsr allowT w s
   | C.slice d27 d8 w /= 0 || (testBit w 5 /= thumb s && not allowT) = Nothing
   | not (validMode m) = Nothing
-  | otherwise = Just ((setMode m s)
-      { flags = C.slice d31 d28 w, irqMask = testBit w 7, fiqMask = testBit w 6, thumb = testBit w 5 })
+  | otherwise = Just s { flags = C.slice d31 d28 w, irqMask = testBit w 7, fiqMask = testBit w 6
+                       , thumb = testBit w 5, mode = m }
  where m = C.slice d4 d0 w
 
--- | Exception return from a retiring state: CPSR <- SPSR of the current
--- mode, PC <- target with bit 0 dropped if the new state is Thumb (an ARM
--- target must be word-aligned, or the fetch faults). An SPSR outside the
--- subset faults at the instruction.
-returnTo :: Word -> Cpu -> Cpu -> Cpu
-returnTo target at s = case setCpsr True (currentSpsr s) s of
-  Nothing -> stop 1 (pc at) at
-  Just x -> x { nextPc = target .&. (if thumb x then 0xfffffffe else 0xffffffff) }
-
--- | Exception entry: SPSR_<mode> <- CPSR; ARM state in the new mode with I
--- set and F kept; R14_<mode> <- lr. The caller sets the PC.
-enterException :: BitVector 5 -> Word -> Cpu -> Cpu
-enterException m lr s = writeReg 14 lr
-  ((writeSpsr m (cpsrWord s) (setMode m s)) { irqMask = True, thumb = False })
-
--- | IRQ entry at an instruction boundary: R14_irq <- the next instruction's
--- address + 4 in either state, PC <- the IRQ vector. Nothing of the
--- interrupted instruction stream has started.
-enterIrq :: Cpu -> Cpu
-enterIrq s = (enterException 0x12 (pc s + 4) s) { pc = irqVector }
-
--- | SWI, ARM or Thumb: R14_svc <- the next instruction, PC <- the SWI vector
--- once the SWI retires.
-enterSwi :: Cpu -> Cpu
-enterSwi s = (enterException 0x13 (pc s + step s) (finish s)) { nextPc = swiVector }
-
--- | A value loaded into R15 outside an exception return. ARMv5 interworks
--- on bit 0; ARMv4T keeps the state and drops bit 0 in Thumb.
-loadPc :: Word -> Cpu -> Cpu
-loadPc v s
-  | armV5 arch = s { nextPc = v .&. 0xfffffffe, thumb = testBit v 0 }
-  | thumb s = s { nextPc = v .&. 0xfffffffe }
-  | otherwise = s { nextPc = v }
-
--- | One memory beat is done. An LDM/STM continues with its next register;
--- otherwise the instruction retires and applies any base writeback.
-complete :: Bool -> Cpu -> Cpu
-complete ramStore s
-  | rest /= 0 = s { phase = BlockBeat, blockLeft = rest, blockAddr = blockAddr s + 4
-                  , lastStore = ramStore }
-  | otherwise = (based (finish s)) { blockLeft = 0, lastStore = ramStore }
- where
-  rest = blockLeft s .&. (blockLeft s - 1)
-  based x = if writeBack s then writeReg (wbReg s) (wbValue s) x else x
-
--- | A load to R15 (word LDR, or the last LDM/POP beat) branches through
--- 'loadPc'; LDM {.., pc}^ instead copies the SPSR to the CPSR after its
--- writeback.
-loadDone :: Cpu -> Word -> Cpu
-loadDone s raw
-  | accessReg a /= 15 = complete False (writeReg (accessReg a) value s)
-  | blockSpsr s = returnTo value s (complete False s)
-  | otherwise = loadPc value (complete False s)
- where
-  a = pending s
-  masked = raw .&. widthMask (accessWidth a)
-  value
-    | not (accessSigned a) = masked
-    | accessWidth a == 1 = pack (resize (unpack (C.slice d7 d0 masked) :: Signed 8) :: Signed 32)
-    | otherwise = pack (resize (unpack (C.slice d15 d0 masked) :: Signed 16) :: Signed 32)
-
--- | Fault code, or the phase that serves the access.
-routeTo :: Access -> Either (BitVector 3) Phase
-routeTo a
-  | not (aligned a) = Left 2
-  | inBoot addr && not (accessWrite a) = Right BootLoad
-  | inRam addr = Right LocalRead
-  | linkOwns a = Right Offer
-  | otherwise = Left 3
- where addr = accessAddr a
-
-route :: Cpu -> Access -> Cpu
-route s a = case routeTo a of
-  Left code -> stop code (accessAddr a) s
-  Right p -> s { phase = p, pending = a }
-
--- | LDM/STM beats serve only the boot ROM and local RAM. The link stays
--- single-transfer: a block whose beat would reach it faults 3 at that beat's
--- address, like any other address with no route, before the first beat.
-blockFault :: Bool -> Word -> BitVector 3
-blockFault store addr = case routeTo (Access addr 4 store False 0 0) of
-  Left code -> code
-  Right Offer -> 3
-  Right _ -> 0
-
-lowestReg :: BitVector 16 -> Index 16
-lowestReg l = maybe 0 id (findIndex id (reverse (unpack l :: Vec 16 Bool)))
+-- | Exception entry: ARM state in the new mode with I set and F kept.
+-- SPSR_<mode> <- the old CPSR and R14_<mode> are separate register-file
+-- writes made by the caller.
+enterMode :: BitVector 5 -> Psr -> Psr
+enterMode m s = s { mode = m, irqMask = True, thumb = False }
 
 -- | ARM condition field against NZCV (bit 3 = N ... bit 0 = V).
 condPasses :: BitVector 4 -> BitVector 4 -> Bool
@@ -410,10 +469,15 @@ condPasses cond nzcv = case cond of
   c = testBit nzcv 1
   v = testBit nzcv 0
 
--- | Barrel shifter for a nonzero-or-register amount: kind 0 LSL, 1 LSR,
--- 2 ASR, 3 ROR. Amount 0 passes the operand and carry through unchanged.
-shiftBy :: BitVector 2 -> BitVector 8 -> Bool -> Word -> (Word, Bool)
-shiftBy kind amount carry rm
+-- * Datapath units (one instance each)
+
+-- | The barrel shifter: kind 0 LSL, 1 LSR, 2 ASR, 3 ROR by an 8-bit amount
+-- (register shifts and rotated immediates), or with immediate-shift
+-- encoding when 'immForm' (LSR/ASR #0 mean #32, ROR #0 is RRX). Amount 0
+-- passes the operand and carry through unchanged.
+barrel :: BitVector 2 -> BitVector 8 -> Bool -> Bool -> Word -> (Word, Bool)
+barrel kind amount0 immForm carry rm
+  | rrx = (pack carry ++# C.slice d31 d1 rm, testBit rm 0)
   | amount == 0 = (rm, carry)
   | otherwise = case kind of
       0 -> let y = shiftL (0 ++# rm :: BitVector 33) n in (C.slice d31 d0 y, testBit y 32)
@@ -422,89 +486,66 @@ shiftBy kind amount carry rm
            in (C.slice d32 d1 y, testBit y 0)
       _ -> let r = rotateR rm (fromIntegral (C.slice d4 d0 amount)) in (r, testBit r 31)
  where
+  zeroImm = immForm && amount0 == 0
+  rrx = zeroImm && kind == 3
+  amount = if zeroImm && (kind == 1 || kind == 2) then 32 else amount0
   n = fromIntegral amount :: Int
-
--- | Immediate-amount shifts: LSR/ASR #0 encode #32 and ROR #0 encodes RRX.
-shiftImm :: BitVector 2 -> BitVector 5 -> Bool -> Word -> (Word, Bool)
-shiftImm kind amount carry rm
-  | amount /= 0 = shiftBy kind (resize amount) carry rm
-  | kind == 3 = (pack carry ++# C.slice d31 d1 rm, testBit rm 0)
-  | kind == 0 = (rm, carry)
-  | otherwise = shiftBy kind 32 carry rm
 
 -- | Result, carry, overflow and whether the opcode is arithmetic (writes V).
 aluOp :: BitVector 4 -> Bool -> Bool -> Word -> Word -> (Word, Bool, Bool, Bool)
 aluOp opc carry shifterCarry a b = case opc of
   0x0 -> logic (a .&. b)
   0x1 -> logic (xor a b)
-  0x2 -> carrySum a (complement b) True
-  0x3 -> carrySum b (complement a) True
-  0x4 -> carrySum a b False
-  0x5 -> carrySum a b carry
-  0x6 -> carrySum a (complement b) carry
-  0x7 -> carrySum b (complement a) carry
   0x8 -> logic (a .&. b)
   0x9 -> logic (xor a b)
-  0xa -> carrySum a (complement b) True
-  0xb -> carrySum a b False
   0xc -> logic (a .|. b)
   0xd -> logic b
   0xe -> logic (a .&. complement b)
-  _   -> logic (complement b)
+  0xf -> logic (complement b)
+  _   -> (r, testBit total 32, msb x == msb y && msb r /= msb x, True)
  where
-  logic r = (r, shifterCarry, False, False)
-  carrySum x y cin =
-    let total = (0 ++# x) + (0 ++# y) + (if cin then 1 else 0) :: BitVector 33
-        r = C.slice d31 d0 total
-    in (r, testBit total 32, msb x == msb y && msb r /= msb x, True)
+  logic v = (v, shifterCarry, False, False)
+  -- One adder: SUB/CMP a-b, RSB b-a, ADD/CMN a+b, ADC, SBC, RSC.
+  (x, y, cin) = case opc of
+    0x2 -> (a, complement b, True)
+    0x3 -> (b, complement a, True)
+    0x5 -> (a, b, carry)
+    0x6 -> (a, complement b, carry)
+    0x7 -> (b, complement a, carry)
+    0xa -> (a, complement b, True)
+    _   -> (a, b, False)
+  total = (0 ++# x) + (0 ++# y) + (if cin then 1 else 0) :: BitVector 33
+  r = C.slice d31 d0 total
 
--- | What the front end decided for one instruction. Kept small so the
--- per-format choice muxes a few words, not whole CPU states.
-data Front
-  = Run Word Word                 -- ^ R15 read value and ARM opcode for 'execute'
-  | Branch Word Bool (Maybe Word) -- ^ target, new T, R14 value
-  | Skip                          -- ^ condition failed: retire with no effect
-  | Undefined                     -- ^ outside the subset: fault 1
-
--- | Predication happens before the implemented-form check: a cond-failed
--- instruction retires with no register, flag or bus effect whatever its
--- encoding. In the cond = 1111 space only ARMv5 BLX (immediate) executes;
--- the rest faults unpredicated. ARM and Thumb share the one 'execute'
--- (one ALU, shifter, multiplier and exception path in hardware): the front
--- end hands it an ARM opcode and the value R15 reads.
-decode :: Cpu -> Cpu
-decode s = case front of
-  Run pcRead op -> maybe bad id (execute pcRead op s)
-  Branch target t lr -> (maybe id (writeReg 14) lr (finish s)) { nextPc = target, thumb = t }
-  Skip -> finish s
-  Undefined -> bad
+-- | Count of leading zero bits (CLZ): 32 for zero. Five mux levels.
+leadingZeros :: Word -> Word
+leadingZeros w
+  | w == 0 = 32
+  | otherwise = zeroExtend (pack (z16, z8, z4, z2, z1))
  where
-  bad = stop 1 (pc s) s
-  armOp = opcode s
-  cond = C.slice d31 d28 armOp
-  front
-    | thumb s = thumbOp s
-    | cond == 0xf && armV5 arch && armOp .&. 0x0e000000 == 0x0a000000 =
-        -- BLX <imm>: to Thumb at pc + 8 + imm24 * 4 + H * 2, R14 <- pc + 4.
-        Branch (pc s + 8 + armDisplacement armOp + (if testBit armOp 24 then 2 else 0)) True
-               (Just (pc s + 4))
-    | cond == 0xf = Undefined
-    | not (condPasses cond (flags s)) = Skip
-    | otherwise = Run (pc s + 8) armOp
+  z16 = C.slice d31 d16 w == 0
+  w1 = if z16 then shiftL w 16 else w
+  z8 = C.slice d31 d24 w1 == 0
+  w2 = if z8 then shiftL w1 8 else w1
+  z4 = C.slice d31 d28 w2 == 0
+  w3 = if z4 then shiftL w2 4 else w2
+  z2 = C.slice d31 d30 w3 == 0
+  w4 = if z2 then shiftL w3 2 else w3
+  z1 = not (testBit w4 31)
 
 -- | Sign-extended B/BL/BLX word displacement in bytes.
 armDisplacement :: Word -> Word
 armDisplacement op = pack (resize (unpack (C.slice d23 d0 op ++# (0 :: BitVector 2)) :: Signed 26) :: Signed 32)
 
--- | Thumb front end. The branch formats (B<cond>, B, the BL/BLX halves)
--- are decided here. Every other ARMv5T format, SWI and BX/BLX Rm included,
--- is rewritten into the equivalent AL-condition ARM opcode for 'execute',
--- with R15 reading as pc + 4, or (pc + 4) & ~3 for the PC-relative load
--- and ADD. So Thumb shares the ARM ALU, shifter, flags, single-beat link,
--- LDM/STM precheck and fault rules. BKPT, the undefined B<cond> space and
--- ARMv6 forms are Undefined.
-thumbOp :: Cpu -> Front
-thumbOp s = case top5 of
+-- * Stages
+
+-- | Thumb expand stage. Every ARMv5T format except the branches is
+-- rewritten into the equivalent AL-condition ARM opcode, so Thumb shares
+-- the ARM decode, shifter, ALU, flags, link, LDM/STM precheck and fault
+-- rules. B<cond>, B and the BL/BLX halves carry their offset; BKPT, the
+-- undefined B<cond> space and ARMv6 forms are 'AuxUndef'.
+expandStage :: Tag -> IrTok
+expandStage tag = case top5 of
   0x00 -> arm (shiftImm' 0)
   0x01 -> arm (shiftImm' 1)
   0x02 -> arm (shiftImm' 2)
@@ -532,31 +573,30 @@ thumbOp s = case top5 of
            arm (dp (if testBit t 7 then 2 else 4) True False 13 13 (0xf00 .|. zeroExtend (C.slice d6 d0 t)))
        | C.slice d10 d9 t == 2 ->
            arm (0xe92d0000 .|. (if testBit t 8 then bit 14 else 0) .|. zeroExtend imm8)
-       | otherwise -> Undefined
+       | otherwise -> undef
   0x17 | C.slice d10 d9 t == 2 ->
            arm (0xe8bd0000 .|. (if testBit t 8 then bit 15 else 0) .|. zeroExtend imm8)
-       | otherwise -> Undefined
+       | otherwise -> undef
   0x18 -> arm (0xe8a00000 .|. reg16 hi8 .|. zeroExtend imm8)
   -- LDMIA with the base in the list keeps the loaded value: no writeback.
   0x19 -> arm (0xe8900000 .|. (if testBit imm8 (fromIntegral hi8) then 0 else bit 21)
                 .|. reg16 hi8 .|. zeroExtend imm8)
   0x1a -> branchCond
   0x1b -> branchCond
-  0x1c -> Branch (pcPlus4 + sext 12 (C.slice d10 d0 t ++# (0 :: BitVector 1))) True Nothing
+  0x1c -> special AuxBranch 0xe (sext 12 (C.slice d10 d0 t ++# (0 :: BitVector 1)))
   -- BLX suffix: to ARM at (R14 + offset) & ~3; bit 0 of the offset must be 0.
-  0x1d | armV5 arch && not (testBit t 0) -> Branch ((lr + suffix) .&. 0xfffffffc) False (Just next)
-       | otherwise -> Undefined
-  -- BL/BLX prefix: R14 <- pc + 4 + (offset << 12); the next halfword follows.
-  0x1e -> Branch (pc s + 2) True (Just (pcPlus4 + shiftL (sext 11 (zeroExtend (C.slice d10 d0 t))) 12))
-  _ -> Branch (lr + suffix) True (Just next)
+  0x1d | armV5 arch && not (testBit t 0) -> special AuxBlxSuffix 0xe suffix
+       | otherwise -> undef
+  -- BL/BLX prefix: R14 <- pc + 4 + (offset << 12).
+  0x1e -> special AuxBlPrefix 0xe (shiftL (sext 11 (zeroExtend (C.slice d10 d0 t))) 12)
+  _ -> special AuxBlSuffix 0xe suffix
  where
-  t = C.slice d15 d0 (opcode s)
+  t = C.slice d15 d0 (tagOp tag)
   top5 = C.slice d15 d11 t
-  arm x = Run pcPlus4 x
-  wordPc x = Run (pcPlus4 .&. 0xfffffffc) x
-  next = pc s + 2 .|. 1
-  pcPlus4 = pc s + 4
-  lr = regs s !! (14 :: Index 16)
+  arm x = IrTok tag x AuxArm 0xe 0
+  wordPc x = IrTok tag x AuxWordPc 0xe 0
+  special aux cond imm = IrTok tag 0 aux cond imm
+  undef = IrTok tag 0 AuxUndef 0xe 0
   suffix = shiftL (zeroExtend (C.slice d10 d0 t)) 1 :: Word
   sext :: Int -> BitVector 12 -> Word
   sext n v = let w = zeroExtend v :: Word in if testBit w (n - 1) then w .|. shiftL 0xffffffff n else w
@@ -599,13 +639,13 @@ thumbOp s = case top5 of
   hRm = pack (testBit t 6) ++# C.slice d5 d3 t
   bothLow = not (testBit t 7) && not (testBit t 6)
   hiOps = case C.slice d9 d8 t of
-    0 | bothLow -> Undefined
+    0 | bothLow -> undef
       | otherwise -> arm (dp 0x4 False False hRd hRd (zeroExtend hRm))
-    1 | bothLow -> Undefined
+    1 | bothLow -> undef
       | otherwise -> arm (dp 0xa False True hRd 0 (zeroExtend hRm))
-    2 | bothLow -> Undefined
+    2 | bothLow -> undef
       | otherwise -> arm (dp 0xd False False 0 hRd (zeroExtend hRm))
-    _ | C.slice d2 d0 t /= 0 -> Undefined
+    _ | C.slice d2 d0 t /= 0 -> undef
       | otherwise -> arm ((if testBit t 7 then 0xe12fff30 else 0xe12fff10) .|. zeroExtend hRm)
   -- Register-offset transfers, L = bit 11: STR STRH STRB LDRSB / LDR LDRH
   -- LDRB LDRSH.
@@ -622,228 +662,484 @@ thumbOp s = case top5 of
     .|. shiftL (zeroExtend (C.slice d4 d3 imm5)) 8 .|. shiftL (zeroExtend (C.slice d2 d0 imm5)) 1
   -- B<cond>; cond 1110 is undefined and 1111 is SWI.
   branchCond = case C.slice d11 d8 t of
-    0xe -> Undefined
+    0xe -> undef
     0xf -> arm (0xef000000 .|. zeroExtend imm8)
-    c | condPasses c (flags s) -> Branch (pcPlus4 + sext 9 (zeroExtend imm8 ++# (0 :: BitVector 1))) True Nothing
-      | otherwise -> Skip
+    c -> special AuxBranch c (sext 9 (zeroExtend imm8 ++# (0 :: BitVector 1)))
 
-execute :: Word -> Word -> Cpu -> Maybe Cpu
-execute pcRead op s
-  | op .&. 0x0f000000 == 0x0f000000 = Just (enterSwi s)
-  | op .&. 0x0ffffff0 == 0x012fff10 && (rm /= 15 || thumb s) = Just (exchange False)
-  | op .&. 0x0ffffff0 == 0x012fff30 && rm /= 15 && armV5 arch = Just (exchange True)
-  | op .&. 0x0fff0ff0 == 0x016f0f10 && armV5 arch = clz
-  | op .&. 0x0fc000f0 == 0x00000090 = mulShort
-  | op .&. 0x0f8000f0 == 0x00800090 = mulLong
-  | op .&. 0x0fbf0fff == 0x010f0000 && rd /= 15 = statusRead
-  | op .&. 0x0fb0f000 == 0x0320f000 = statusWrite immediate
-  | op .&. 0x0fb0fff0 == 0x0120f000 && rm /= 15 = statusWrite rmValue
-  | op .&. 0x0e000000 == 0x0a000000 =
-      Just ((if testBit op 24 then link else finish s) { nextPc = pcRead + armDisplacement op })
-  | op .&. 0x0e000000 == 0x08000000 = blockTransfer
+-- | ARM token for a fetched ARM word.
+armToken :: Tag -> IrTok
+armToken tag = IrTok tag (tagOp tag) AuxArm (C.slice d31 d28 (tagOp tag)) 0
+
+-- | Implemented-form check and class of an ARM opcode (Thumb: the
+-- rewritten one), in the guard order that also resolves overlapping
+-- encodings. Every UNPREDICTABLE or unimplemented combination is 'CUndef'
+-- and faults 1 if its condition passes.
+classify :: Bool -> BitVector 5 -> Word -> Cls
+classify th m op
+  | op .&. 0x0f000000 == 0x0f000000 = CSwi
+  | op .&. 0x0ffffff0 == 0x012fff10 && (rm /= 15 || th) = CBx
+  | op .&. 0x0ffffff0 == 0x012fff30 && rm /= 15 && armV5 arch = CBx
+  | op .&. 0x0fff0ff0 == 0x016f0f10 && armV5 arch = valid (rd /= 15 && rm /= 15) CClz
+  -- MUL/MLA: R15 operands and MUL with nonzero SBZ (Rn) fault; Rd = Rm is
+  -- defined (operands are read before the result is written).
+  | op .&. 0x0fc000f0 == 0x00000090 =
+      valid (not (rn == 15 || rm == 15 || rs == 15 || (accumulate && rd == 15) || (not accumulate && rd /= 0))) CMul
+  -- UMULL/UMLAL/SMULL/SMLAL: R15 operands and RdHi = RdLo fault.
+  | op .&. 0x0f8000f0 == 0x00800090 =
+      valid (not (rn == 15 || rd == 15 || rm == 15 || rs == 15 || rn == rd)) CMulLong
+  | op .&. 0x0fbf0fff == 0x010f0000 && rd /= 15 = valid (not spsrSelected || hasSpsr m) CMrs
+  | op .&. 0x0fb0f000 == 0x0320f000 = msr
+  | op .&. 0x0fb0fff0 == 0x0120f000 && rm /= 15 = msr
+  | op .&. 0x0e000000 == 0x0a000000 = CBranch
+  | op .&. 0x0e000000 == 0x08000000 = block
   | op .&. 0x0c000000 == 0x04000000 = singleWord
   | op .&. 0x0e000090 == 0x00000090 && halfKind /= 0 = singleHalf
-  | op .&. 0x0c000000 == 0 && dataForm = Just dataProcessing
-  | otherwise = Nothing
+  | op .&. 0x0c000000 == 0 && dataForm = CDp
+  | otherwise = CUndef
  where
   rd = fromIntegral (C.slice d15 d12 op) :: Index 16
   rn = fromIntegral (C.slice d19 d16 op) :: Index 16
   rm = fromIntegral (C.slice d3 d0 op) :: Index 16
   rs = fromIntegral (C.slice d11 d8 op) :: Index 16
-  reg r = if r == 15 then pcRead else regs s !! r
-  base = reg rn
-  rmValue = reg rm
-  carry = testBit (flags s) 1
-  -- CLZ Rd, Rm.
-  clz | rd == 15 || rm == 15 = Nothing
-      | otherwise = Just (writeReg rd (leadingZeros (regs s !! rm)) (finish s))
-  -- MUL/MLA Rd, Rm, Rs[, Rn] and UMULL/UMLAL/SMULL/SMLAL RdLo, RdHi, Rm, Rs.
-  -- Operands are read before either destination is written, so Rd = Rm and
-  -- Rm overlapping RdLo/RdHi give the product, as the ARM946E-S does. R15
-  -- operands, RdHi = RdLo and nonzero SBZ bits fault. S sets N and Z from
-  -- the 32- or 64-bit result; C and V are unchanged (ARMv5). All forms
-  -- share one 33x33 signed multiplier (operands sign-extended for SMULL/
-  -- SMLAL, zero-extended otherwise) and one 64-bit accumulate adder.
+  valid ok c = if ok then c else CUndef
   accumulate = testBit op 21
-  longForm = testBit op 23
-  operand v = unpack ((if longForm && testBit op 22 then pack (msb v) else 0) ++# v) :: Signed 33
-  addend
-    | not accumulate = 0
-    | longForm = (regs s !! rn) ++# (regs s !! rd)
-    | otherwise = zeroExtend (regs s !! rd)
-  r64 = C.slice d63 d0 (pack (operand (regs s !! rm) `mul` operand (regs s !! rs))) + addend :: BitVector 64
-  product32 = C.slice d31 d0 r64
-  nzFlags n z = pack n ++# pack z ++# C.slice d1 d0 (flags s)
-  mulShort
-    | rn == 15 || rm == 15 || rs == 15 || (accumulate && rd == 15) = Nothing
-    | not accumulate && rd /= 0 = Nothing
-    | otherwise = Just (writeReg rn product32
-        (if setFlags then (finish s) { flags = nzFlags (testBit product32 31) (product32 == 0) } else finish s))
-  mulLong
-    | rn == 15 || rd == 15 || rm == 15 || rs == 15 || rn == rd = Nothing
-    | otherwise = Just (writeReg rn (C.slice d63 d32 r64) (writeReg rd product32
-        (if setFlags then (finish s) { flags = nzFlags (testBit r64 63) (r64 == 0) } else finish s)))
-  -- MRS/MSR (R = bit 22 selects SPSR). SVC and IRQ have SPSRs; SPSR access
-  -- in User or System mode faults. In User mode an MSR to the CPSR writes
-  -- only the flags byte; other fields are ignored (ARM ARM). An empty field
-  -- mask faults, and a CPSR value outside the subset or changing T faults
-  -- (see 'setCpsr'). An SPSR stores any value and is checked when an
-  -- exception return copies it to the CPSR.
+  -- MRS/MSR (R = bit 22 selects SPSR): SVC and IRQ have SPSRs; SPSR access
+  -- in User or System mode faults; an empty MSR field mask faults. A CPSR
+  -- value outside the subset faults in the ALU (see 'setCpsr').
   spsrSelected = testBit op 22
-  statusRead
-    | not spsrSelected = Just (finish (writeReg rd (cpsrWord s) s))
-    | hasSpsr (mode s) = Just (finish (writeReg rd (currentSpsr s) s))
-    | otherwise = Nothing
-  fieldMask = pack (map (\b -> if b then 0xff else 0 :: BitVector 8)
-                      (unpack (C.slice d19 d16 op) :: Vec 4 Bool)) :: Word
-  cpsrMask = if mode s == 0x10 then fieldMask .&. 0xff000000 else fieldMask
-  merged mask old value = (old .&. complement mask) .|. (value .&. mask)
-  statusWrite value
-    | fieldMask == 0 = Nothing
-    | not spsrSelected = setCpsr False (merged cpsrMask (cpsrWord s) value) (finish s)
-    | hasSpsr (mode s) = Just (writeSpsr (mode s) (merged fieldMask (currentSpsr s) value) (finish s))
-    | otherwise = Nothing
-  rotation = fromIntegral (C.slice d11 d8 op ++# (0 :: BitVector 1)) :: Int
-  immediate = rotateR (resize (C.slice d7 d0 op)) rotation :: Word
-  -- BL/BLX link: the next instruction, with bit 0 set when it is Thumb.
-  link = writeReg 14 (if thumb s then pc s + 2 .|. 1 else pc s + 4) (finish s)
+  msr = valid (C.slice d19 d16 op /= 0 && (not spsrSelected || hasSpsr m)) CMsr
   load = testBit op 20
   preIndex = testBit op 24
   baseWrite = not preIndex || testBit op 21
-  -- Single transfers: P U _ W L at bits 24..20. The offset is added (U) or
-  -- subtracted before (P) or after the access and written back when P=0 or
-  -- W. UNPREDICTABLE operand combinations fault instead of picking one.
-  transfer width signed regOffset offset
-    | regOffset && rm == 15 = Nothing
-    | baseWrite && (rn == 15 || rn == rd || (regOffset && rm == rn)) = Nothing
-    | rd == 15 && not (load && width == 4) = Nothing
-    | otherwise = Just ((route s (Access addr width (not load) signed rd payload))
-        { writeBack = baseWrite, wbReg = rn, wbValue = offsetAddr, blockLeft = 0, blockSpsr = False })
-   where
-    offsetAddr = if testBit op 23 then base + offset else base - offset
-    addr = if preIndex then offsetAddr else base
-    payload = if load then 0 else (regs s !! rd) .&. widthMask width
+  -- Single transfers: P U _ W L at bits 24..20. UNPREDICTABLE operand
+  -- combinations fault instead of picking one.
+  transferOk width regOffset =
+    not (regOffset && rm == 15)
+    && not (baseWrite && (rn == 15 || rn == rd || (regOffset && rm == rn)))
+    && not (rd == 15 && not (load && width == (4 :: Int)))
   -- Word/byte; I (bit 25) selects an immediate-shifted Rm. P=0 with W is
   -- LDRT/STRT; I with bit 4 set is the media/undefined space.
-  singleWord
-    | not preIndex && testBit op 21 = Nothing
-    | testBit op 25 && testBit op 4 = Nothing
-    | otherwise = transfer (if testBit op 22 then 1 else 4) False (testBit op 25) wordOffset
-  wordOffset
-    | testBit op 25 = fst (shiftImm (C.slice d6 d5 op) (C.slice d11 d7 op) carry rmValue)
-    | otherwise = resize (C.slice d11 d0 op)
+  singleWord = valid (not (not preIndex && testBit op 21) && not (testBit op 25 && testBit op 4)
+                      && transferOk (if testBit op 22 then 1 else 4) (testBit op 25)) CSingle
   -- Halfword and signed byte/halfword (SH = bits 6..5). Bit 22 selects a
   -- split 8-bit immediate, otherwise Rm with bits 11..8 zero. Stores with
   -- SH = 1x are LDRD/STRD, outside the subset.
   halfKind = C.slice d6 d5 op
-  singleHalf
-    | not preIndex && testBit op 21 = Nothing
-    | not (testBit op 22) && C.slice d11 d8 op /= 0 = Nothing
-    | not load && halfKind /= 1 = Nothing
-    | otherwise = transfer (if halfKind == 2 then 1 else 2) (halfKind /= 1)
-        (not (testBit op 22)) halfOffset
-  halfOffset
-    | testBit op 22 = resize (C.slice d11 d8 op ++# C.slice d3 d0 op)
-    | otherwise = rmValue
-  -- LDM/STM: P U S W L at bits 24..20. An empty list, an R15 base, STM of
-  -- R15, the UNPREDICTABLE base-in-list writebacks and the S forms other
-  -- than LDM {.., pc}^ in a mode with an SPSR (user-bank transfers) fault;
-  -- STM! storing its lowest-numbered base is defined.
+  singleHalf = valid (not (not preIndex && testBit op 21)
+                      && not (not (testBit op 22) && C.slice d11 d8 op /= 0)
+                      && not (not load && halfKind /= 1)
+                      && transferOk (if halfKind == 2 then 1 else 2) (not (testBit op 22))) CSingle
+  -- LDM/STM: an empty list, an R15 base, STM of R15, the UNPREDICTABLE
+  -- base-in-list writebacks and the S forms other than LDM {.., pc}^ in a
+  -- mode with an SPSR (user-bank transfers) fault; STM! storing its
+  -- lowest-numbered base is defined.
   regList = C.slice d15 d0 op
-  listBytes = sum (map (\b -> if b then 4 else 0) (unpack regList :: Vec 16 Bool)) :: Word
   restoring = testBit op 22
-  blockTransfer
-    | rn == 15 || regList == 0 = Nothing
-    | restoring && not (load && testBit regList 15 && hasSpsr (mode s)) = Nothing
-    | not load && testBit regList 15 = Nothing
-    | testBit op 21 && regList ! rn == 1 && (load || lowestReg regList /= rn) = Nothing
-    | otherwise = Just s { phase = BlockCheck, blockLeft = regList, blockAddr = start
-                         , blockStore = not load, blockSpsr = restoring
-                         , checkLeft = regList, checkAddr = start
-                         , writeBack = testBit op 21, wbReg = rn, wbValue = final }
-  (start, final)
-    | testBit op 23 = (if preIndex then base + 4 else base, base + listBytes)
-    | otherwise = (if preIndex then base - listBytes else base - listBytes + 4, base - listBytes)
-  -- BX/BLX register: bit 0 selects Thumb; a misaligned ARM target faults at
-  -- fetch. BX pc is defined in Thumb (to ARM at pc + 4), not in ARM.
-  exchange withLink = (if withLink then link else finish s)
-    { nextPc = rmValue .&. 0xfffffffe, thumb = testBit rmValue 0 }
-  -- Data processing: immediate, immediate-shift and register-shift operand 2.
-  -- Test opcodes require S (the S=0 space holds MRS/MSR/BX/etc.); register
-  -- shifts with any R15 operand are UNPREDICTABLE. Rd=PC without S
-  -- branches (bit 0 dropped in Thumb, which stays in Thumb); with S
-  -- (SUBS pc, lr, #4, MOVS pc, lr) it is an exception return, available
-  -- only in SVC and IRQ mode, the modes with an SPSR.
-  immediateForm = testBit op 25
-  registerShift = not immediateForm && testBit op 4
-  opc = C.slice d24 d21 op
+  block = valid (not (rn == 15 || regList == 0)
+                 && not (restoring && not (load && testBit regList 15 && hasSpsr m))
+                 && not (not load && testBit regList 15)
+                 && not (testBit op 21 && regList ! rn == 1 && (load || lowestReg regList /= rn))) CBlock
+  -- Data processing: test opcodes require S (the S=0 space holds
+  -- MRS/MSR/BX/etc.); register shifts with any R15 operand are
+  -- UNPREDICTABLE; S with Rd = PC is an exception return, only in a mode
+  -- with an SPSR.
+  registerShift = not (testBit op 25) && testBit op 4
   setFlags = testBit op 20
   testOp = C.slice d24 d23 op == 2
   dataForm = (setFlags || not testOp)
-    && not (setFlags && rd == 15 && (testOp || not (hasSpsr (mode s))))
+    && not (setFlags && rd == 15 && (testOp || not (hasSpsr m)))
     && not (registerShift && (testBit op 7 || rd == 15 || rn == 15 || rm == 15 || rs == 15))
-  (operand2, shifterCarry)
-    | immediateForm = (immediate, if rotation == 0 then carry else testBit immediate 31)
-    | registerShift = shiftBy (C.slice d6 d5 op) (C.slice d7 d0 (regs s !! rs)) carry rmValue
-    | otherwise = shiftImm (C.slice d6 d5 op) (C.slice d11 d7 op) carry rmValue
-  (result, carryOut, overflow, arithmetic) = aluOp opc carry shifterCarry base operand2
+
+-- | Decode stage: class, condition, the value R15 reads, operand selection
+-- and the register reads the shift stage consumes.
+decodeStage :: BitVector 5 -> IrTok -> (DecTok, Maybe Row, Maybe Row)
+decodeStage m (IrTok tag op aux cond imm) = (tok, readRow aRow, readRow bRow)
+ where
+  th = tagThumb tag
+  pcRead
+    | not th = tagPc tag + 8
+    | aux == AuxWordPc = (tagPc tag + 4) .&. complement 3
+    | otherwise = tagPc tag + 4
+  armBlx = not th && cond == 0xf && armV5 arch && op .&. 0x0e000000 == 0x0a000000
+  cls = case aux of
+    AuxBranch -> CBranch
+    AuxBlSuffix -> CBranch
+    AuxBlxSuffix -> CBranch
+    AuxBlPrefix -> CLinkOnly
+    AuxUndef -> CUndef
+    _ | armBlx -> CBranch
+      | not th && cond == 0xf -> CUndef
+      | otherwise -> classify th m op
+  -- The cond = 1111 space is not predicated: BLX <imm> always executes,
+  -- the rest faults.
+  cond' = if not th && cond == 0xf then 0xe else cond
+  rn = fromIntegral (C.slice d19 d16 op) :: Index 16
+  rm = fromIntegral (C.slice d3 d0 op) :: Index 16
+  rs = fromIntegral (C.slice d11 d8 op) :: Index 16
+  regList = C.slice d15 d0 op
+  listBytes = sum (map (\b -> if b then 4 else 0) (unpack regList :: Vec 16 Bool)) :: Word
+  registerShift = not (testBit op 25) && testBit op 4
+  thumbBranch = aux == AuxBranch || aux == AuxBlSuffix || aux == AuxBlxSuffix || aux == AuxBlPrefix
+  -- Operand 2 immediate (rotated or shifted later by the shift stage).
+  immValue
+    | thumbBranch = imm
+    | armBlx = armDisplacement op .|. (if testBit op 24 then 2 else 0)
+    | cls == CBranch = armDisplacement op
+    | cls == CBlock = listBytes
+    | cls == CSingle && op .&. 0x0c000000 == 0x04000000 = zeroExtend (C.slice d11 d0 op)
+    | cls == CSingle = zeroExtend (C.slice d11 d8 op ++# C.slice d3 d0 op)
+    | otherwise = zeroExtend (C.slice d7 d0 op)
+  bImm = case cls of
+    CBranch -> True
+    CLinkOnly -> True
+    CBlock -> True
+    CDp -> testBit op 25
+    CMsr -> testBit op 25
+    CSingle | op .&. 0x0c000000 == 0x04000000 -> not (testBit op 25)
+            | otherwise -> testBit op 22
+    _ -> False
+  -- Operand 1: R15 reads pcRead; branches add to pcRead, except the Thumb
+  -- BL/BLX suffix, which adds to R14.
+  suffix = aux == AuxBlSuffix || aux == AuxBlxSuffix
+  aReg = case cls of
+    CBranch | suffix -> Just 14
+            | otherwise -> Nothing
+    CLinkOnly -> Nothing
+    CDp -> Just rn
+    CSingle -> Just rn
+    CBlock -> Just rn
+    CMul -> Just rm
+    CMulLong -> Just rm
+    _ -> Nothing
+  -- Operand 2 register; a register shift reads Rs first (then Rm).
+  bReg = case cls of
+    CDp | bImm -> Nothing
+        | registerShift -> Just rs
+        | otherwise -> Just rm
+    CMsr | bImm -> Nothing
+         | otherwise -> Just rm
+    CSingle | bImm -> Nothing
+            | otherwise -> Just rm
+    CClz -> Just rm
+    CBx -> Just rm
+    CMul -> Just rs
+    CMulLong -> Just rs
+    _ -> Nothing
+  readRow r = case r of
+    Just x | x /= 15 -> Just (regRow m x)
+    _ -> Nothing
+  aRow = aReg
+  bRow = bReg
+  tok = DecTok
+    { dTag = tag, dOp = op, dCls = cls, dCond = cond', dPcRead = pcRead, dImm = immValue
+    , dBImm = bImm
+    , dA15 = maybe True (== 15) aReg
+    , dB15 = bReg == Just 15
+    , dLink = case aux of
+        AuxBlSuffix -> True
+        AuxBlxSuffix -> True
+        AuxArm | armBlx -> True
+               | cls == CBranch -> testBit op 24
+               | cls == CBx -> testBit op 5
+        _ -> False
+    , dSetT = case aux of
+        AuxBlxSuffix -> Just False
+        _ | armBlx -> Just True
+          | otherwise -> Nothing
+    , dAlign4 = aux == AuxBlxSuffix
+    }
+
+-- | Shift stage: operand 1 and the shifted operand 2. A register shift
+-- takes two cycles: Rn and Rs first, then Rm. Presents the reads the ALU
+-- consumes: the current SPSR (MRS/MSR/exception return) on port A, the
+-- store data register on port B.
+shiftStage :: BitVector 5 -> Bool -> DecTok -> Maybe (Word, BitVector 8) -> Word -> Word
+  -> (Either (Word, BitVector 8) ShTok, Maybe Row, Maybe Row)
+shiftStage m carry d latch portA portB
+  | regShift, Nothing <- latch = (Left (portA, C.slice d7 d0 portB), Nothing, Just (regRow m rm))
+  | otherwise = (Right (ShTok d aVal b c), presentA, presentB)
+ where
+  op = dOp d
+  cls = dCls d
+  rm = fromIntegral (C.slice d3 d0 op) :: Index 16
+  rd = fromIntegral (C.slice d15 d12 op) :: Index 16
+  regShift = cls == CDp && not (testBit op 25) && testBit op 4
+  aVal
+    | dA15 d = dPcRead d
+    | Just (rn, _) <- latch = rn
+    | otherwise = portA
+  bIn
+    | dBImm d = dImm d
+    | dB15 d = dPcRead d
+    | otherwise = portB
+  rsAmount = maybe 0 snd latch
+  (kind, amount, immForm) = case cls of
+    CDp | testBit op 25 -> rotateImm
+        | regShift -> (C.slice d6 d5 op, rsAmount, False)
+        | otherwise -> immShift
+    CMsr | testBit op 25 -> rotateImm
+    CSingle | op .&. 0x0c000000 == 0x04000000 && testBit op 25 -> immShift
+    _ -> (0, 0, False)
+  rotateImm = (3, zeroExtend (C.slice d11 d8 op ++# (0 :: BitVector 1)), False)
+  immShift = (C.slice d6 d5 op, zeroExtend (C.slice d11 d7 op), True)
+  (b, c) = barrel kind amount immForm carry bIn
+  presentA = if cls == CDp || cls == CMrs || cls == CMsr then Just (spsrRow m) else Nothing
+  presentB = if cls == CSingle && not (testBit op 20) then Just (regRow m rd) else Nothing
+
+-- | What the ALU stage hands on.
+data AluNext = ToRetire Word | ToMem MemSt | ToFault (BitVector 3) Word
+  deriving (Generic, NFDataX)
+
+-- | ALU stage: condition check, the one adder/logic unit, flags, register
+-- write, branches, PSR transfers, and the start of memory, multiply and
+-- SWI work. portA/portB carry what the shift stage presented (SPSR, store
+-- data).
+aluStage :: Psr -> ShTok -> Word -> Word -> (Psr, Maybe (Row, Word), Maybe Row, Maybe Row, AluNext)
+aluStage s (ShTok d a b sc) portA portB
+  | not (condPasses (dCond d) (flags s)) = (s, Nothing, Nothing, Nothing, ToRetire next)
+  | otherwise = case dCls d of
+      CUndef -> faultHere
+      CDp
+        | testOp -> (flagged, Nothing, Nothing, Nothing, ToRetire next)
+        | rd == 15 && setFlags -> case setCpsr True portA s of
+            Nothing -> faultHere
+            Just s' -> (s', Nothing, Nothing, Nothing, ToRetire (result .&. pcMask (thumb s')))
+        | rd == 15 -> (flagged, Nothing, Nothing, Nothing, ToRetire (result .&. pcMask th))
+        | otherwise -> (flagged, write rd result, Nothing, Nothing, ToRetire next)
+      CMrs -> (s, write rd (if spsrSelected then portA else cpsrWord s), Nothing, Nothing, ToRetire next)
+      CMsr
+        | not spsrSelected -> case setCpsr False (merged cpsrMask (cpsrWord s) b) s of
+            Nothing -> faultHere
+            Just s' -> (s', Nothing, Nothing, Nothing, ToRetire next)
+        | otherwise -> (s, Just (spsrRow (mode s), merged fieldMask portA b), Nothing, Nothing, ToRetire next)
+      CClz -> (s, write rd (leadingZeros b), Nothing, Nothing, ToRetire next)
+      CBranch -> branchTo (if dAlign4 d then result .&. complement 3 else result)
+      CBx -> branchTo b
+      CLinkOnly -> (s, write 14 result, Nothing, Nothing, ToRetire next)
+      CSwi -> (s, Just (spsrRow 0x13, cpsrWord s), Nothing, Nothing, ToMem (mem MSwiLink))
+      CSingle -> (s, Nothing, Nothing, Nothing, ToMem (mem MRoute)
+        { pending = Access (if preIndex then result else a) width (not load) signed rd
+                      (if load then 0 else portB .&. widthMask width)
+        , writeBack = baseWrite, wbReg = rn, wbValue = result })
+      CBlock -> (s, Nothing, Nothing, Nothing, ToMem (mem MCheck)
+        { blockLeft = regList, blockAddr = start, blockStore = not load
+        , checkLeft = regList, checkAddr = start, blockSpsr = testBit op 22
+        , writeBack = testBit op 21, wbReg = rn, wbValue = result })
+      -- Present the accumulator: RdLo/Rn (bits 15..12) on A, RdHi on B.
+      CMul -> mulStart
+      CMulLong -> mulStart
+ where
+  op = dOp d
+  tag = dTag d
+  th = tagThumb tag
+  next = tagPc tag + stepOf th
+  rd = fromIntegral (C.slice d15 d12 op) :: Index 16
+  rn = fromIntegral (C.slice d19 d16 op) :: Index 16
+  write r v = Just (regRow (mode s) r, v)
+  faultHere = (s, Nothing, Nothing, Nothing, ToFault 1 (tagPc tag))
+  pcMask t = if t then 0xfffffffe else 0xffffffff
+  load = testBit op 20
+  up = testBit op 23
+  preIndex = testBit op 24
+  baseWrite = not preIndex || testBit op 21
+  setFlags = testBit op 20
+  testOp = C.slice d24 d23 op == 2
+  carry = testBit (flags s) 1
+  wordForm = op .&. 0x0c000000 == 0x04000000
+  halfKind = C.slice d6 d5 op
+  width = if wordForm then (if testBit op 22 then 1 else 4) else (if halfKind == 2 then 1 else 2)
+  signed = not wordForm && halfKind /= 1
+  regList = C.slice d15 d0 op
+  opc = case dCls d of
+    CDp -> C.slice d24 d21 op
+    CSingle -> if up then 0x4 else 0x2
+    CBlock -> if up then 0x4 else 0x2
+    CBranch -> 0x4
+    CLinkOnly -> 0x4
+    _ -> 0xd
+  (result, carryOut, overflow, arithmetic) = aluOp opc carry sc a b
   newFlags = pack (msb result) ++# pack (result == 0) ++# pack carryOut
     ++# pack (if arithmetic then overflow else testBit (flags s) 0)
-  flagged = if setFlags then (finish s) { flags = newFlags } else finish s
-  dataProcessing
-    | testOp = flagged
-    | rd == 15 && setFlags = returnTo result s (finish s)
-    | rd == 15 = flagged { nextPc = if thumb s then result .&. 0xfffffffe else result }
-    | otherwise = writeReg rd result flagged
+  flagged = if setFlags then s { flags = newFlags } else s
+  -- LDM/STM first beat: IA base, IB base + 4, DA final + 4, DB final.
+  start = a + (if up then (if preIndex then 4 else 0) else (if preIndex then 0 else 4) - b)
+  -- MSR field mask; in User mode an MSR to the CPSR writes only NZCV.
+  spsrSelected = testBit op 22
+  fieldMask = pack (map (\x -> if x then 0xff else 0 :: BitVector 8)
+                      (unpack (C.slice d19 d16 op) :: Vec 4 Bool)) :: Word
+  cpsrMask = if mode s == 0x10 then fieldMask .&. 0xff000000 else fieldMask
+  merged mask old value = (old .&. complement mask) .|. (value .&. mask)
+  -- BL/BLX link: the next instruction, with bit 0 set when it is Thumb.
+  link = if th then (tagPc tag + 2) .|. 1 else tagPc tag + 4
+  branchTo target =
+    let t' = case dSetT d of
+          Just t -> t
+          Nothing -> if dCls d == CBx then testBit target 0 else th
+        target' = if dCls d == CBx then target .&. complement 1 else target
+    in (s { thumb = t' }, if dLink d then write 14 link else Nothing, Nothing, Nothing, ToRetire target')
+  mem p = MemSt p tag next (Access 0 4 False False 0 0) 0 0 False 0 0 False 0 0 False False op 0
+  -- One 33x33 multiplier: operands sign-extended for SMULL/SMLAL.
+  longForm = testBit op 23
+  operand v = unpack ((if longForm && testBit op 22 then pack (msb v) else 0) ++# v) :: Signed 33
+  product64 = C.slice d63 d0 (pack (operand a `mul` operand b))
+  mulStart = (s, Nothing, Just (regRow (mode s) rd), Just (regRow (mode s) rn), ToMem (mem MMulAcc) { mulProd = product64 })
 
-transition :: Cpu -> SliceIn -> Word -> (Cpu, Maybe (RamIndex, Word))
-transition s i readWord = case phase s of
-  Fetch
-    | irqRequest i && not (irqMask s) -> idle (enterIrq s)
-    | pc s .&. (if thumb s then 1 else 3) /= 0 -> idle (stop 2 (pc s) s)
-    | inRam (pc s) -> idle (s { phase = FetchRam, pending = Access (pc s) 4 False False 0 0 })
-    | not (inBoot (pc s)) -> idle (stop 3 (pc s) s)
-    | otherwise -> idle (s { phase = Decode, opcode = fetched (bootWord i) })
-  -- A RAM fetch presents the address on the synchronous port for one
-  -- cycle and decodes the word it returns.
-  FetchRam -> idle (s { phase = FetchWord })
-  FetchWord -> idle (s { phase = Decode, opcode = fetched readWord })
-  Decode -> idle (decode s)
-  BootLoad -> idle (loadDone s (extract a (bootWord i)))
-  LocalRead -> idle (s { phase = RamAccess })
-  BlockCheck -> idle (case blockFault (blockStore s) (checkAddr s) of
-    0 -> let rest = checkLeft s .&. (checkLeft s - 1) in
-      s { phase = if rest == 0 then BlockBeat else BlockCheck
-        , checkLeft = rest, checkAddr = checkAddr s + 4 }
-    code -> stop code (checkAddr s) s)
-  BlockBeat -> let r = lowestReg (blockLeft s) in
-    idle (route s (Access (blockAddr s) 4 (blockStore s) False r
-                     (if blockStore s then regs s !! r else 0)))
-  RamAccess
-    | accessWrite a -> let value = mergeStore a readWord in
-        ((complete True s) { fullWord = value }, Just (ramAddress s, value))
-    | otherwise -> idle (loadDone s (extract a readWord))
-  Offer -> idle (if gpuReqReady i then s { phase = Await } else s)
-  Await
-    | not (gpuReplyValid i) -> idle s
-    | gpuReplyFault i -> idle (stop 4 (accessAddr a) s)
-    | accessWrite a -> idle (complete False s)
-    | otherwise -> idle (loadDone s (gpuReplyData i))
-  Retire -> idle (s { phase = Fetch, pc = nextPc s, lastStore = False })
-  Halted -> idle s
+-- | Mem stage: memory routes and beats, base writeback, LDM^ CPSR restore,
+-- multiply-accumulate, and the second half of SWI entry.
+data MemOut = MemOut
+  { moPsr    :: Psr
+  , moMem    :: Maybe MemSt
+  , moRetire :: Maybe RetTok
+  , moFault  :: Maybe (BitVector 3, Word)
+  , moReg    :: Maybe (Row, Word)
+  , moRam    :: Bool                   -- ^ write the merged store word to local RAM
+  , moStore  :: Maybe (Word, Word)
+  , moReadA  :: Maybe Row
+  , moReadB  :: Maybe Row
+  } deriving (Generic, NFDataX)
+
+memStage :: SliceIn -> Word -> Word -> Word -> Psr -> MemSt -> MemOut
+memStage i ramWord portA portB s m = case mPhase m of
+  MRoute -> case routeTo acc of
+    Left code -> faulted code (accessAddr acc)
+    Right p -> stay m { mPhase = p }
+  MBoot -> loaded
+  MLocal -> stay m { mPhase = MRam }
+  MRam
+    | accessWrite acc -> (complete m) { moRam = True, moStore = Just (accessAddr acc .&. 0xfffffffc, stored) }
+    | otherwise -> loaded
+  MOffer -> stay (if gpuReqReady i then m { mPhase = MAwait } else m)
+  MAwait
+    | not (gpuReplyValid i) -> stay m
+    | gpuReplyFault i -> faulted 4 (accessAddr acc)
+    | accessWrite acc -> complete m
+    | otherwise -> loaded
+  MCheck -> case blockFault (blockStore m) (checkAddr m) of
+    0 -> let rest = checkLeft m .&. (checkLeft m - 1) in
+      if rest == 0
+        then (stay m { mPhase = MBeat, checkLeft = 0 }) { moReadB = beatRead (blockLeft m) }
+        else stay m { checkLeft = rest, checkAddr = checkAddr m + 4 }
+    code -> faulted code (checkAddr m)
+  MBeat ->
+    let r = lowestReg (blockLeft m)
+        beat = Access (blockAddr m) 4 (blockStore m) False r (if blockStore m then portB else 0)
+    in case routeTo beat of
+         Left code -> faulted code (blockAddr m)
+         Right p -> stay m { mPhase = p, pending = beat }
+  MWriteBack -> (finish m { writeBack = False }) { moReg = Just (regRow (mode s) (wbReg m), wbValue m) }
+  MRestore -> case setCpsr True portA s of
+    Nothing -> faulted 1 (tagPc (mTag m))
+    Just s' -> (out s') { moRetire = Just (RetTok (mTag m) (mNext m .&. (if thumb s' then 0xfffffffe else 0xffffffff))) }
+  MMulAcc ->
+    let mo = mulOp m
+        long = testBit mo 23
+        acc64 | not (testBit mo 21) = 0
+              | long = portB ++# portA
+              | otherwise = zeroExtend portA
+        r64 = mulProd m + acc64
+        lo = C.slice d31 d0 r64
+        n = if long then testBit r64 63 else testBit lo 31
+        z = if long then r64 == 0 else lo == 0
+        s' = if testBit mo 20 then s { flags = pack n ++# pack z ++# C.slice d1 d0 (flags s) } else s
+        dst = fromIntegral (if long then C.slice d15 d12 mo else C.slice d19 d16 mo) :: Index 16
+        o = (out s') { moReg = Just (regRow (mode s) dst, lo) }
+    in if long then o { moMem = Just m { mPhase = MMulHi, wbValue = C.slice d63 d32 r64 } }
+       else o { moRetire = Just (RetTok (mTag m) (mNext m)) }
+  MMulHi -> (retireWith s) { moReg = Just (regRow (mode s) (fromIntegral (C.slice d19 d16 (mulOp m))), wbValue m) }
+  MSwiLink -> (out (enterMode 0x13 s))
+    { moReg = Just (regRow 0x13 14, tagPc (mTag m) + stepOf (tagThumb (mTag m)))
+    , moRetire = Just (RetTok (mTag m) swiVector) }
  where
-  a = pending s
-  idle x = (x, Nothing)
-  -- Thumb fetches the halfword selected by pc[1] of the fetched word.
-  fetched w
-    | not (thumb s) = w
-    | testBit (pc s) 1 = zeroExtend (C.slice d31 d16 w)
-    | otherwise = zeroExtend (C.slice d15 d0 w)
+  acc = pending m
+  stored = mergeStore acc ramWord
+  out s' = MemOut s' Nothing Nothing Nothing Nothing False Nothing Nothing Nothing
+  stay m' = (out s) { moMem = Just m' }
+  faulted code addr = (out s) { moFault = Just (code, addr) }
+  retireWith s' = (out s') { moRetire = Just (RetTok (mTag m) (mNext m)) }
+  beatRead l = if blockStore m then Just (regRow (mode s) (lowestReg l)) else Nothing
+  -- The loaded value: boot ROM, local RAM or link reply.
+  raw = case mPhase m of
+    MBoot -> extract acc (bootWord i)
+    MRam -> extract acc ramWord
+    _ -> gpuReplyData i
+  masked = raw .&. widthMask (accessWidth acc)
+  value
+    | not (accessSigned acc) = masked
+    | accessWidth acc == 1 = pack (resize (unpack (C.slice d7 d0 masked) :: Signed 8) :: Signed 32)
+    | otherwise = pack (resize (unpack (C.slice d15 d0 masked) :: Signed 16) :: Signed 32)
+  -- A load to R15 (word LDR, or the last LDM/POP beat) branches: LDM
+  -- {.., pc}^ restores the CPSR from the SPSR at the end; otherwise ARMv5
+  -- interworks on bit 0 (ARMv4T keeps the state, dropping bit 0 in Thumb).
+  loaded
+    | accessReg acc /= 15 = (complete m) { moReg = Just (regRow (mode s) (accessReg acc), value) }
+    | blockSpsr m = complete m { mNext = value, restore = True }
+    | armV5 arch = (complete m { mNext = value .&. 0xfffffffe }) { moPsr = s { thumb = testBit value 0 } }
+    | thumb s = complete m { mNext = value .&. 0xfffffffe }
+    | otherwise = complete m { mNext = value }
+  -- One beat is done: the next LDM/STM register, or the end of the transfer.
+  complete m'
+    | rest /= 0 = (stay m' { mPhase = MBeat, blockLeft = rest, blockAddr = blockAddr m' + 4 })
+                    { moReadB = beatRead rest }
+    | otherwise = finish m' { blockLeft = 0 }
+   where rest = blockLeft m' .&. (blockLeft m' - 1)
+  finish m'
+    | writeBack m' = stay m' { mPhase = MWriteBack }
+    | restore m' = (stay m' { mPhase = MRestore }) { moReadA = Just (spsrRow (mode s)) }
+    | otherwise = (out s) { moRetire = Just (RetTok (mTag m') (mNext m')) }
 
--- | Count of leading zero bits (CLZ): 32 for zero.
-leadingZeros :: Word -> Word
-leadingZeros w = fromIntegral (snd (foldl count (False, 0 :: Index 33) (unpack w :: Vec 32 Bool)))
- where count (seen, n) b = if seen || b then (True, n) else (False, n + 1)
+-- | One clock of the whole CPU: the stage holding the token runs (fetch
+-- when the pipe is empty).
+transition :: Cpu -> SliceIn -> Word -> Word -> Word -> Step
+transition s1 i ramWord portA portB
+  | faultCode s /= 0 = plain s
+  | Just r <- rq s = plain s { psr = p { pc = rNext r }, rq = Nothing }
+  | Just m <- mq s =
+      let o = memStage i ramWord portA portB p m
+          s' = s { psr = moPsr o, mq = moMem o, rq = moRetire o, storeObs = moStore o }
+      in Step (faultWith (moFault o) s') (if moRam o then Just (ramAddress s, mergeStore (pending m) ramWord) else Nothing)
+              (moReg o) (moReadA o) (moReadB o)
+  | Just t <- sq s =
+      let (p', w, ra, rb, nxt) = aluStage p t portA portB
+          s0 = s { psr = p', sq = Nothing }
+          s' = case nxt of
+            ToRetire target -> s0 { rq = Just (RetTok (dTag (sDec t)) target) }
+            ToMem m -> s0 { mq = Just m }
+            ToFault c addr -> faultWith (Just (c, addr)) s0
+      in Step s' Nothing w ra rb
+  | Just d <- dq s = case shiftStage (mode p) (testBit (flags p) 1) d (shLatch s) portA portB of
+      (Left l, ra, rb) -> Step s { shLatch = Just l } Nothing Nothing ra rb
+      (Right t, ra, rb) -> Step s { dq = Nothing, shLatch = Nothing, sq = Just t } Nothing Nothing ra rb
+  | Just t <- iq s = let (d, ra, rb) = decodeStage (mode p) t in Step s { iq = Nothing, dq = Just d } Nothing Nothing ra rb
+  | Just t <- xq s = plain s { xq = Nothing, iq = Just (expandStage t) }
+  | otherwise = case fphase s of
+      FIdle
+        -- IRQ entry at an instruction boundary: SPSR_irq <- CPSR now,
+        -- R14_irq <- next instruction + 4 in either state next cycle.
+        | irqRequest i && not (irqMask p) ->
+            Step s { fphase = FIrqLink } Nothing (Just (spsrRow 0x12, cpsrWord p)) Nothing Nothing
+        | pc p .&. (if thumb p then 1 else 3) /= 0 -> plain (faultWith (Just (2, pc p)) s)
+        | inRam (pc p) -> plain s { fphase = FRam }
+        | not (inBoot (pc p)) -> plain (faultWith (Just (3, pc p)) s)
+        | otherwise -> plain (issue (bootWord i))
+      -- A RAM fetch presents the address on the synchronous port for one
+      -- cycle and decodes the word it returns.
+      FRam -> plain s { fphase = FWord }
+      FWord -> plain (issue ramWord) { fphase = FIdle }
+      FIrqLink -> Step s { fphase = FIdle, psr = (enterMode 0x12 p) { pc = irqVector } } Nothing
+                    (Just (regRow 0x12 14, pc p + 4)) Nothing Nothing
+ where
+  -- A store is observed for exactly the one cycle after its RAM write.
+  s = s1 { storeObs = Nothing }
+  p = psr s
+  plain x = Step x Nothing Nothing Nothing Nothing
+  faultWith f x = case f of
+    Just (c, addr) -> x { faultCode = c, faultAt = addr }
+    Nothing -> x
+  -- Thumb fetches the halfword selected by pc[1] of the fetched word.
+  issue w
+    | thumb p = s { xq = Just (Tag (pc p) (zeroExtend half) True) }
+    | otherwise = s { iq = Just (armToken (Tag (pc p) w False)) }
+   where half = if testBit (pc p) 1 then C.slice d31 d16 w else C.slice d15 d0 w
 
 slice :: HiddenClockResetEnable dom => Signal dom SliceIn -> Signal dom SliceOut
 slice = arm9Slice hasClock hasReset hasEnable
@@ -855,9 +1151,12 @@ arm9Slice
 arm9Slice clk rst en input = qualify <$> active <*> (observe <$> state)
  where
   active = (&&) <$> fromEnable en <*> (not <$> unsafeToActiveHigh rst)
-  state = E.register clk rst en initialCpu next
-  (next, wr) = unbundle (transition <$> state <*> input <*> readWord)
-  readWord = E.blockRam clk (toEnable active) (repeat @1024 0) (ramAddress <$> state) wr
+  ramEn = toEnable active
+  state = E.register clk rst en initialCpu (stepCpu <$> next)
+  next = transition <$> state <*> input <*> readWord <*> regA <*> regB
+  readWord = E.blockRam clk ramEn (repeat @1024 0) (ramAddress <$> state) (ramWrite <$> next)
+  regA = E.blockRam clk ramEn (repeat @32 0) (fromMaybe 0 . readA <$> next) (regWrite <$> next)
+  regB = E.blockRam clk ramEn (repeat @32 0) (fromMaybe 0 . readB <$> next) (regWrite <$> next)
   qualify True out = out
   qualify False out = out { gpuReqValid = False, gpuReplyReady = False
                           , storeValid = False, retireValid = False }
@@ -879,5 +1178,5 @@ arm9SliceTopEntity
   :: Clock System -> Reset System -> Enable System
   -> Signal System Word -> Signal System Bool -> Signal System Bool
   -> Signal System Word -> Signal System Bool -> Signal System Bool -> Signal System SliceOut
-arm9SliceTopEntity clk rst en rom reqReady replyValid replyData replyFault irq =
-  arm9Slice clk rst en (SliceIn <$> rom <*> reqReady <*> replyValid <*> replyData <*> replyFault <*> irq)
+arm9SliceTopEntity clk rst en boot reqReady replyValid replyData replyFault irq =
+  arm9Slice clk rst en (SliceIn <$> boot <*> reqReady <*> replyValid <*> replyData <*> replyFault <*> irq)

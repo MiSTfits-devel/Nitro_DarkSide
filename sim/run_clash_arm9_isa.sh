@@ -110,12 +110,13 @@ product isa-product hs_arm9_isa 64
 product mem hs_arm9_mem $((16#$mem_scratch))
 
 # (2) Pure Haskell transition function.
-(cd "$root/clash" && stack --resolver lts-22.43 ghc -- -O1 -isrc -itest \
-    -outputdir "$out/ghc" test/Arm9IsaCheck.hs -o "$out/isa-check")
+# Every GHC/Clash process and every built checker is capped at a 3 GB heap.
+(cd "$root/clash" && stack --resolver lts-22.43 ghc -- +RTS -M3g -RTS -rtsopts -with-rtsopts=-M3g \
+    -O1 -isrc -itest -outputdir "$out/ghc" test/Arm9IsaCheck.hs -o "$out/isa-check")
 run_cases "$out/isa-check"
 
 # (3) Fresh Clash Verilog, never a checked-in or stale netlist.
-(cd "$root/clash" && stack exec clash -- --verilog -isrc \
+(cd "$root/clash" && stack exec clash -- +RTS -M3g -RTS --verilog -isrc \
     -fclash-no-escaped-identifiers -outputdir "$out/hdl" src/Nds/WholeCore/Arm9Slice.hs)
 topfile=$(find "$out/hdl" -name 'nds_arm9_slice.v' -print)
 [[ -n $topfile && $(printf '%s\n' "$topfile" | wc -l | tr -d ' ') = 1 ]] || {

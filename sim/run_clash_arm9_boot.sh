@@ -69,11 +69,12 @@ run_cases() {
     done <"$out/cases"
 }
 
-(cd "$root/clash" && stack --resolver lts-22.43 ghc -- -O1 -isrc -itest \
-    -outputdir "$out/ghc" test/Arm9CardCheck.hs -o "$out/card-check")
+# Every GHC/Clash process and every built checker is capped at a 3 GB heap.
+(cd "$root/clash" && stack --resolver lts-22.43 ghc -- +RTS -M3g -RTS -rtsopts -with-rtsopts=-M3g \
+    -O1 -isrc -itest -outputdir "$out/ghc" test/Arm9CardCheck.hs -o "$out/card-check")
 run_cases "$out/card-check" pure
 
-(cd "$root/clash" && stack exec clash -- --verilog -isrc \
+(cd "$root/clash" && stack exec clash -- +RTS -M3g -RTS --verilog -isrc \
     -fclash-no-escaped-identifiers -outputdir "$out/hdl" src/Nds/WholeCore/Arm9Soc.hs)
 topfile=$(find "$out/hdl" -name nds_arm9_soc.v -print)
 [[ -n $topfile && $(printf '%s\n' "$topfile" | wc -l | tr -d ' ') = 1 ]] || {

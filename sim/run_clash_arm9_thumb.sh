@@ -9,8 +9,10 @@
 #                                  User modes (CPU only);
 #   sim/tests/hs_arm9_thumb_irq.S  IRQ entry from Thumb, return to Thumb by
 #                                  SUBS and LDM^, an IRQ between the halves
-#                                  of a Thumb BL (Arm9Soc with timers).
-# Run on (1) the product ARM9 RTL: the Thumb image, the PRODUCT_ORACLE
+#                                  of a Thumb BL (Arm9Soc with timers);
+#   sim/tests/hs_arm9_banks.S      SPSR_svc/SPSR_irq and the three R13/R14
+#                                  banks live at once (CPU only).
+# Run on (1) the product ARM9 RTL: the Thumb and bank images, the PRODUCT_ORACLE
 # interwork image (SPSR_svc primed: the product loads CPSR flags/F from the
 # old SPSR on exception entry) and the PRODUCT_ORACLE Thumb IRQ image (first
 # 7 words: no harness IRQ source there); (2) the pure Haskell sliceStep /
@@ -64,6 +66,8 @@ echo "interwork hs_arm9_interwork --scratch 38" >>"$out/cpu-cases"
 echo "interwork-product hs_arm9_interwork --scratch 38" >>"$out/cpu-cases"
 faults hs_arm9_interwork interwork- 38 NEG_MRS_SPSR_USER:1 NEG_MOVS_PC_USER:1 NEG_MUL_PC:1 \
     NEG_MUL_SBZ:1 NEG_UMULL_SAME:1 NEG_SMLAL_PC:1 NEG_CLZ_PC:1 NEG_LDM_USER_SVC:1
+build_rom banks hs_arm9_banks
+echo "banks hs_arm9_banks --scratch 30" >>"$out/cpu-cases"
 
 # Arm9Soc case: the harness raises IF bit 1 when the BL prefix retires.
 build_rom thumb-irq hs_arm9_thumb_irq
@@ -106,20 +110,22 @@ product() {
 }
 product thumb hs_arm9_thumb -gSCRATCH=48
 product interwork-product hs_arm9_interwork -gSCRATCH=56
+product banks hs_arm9_banks -gSCRATCH=48
 product thumb-irq-product hs_arm9_thumb_irq -gSCRATCH=48 -gMAILBOX_WORDS=7 -gIRQ_IO=true
 
 # (2) Pure Haskell slice and SoC.
-(cd "$root/clash" && stack --resolver lts-22.43 ghc -- -O1 -isrc -itest \
-    -outputdir "$out/ghc-isa" test/Arm9IsaCheck.hs -o "$out/isa-check" &&
- stack --resolver lts-22.43 ghc -- -O1 -isrc -itest \
-    -outputdir "$out/ghc-irq" test/Arm9IrqCheck.hs -o "$out/irq-check")
+# Every GHC/Clash process and every built checker is capped at a 3 GB heap.
+(cd "$root/clash" && stack --resolver lts-22.43 ghc -- +RTS -M3g -RTS -rtsopts -with-rtsopts=-M3g \
+    -O1 -isrc -itest -outputdir "$out/ghc-isa" test/Arm9IsaCheck.hs -o "$out/isa-check" &&
+ stack --resolver lts-22.43 ghc -- +RTS -M3g -RTS -rtsopts -with-rtsopts=-M3g \
+    -O1 -isrc -itest -outputdir "$out/ghc-irq" test/Arm9IrqCheck.hs -o "$out/irq-check")
 run_cpu "$out/isa-check"
 run_irq "$out/irq-check"
 
 # (3) Fresh Clash Verilog, never a checked-in or stale netlist.
 verilate() {
     local module=$1 source=$2 host=$3 dir=$4
-    (cd "$root/clash" && stack exec clash -- --verilog -isrc \
+    (cd "$root/clash" && stack exec clash -- +RTS -M3g -RTS --verilog -isrc \
         -fclash-no-escaped-identifiers -outputdir "$out/$dir-hdl" "src/Nds/WholeCore/$source.hs")
     local topfile
     topfile=$(find "$out/$dir-hdl" -name "$module.v" -print)
@@ -136,4 +142,4 @@ verilate nds_arm9_slice Arm9Slice clash_arm9_isa.cpp slice
 run_cpu "$out/slice-obj/Vnds_arm9_slice"
 verilate nds_arm9_soc Arm9Soc clash_arm9_irq.cpp soc
 run_irq "$out/soc-obj/Vnds_arm9_soc"
-echo "PASS: ARM9 Thumb, interworking, multiply, SWI/mode and Thumb IRQ fixtures on product RTL, Haskell and generated Verilog"
+echo "PASS: ARM9 Thumb, interworking, multiply, SWI/mode, register-bank and Thumb IRQ fixtures on product RTL, Haskell and generated Verilog"

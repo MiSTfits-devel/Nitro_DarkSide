@@ -38,8 +38,9 @@ build_rom bad-status "$gfx" --defsym UNSUPPORTED_STATUS=1
 # name:expected CPU fault code:fault address (all GPU reply errors)
 negatives=(bad-mode:4:04000000 bad-bank:4:04000242 bad-status:4:04000006)
 
-(cd "$root/clash" && stack --resolver lts-22.43 ghc -- -O2 -isrc -itest \
-    -outputdir "$out/ghc" test/GfxSliceCheck.hs -o "$out/gfx-slice-check")
+# Every GHC/Clash process and every built checker is capped at a 3 GB heap.
+(cd "$root/clash" && stack --resolver lts-22.43 ghc -- +RTS -M3g -RTS -rtsopts -with-rtsopts=-M3g \
+    -O2 -isrc -itest -outputdir "$out/ghc" test/GfxSliceCheck.hs -o "$out/gfx-slice-check")
 for name in gfx witness; do
     mkdir "$out/$name"
     "$out/gfx-slice-check" "$out/$name.hex" "$out/$name"
@@ -55,7 +56,7 @@ done
 # contents, see vramZeroFile); Clash reads it from its working directory and
 # copies it beside the netlist, which is where the RTL host and stage use it.
 awk 'BEGIN { for (i = 0; i < 32768; i++) print "0000000000000000" }' >"$out/nds_vram_zero.bin"
-(cd "$out" && STACK_YAML="$root/clash/stack.yaml" stack exec clash -- --verilog \
+(cd "$out" && STACK_YAML="$root/clash/stack.yaml" stack exec clash -- +RTS -M3g -RTS --verilog \
     -i"$root/clash/src" -fclash-no-escaped-identifiers -outputdir "$out/hdl" \
     "$root/clash/src/Nds/WholeCore/GfxSoc.hs")
 hdl="$out/hdl/Nds.WholeCore.GfxSoc.gfxSocTopEntity"

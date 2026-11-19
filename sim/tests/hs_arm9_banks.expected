@@ -1,0 +1,14 @@
+80000010  # 0  SPSR_svc as written in SVC, after SPSR_irq was written in IRQ mode
+00000500  # 1  R13_svc, after R13_irq and R13_sys were written
+00000600  # 2  R14_svc
+00000055  # 3  R5 written in IRQ mode, read in SVC: R0-R12 are not banked
+4000001f  # 4  SPSR_irq as written in IRQ mode
+00000100  # 5  R13_irq
+00000200  # 6  R14_irq
+00000300  # 7  R13_sys (the User/System bank)
+00000400  # 8  R14_sys
+80000010  # 9  SPSR_svc unchanged by the IRQ- and System-mode visits
+00000500  # 10 R13_svc unchanged
+00000600  # 11 R14_svc unchanged
+00000000  # 12 MOVS r0, r1(=1), RRX with C = 0: C into bit 31, bit 0 shifted out
+600000d3  # 13 Z, C = old bit 0 = 1; SVC, I = F = 1

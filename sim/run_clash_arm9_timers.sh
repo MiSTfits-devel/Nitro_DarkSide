@@ -11,10 +11,11 @@ done
 arm-none-eabi-as -EL -o "$out/rom.o" "$root/sim/tests/hs_arm9_timers.S"
 arm-none-eabi-objcopy -j .text -O binary "$out/rom.o" "$out/rom.bin"
 od -An -v -tx4 "$out/rom.bin" | awk '{for (i=1; i<=NF; i++) print $i}' >"$out/rom.hex"
-(cd "$root/clash" && stack --resolver lts-22.43 ghc -- -O1 -isrc -itest \
-    -outputdir "$out/ghc" test/Arm9TimerIntegrationCheck.hs -o "$out/check")
+# Every GHC/Clash process and every built checker is capped at a 3 GB heap.
+(cd "$root/clash" && stack --resolver lts-22.43 ghc -- +RTS -M3g -RTS -rtsopts -with-rtsopts=-M3g \
+    -O1 -isrc -itest -outputdir "$out/ghc" test/Arm9TimerIntegrationCheck.hs -o "$out/check")
 "$out/check" "$out/rom.hex" "$root/sim/tests/hs_arm9_timers.expected"
-(cd "$root/clash" && stack exec clash -- --verilog -isrc \
+(cd "$root/clash" && stack exec clash -- +RTS -M3g -RTS --verilog -isrc \
     -fclash-no-escaped-identifiers -outputdir "$out/hdl" src/Nds/WholeCore/Arm9Soc.hs)
 topfile=$(find "$out/hdl" -name nds_arm9_soc.v -print)
 [[ -n $topfile && $(printf '%s\n' "$topfile" | wc -l | tr -d ' ') = 1 ]] || {

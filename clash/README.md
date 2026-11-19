@@ -62,7 +62,7 @@ immediate; MUL, MLA, UMULL, UMLAL, SMULL and SMLAL; CLZ; SWI; single
 transfers; and LDM/STM. Every ARMv5T Thumb format executes: the branch
 formats (B<cond>, B, the BL/BLX prefix and suffix) are decoded directly and
 every other format, Thumb SWI and BX/BLX Rm included, is rewritten into the
-equivalent AL-condition ARM opcode for the one shared execute stage, with
+equivalent AL-condition ARM opcode for the one shared decode/shift/ALU path, with
 R15 reading as pc + 4 (word-aligned for the PC-relative LDR and ADD). Thumb
 therefore inherits the ARM flag, link, LDM/STM precheck and fault rules,
 plus Thumb-only ones: LDMIA with its base in the list does not write back,
@@ -158,7 +158,10 @@ and right-justified data until `GPU_REQ_VALID && GPU_REQ_READY`; only one
 beat may be in flight. The target holds its right-justified reply until
 `GPU_REPLY_VALID && GPU_REPLY_READY`; a write must also return a reply.
 Transfers and observation pulses count only with `EN` high and `RST` low.
-Reset clears CPU/link state, not RAM. Any adapter must discard pre-reset
+Reset clears CPU/link state, not RAM: neither the local RAM nor the
+register file (R0-R14, banked R13/R14, SPSRs; zero at power-up in the pure
+model and the generated Verilog alike) is cleared by `RST`, and no fixture
+reads a register before writing it after a reset. Any adapter must discard pre-reset
 replies before the next request. `FAULT` is sticky until reset:
 1 = unsupported opcode (instruction address), 2 = alignment (including a
 misaligned branch target, reported at fetch, and an unaligned LDM/STM base),
@@ -282,14 +285,6 @@ unsigned SMULL, Rd = Rm faulting, ARM-step SWI link, wrong Thumb IRQ link,
 User MSR writing control bits, System with its own bank, LDMIA base
 writeback, CLZ off by one) each fail the pure fixtures.
 
-Size (Yosys 0.71 generic synthesis of the generated `nds_arm9_slice`:
-`hierarchy; proc; flatten; opt; memory -nomap; opt; techmap; opt -fast;
-abc; stat`, the 4 KiB RAM kept as one memory): 49,746 cells and 991
-flip-flops before this Thumb/mode/multiply work, 99,644 cells and 1,156
-flip-flops after; about 8,900 of the new cells are the 33x33 multiplier,
-which an FPGA maps to DSP blocks. The extra flip-flops are the R13/R14
-banks, SPSR_svc, T and the mode field.
-
 `sim/run_clash_arm9_card.sh` checks the read-only NTR game-card slot,
 [`Nds.WholeCore.Card`](src/Nds/WholeCore/Card.hs), which `Arm9Soc` puts
 behind the router for `0x040001A0-A1`, `0x040001A4-AF` and `0x04100010`
@@ -371,6 +366,153 @@ Today's observed slice gates (ISA, link reset, native `Nds.Gpu.Live` frames,
 generated CPU + VRAM graphics) and their limits are listed in the
 [M7 ledger](../docs/MILESTONES.md#m7-finite-slice-gates-observed-2026-11-18-not-acceptance);
 M7 remains not accepted.
+
+### Microarchitecture, measured size, clock and throughput
+
+Register file: R0-R14, the banked R13/R14 (User/System, SVC, IRQ) and
+SPSR_svc/SPSR_irq are 23 rows of a 32-word register file held in two block
+RAMs with one shared write port (two synchronous read ports by
+duplication). The row follows the mode register, so a mode change (MSR,
+exception entry or return) swaps no data. PC and the CPSR fields are
+flip-flops. Both copies power up zero in the pure model and in the
+generated Verilog (a 32-word `initial`, which Quartus 17 accepts; the
+4 KiB local RAM already uses the same form). The design never reads and
+writes the same row in one cycle, so the RAMs' read-during-write behaviour
+never matters. The pure `sliceStep` turns a violation into an error, which
+fails every pure gate. It also forces its next state each step, so long
+pure runs hold one state.
+
+An instruction is a token that moves through stages. Each stage is a
+function from its own input record to its own output record with a valid
+bit: fetch → (Thumb expand) → decode (class, condition, register reads) →
+shift (the one barrel shifter; register shifts take a second cycle) → ALU
+(the one adder/logic unit, condition check, flags, register write) → mem
+(memory routes and beats, base writeback, LDM^ restore, multiply
+accumulate, the SWI link) → retire. Exactly one token is in flight; no stage
+reads another stage's pipeline register. Overlapping them later needs:
+- fetch-ahead with sequential PC prediction;
+- a flush of younger tokens on every PC write (branches, R15 data
+  processing, loads to R15, exception entry and return) and on every mode
+  or SPSR change, since the register row depends on the mode;
+- forwarding of ALU and load results into the shift stage's operands (the
+  register file reads one cycle ahead, so a dependent token would read the
+  old row);
+- a load-use interlock and a stall while the mem stage is busy;
+- IRQ sampling at the oldest token's boundary.
+
+Standalone Quartus 17.0.2 fits on 5CSEBA6U23I7 (no pins, all ports
+virtual, fresh Clash netlists). This was a local run, not reproducible from
+the repo: the fit used a local variant of `clash/tests/remote_quartus_block.sh`
+with an added case for these tops. Worst setup and hold over the four corners:
+
+| Top, constraint | ALMs | Registers | M10K (bits) | DSP | Worst setup | Worst hold |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| slice before, 33.51 MHz | 5,235 | 1,154 | 4 (32,768) | 3 | +4.434 ns | +0.138 ns |
+| slice before, 67.03 MHz | 5,287 | 1,154 | 4 (32,768) | 3 | **−8.287 ns** | +0.134 ns |
+| soc before, 33.51 MHz | 6,132 | 1,682 | 4 (32,768) | 3 | +4.816 ns | +0.164 ns |
+| soc before, 67.03 MHz | 6,168 | 1,682 | 4 (32,768) | 3 | **−8.256 ns** | +0.154 ns |
+| slice after, 33.51 MHz | 2,432 | 1,183 | 6 (34,816) | 3 | +13.282 ns | +0.127 ns |
+| slice after, 67.03 MHz | 2,473 | 1,183 | 6 (34,816) | 3 | +1.737 ns | +0.144 ns |
+| soc after, 33.51 MHz | 3,432 | 1,711 | 6 (34,816) | 3 | +12.454 ns | +0.124 ns |
+| soc after, 67.03 MHz | 3,442 | 1,711 | 6 (34,816) | 3 | +1.008 ns | +0.152 ns |
+
+Notes on the fits:
+- **Timing:** every corner of the "after" fits has positive setup and hold
+  slack at both clocks.
+- **Memory:** the 4 KiB local RAM is four M10K blocks and the register file
+  two. The multiplier is three DSP blocks.
+- **Before:** the critical path was opcode → decode → register-file read
+  mux → barrel shifter → ALU adders → register-file write mux, 21 logic
+  levels in one cycle.
+- **After:** the worst 67.03 MHz path runs from the decode token's class
+  field through the shift-amount select and the barrel shifter into the
+  shift token's operand register (10 levels). Next are opcode → ALU →
+  register-file write data.
+- **For scale:** the product `nds_cpu9` core row in the integrated product fit
+  (`artifacts/zero-arm-graphics/stage0-fit/NDS4MiSTer.fit.rpt`) is 4,164
+  ALMs, 3,404 registers and 9 DSP. Its caches (`nds_cache9`) add 1,954 ALMs
+  and 24 M10K, and the product ARM7 (`gba_cpu`) is 2,952 ALMs. The product
+  cores implement far more: caches, CP15, the full ARMv5TE ISA,
+  pipelining and savestates.
+
+The restructure changes no behaviour. Every existing gate passes unmodified:
+all mailbox, fault, link-offer, card-address and RAM-retirement checks,
+including the IRQ fixture's free-running-timer slots. `run.sh --soc 10`
+still displays buffers 0..3 in its 10 frames, so its frame count is
+unchanged. The Thumb gate adds
+[`hs_arm9_banks.S`](../sim/tests/hs_arm9_banks.S): 14 hand-derived words with
+both SPSRs and all three R13/R14 banks live at once, plus RRX carry-out from
+bit 0. The product `nds_cpu9` matches all 14. It exists because two of 16
+CPU mutants (SVC and IRQ sharing one SPSR row; RRX carry taken from bit 31)
+survived the earlier fixtures. All 16 now fail the pure fixtures. The
+others cover:
+- banking: SVC or IRQ sharing a bank, R14 written to the wrong bank on IRQ
+  or SWI entry, LDM^ not reading the SPSR, STM reading a stale row;
+- writeback: none, to the wrong register, the pre-index address, LDM's
+  start address;
+- flags: logical C ignoring the shifter, no flag update, wrong V, MUL
+  clearing C/V.
+
+Yosys 0.71 generic counts of `nds_arm9_slice` (`hierarchy; proc; flatten;
+opt; memory -nomap; opt; techmap; opt -fast; abc; stat`, RAMs kept as
+memories): 49,746 cells before the Thumb/mode/multiply work, 99,644 after
+it and 30,239 after this restructure.
+
+Cycles per retired instruction, from the pure model, counting each
+instruction from the previous retirement to its own. Rows cover the ISA,
+memory, Thumb and interwork fixtures, the direct-boot card loader and
+`run.sh --soc 10`. Link costs include the harness targets' reply latency.
+
+| Class (ARM, fetched from the boot ROM unless noted) | Before | After | ARM946E-S, melonDS accounting, cached |
+| --- | ---: | ---: | ---: |
+| data processing, condition failed, branch not taken | 3 | 5 | 1 |
+| branch taken, data processing to PC | 3 | 5 | 5 |
+| multiply / long multiply | 3 / 3 | 6 / 7 | 2 |
+| SWI | 3 | 6 | 5 |
+| load from boot ROM | 4 | 7 | 3 |
+| load / store local RAM | 5 / 5 | 8.5 / 8.2 | 3 |
+| load I/O over the link | 5 | 8 | 8 |
+| store VRAM over the link | 5.5 | 8.3 | 10 |
+| LDM / STM, per beat | 5.0 / 5.3 | 5.9 / 6.4 | 1.7 / 1.8 |
+| Thumb data processing, BL prefix | 3 | 6 | 1 |
+| Thumb branch taken | 3 | 6 | 5 |
+| Thumb load / store local RAM | 5 | 9 | 3 |
+| any instruction fetched from local RAM instead | +2 | +2 | +0 |
+| **average, boot loader (15,023 instructions)** | **3.10** | **5.17** | **2.03** |
+| **average, native `--soc 10`** | **3.37** | **5.30** | **2.13** (after mix) |
+
+The ARM946E-S column assumes cached code and data, applying the rules of
+melonDS's `ARMv5` class:
+- a data-processing instruction costs 1 cycle;
+- a branch adds a refill: 3 cycles for the target line, then 1;
+- a load or store costs `max(C + D − 6, max(C, D))` with cached data 3;
+- I/O and VRAM costs follow `SetARM9RegionTimings`: 32-bit I/O 8 and
+  16-bit-bus VRAM 10 cycles at the ARM9 clock;
+- multiplies cost 1 + 1.
+
+Native's instruction mix depends on CPU speed, because the polling loops
+run fewer times on a slower core: 3.32 million instructions retire in the
+same 11.2 million cycles before, 2.12 million after.
+
+**How far from real time.** The boot loader's fixed work costs 30,469
+cycles under that accounting: 455 µs on a real DS ARM9 at 67.03 MHz.
+
+| Core | Clock | Time | vs a real DS ARM9 |
+| --- | ---: | ---: | ---: |
+| Before | 33.51 MHz (fails 67.03) | 1,388 µs | 3.05× slower |
+| After | 67.03 MHz | 1,158 µs | 2.55× slower |
+| After | 33.51 MHz | 2,317 µs | 5.10× slower |
+
+A data-processing instruction takes 5 cycles against the real core's 1, so
+an ALU-bound loop is 5× slower at the same clock. Overlapping the stages
+(above) is what closes that gap.
+
+Heap caps: every ARM9 and graphics runner compiles with `+RTS -M3g` and
+links its checkers with `-with-rtsopts=-M3g`. `GfxSliceCheck` now forces its
+per-tick state and log lines (strictness only). Unforced, it ran out of a
+3 GB heap even on the earlier slice. Forced, its peak residency is 126 MB,
+and its logs, frame and PPM are byte-identical between the earlier and the
+restructured slice.
 
 ## 3D inversion
 

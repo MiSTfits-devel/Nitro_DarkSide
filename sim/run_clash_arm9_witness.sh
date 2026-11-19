@@ -18,20 +18,22 @@ build_rom witness
 build_rom unsupported --defsym UNSUPPORTED_IO=1
 # Build one service library for both the product and generated RTL processes.
 export HS_GPU_LIBRARY="$out/gpu.so"
-(cd "$root/clash" && stack --resolver lts-22.43 ghc -- -O2 -dynamic -shared -fPIC \
+# Every GHC/Clash process and every built checker is capped at a 3 GB heap
+# (the GPU service library runs inside the Verilator host: GHC only).
+(cd "$root/clash" && stack --resolver lts-22.43 ghc -- +RTS -M3g -RTS -O2 -dynamic -shared -fPIC \
     -flink-rts -threaded -no-hs-main -isrc -itest -outputdir "$out/gpu-ghc" \
     test/GpuService.hs -o "$HS_GPU_LIBRARY")
 # The product runner independently assembles the same source, and checks the
 # unsupported I/O negative case as well as its six fixed mailbox expectations.
 "$root/sim/run_hs_gpu_arm9.sh" >"$out/product.log" 2>&1 || { cat "$out/product.log" >&2; exit 1; }
-(cd "$root/clash" && stack --resolver lts-22.43 ghc -- -O2 -isrc -itest \
-    -outputdir "$out/ghc" test/Arm9SliceWitness.hs -o "$out/clash-witness")
+(cd "$root/clash" && stack --resolver lts-22.43 ghc -- +RTS -M3g -RTS -rtsopts -with-rtsopts=-M3g \
+    -O2 -isrc -itest -outputdir "$out/ghc" test/Arm9SliceWitness.hs -o "$out/clash-witness")
 "$out/clash-witness" "$out/witness.hex" >"$out/clash.log" || { cat "$out/clash.log" >&2; exit 1; }
 python3 "$root/sim/compare_hs_arm9_witness.py" "$out/product.log" "$out/clash.log"
 "$out/clash-witness" "$out/unsupported.hex" --unsupported
 
 # Compile from fresh Clash output, never a checked-in or stale netlist.
-(cd "$root/clash" && stack exec clash -- --verilog -isrc \
+(cd "$root/clash" && stack exec clash -- +RTS -M3g -RTS --verilog -isrc \
     -fclash-no-escaped-identifiers -outputdir "$out/hdl" src/Nds/WholeCore/Arm9Slice.hs)
 topfile=$(find "$out/hdl" -name 'nds_arm9_slice.v' -print)
 [[ -n $topfile && $(printf '%s\n' "$topfile" | wc -l | tr -d ' ') = 1 ]] || {
