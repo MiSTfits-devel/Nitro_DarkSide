@@ -20,6 +20,7 @@
 #include "NDS.h"
 #include "GPU.h"
 #include "NDS4MiSTer_2DTrace.h"
+#include "HsGpu.h"
 
 #include "ARMJIT.h"
 
@@ -128,6 +129,7 @@ void GPU::ResetVRAMCache() noexcept
 
 void GPU::Reset() noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::Reset");
 #ifdef NDS4MISTER_EXPERIMENTAL_FMV_PACKED_COLOR
     FmvReceiverEnabled = false;
     FmvPackedColor.Next.fill(0);
@@ -379,6 +381,7 @@ bool GPU::GetFramebuffers(void** top, void** bottom)
 
 u8 GPU::Read8(u32 addr)
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::Read8");
     u16 ret = Read16(addr & ~0x1);
     if (addr & 0x1)
         return ret >> 8;
@@ -388,6 +391,7 @@ u8 GPU::Read8(u32 addr)
 
 u16 GPU::Read16(u32 addr)
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::Read16");
     switch (addr)
     {
         case 0x04000064: return CaptureCnt & 0xFFFF;
@@ -403,6 +407,7 @@ u16 GPU::Read16(u32 addr)
 
 u32 GPU::Read32(u32 addr)
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::Read32");
     switch (addr)
     {
         case 0x04000064: return CaptureCnt;
@@ -417,6 +422,7 @@ u32 GPU::Read32(u32 addr)
 
 void GPU::Write8(u32 addr, u8 val)
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::Write8");
     switch (addr)
     {
         case 0x04000004:
@@ -477,6 +483,7 @@ void GPU::Write8(u32 addr, u8 val)
 
 void GPU::Write16(u32 addr, u16 val)
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::Write16");
     switch (addr)
     {
         case 0x04000004:
@@ -515,6 +522,7 @@ void GPU::Write16(u32 addr, u16 val)
 
 void GPU::Write32(u32 addr, u32 val)
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::Write32");
     switch (addr)
     {
         case 0x04000004:
@@ -612,6 +620,7 @@ u16* GPU::GetUniqueBankCBF(u32 mask, u32 offset)
 
 void GPU::MapVRAM_AB(u32 bank, u8 cnt) noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::MapVRAM_AB");
     cnt &= 0x9B;
 
     u8 oldcnt = VRAMCNT[bank];
@@ -677,6 +686,7 @@ void GPU::MapVRAM_AB(u32 bank, u8 cnt) noexcept
 
 void GPU::MapVRAM_CD(u32 bank, u8 cnt) noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::MapVRAM_CD");
     cnt &= 0x9F;
 
     u8 oldcnt = VRAMCNT[bank];
@@ -773,6 +783,7 @@ void GPU::MapVRAM_CD(u32 bank, u8 cnt) noexcept
 
 void GPU::MapVRAM_E(u32 bank, u8 cnt) noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::MapVRAM_E");
     cnt &= 0x87;
 
     u8 oldcnt = VRAMCNT[bank];
@@ -843,6 +854,7 @@ void GPU::MapVRAM_E(u32 bank, u8 cnt) noexcept
 
 void GPU::MapVRAM_FG(u32 bank, u8 cnt) noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::MapVRAM_FG");
     cnt &= 0x9F;
 
     u8 oldcnt = VRAMCNT[bank];
@@ -952,6 +964,7 @@ void GPU::MapVRAM_FG(u32 bank, u8 cnt) noexcept
 
 void GPU::MapVRAM_H(u32 bank, u8 cnt) noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::MapVRAM_H");
     cnt &= 0x83;
 
     u8 oldcnt = VRAMCNT[bank];
@@ -1010,6 +1023,7 @@ void GPU::MapVRAM_H(u32 bank, u8 cnt) noexcept
 
 void GPU::MapVRAM_I(u32 bank, u8 cnt) noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::MapVRAM_I");
     cnt &= 0x83;
 
     u8 oldcnt = VRAMCNT[bank];
@@ -1079,6 +1093,7 @@ void GPU::MapVRAM_I(u32 bank, u8 cnt) noexcept
 
 void GPU::SetPowerCnt(u32 val) noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::SetPowerCnt");
     // POWCNT1 effects:
     // * bit0: asplodes hardware??? not tested.
     // * bit1: disables engine A palette and OAM (zero-filled) (TODO: affects mem timings???)
@@ -1135,6 +1150,7 @@ void GPU::SampleDisplayFIFO(u32 offset, u32 num)
 
 void GPU::DisplayFIFO(u32 x) noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::DisplayFIFO");
     // sample the FIFO
     // as this starts 16 cycles (~3 pixels) before display start,
     // we aren't aligned to the 8-pixel grid
@@ -1159,6 +1175,7 @@ void GPU::DisplayFIFO(u32 x) noexcept
 
 void GPU::StartFrame() noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::StartFrame");
     ScreensEnabled = !!(NDS.PowerControl9 & (1<<0));
 
     // only run the display FIFO if needed:
@@ -1172,6 +1189,7 @@ void GPU::StartFrame() noexcept
 
 void GPU::StartHBlank(u32 line) noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::StartHBlank");
     DispStat[0] |= (1<<1);
     DispStat[1] |= (1<<1);
 
@@ -1399,6 +1417,7 @@ void GPU::BlankFrame() noexcept
 
 void GPU::StartScanline(u32 line) noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::StartScanline");
     /*
      * order of operations on hardware:
      * 1. VCount is incremented
@@ -1557,6 +1576,7 @@ void GPU::Restart3DFrame() noexcept
 
 void GPU::SetDispStat(u32 cpu, u16 val, u16 mask) noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::SetDispStat");
     const u16 ro_mask = 0x0047;
 
     val &= (mask & ~ro_mask);
@@ -1568,6 +1588,7 @@ void GPU::SetDispStat(u32 cpu, u16 val, u16 mask) noexcept
 
 void GPU::SetVCount(u16 val, u16 mask) noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::SetVCount");
     // the VCount register is 9 bits wide
     val &= mask & 0x1FF;
 
@@ -1759,6 +1780,7 @@ void GPU::VRAMCBFlagsOr(u32 bank, u32 block, u16 val)
 
 void GPU::CheckCaptureStart()
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::CheckCaptureStart");
     u32 dstbank = (CaptureCnt >> 16) & 0x3;
     if (!(VRAMMap_LCDC & (1<<dstbank)))
         return;
@@ -1803,6 +1825,7 @@ void GPU::CheckCaptureStart()
 
 void GPU::CheckCaptureEnd()
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU::CheckCaptureEnd");
     // mark this capture as complete
     // TODO this will break if they change CaptureCnt during a capture
     u32 dstbank = (CaptureCnt >> 16) & 0x3;

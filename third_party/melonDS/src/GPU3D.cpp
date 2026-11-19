@@ -22,6 +22,7 @@
 #include <algorithm>
 #include "NDS.h"
 #include "GPU.h"
+#include "HsGpu.h"
 #include "FIFO.h"
 #include "GPU3D_Soft.h"
 #include "Platform.h"
@@ -588,6 +589,7 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
 
 void GPU3D::SetEnabled(bool geometry, bool rendering) noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU3D::SetEnabled");
     GeometryEnabled = geometry;
     RenderingEnabled = rendering;
 
@@ -2794,6 +2796,7 @@ void GPU3D::FinishWork(s32 cycles) noexcept
 
 void GPU3D::Run() noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU3D::Run");
     const auto commandsEmpty = [this]() noexcept {
         return ExternalCommandReplay ?
             ExternalCommandsEmpty() : CmdPIPE.IsEmpty();
@@ -2833,6 +2836,7 @@ void GPU3D::Run() noexcept
 
 void GPU3D::CheckFIFOIRQ() noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU3D::CheckFIFOIRQ");
     bool irq = false;
     switch (GXStat >> 30)
     {
@@ -2846,6 +2850,7 @@ void GPU3D::CheckFIFOIRQ() noexcept
 
 void GPU3D::CheckFIFODMA() noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU3D::CheckFIFODMA");
     if (CmdFIFO.Level() < 128)
         NDS.CheckDMAs(0, 0x07);
 }
@@ -2865,6 +2870,7 @@ bool YSort(Polygon* a, Polygon* b)
 
 void GPU3D::VBlank() noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU3D::VBlank");
     if (GeometryEnabled)
     {
         if (RenderingEnabled)
@@ -2949,6 +2955,7 @@ void GPU3D::VBlank() noexcept
 
 void GPU3D::SetRenderXPos(u16 xpos, u16 mask) noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU3D::SetRenderXPos");
     if (!RenderingEnabled) return;
 
     RenderXPos = (RenderXPos & ~mask) | (xpos & mask & 0x01FF);
@@ -2959,6 +2966,7 @@ void GPU3D::SetRenderXPos(u16 xpos, u16 mask) noexcept
 
 void GPU3D::WriteToGXFIFO(u32 val) noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU3D::WriteToGXFIFO");
     if (!NDS4MiSTerGXStreamSeq && !NDS4MiSTerGXStream) {
         if (const char* path = std::getenv("NDS4MISTER_GX_STREAM")) {
             NDS4MiSTerGXStream = std::fopen(path, "w");
@@ -3116,6 +3124,7 @@ void GPU3D::WriteExternalNormalizedCommandTriple(
 
 u8 GPU3D::Read8(u32 addr) noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU3D::Read8");
     switch (addr)
     {
     case 0x04000600:
@@ -3155,6 +3164,7 @@ u8 GPU3D::Read8(u32 addr) noexcept
 
 u16 GPU3D::Read16(u32 addr) noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU3D::Read16");
     switch (addr)
     {
     case 0x04000060:
@@ -3199,6 +3209,7 @@ u16 GPU3D::Read16(u32 addr) noexcept
 
 u32 GPU3D::Read32(u32 addr) noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU3D::Read32");
     switch (addr)
     {
     case 0x04000060:
@@ -3252,6 +3263,7 @@ u32 GPU3D::Read32(u32 addr) noexcept
 
 void GPU3D::Write8(u32 addr, u8 val) noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU3D::Write8");
     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
     if (NDS4MiSTer::Trace2DEnabled() && NDS4MiSTer::Raw3DInputsEnabled())
@@ -3306,6 +3318,7 @@ void GPU3D::Write8(u32 addr, u8 val) noexcept
 
 void GPU3D::Write16(u32 addr, u16 val) noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU3D::Write16");
     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
     if (NDS4MiSTer::Trace2DEnabled() && NDS4MiSTer::Raw3DInputsEnabled())
@@ -3397,6 +3410,7 @@ void GPU3D::Write16(u32 addr, u16 val) noexcept
 
 void GPU3D::Write32(u32 addr, u32 val) noexcept
 {
+    if (NDS.HsGpu) HsStockGpuForbidden("GPU3D::Write32");
     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
     if (NDS4MiSTer::Trace2DEnabled() && NDS4MiSTer::Raw3DInputsEnabled())

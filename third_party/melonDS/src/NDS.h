@@ -23,6 +23,9 @@
 #include <string>
 #include <optional>
 #include <functional>
+#include <vector>
+#include <cstdio>
+#include <cstdint>
 
 #include "Platform.h"
 #include "Savestate.h"
@@ -52,6 +55,8 @@
 // with this enabled, to make sure it doesn't desync
 //#define DEBUG_CHECK_DESYNC
 
+struct NdsHsGpuRequest;
+struct NdsHsGpuReply;
 namespace melonDS
 {
 struct NDSArgs;
@@ -380,6 +385,36 @@ class Wifi;
 class AREngine;
 class GPU;
 class ARMJIT;
+class HsGpuClient;
+
+// Bridge state for the closed-loop Haskell GPU backend.
+struct HsGpuState
+{
+    bool Failed = false;
+    std::string Error;
+    bool InStep = false;        // a CPU/DMA master is executing: bus accesses are legal
+    bool InARM9Instruction = false; // exact interpreter instruction scope, never DMA
+    bool InstructionGXStalled = false; // this instruction's GX write asserted stall
+    u64 InstructionClock = 0;  // raw ARM9 ticks at instruction entry
+    u64 InstructionScope = 0;  // allocated lazily on this handler's first GX command write
+    u64 NextInstructionScope = 0;
+    bool BootDone = false;      // first scheduler step ran: out-of-step accesses are fatal
+    bool FrameDone = false;     // device reported a completed frame this RunFrameHs
+    bool FrameValid = false;
+    u32 FrameNumber = 0;
+    std::vector<u32> Frame;     // 256x384 BGRA, top screen then bottom
+    u64 LastStamp = 0;          // stamp of the most recent device request
+    u64 Deadline = UINT64_MAX;  // device's next event, absolute system cycles
+    bool GXStalled = false;
+    bool FifoLtHalf = true;
+    bool DMABlocked = false;    // a GPU DMA unit waits: lower channels must not run
+    u64 Transactions = 0;
+    u64 Services = 0;
+    bool FetchPending = false;       // completion pulse without pixels: FRAME op required
+    bool FrameStartIssued = false;
+    u32 SameDeadlineRepeats = 0;
+    FILE* TxnLog = nullptr;
+};
 
 class NDS
 {
@@ -549,6 +584,35 @@ public: // TODO: Encapsulate the rest of these members
     std::unique_ptr<GBACart::CartCommon> EjectGBACart() { return GBACartSlot.EjectCart(); }
 
     u32 RunFrame();
+
+    // Closed-loop Haskell GPU. When non-null the machine runs RunFrameHs and
+    // every GPU register/memory/timing/IRQ/DMA decision is made by the device;
+    // no stock GPU, GPU2D, GPU3D or Renderer code executes. Attach before Reset().
+    bool AttachHsGpu(HsGpuClient* client, std::string& error);
+    bool HsGpuActive() const noexcept { return HsGpu != nullptr; }
+    bool HsGpuFailed() const noexcept { return HsState.Failed; }
+    const std::string& HsGpuError() const noexcept { return HsState.Error; }
+    // Last frame completed by the device (copied on receipt), or null.
+    const u32* HsGpuFrame(u32& frameNumber) const noexcept
+    {
+        frameNumber = HsState.FrameNumber;
+        return HsState.FrameValid ? HsState.Frame.data() : nullptr;
+    }
+    // Optional text log of every GPU service call: actual access clock, kind,
+    // service stamp. For proving honest callback times; no effect on behavior.
+    void SetHsGpuTransactionLog(FILE* file) noexcept { HsState.TxnLog = file; }
+    bool HsGpuOwnsAddr(u32 cpu, u32 addr) const noexcept;
+    // GPU-touching DMA unit gate: charges the unit's wait to the DMA clock and
+    // returns true only when the access may happen now at its original time.
+    bool HsDMAGate(u32 cpu, u64& waitTicks);
+    // GXFIFO-mode DMA start check (stock: GPU3D::CheckFIFODMA).
+    void CheckGXFIFODMA();
+    HsGpuClient* HsGpu = nullptr;
+    HsGpuState HsState;
+    // Control mode: the STOCK GPU driven by the same minimum-clock/quantum CPU
+    // coordinator as the hs backend (no device, no routing). Separates the effect
+    // of the CPU schedule from the effect of the GPU model.
+    bool InterleavedSchedule = false;
     // NDS4MiSTer hybrid mode: advance peripherals using cycles executed by
     // an external FPGA CPU without running melonDS's software CPU.
     u64 AdvanceExternalCPU(u32 cpu, u32 cycles);
@@ -875,6 +939,26 @@ protected:
     void EnterSleepMode();
     template <CPUExecuteMode cpuMode>
     u32 RunFrame();
+
+    // ---- closed-loop Haskell GPU backend (NDSHsGpu.cpp) ----
+    // Every function below is reachable only when HsGpu != nullptr.
+    u32 RunFrameHs();
+    void HsStep(u32 cpu, u64 targetOwnTicks);
+    u32 HsBus(u32 op, u32 cpu, u32 addr, u32 width, u32 value);
+    bool HsIORead9(u32 addr, u32 width, u32& out);
+    bool HsIOWrite9(u32 addr, u32 width, u32 val);
+    bool HsIORead7(u32 addr, u32 width, u32& out);
+    bool HsIOWrite7(u32 addr, u32 width, u32 val);
+    void HsIFAck(u32 cpu, u32 mask);
+    void HsProxyEvent(u32 param);
+    void HsServiceDeadlines(u64 through);
+    bool HsCall(const NdsHsGpuRequest& request, NdsHsGpuReply& reply);
+    void HsApplyReply(const NdsHsGpuRequest& request, const NdsHsGpuReply& reply, u32 cpu);
+    void HsFail(const char* fmt, ...);
+    void HsFrameStart(u64 stamp);
+    void HsFetchFrame(u64 stamp);
+    void HsReset();
+    u32 RunFrameInterleaved();
 
 public:
     NDS(NDSArgs&& args, void* userdata = nullptr) noexcept : NDS(std::move(args), 0, userdata) {}

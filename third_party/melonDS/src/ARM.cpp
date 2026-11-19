@@ -791,6 +791,13 @@ void ARMv5::Execute()
                 if (R[15] & 0x2) { NextInstr[1] >>= 16; CodeCycles = 0; }
                 else             NextInstr[1] = CodeRead32(R[15], false);
                 TraceInstructionEntry();
+                if (NDS.HsGpu)
+                {
+                    NDS.HsState.InARM9Instruction = true;
+                    NDS.HsState.InstructionGXStalled = false;
+                    NDS.HsState.InstructionScope = 0;
+                    NDS.HsState.InstructionClock = NDS.ARM9Timestamp;
+                }
 
                 // actually execute
                 u32 icode = (CurInstr >> 6) & 0x3FF;
@@ -807,6 +814,13 @@ void ARMv5::Execute()
                 NextInstr[0] = NextInstr[1];
                 NextInstr[1] = CodeRead32(R[15], false);
                 TraceInstructionEntry();
+                if (NDS.HsGpu)
+                {
+                    NDS.HsState.InARM9Instruction = true;
+                    NDS.HsState.InstructionGXStalled = false;
+                    NDS.HsState.InstructionScope = 0;
+                    NDS.HsState.InstructionClock = NDS.ARM9Timestamp;
+                }
 
                 // actually execute
                 if (CheckCondition(CurInstr >> 28))
@@ -821,6 +835,9 @@ void ARMv5::Execute()
                 else
                     AddCycles_C();
             }
+            if (NDS.HsGpu)
+                NDS.HsState.InARM9Instruction = false;
+
 
             // TODO optimize this shit!!!
             if (Halted)
@@ -842,6 +859,10 @@ void ARMv5::Execute()
 
         NDS.ARM9Timestamp += Cycles;
         Cycles = 0;
+        // A GX write may stall in the middle of a multi-beat instruction. Its
+        // remaining beats have already run at this instruction's start clock,
+        // but a subsequent instruction must not start until the GPU unstalls.
+        if (NDS.HsGpu && NDS.HsState.GXStalled) break;
     }
 
     if (Halted == 2)

@@ -55,6 +55,7 @@ public:
     }
 
     bool IsRunning() const noexcept { return Running!=0; }
+    bool HsPendingUnit() const noexcept { return HsUnitPending; }
 
     void StartIfNeeded(u32 mode)
     {
@@ -101,6 +102,12 @@ private:
 
     u32 MRAMBurstCount {};
     std::array<u8, 256> MRAMBurstTable;
+
+    // Closed-loop GPU: wait of the unit in flight (own-clock ticks), cached so the
+    // burst-table state is consumed exactly once while its access is gated.
+    u64 HsUnitWait {};
+    bool HsUnitPending {};
+    bool ChargeUnit(bool wide, bool& burststart);
 };
 
 }

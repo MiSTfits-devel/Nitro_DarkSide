@@ -6,6 +6,8 @@
 //
 //   melonds_fbdump [--direct] [--input FILE] <image.nds> <dump.txt> <frames> [dump_b.txt]
 //
+//   melonds_fbdump --hs-gpu LIB [--hs-ndsf FILE|-] [--hs-txn-log FILE] --direct <image.nds> <dump.txt> <frames>
+//   (closed-loop Haskell GPU backend; see NDS::RunFrameHs in third_party/melonDS/src/NDSHsGpu.cpp)
 // --input polls a 16-byte little-endian control file before every frame:
 // "NDSI", u32 key mask (melonDS SetKeyMask order, active low, 12 bits),
 // u32 touch (bit 31 pressed, x bits 0-7, y bits 8-15), u32 sequence.
@@ -72,6 +74,9 @@ static void printIrq7Census(int frame)
 }
 #endif
 
+#include <string>
+#include <unistd.h>
+#include "HsGpu.h"
 using namespace melonDS;
 
 static void getFramebuffers(GPU& gpu, u32*& top, u32*& bottom)
@@ -155,6 +160,15 @@ int main(int argc, char** argv)
     bool trace2dphase = false;
     bool trace2dprovenance = false;
     bool trace2draw3d = false;
+    const char* hsLib = nullptr;
+    const char* hsNdsf = nullptr;
+    const char* hsTxnLog = nullptr;
+    bool hsProfile = false;
+    bool noTextDump = false;
+    const char* clockLogPath = nullptr;
+    const char* ramDump = nullptr;
+    bool schedInterleave = false;
+    FILE* clockLog = nullptr;
     std::vector<const char*> positional;
     LiveInput liveInput;
     for (int i = 1; i < argc; i++)
@@ -174,6 +188,14 @@ int main(int argc, char** argv)
             trace2dpath = argv[++i];
         }
         else if (strncmp(argv[i], "--trace2d=", 10) == 0) trace2dpath = argv[i] + 10;
+        else if (strcmp(argv[i], "--hs-gpu") == 0 && i + 1 < argc) hsLib = argv[++i];
+        else if (strcmp(argv[i], "--hs-ndsf") == 0 && i + 1 < argc) hsNdsf = argv[++i];
+        else if (strcmp(argv[i], "--hs-txn-log") == 0 && i + 1 < argc) hsTxnLog = argv[++i];
+        else if (strcmp(argv[i], "--hs-profile") == 0) hsProfile = true;
+        else if (strcmp(argv[i], "--no-text-dump") == 0) noTextDump = true;
+        else if (strcmp(argv[i], "--clock-log") == 0 && i + 1 < argc) clockLogPath = argv[++i];
+        else if (strcmp(argv[i], "--ram-dump") == 0 && i + 1 < argc) ramDump = argv[++i];
+        else if (strcmp(argv[i], "--sched=interleave") == 0) schedInterleave = true;
         else if (strcmp(argv[i], "--input") == 0 && i + 1 < argc)
         {
             liveInput.fd = open(argv[++i], O_RDWR);
@@ -190,6 +212,28 @@ int main(int argc, char** argv)
         fprintf(stderr, "--trace2d-phase/--trace2d-provenance/--trace2d-raw3d need --trace2d <file>\n");
         return 2;
     }
+    if ((hsNdsf || hsTxnLog) && !hsLib)
+    {
+        fprintf(stderr, "--hs-ndsf/--hs-txn-log need --hs-gpu <lib>\n");
+        return 2;
+    }
+    if (hsLib && (trace2dpath || getenv("VIDLOG") || getenv("SNAPSHOT_PREFIX") || fwboot))
+    {
+        fprintf(stderr, "--hs-gpu does not support --trace2d, --fw, VIDLOG or SNAPSHOT_PREFIX "
+                        "(they read or replay stock GPU state)\n");
+        return 2;
+    }
+    // --hs-ndsf '-': the binary record stream owns the original stdout. Move stdout to
+    // stderr BEFORE anything else (ROM metadata, dlopen/RTS init, all later printf) can
+    // write to it. No fflush here: nothing has been written yet.
+    FILE* ndsfEarly = nullptr;
+    if (hsNdsf && strcmp(hsNdsf, "-") == 0)
+    {
+        const int out = dup(1);
+        if (out < 0 || dup2(2, 1) < 0) { fprintf(stderr, "cannot redirect stdout\n"); return 1; }
+        ndsfEarly = fdopen(out, "wb");
+        if (!ndsfEarly) { fprintf(stderr, "cannot open --hs-ndsf stdout stream\n"); return 1; }
+    }
     if (positional.size() < 3)
     {
         fprintf(stderr, "usage: %s [--direct|--fw] [--input <file>] [--trace2d <file> [--trace2d-phase]]"
@@ -198,6 +242,19 @@ int main(int argc, char** argv)
                         "--trace2d-provenance selects v11 (capture Begin/Delta/End + lifecycle); "
                         "--trace2d-raw3d selects v12 (ordered raw 3D power/XPos/abort/render-start/"
                         "VBlank/frame-end, render-start memory and texture maps).\n");
+        fprintf(stderr, "  --hs-gpu <lib.dylib> runs the closed-loop Haskell GPU (HsGpuAbi.h): every GPU register,\n"
+                        "    memory, timing, IRQ and DMA request is answered by the device; stock GPU code never runs.\n"
+                        "    --hs-ndsf <file|-> writes one NDSF record per frame from the device pixels ('-' = stdout,\n"
+                        "    logs move to stderr); --hs-txn-log <file> logs every device call with the actual access\n"
+                        "    clock. Not combinable with --trace2d/--fw/VIDLOG/SNAPSHOT_PREFIX. Exit 4 = device failure.\n");
+        fprintf(stderr, "  --hs-ndsf ends the stream with an NDSE record (status 0 normal end, 1 error + message).\n"
+                        "  --hs-profile prints per-op device call counts at exit: exact ADVANCE timings; 1/256-sampled bus timings (--hs-gpu).\n"
+                        "  --clock-log <file> writes per dump frame: emulated ARM9/ARM7 system cycles, device frame,\n"
+                        "    real RunFrame/cumulative wall ms and input-file sequence/ack wall time.\n"
+                        "  --no-text-dump skips the text frame dump entirely: <dump.txt>/[dump_b.txt] are still\n"
+                        "    positionals for the legacy interface but are ignored (no file created, no hex formatting).\n"
+                        "  --sched=interleave runs the STOCK GPU under the hs min-clock CPU coordinator (control for\n"
+                        "    --hs-gpu; not combinable with it).\n");
         return 2;
     }
     const char* ndspath  = positional[0];
@@ -225,6 +282,53 @@ int main(int argc, char** argv)
     // Default NDSArgs uses FreeBIOS. BIOS9/BIOS7 optionally replace those
     // images so differential traces can execute the exact ROMs served by RTL.
     // (heap-allocated: the 1.1 NDS object is far too large for the stack)
+    const auto wallOrigin = std::chrono::steady_clock::now();
+    double ackWallMs = -1.0;
+    if (clockLogPath)
+    {
+        clockLog = fopen(clockLogPath, "w");
+        if (!clockLog) { fprintf(stderr, "cannot open --clock-log %s\n", clockLogPath); return 1; }
+    }
+    std::unique_ptr<HsGpuClient> hsClient;
+    FILE* ndsfOut = nullptr;
+    // Terminal record, same 20-byte layout as TraceView: "NDSE", u32 status (0 end of
+    // stream, 1 error), u32 message bytes, u64 0, then the UTF-8 message. Always last.
+    auto endNdsf = [&](u32 status, const char* message) -> bool
+    {
+        const size_t len = strlen(message);
+        const u32 head[5] = { 0x4553444E /* "NDSE" little-endian */, status, (u32)len, 0, 0 };
+        bool ok = fwrite(head, 4, 5, ndsfOut) == 5 && fwrite(message, 1, len, ndsfOut) == len
+                  && fflush(ndsfOut) == 0;
+        if (fclose(ndsfOut) != 0) ok = false;
+        ndsfOut = nullptr;
+        if (!ok) fprintf(stderr, "cannot write --hs-ndsf terminal record\n");
+        return ok;
+    };
+    FILE* txnLog = nullptr;
+    if (hsLib)
+    {
+        std::string hsError;
+        hsClient = HsGpuClient::Open(hsLib, hsError);
+        if (!hsClient)
+        {
+            fprintf(stderr, "--hs-gpu: %s\n", hsError.c_str());
+            return 1;
+        }
+        if (hsProfile) hsClient->EnableProfile();
+        if (hsNdsf)
+        {
+            if (!ndsfEarly)
+                ndsfOut = fopen(hsNdsf, "wb");
+            else
+                ndsfOut = ndsfEarly;
+            if (!ndsfOut) { fprintf(stderr, "cannot open --hs-ndsf %s\n", hsNdsf); return 1; }
+        }
+        if (hsTxnLog)
+        {
+            txnLog = fopen(hsTxnLog, "w");
+            if (!txnLog) { fprintf(stderr, "cannot open --hs-txn-log %s\n", hsTxnLog); return 1; }
+        }
+    }
     auto nds_holder = std::make_unique<NDS>();
     NDS& nds = *nds_holder;
     auto loadBIOS = [](const char* envname, auto image, auto setter) -> bool
@@ -243,6 +347,21 @@ int main(int argc, char** argv)
     };
     if (!loadBIOS("BIOS9", nds.GetARM9BIOS(), [&](const auto& v) { nds.SetARM9BIOS(v); })) return 1;
     if (!loadBIOS("BIOS7", nds.GetARM7BIOS(), [&](const auto& v) { nds.SetARM7BIOS(v); })) return 1;
+    if (hsClient)
+    {
+        std::string hsError;
+        if (!nds.AttachHsGpu(hsClient.get(), hsError))
+        {
+            fprintf(stderr, "--hs-gpu: %s\n", hsError.c_str());
+            return 1;
+        }
+        nds.SetHsGpuTransactionLog(txnLog);
+    }
+    if (schedInterleave)
+    {
+        if (hsClient) { fprintf(stderr, "--sched=interleave is the stock-GPU control; not with --hs-gpu\n"); return 2; }
+        nds.InterleavedSchedule = true;
+    }
     nds.Reset();
 
     // Attach the trace immediately before the first execution. The extension
@@ -416,13 +535,17 @@ int main(int argc, char** argv)
         fprintf(stderr, "TRACE9/TRACE7 need the upstream patched melonDS tree; ignored\n");
 #endif
 
-    FILE* d = fopen(dumppath, "w");
-    if (!d) { fprintf(stderr, "cannot open %s\n", dumppath); return 1; }
+    FILE* d = nullptr;
     FILE* db = nullptr;
-    if (dumppathb)
+    if (!noTextDump)
     {
-        db = fopen(dumppathb, "w");
-        if (!db) { fprintf(stderr, "cannot open %s\n", dumppathb); return 1; }
+        d = fopen(dumppath, "w");
+        if (!d) { fprintf(stderr, "cannot open %s\n", dumppath); return 1; }
+        if (dumppathb)
+        {
+            db = fopen(dumppathb, "w");
+            if (!db) { fprintf(stderr, "cannot open %s\n", dumppathb); return 1; }
+        }
     }
 
     const char* snapshotPrefix = getenv("SNAPSHOT_PREFIX");
@@ -546,14 +669,73 @@ int main(int argc, char** argv)
             for (u32 i = 0; i <    256; i++) snapOAM[i] = nds.ARM9Read32(0x07000000 + i*4);
             for (u32 i = 0; i <     22; i++) snapRegs[i] = nds.ARM9Read32(0x04000000 + i*4);
         }
+        const u32 ackedBefore = liveInput.acked;
         pollLiveInput(liveInput, nds, n);
+        if (liveInput.acked != ackedBefore)
+            ackWallMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wallOrigin).count();
+        const auto runStart = std::chrono::steady_clock::now();
         nds.RunFrame();
+        const auto runEnd = std::chrono::steady_clock::now();
         u32* top = nullptr;
         u32* bot = nullptr;
-        getFramebuffers(nds.GPU, top, bot);
-        fprintf(d, "frame %d\n", n);
-        for (int i = 0; i < 256 * 192; i++)
-            fprintf(d, "%08x\n", top[i]);
+        if (hsClient)
+        {
+            if (nds.HsGpuFailed())
+            {
+                fprintf(stderr, "hs-gpu failed at dump frame %d: %s\n", n, nds.HsGpuError().c_str());
+                if (ndsfOut) endNdsf(1, nds.HsGpuError().c_str());
+                return 4;
+            }
+            u32 hsFrame = 0;
+            const u32* px = nds.HsGpuFrame(hsFrame);
+            if (!px || !nds.HsState.FrameDone)
+            {
+                // The machine stopped without the device completing a frame: report it,
+                // never repeat the previous frame.
+                char why[160];
+                snprintf(why, sizeof(why), "machine stopped without a device frame completing at dump frame %d", n);
+                fprintf(stderr, "hs-gpu: %s\n", why);
+                if (ndsfOut) endNdsf(1, why);
+                return 4;
+            }
+            top = const_cast<u32*>(px);
+            bot = top + 256 * 192;
+            if (ndsfOut)
+            {
+                // Same record layout as TraceView: NDSF, frame, matched, compared, 0, then
+                // 256x384 BGRA (top, bottom). The device frame is the only pixel source.
+                const u32 head[5] = { 0x4653444E /* "NDSF" little-endian */, hsFrame, 0, 0, 0 };
+                if (fwrite(head, 4, 5, ndsfOut) != 5 ||
+                    fwrite(px, 4, 256 * 384, ndsfOut) != 256 * 384 || fflush(ndsfOut) != 0)
+                {
+                    fprintf(stderr, "cannot write --hs-ndsf record\n");
+                    return 4;
+                }
+            }
+        }
+        else
+            getFramebuffers(nds.GPU, top, bot);
+        // --no-text-dump: no text frame dump is produced at all (the dump path
+        // positionals are ignored), so the 98k-line hex formatting is skipped.
+        if (!noTextDump)
+        {
+            fprintf(d, "frame %d\n", n);
+        }
+        if (clockLog)
+        {
+            const unsigned long long a9 = nds.ARM9Timestamp >> nds.ARM9ClockShift;
+            u32 devFrame = 0;
+            if (hsClient) nds.HsGpuFrame(devFrame);
+            const double frameMs = std::chrono::duration<double, std::milli>(runEnd - runStart).count();
+            const double nowMs = std::chrono::duration<double, std::milli>(runEnd - wallOrigin).count();
+            fprintf(clockLog, "dump=%d arm9_sys=%llu arm7_sys=%llu hw_frames=%.3f device_frame=%u runframe_numframes=%u frame_wall_ms=%.2f wall_ms=%.2f input_seq=%u input_acked=%u ack_wall_ms=%.2f\n",
+                    n, a9, (unsigned long long)nds.ARM7Timestamp, (double)a9 / 560190.0, devFrame, nds.NumFrames,
+                    frameMs, nowMs, liveInput.seq, liveInput.acked, ackWallMs);
+            fflush(clockLog);
+        }
+        if (!noTextDump)
+            for (int i = 0; i < 256 * 192; i++)
+                fprintf(d, "%08x\n", top[i]);
         if (db)
         {
             fprintf(db, "frame %d\n", n);
@@ -561,7 +743,7 @@ int main(int argc, char** argv)
                 fprintf(db, "%08x\n", bot[i]);
         }
     }
-    fclose(d);
+    if (d) fclose(d);
     if (db) fclose(db);
 #ifdef NDS4MISTER_VENDORED_FORK
     if (trace2dAttached)
@@ -603,6 +785,47 @@ int main(int argc, char** argv)
     }
     printf("ARM7 irq handler ptr [0380FFFC]=%08X  [0380FFF8]=%08X\n",
            nds.ARM7Read32(0x0380FFFC), nds.ARM7Read32(0x0380FFF8));
+    // --ram-dump ADDR:WORDS prints non-GPU memory words (main RAM / WRAM only: a GPU
+    // address would be a debug bus access and is fatal in --hs-gpu mode).
+    if (ramDump)
+    {
+        char* colon = nullptr;
+        const u32 base = (u32)strtoul(ramDump, &colon, 0);
+        const u32 count = (colon && *colon == ':') ? (u32)strtoul(colon + 1, nullptr, 0) : 1;
+        for (u32 i = 0; i < count; i++)
+            printf("ram[%08X]=%08X\n", base + i * 4, nds.ARM9Read32(base + i * 4));
+    }
+
+    if (hsClient)
+    {
+        if (nds.HsGpuFailed())
+        {
+            fprintf(stderr, "hs-gpu failed after the last frame: %s\n", nds.HsGpuError().c_str());
+            if (ndsfOut) endNdsf(1, nds.HsGpuError().c_str());
+            return 4;
+        }
+        if (ndsfOut && !endNdsf(0, "end of stream: requested frame count reached")) return 4;
+        if (txnLog) fclose(txnLog);
+        printf("hs-gpu: %llu device calls\n", (unsigned long long)hsClient->CallCount());
+        if (hsProfile)
+        {
+            static const char* names[] = { "ADVANCE", "IO_READ", "IO_WRITE", "MEM_READ", "MEM_WRITE", "RESET", "IF_ACK", "FRAME", "FRAME_START", "IO_CONTINUE" };
+            double totalMs = 0;
+            for (unsigned op = 0; op < sizeof(names) / sizeof(names[0]); op++)
+            {
+                const auto& p = hsClient->ProfileOf(op);
+                if (!p.calls) continue;
+                const double avgUs = p.sampled ? (double)p.sampledNs / p.sampled / 1000.0 : 0.0;
+                const double estMs = avgUs * p.calls / 1000.0;
+                totalMs += estMs;
+                printf("hs-profile %-11s calls=%llu sampled=%llu avg=%.3fus est-total=%.1fms\n", names[op],
+                       (unsigned long long)p.calls, (unsigned long long)p.sampled, avgUs, estMs);
+            }
+            printf("hs-profile estimated time inside device calls: %.1f ms\n", totalMs);
+        }
+        printf("dumped %d frames to %s\n", frames, dumppath);
+        return nds.HsGpuFailed() ? 4 : 0;
+    }
 
     // scene-debug peeks (harmless noise for real runs)
     printf("DISPCNT=%08X POWCNT=%08X mail=%08X/%08X vb=%u\n",

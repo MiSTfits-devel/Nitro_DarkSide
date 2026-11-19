@@ -1,4 +1,4 @@
-// AppKit window for clash/test/TraceView.hs output on stdin.
+// AppKit window for NDSF/NDSE from the closed-loop GPU service or TraceView.
 //
 // It only displays frames the Haskell renderer produced; it never generates,
 // substitutes or repeats pixels from another renderer. When the stream ends,
@@ -13,15 +13,21 @@ import GameController
 
 let width = 256, height = 384, headerSize = 20
 let frameBytes = width * height * 4
-let baseTitle = "Haskell GPU render of live melonDS-CPU stream (open loop; not a closed-loop console)"
+let viewMode = ProcessInfo.processInfo.environment["NDS_VIEW_MODE"] ?? "replay"
+let closedLoop = viewMode == "closed-loop"
+let liveInput = viewMode != "replay"
+let baseTitle = closedLoop
+    ? "Closed-loop Haskell GPU; melonDS CPUs/non-GPU peripherals"
+    : (liveInput ? "Haskell GPU live trace (open loop; CPU reads melonDS GPU)"
+                 : "Haskell GPU trace replay (diagnostic, not live)")
 
 // melonDS SetKeyMask bit order.
 enum Key: Int { case a = 0, b, select, start, right, left, up, down, r, l, x, y }
 
 /// Control file: viewer writes bytes 0-15, melonds_fbdump writes the sequence
-/// it ran a whole frame with at bytes 16-19. A press or touch shorter than one
-/// emulated frame stays latched until that ack, so taps are not dropped while
-/// the pipe throttles melonDS to the Haskell renderer's speed.
+/// it latched/applied for a frame at bytes 16-19, before running that frame.
+/// A short press/touch stays latched until this sampling ack. Clearing the
+/// file latch cannot change the emulator's copied input before its next poll.
 final class InputChannel {
     private let fd: Int32
     private let lock = NSLock()
@@ -266,16 +272,27 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         while let head = readExactly(headerSize) {
             let u = { (i: Int) in head.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: i, as: UInt32.self).littleEndian } }
             if head.prefix(4) == Data("NDSE".utf8) {
-                let text = readExactly(Int(u(8))).flatMap { String(data: $0, encoding: .utf8) } ?? "(unreadable message)"
-                stopped(u(4) == 0 ? "renderer finished: \(text)" : "RENDERER ERROR: \(text)", last: last, error: u(4) != 0)
+                guard let message = readExactly(Int(u(8))) else {
+                    stopped("truncated GPU terminal message", last: last, error: true); return
+                }
+                guard let text = String(data: message, encoding: .utf8) else {
+                    stopped("invalid UTF-8 GPU terminal message", last: last, error: true); return
+                }
+                stopped(u(4) == 0 ? "producer finished: \(text)" : "GPU ERROR: \(text)", last: last, error: u(4) != 0)
                 return
             }
-            guard head.prefix(4) == Data("NDSF".utf8) else { stopped("bad record magic from trace-view", last: last, error: true); return }
+            guard head.prefix(4) == Data("NDSF".utf8) else { stopped("bad GPU frame-producer record magic", last: last, error: true); return }
             let frame = u(4), matched = u(8), compared = u(12)
-            guard let pixels = readExactly(frameBytes) else { stopped("truncated frame from trace-view", last: last, error: true); return }
+            guard let pixels = readExactly(frameBytes) else { stopped("truncated GPU producer frame", last: last, error: true); return }
             guard let cg = makeImage(pixels) else { stopped("could not build an image for frame \(frame)", last: last, error: true); return }
             frames += 1
-            last = "last shown: trace frame \(frame) (#\(frames)) | lines equal to melonDS's own render: \(matched)/\(compared)"
+            if closedLoop {
+                last = "last shown: GPU frame \(frame) (#\(frames)) | Haskell GPU authoritative; no inline oracle"
+            } else {
+                last = "last shown: trace frame \(frame) (#\(frames))"
+                    + (compared == 0 ? " | no inline oracle comparison"
+                                     : " | oracle lines equal: \(matched)/\(compared)")
+            }
             if let path = ProcessInfo.processInfo.environment["NDS_VIEW_SNAPSHOT"] {
                 // The exact bitmap handed to the window, for inspection without screen capture.
                 do {
@@ -289,11 +306,12 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let text = last
             DispatchQueue.main.async {
                 self.imageView.image = image
-                self.status.stringValue = "LIVE (open loop) — " + text
+                self.status.stringValue = (closedLoop ? "LIVE (closed-loop GPU)" : (liveInput ? "LIVE (open-loop diagnostic)" : "REPLAY (not live)")) + " — " + text
                 self.window.title = "\(baseTitle) — frame \(frame)"
             }
         }
-        stopped("trace-view exited without a terminal record (see trace-view.log)", last: last, error: true)
+        let log = ProcessInfo.processInfo.environment["NDS_VIEW_PRODUCER_LOG"] ?? "producer log"
+        stopped("GPU producer exited without a terminal record (see \(log))", last: last, error: true)
     }
 
     /// The stream is over: keep the last actual frame, never mark it live.

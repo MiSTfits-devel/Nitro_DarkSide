@@ -38,6 +38,7 @@
 #include "FreeBIOS.h"
 #include "Args.h"
 #include "version.h"
+#include "HsGpu.h"
 
 #include "DSi.h"
 #include "DSi_SPI_TSC.h"
@@ -429,7 +430,8 @@ void NDS::SetupDirectBoot(const std::string& romname)
     PostFlag7 = 0x01;
 
     PowerControl9 = 0x820F;
-    GPU.SetPowerCnt(PowerControl9);
+    if (HsGpu) HsBus(NDS_HS_GPU_IO_WRITE, 0, 0x04000304, 2, PowerControl9);
+    else GPU.SetPowerCnt(PowerControl9);
 
     PowerControl7 = 0x0001;
     SPU.SetPowerCnt(PowerControl7 & 0x0001);
@@ -604,7 +606,8 @@ void NDS::Reset()
     KeyCnt[1] = 0;
     RCnt = 0;
 
-    GPU.Reset();
+    if (HsGpu) HsReset();
+    else GPU.Reset();
     NDSCartSlot.Reset();
     GBACartSlot.Reset();
     SPU.Reset();
@@ -677,7 +680,7 @@ void NDS::Stop(Platform::StopReason reason)
     Log(level, "Stopping emulated console (Reason: %s)\n", StopReasonName(reason));
     Running = false;
     Platform::SignalStop(reason, UserData);
-    GPU.Stop();
+    if (!HsGpu) GPU.Stop();
     SPU.Stop();
     Mic.StopAll();
 }
@@ -694,6 +697,11 @@ u32 NDS::GetSavestateConfig()
 
 bool NDS::DoSavestate(Savestate* file)
 {
+    if (HsGpu)
+    {
+        HsFail("savestates are unsupported with the hs gpu backend");
+        return false;
+    }
     file->Section("NDSG");
 
     u32 config = GetSavestateConfig();
@@ -3422,6 +3430,8 @@ u64 NDS::AdvanceExternalSystemToNextEvent(u64 bound)
 
 u32 NDS::RunFrame()
 {
+    if (HsGpu) return RunFrameHs();
+    if (InterleavedSchedule) return RunFrameInterleaved();
 #ifdef JIT_ENABLED
     if (EnableJIT)
         return RunFrame<CPUExecuteMode::JIT>();
@@ -4042,7 +4052,13 @@ void NDS::NocashPrint(u32 ncpu, u32 addr, bool appendNewline)
                 else if (!strcmp(cmd, "lr")) snprintf(subs, sizeof(subs), "%08X", cpu->R[14]);
                 else if (!strcmp(cmd, "pc")) snprintf(subs, sizeof(subs), "%08X", cpu->R[15]);
                 else if (!strcmp(cmd, "frame")) snprintf(subs, sizeof(subs), "%u", NumFrames);
-                else if (!strcmp(cmd, "scanline")) snprintf(subs, sizeof(subs), "%u", GPU.VCount);
+                else if (!strcmp(cmd, "scanline"))
+                {
+                    // Under the closed-loop backend VCOUNT belongs to the device: read it as a real
+                    // bus transaction at the executing CPU's actual clock, never a stock shadow.
+                    const u32 vcount = HsGpu ? HsBus(NDS_HS_GPU_IO_READ, (u32)CurCPU, 0x04000006, 2, 0) : GPU.VCount;
+                    snprintf(subs, sizeof(subs), "%u", vcount);
+                }
                 else if (!strcmp(cmd, "totalclks")) snprintf(subs, sizeof(subs), "%" PRIu64, GetSysClockCycles(0));
                 else if (!strcmp(cmd, "lastclks")) snprintf(subs, sizeof(subs), "%" PRIu64, GetSysClockCycles(1));
                 else if (!strcmp(cmd, "zeroclks"))
@@ -4417,6 +4433,9 @@ u8 NDS::ARM9Read8(u32 addr)
         return *(u8*)&ARM9BIOS[addr & 0xFFF];
     }
 
+    if (HsGpu && ((addr >> 24) - 5u) < 3u)
+        return (u8)HsBus(NDS_HS_GPU_MEM_READ, 0, addr, 1, 0);
+
     switch (addr & 0xFF000000)
     {
     case 0x02000000:
@@ -4478,6 +4497,9 @@ u16 NDS::ARM9Read16(u32 addr)
         return *(u16*)&ARM9BIOS[addr & 0xFFF];
     }
 
+    if (HsGpu && ((addr >> 24) - 5u) < 3u)
+        return (u16)HsBus(NDS_HS_GPU_MEM_READ, 0, addr, 2, 0);
+
     switch (addr & 0xFF000000)
     {
     case 0x02000000:
@@ -4538,6 +4560,9 @@ u32 NDS::ARM9Read32(u32 addr)
         return *(u32*)&ARM9BIOS[addr & 0xFFF];
     }
 
+    if (HsGpu && ((addr >> 24) - 5u) < 3u)
+        return HsBus(NDS_HS_GPU_MEM_READ, 0, addr, 4, 0);
+
     switch (addr & 0xFF000000)
     {
     case 0x02000000:
@@ -4594,6 +4619,12 @@ u32 NDS::ARM9Read32(u32 addr)
 
 void NDS::ARM9Write8(u32 addr, u8 val)
 {
+    if (HsGpu && ((addr >> 24) - 5u) < 3u)
+    {
+        HsBus(NDS_HS_GPU_MEM_WRITE, 0, addr, 1, val);
+        return;
+    }
+
     switch (addr & 0xFF000000)
     {
     case 0x02000000:
@@ -4634,6 +4665,12 @@ void NDS::ARM9Write8(u32 addr, u8 val)
 void NDS::ARM9Write16(u32 addr, u16 val)
 {
     addr &= ~0x1;
+
+    if (HsGpu && ((addr >> 24) - 5u) < 3u)
+    {
+        HsBus(NDS_HS_GPU_MEM_WRITE, 0, addr, 2, val);
+        return;
+    }
 
     switch (addr & 0xFF000000)
     {
@@ -4694,6 +4731,12 @@ void NDS::ARM9Write16(u32 addr, u16 val)
 void NDS::ARM9Write32(u32 addr, u32 val)
 {
     addr &= ~0x3;
+
+    if (HsGpu && ((addr >> 24) - 5u) < 3u)
+    {
+        HsBus(NDS_HS_GPU_MEM_WRITE, 0, addr, 4, val);
+        return;
+    }
 
     switch (addr & 0xFF000000)
     {
@@ -4799,6 +4842,9 @@ u8 NDS::ARM7Read8(u32 addr)
         return *(u8*)&ARM7BIOS[addr];
     }
 
+    if (HsGpu && (addr >> 24) == 6)
+        return (u8)HsBus(NDS_HS_GPU_MEM_READ, 1, addr, 1, 0);
+
     switch (addr & 0xFF800000)
     {
     case 0x02000000:
@@ -4866,6 +4912,9 @@ u16 NDS::ARM7Read16(u32 addr)
         return *(u16*)&ARM7BIOS[addr];
     }
 
+    if (HsGpu && (addr >> 24) == 6)
+        return (u16)HsBus(NDS_HS_GPU_MEM_READ, 1, addr, 2, 0);
+
     switch (addr & 0xFF800000)
     {
     case 0x02000000:
@@ -4932,6 +4981,9 @@ u32 NDS::ARM7Read32(u32 addr)
         return *(u32*)&ARM7BIOS[addr];
     }
 
+    if (HsGpu && (addr >> 24) == 6)
+        return HsBus(NDS_HS_GPU_MEM_READ, 1, addr, 4, 0);
+
     switch (addr & 0xFF800000)
     {
     case 0x02000000:
@@ -4989,6 +5041,12 @@ u32 NDS::ARM7Read32(u32 addr)
 
 void NDS::ARM7Write8(u32 addr, u8 val)
 {
+    if (HsGpu && (addr >> 24) == 6)
+    {
+        HsBus(NDS_HS_GPU_MEM_WRITE, 1, addr, 1, val);
+        return;
+    }
+
     switch (addr & 0xFF800000)
     {
     case 0x02000000:
@@ -5047,6 +5105,12 @@ void NDS::ARM7Write8(u32 addr, u8 val)
 void NDS::ARM7Write16(u32 addr, u16 val)
 {
     addr &= ~0x1;
+
+    if (HsGpu && (addr >> 24) == 6)
+    {
+        HsBus(NDS_HS_GPU_MEM_WRITE, 1, addr, 2, val);
+        return;
+    }
 
     switch (addr & 0xFF800000)
     {
@@ -5117,6 +5181,12 @@ void NDS::ARM7Write16(u32 addr, u16 val)
 void NDS::ARM7Write32(u32 addr, u32 val)
 {
     addr &= ~0x3;
+
+    if (HsGpu && (addr >> 24) == 6)
+    {
+        HsBus(NDS_HS_GPU_MEM_WRITE, 1, addr, 4, val);
+        return;
+    }
 
     switch (addr & 0xFF800000)
     {
@@ -5248,6 +5318,8 @@ bool NDS::ARM7GetMemRegion(u32 addr, bool write, MemRegion* region)
 
 u8 NDS::ARM9IORead8(u32 addr)
 {
+    u32 hv;
+    if (HsGpu && HsIORead9(addr, 1, hv)) return (u8)hv;
     switch (addr)
     {
     case 0x04000004: return GPU.DispStat[0] & 0xFF;
@@ -5339,6 +5411,8 @@ u8 NDS::ARM9IORead8(u32 addr)
 
 u16 NDS::ARM9IORead16(u32 addr)
 {
+    u32 hv;
+    if (HsGpu && HsIORead9(addr, 2, hv)) return (u16)hv;
     switch (addr)
     {
     case 0x04000004: return GPU.DispStat[0];
@@ -5465,6 +5539,8 @@ u16 NDS::ARM9IORead16(u32 addr)
 
 u32 NDS::ARM9IORead32(u32 addr)
 {
+    u32 hv;
+    if (HsGpu && HsIORead9(addr, 4, hv)) return hv;
     switch (addr)
     {
     case 0x04000004: return GPU.DispStat[0] | (GPU.VCount << 16);
@@ -5589,6 +5665,7 @@ u32 NDS::ARM9IORead32(u32 addr)
 
 void NDS::ARM9IOWrite8(u32 addr, u8 val)
 {
+    if (HsGpu && HsIOWrite9(addr, 1, val)) return;
     switch (addr)
     {
     case 0x04000004: GPU.SetDispStat(0, val, 0x00FF); return;
@@ -5708,6 +5785,7 @@ void NDS::ARM9IOWrite8(u32 addr, u8 val)
 
 void NDS::ARM9IOWrite16(u32 addr, u16 val)
 {
+    if (HsGpu && HsIOWrite9(addr, 2, val)) return;
     switch (addr)
     {
     case 0x04000004: GPU.SetDispStat(0, val, 0xFFFF); return;
@@ -5825,8 +5903,8 @@ void NDS::ARM9IOWrite16(u32 addr, u16 val)
     case 0x04000210: IE[0] = (IE[0] & 0xFFFF0000) | val; UpdateIRQ(0); return;
     case 0x04000212: IE[0] = (IE[0] & 0x0000FFFF) | (val << 16); UpdateIRQ(0); return;
     // TODO: what happens when writing to IF this way??
-    case 0x04000214: ClearIRQMask(0, val); GPU.GPU3D.CheckFIFOIRQ(); return;
-    case 0x04000216: ClearIRQMask(0, val<<16); GPU.GPU3D.CheckFIFOIRQ(); return;
+    case 0x04000214: ClearIRQMask(0, val); if (HsGpu) HsIFAck(0, val); else GPU.GPU3D.CheckFIFOIRQ(); return;
+    case 0x04000216: ClearIRQMask(0, val<<16); if (HsGpu) HsIFAck(0, val<<16); else GPU.GPU3D.CheckFIFOIRQ(); return;
 
     case 0x04000240:
         GPU.MapVRAM_AB(0, val & 0xFF);
@@ -5885,6 +5963,7 @@ void NDS::ARM9IOWrite16(u32 addr, u16 val)
 
 void NDS::ARM9IOWrite32(u32 addr, u32 val)
 {
+    if (HsGpu && HsIOWrite9(addr, 4, val)) return;
     switch (addr)
     {
     case 0x04000004:
@@ -5986,7 +6065,7 @@ void NDS::ARM9IOWrite32(u32 addr, u32 val)
 
     case 0x04000208: IME[0] = val & 0x1; UpdateIRQ(0); return;
     case 0x04000210: IE[0] = val; UpdateIRQ(0); return;
-    case 0x04000214: ClearIRQMask(0, val); GPU.GPU3D.CheckFIFOIRQ(); return;
+    case 0x04000214: ClearIRQMask(0, val); if (HsGpu) HsIFAck(0, val); else GPU.GPU3D.CheckFIFOIRQ(); return;
 
     case 0x04000240:
         GPU.MapVRAM_AB(0, val & 0xFF);
@@ -6075,6 +6154,8 @@ void NDS::ARM9IOWrite32(u32 addr, u32 val)
 
 u8 NDS::ARM7IORead8(u32 addr)
 {
+    u32 hv;
+    if (HsGpu && HsIORead7(addr, 1, hv)) return (u8)hv;
     switch (addr)
     {
     case 0x04000004: return GPU.DispStat[1] & 0xFF;
@@ -6127,6 +6208,8 @@ u8 NDS::ARM7IORead8(u32 addr)
 
 u16 NDS::ARM7IORead16(u32 addr)
 {
+    u32 hv;
+    if (HsGpu && HsIORead7(addr, 2, hv)) return (u16)hv;
     switch (addr)
     {
     case 0x04000004: return GPU.DispStat[1];
@@ -6202,6 +6285,8 @@ u16 NDS::ARM7IORead16(u32 addr)
 
 u32 NDS::ARM7IORead32(u32 addr)
 {
+    u32 hv;
+    if (HsGpu && HsIORead7(addr, 4, hv)) return hv;
     switch (addr)
     {
     case 0x04000004: return GPU.DispStat[1] | (GPU.VCount << 16);
@@ -6281,6 +6366,7 @@ u32 NDS::ARM7IORead32(u32 addr)
 
 void NDS::ARM7IOWrite8(u32 addr, u8 val)
 {
+    if (HsGpu && HsIOWrite7(addr, 1, val)) return;
     switch (addr)
     {
     case 0x04000004: GPU.SetDispStat(1, val, 0x00FF); return;
@@ -6382,6 +6468,7 @@ void NDS::ARM7IOWrite8(u32 addr, u8 val)
 
 void NDS::ARM7IOWrite16(u32 addr, u16 val)
 {
+    if (HsGpu && HsIOWrite7(addr, 2, val)) return;
     switch (addr)
     {
     case 0x04000004: GPU.SetDispStat(1, val, 0xFFFF); return;
@@ -6530,6 +6617,7 @@ void NDS::ARM7IOWrite16(u32 addr, u16 val)
 
 void NDS::ARM7IOWrite32(u32 addr, u32 val)
 {
+    if (HsGpu && HsIOWrite7(addr, 4, val)) return;
     switch (addr)
     {
     case 0x04000004:
@@ -6625,7 +6713,7 @@ void NDS::ARM7IOWrite32(u32 addr, u32 val)
 
     case 0x04000208: IME[1] = val & 0x1; UpdateIRQ(1); return;
     case 0x04000210: IE[1] = val; UpdateIRQ(1); return;
-    case 0x04000214: ClearIRQMask(1, val); return;
+    case 0x04000214: ClearIRQMask(1, val); if (HsGpu) HsIFAck(1, val); return;
 
     case 0x04000304:
         {

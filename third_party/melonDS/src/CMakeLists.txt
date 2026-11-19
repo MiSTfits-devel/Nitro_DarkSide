@@ -43,6 +43,9 @@ add_library(core STATIC
     GPU3D_Texcache.h
     Mic.cpp
     NDS4MiSTer_2DTrace.cpp
+    HsGpu.cpp
+    HsGpu.h
+    NDSHsGpu.cpp
     NDS4MiSTer_2DTrace.h
     NDS.cpp
     NDSCart.cpp
@@ -183,6 +186,17 @@ add_subdirectory(teakra EXCLUDE_FROM_ALL)
 # Workaround for building teakra with -O0 on Windows either failing or hanging forever
 target_compile_options(teakra PRIVATE "$<$<CONFIG:DEBUG>:-Og>")
 target_link_libraries(core PRIVATE teakra)
+
+# Closed-loop Haskell GPU backend (HsGpu.cpp/NDSHsGpu.cpp). The ABI header is the
+# shared contract owned by sim/melonds_tracer; override NDS_HS_GPU_ABI_DIR to move it.
+if (NOT NDS_HS_GPU_ABI_DIR)
+    set(NDS_HS_GPU_ABI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../sim/melonds_tracer")
+endif()
+if (NOT EXISTS "${NDS_HS_GPU_ABI_DIR}/HsGpuAbi.h")
+    message(FATAL_ERROR "HsGpuAbi.h not found in NDS_HS_GPU_ABI_DIR=${NDS_HS_GPU_ABI_DIR}")
+endif()
+target_include_directories(core PUBLIC "${NDS_HS_GPU_ABI_DIR}")
+target_link_libraries(core PRIVATE ${CMAKE_DL_LIBS})
 
 if (NOT MSVC)
     # MSVC has its own compiler flag syntax; if we ever support it,

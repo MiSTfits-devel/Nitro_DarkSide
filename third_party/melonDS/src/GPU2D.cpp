@@ -20,6 +20,7 @@
 #include <string.h>
 #include "NDS.h"
 #include "GPU.h"
+#include "HsGpu.h"
 #include "GPU3D.h"
 
 namespace melonDS
@@ -188,6 +189,7 @@ void GPU2D::DoSavestate(Savestate* file)
 
 u8 GPU2D::Read8(u32 addr)
 {
+    if (GPU.NDS.HsGpu) HsStockGpuForbidden("GPU2D::Read8");
     switch (addr & 0x00000FFF)
     {
     case 0x000: return DispCnt & 0xFF;
@@ -226,6 +228,7 @@ u8 GPU2D::Read8(u32 addr)
 
 u16 GPU2D::Read16(u32 addr)
 {
+    if (GPU.NDS.HsGpu) HsStockGpuForbidden("GPU2D::Read16");
     switch (addr & 0x00000FFF)
     {
     case 0x000: return DispCnt & 0xFFFF;
@@ -250,6 +253,7 @@ u16 GPU2D::Read16(u32 addr)
 
 u32 GPU2D::Read32(u32 addr)
 {
+    if (GPU.NDS.HsGpu) HsStockGpuForbidden("GPU2D::Read32");
     switch (addr & 0x00000FFF)
     {
     case 0x000: return DispCnt;
@@ -260,6 +264,7 @@ u32 GPU2D::Read32(u32 addr)
 
 void GPU2D::Write8(u32 addr, u8 val)
 {
+    if (GPU.NDS.HsGpu) HsStockGpuForbidden("GPU2D::Write8");
     switch (addr & 0x00000FFF)
     {
     case 0x000:
@@ -364,6 +369,7 @@ void GPU2D::Write8(u32 addr, u8 val)
 
 void GPU2D::Write16(u32 addr, u16 val)
 {
+    if (GPU.NDS.HsGpu) HsStockGpuForbidden("GPU2D::Write16");
     switch (addr & 0x00000FFF)
     {
     case 0x000:
@@ -497,6 +503,7 @@ void GPU2D::Write16(u32 addr, u16 val)
 
 void GPU2D::Write32(u32 addr, u32 val)
 {
+    if (GPU.NDS.HsGpu) HsStockGpuForbidden("GPU2D::Write32");
     switch (addr & 0x00000FFF)
     {
     case 0x000:
@@ -561,6 +568,7 @@ u16* GPU2D::GetOBJExtPal()
 
 void GPU2D::UpdateRegistersPreDraw(bool reset)
 {
+    if (GPU.NDS.HsGpu) HsStockGpuForbidden("GPU2D::UpdateRegistersPreDraw");
     if (!Enabled) return;
 
     // enabling BG/OBJ layers or disabling forced blank takes two scanlines to apply
@@ -607,6 +615,7 @@ void GPU2D::UpdateRegistersPreDraw(bool reset)
 
 void GPU2D::UpdateRegistersPostDraw(bool reset)
 {
+    if (GPU.NDS.HsGpu) HsStockGpuForbidden("GPU2D::UpdateRegistersPostDraw");
     if (!Enabled) return;
 
     if (reset)
@@ -657,6 +666,7 @@ void GPU2D::UpdateRegistersPostDraw(bool reset)
 
 void GPU2D::UpdateWindows(u32 line)
 {
+    if (GPU.NDS.HsGpu) HsStockGpuForbidden("GPU2D::UpdateWindows");
     if (!Enabled) return;
 
     // this seems to be done at the very beginning of each scanline

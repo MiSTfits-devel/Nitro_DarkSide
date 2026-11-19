@@ -122,6 +122,8 @@ void DMA::Reset()
     Executing = false;
     InProgress = false;
     MRAMBurstCount = 0;
+    HsUnitWait = 0;
+    HsUnitPending = false;
     MRAMBurstTable = DMATiming::MRAMDummy;
 }
 
@@ -189,7 +191,7 @@ void DMA::WriteCnt(u32 val)
         else if (StartMode == 0x05 || StartMode == 0x12)
             NDS.NDSCartSlots[0]->CheckDMA(CPU);
         else if (StartMode == 0x07)
-            NDS.GPU.GPU3D.CheckFIFODMA();
+            NDS.CheckGXFIFODMA();
 
         if (StartMode==0x06 || StartMode==0x13)
             Log(LogLevel::Warn, "UNIMPLEMENTED ARM%d DMA%d START MODE %02X, %08X->%08X\n", CPU?7:9, Num, StartMode, SrcAddr, DstAddr);
@@ -593,6 +595,36 @@ u32 DMA::UnitTimings7_32(bool burststart)
     }
 }
 
+// Charges the next unit's wait to this channel's CPU clock before its access.
+// With the closed-loop GPU, a unit touching GPU-owned addresses keeps its wait
+// cached and may be split at the device's exact deadline or deferred behind the
+// other CPU; its access time never changes (NDS::HsDMAGate). Returns false when
+// the access must not happen yet.
+bool DMA::ChargeUnit(bool wide, bool& burststart)
+{
+    const u32 shift = CPU == 0 ? NDS.ARM9ClockShift : 0;
+    u64& clock = CPU == 0 ? NDS.ARM9Timestamp : NDS.ARM7Timestamp;
+    const bool gated = NDS.HsGpu &&
+        (NDS.HsGpuOwnsAddr(CPU, CurSrcAddr) || NDS.HsGpuOwnsAddr(CPU, CurDstAddr));
+    if (!gated || !HsUnitPending)
+    {
+        u32 unit;
+        if (CPU == 0) unit = wide ? UnitTimings9_32(burststart) : UnitTimings9_16(burststart);
+        else          unit = wide ? UnitTimings7_32(burststart) : UnitTimings7_16(burststart);
+        burststart = false;
+        if (!gated)
+        {
+            clock += (u64)unit << shift;
+            return true;
+        }
+        HsUnitWait = (u64)unit << shift;
+        HsUnitPending = true;
+    }
+    if (!NDS.HsDMAGate(CPU, HsUnitWait)) return false;
+    HsUnitPending = false;
+    return true;
+}
+
 void DMA::Run9()
 {
     if (NDS.ARM9Timestamp >= NDS.ARM9Target) return;
@@ -607,8 +639,7 @@ void DMA::Run9()
     {
         while (IterCount > 0 && !Stall)
         {
-            NDS.ARM9Timestamp += (UnitTimings9_16(burststart) << NDS.ARM9ClockShift);
-            burststart = false;
+            if (!ChargeUnit(false, burststart)) break;
 
             NDS.ARM9Write16(CurDstAddr, NDS.ARM9Read16(CurSrcAddr));
 
@@ -624,8 +655,7 @@ void DMA::Run9()
     {
         while (IterCount > 0 && !Stall)
         {
-            NDS.ARM9Timestamp += (UnitTimings9_32(burststart) << NDS.ARM9ClockShift);
-            burststart = false;
+            if (!ChargeUnit(true, burststart)) break;
 
             const u32 value = NDS.ARM9Read32(CurSrcAddr);
             if (IsGXFIFODMA)
@@ -653,7 +683,7 @@ void DMA::Run9()
             NDS.ResumeCPU(0, 1<<Num);
 
             if (StartMode == 0x07)
-                NDS.GPU.GPU3D.CheckFIFODMA();
+                NDS.CheckGXFIFODMA();
         }
 
         return;
@@ -687,8 +717,7 @@ void DMA::Run7()
     {
         while (IterCount > 0 && !Stall)
         {
-            NDS.ARM7Timestamp += UnitTimings7_16(burststart);
-            burststart = false;
+            if (!ChargeUnit(false, burststart)) break;
 
             NDS.ARM7Write16(CurDstAddr, NDS.ARM7Read16(CurSrcAddr));
 
@@ -704,8 +733,7 @@ void DMA::Run7()
     {
         while (IterCount > 0 && !Stall)
         {
-            NDS.ARM7Timestamp += UnitTimings7_32(burststart);
-            burststart = false;
+            if (!ChargeUnit(true, burststart)) break;
 
             NDS.ARM7Write32(CurDstAddr, NDS.ARM7Read32(CurSrcAddr));
 

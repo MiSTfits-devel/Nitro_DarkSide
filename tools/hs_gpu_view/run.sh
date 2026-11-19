@@ -1,49 +1,76 @@
-#!/bin/sh
+#!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# Visible host viewer for the Haskell GPU models.
+# Native host viewer for the Haskell GPU.
 #
-#   tools/hs_gpu_view/run.sh CART.nds [FRAMES]    live: melonDS CPU -> pipe -> Haskell -> window
-#   tools/hs_gpu_view/run.sh --replay TRACE.nsd2  recorded v12 trace -> Haskell -> window
+#   run.sh CART.nds [FRAMES]                closed-loop Haskell GPU + melonDS CPUs/peripherals
+#   run.sh --replay TRACE.nsd2              recorded trace diagnostic, not live
+#   run.sh --open-loop CART.nds [FRAMES]    explicit legacy trace diagnostic
 #
-# Live mode runs melonds_fbdump (vendored melonDS: ARM9/ARM7, memory, cart,
-# and its own GPU, which the CPU keeps reading) and pipes its NSD2 v12 trace
-# (fd 3) into trace-view. Every displayed pixel comes from
-# Nds.Gpu3D.Chip + Nds.Gpu2D; melonDS's own screen records are only counted
-# for the status line. This is open loop: the Haskell GPU never feeds back into
-# the emulated CPU. Pad/keyboard/mouse-touch input goes to melonDS via the
-# --input control file. Logs (stderr) go to $OUT/*.log; stdout carries frames.
-# Closing the window ends the pipeline (SIGPIPE); if melonDS or trace-view
-# stops, the window stays open on the last actual frame, marked STOPPED.
-set -eu
+# Default live mode makes the Haskell service authoritative for GPU I/O,
+# memory, capture, video events, IRQ and DMA. No melonDS GPU is on that path.
+# Replay/open-loop remain separate diagnostics. Any producer failure stops
+# the machine and leaves the last actual bitmap visibly STOPPED, NOT LIVE.
+# FBDUMP / HS_GPU_LIBRARY may select already-built binaries for a measured run.
+set -euo pipefail
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 out=${OUT:-${TMPDIR:-/tmp}/nds-hsview}
 mkdir -p "$out"
+out=$(CDPATH= cd -- "$out" && pwd)
 
-mode=live
+mode=closed-loop
 case ${1:-} in
     --replay) mode=replay; trace=${2:?usage: run.sh --replay TRACE.nsd2} ;;
-    "") echo "usage: run.sh CART.nds [FRAMES] | run.sh --replay TRACE.nsd2" >&2; exit 2 ;;
+    --open-loop) mode=open-loop; cart=${2:?usage: run.sh --open-loop CART.nds [FRAMES]}; frames=${3:-1000000} ;;
+    "") echo "usage: run.sh CART.nds [FRAMES] | --replay TRACE.nsd2 | --open-loop CART.nds [FRAMES]" >&2; exit 2 ;;
     *) cart=$1; frames=${2:-1000000} ;;
 esac
 
-fbdump=$repo/sim/melonds_tracer/build-vendored/melonds_fbdump
-[ -x "$fbdump" ] || sh "$repo/sim/melonds_tracer/build-fbdump-vendored.sh"
-(cd "$repo/clash" && stack --resolver lts-22.43 ghc -- -O2 -isrc -itest \
-    -outputdir "$out/obj" test/TraceView.hs -o "$out/trace-view") >"$out/build.log" 2>&1 &&
+: >"$out/build.log"
+fbdump=${FBDUMP:-$repo/sim/melonds_tracer/build-vendored/melonds_fbdump}
+if [ "$mode" != replay ] && [ -z "${FBDUMP:-}" ]; then
+    sh "$repo/sim/melonds_tracer/build-fbdump-vendored.sh" >>"$out/build.log" 2>&1 ||
+        { echo "CPU bridge build failed; see $out/build.log" >&2; exit 1; }
+fi
+if [ "$mode" = closed-loop ]; then
+    service=${HS_GPU_LIBRARY:-$out/hs-gpu-$$.dylib}
+    if [ -z "${HS_GPU_LIBRARY:-}" ]; then
+        # A distinct output inode per launch: never overwrite a mapped dylib.
+        (cd "$repo/clash" && stack --resolver lts-22.43 ghc -- -O2 -dynamic \
+            -shared -fPIC -flink-rts -threaded -no-hs-main -isrc -itest \
+            -outputdir "$out/obj-service" test/GpuService.hs -o "$service") >>"$out/build.log" 2>&1 ||
+            { echo "Haskell GPU build failed; see $out/build.log" >&2; exit 1; }
+    fi
+    printf '%s\n' "$service" >"$out/service-path.txt"
+else
+    (cd "$repo/clash" && stack --resolver lts-22.43 ghc -- -O2 -isrc -itest \
+        -outputdir "$out/obj-trace" test/TraceView.hs -o "$out/trace-view") >>"$out/build.log" 2>&1 ||
+        { echo "Trace renderer build failed; see $out/build.log" >&2; exit 1; }
+fi
 swiftc -O "$repo/tools/hs_gpu_view/NdsView.swift" "$repo/tools/hs_gpu_view/main.swift" \
     -o "$out/nds-view" >>"$out/build.log" 2>&1 ||
     { echo "build failed; see $out/build.log" >&2; exit 1; }
 
 if [ "$mode" = replay ]; then
     "$out/trace-view" "$trace" 2>"$out/trace-view.log" \
-        | NDS_VIEW_SNAPSHOT=$out/shown.png "$out/nds-view" 2>"$out/nds-view.log"
+        | NDS_VIEW_MODE=replay NDS_VIEW_PRODUCER_LOG=$out/trace-view.log \
+          "$out/nds-view" 2>"$out/nds-view.log"
     exit
 fi
 
 input=$out/input.bin
 : >"$input"
+if [ "$mode" = closed-loop ]; then
+    "$fbdump" --direct --hs-gpu "$service" --hs-ndsf - --no-text-dump \
+        --input "$input" "$cart" /dev/null "$frames" \
+        2>"$out/melonds.log" \
+        | NDS_VIEW_MODE=closed-loop NDS_VIEW_PRODUCER_LOG=$out/melonds.log \
+          NDS_VIEW_INPUT=$input \
+          "$out/nds-view" 2>"$out/nds-view.log"
+    exit
+fi
 "$fbdump" --direct --input "$input" --trace2d /dev/fd/3 --trace2d-raw3d \
     "$cart" /dev/null "$frames" 3>&1 >"$out/melonds.log" 2>&1 \
     | "$out/trace-view" /dev/stdin 2>"$out/trace-view.log" \
-    | NDS_VIEW_INPUT=$input NDS_VIEW_SNAPSHOT=$out/shown.png "$out/nds-view" 2>"$out/nds-view.log"
+    | NDS_VIEW_MODE=open-loop NDS_VIEW_PRODUCER_LOG=$out/trace-view.log \
+      NDS_VIEW_INPUT=$input "$out/nds-view" 2>"$out/nds-view.log"
