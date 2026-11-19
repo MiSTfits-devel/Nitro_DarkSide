@@ -1044,7 +1044,8 @@ maintenance operation. Nine ARM9 reference records matched including
 the faulting word. Public controls cover writable and reserved bits,
 MRC to NZCV, condition checks, low SWI vectors, privilege, invalid register
 selects, ARM7 rejection and rejection of unsupported big-endian mode.
-Architectural I/D cache contents and TCM mapping are not implemented.
+That direct-entry configuration has no architectural I/D caches or TCM
+mapping. The native reset configuration's separate TCM gate is below.
 
 MCR `p15,0,Rd,c7,c5,0` invalidates **only** the ARM9 instruction line,
 prevents older outstanding fills from reinstating it, discards younger
@@ -1419,6 +1420,41 @@ transfer at `040001a0` after ROMCTRL. The first **128 PCs on each CPU**
 matched the local reference. At the **100,000-clock** bound ARM9/ARM7 had
 retired **22,225 / 17,733** instructions with no fault or unserved request.
 No comparison beyond those prefixes or firmware menu boot is claimed.
+
+### Native ARM946 tightly-coupled memory
+
+The native CPU has **32 KiB ITCM and 16 KiB DTCM**, private word-wide
+block RAMs on the CPU's enabled clock, not slots in the shared Fabric.
+Privileged CP15 c9,c1,0/1 configure D/I windows; c1[16:19] select enable
+and load mode. The physical-size MRC (`c0,c0,2`) returns `00140180`.
+Reset disables both windows; descriptors reset to base zero and their
+physical sizes. C9 descriptors cover 4 KiB to 4 GiB; larger visible
+windows mirror the physical banks. ITCM has base zero, DTCM relocates,
+and neither belongs to ARM7 or DMA.
+
+Fetch can select ITCM but never DTCM. Ordinary data accesses choose
+ITCM before DTCM, then the preexisting address map. Load mode still sends
+writes to that bank but sends reads (including ITCM fetches) down to the
+next eligible bank or underlying memory. Thus loading an instruction
+image over an existing data alias does not erase the DTCM alias. The MPU
+still checks the original guest address before routing. CP15 commits that
+change mapping refetch younger instructions. See the [ARM946E-S TRM,
+sections 2.3 and 5](https://documentation-service.arm.com/static/5e8e3ee588295d1e18d3aa82).
+
+`sim/run_clash_native_tcm.sh GENERATED_NATIVE_CPU_HDL` runs two public
+BIOS images. ARM9 retains its MPU configuration while remapping TCM,
+uses independent data/instruction storage at overlapping addresses,
+exercises byte/halfword merges and block copies, and executes both ARM
+and Thumb code from a written ITCM mirror. ARM7 reads a different word
+at the same virtual address. The guest seeds external main RAM with
+word and byte writes, overlays it with DTCM, writes different word and
+halfword values privately, and recovers the unchanged external sentinel
+after remapping and disabling DTCM. Each reset epoch accepted exactly
+two external writes and six reads at `0x02000000`; no other external
+address or MMIO acknowledgement was permitted. With the MPU enabled,
+ARM9 retired 159 instructions each time; ARM7 retired 144 and 136 under
+different clock stalls. This does not establish general cache emulation,
+hardware placement or firmware GUI boot.
 
 ### What separates this from booting a commercial game
 
