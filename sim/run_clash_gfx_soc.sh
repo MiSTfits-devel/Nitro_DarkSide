@@ -35,8 +35,14 @@ build_rom witness "$root/sim/tests/hs_gpu_arm9.S"
 build_rom bad-mode "$gfx" --defsym UNSUPPORTED_MODE=1
 build_rom bad-bank "$gfx" --defsym UNSUPPORTED_BANK=1
 build_rom bad-status "$gfx" --defsym UNSUPPORTED_STATUS=1
-# name:expected CPU fault code:fault address (all GPU reply errors)
-negatives=(bad-mode:4:04000000 bad-bank:4:04000242 bad-status:4:04000006)
+build_rom bad-engine-a "$gfx" --defsym UNSUPPORTED_ENGINE_A=1
+build_rom bad-engine-b "$gfx" --defsym UNSUPPORTED_ENGINE_B=1
+build_rom bad-palette "$gfx" --defsym UNSUPPORTED_PALETTE=1
+build_rom bad-oam "$gfx" --defsym UNSUPPORTED_OAM=1
+# name:expected CPU fault code:fault address (all GPU reply errors; the last
+# four are link spans VramDisplay does not implement)
+negatives=(bad-mode:4:04000000 bad-bank:4:04000242 bad-status:4:04000006
+    bad-engine-a:4:04000008 bad-engine-b:4:04001000 bad-palette:4:05000000 bad-oam:4:07000000)
 
 # Every GHC/Clash process and every built checker is capped at a 3 GB heap.
 (cd "$root/clash" && stack --resolver lts-22.43 ghc -- +RTS -M3g -RTS -rtsopts -with-rtsopts=-M3g \

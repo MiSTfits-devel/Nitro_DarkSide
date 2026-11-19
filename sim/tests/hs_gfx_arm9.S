@@ -38,6 +38,25 @@
     ldrh    r2, [r0, #6]        @ VCOUNT: no DS LCD schedule here
     b       .
 .endif
+.ifdef UNSUPPORTED_ENGINE_A
+    strh    r1, [r0, #8]        @ BG0CNT_A: engine A backgrounds are not implemented
+    b       .
+.endif
+.ifdef UNSUPPORTED_ENGINE_B
+    add     r3, r0, #0x1000
+    ldr     r2, [r3]            @ DISPCNT_B: engine B is not implemented
+    b       .
+.endif
+.ifdef UNSUPPORTED_PALETTE
+    mov     r3, #0x05000000
+    strh    r1, [r3]            @ palette RAM is not implemented
+    b       .
+.endif
+.ifdef UNSUPPORTED_OAM
+    mov     r3, #0x07000000
+    ldr     r2, [r3]            @ OAM is not implemented
+    b       .
+.endif
 
     /* Edge E(P) = (P.x-a.x)*(b.y-a.y) - (P.y-a.y)*(b.x-a.x) for the
      * triangle (140,14) (30,178) (232,150); each is 0..30048 inside. */

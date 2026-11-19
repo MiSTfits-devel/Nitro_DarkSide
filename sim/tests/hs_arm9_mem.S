@@ -328,6 +328,21 @@ fault_site:
     stmia   r0, {r1}
     .set    fault_site, rom_table
 .endif
+.ifdef NEG_BLOCK_OAM
+    mov     r0, #0x07000000
+    ldmia   r0, {r1, r2}            @ OAM is single-transfer only
+    .set    fault_site, 0x07000000
+.endif
+.ifdef NEG_PAST_ENGINE_A
+    mov     r0, #0x04000000
+    ldr     r1, [r0, #0x70]         @ first word after BLDY: no route
+    .set    fault_site, 0x04000070
+.endif
+.ifdef NEG_PAST_PALETTE
+    mov     r0, #0x05000000
+    ldr     r1, [r0, #0x800]        @ first word after the palettes: no route
+    .set    fault_site, 0x05000800
+.endif
 /* Link probes: the CPU-only harness never accepts, so the first offer must
  * be exactly this held request. */
 .ifdef OFFER_POST_INDEX
@@ -350,6 +365,22 @@ fault_site:
 .ifdef OFFER_DISPSTAT
     mov     r0, #0x04000000
     strh    r1, [r0, #4]            @ W2 04000004 0000005a
+.endif
+.ifdef OFFER_ENGINE_A
+    mov     r0, #0x04000000
+    strh    r1, [r0, #0x6e]         @ W2 0400006e 0000005a (last halfword)
+.endif
+.ifdef OFFER_ENGINE_B
+    ldr     r0, =0x04001000
+    ldr     r1, [r0, #0x6c]         @ R4 0400106c (last word)
+.endif
+.ifdef OFFER_PALETTE
+    mov     r0, #0x05000000
+    strb    r1, [r0, #0x7ff]        @ W1 050007ff 0000005a (last byte)
+.endif
+.ifdef OFFER_OAM
+    mov     r0, #0x07000000
+    str     r1, [r0]                @ W4 07000000 0000005a
 .endif
 done:
     b       done

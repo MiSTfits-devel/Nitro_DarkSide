@@ -140,16 +140,19 @@ Neither output requires an acknowledgement.
 
 The blocking link (the `GPU_*` ports) carries only single transfers. It
 owns the `0x06xxxxxx` VRAM aperture, DISPCNT and DISPSTAT (`0x04000000-05`),
-VCOUNT (`0x04000006-07`, reads only), TM0CNT-TM3CNT (`0x04000100-0F`),
+VCOUNT (`0x04000006-07`, reads only), the engine A background, scroll,
+window and blend registers (`0x04000008-6F`), TM0CNT-TM3CNT (`0x04000100-0F`),
 AUXSPICNT (`0x040001A0-A1`), ROMCTRL and the game-card command bytes
 (`0x040001A4-AF`), IME (`0x04000208-0B`), IE and IF (`0x04000210-17`),
-POWCNT1 halfword/word, entirely GPU-owned VRAMCNT byte spans and the
-game-card data port (`0x04100010-13`); every access must lie wholly inside
-one span. Timers, IME/IE/IF and the game-card registers are not GPU
+POWCNT1 halfword/word, entirely GPU-owned VRAMCNT byte spans, the engine B
+display registers (`0x04001000-6F`), the game-card data port
+(`0x04100010-13`), palettes (`0x05000000-7FF`) and OAM (`0x07000000-7FF`);
+every access must lie wholly inside one span. Timers, IME/IE/IF and the game-card registers are not GPU
 registers: they are routed for the devices `Arm9Soc` puts in front of the
 GPU, and a target that does not implement an address must reply with an
 error (the [CPU + VRAM display prototype](../fpga/mister_hs_gfx_slice/README.md)
-replies fault to all of them and to DISPSTAT). LDM/STM never use the link:
+replies fault to all of them, to DISPSTAT, and to the engine A/B registers,
+palettes and OAM, which its gate checks). LDM/STM never use the link:
 every beat is route-checked before the first one issues, and a block with a
 beat outside the boot ROM (reads) or local RAM faults 3 at that beat's
 address with nothing transferred, so no burst or GXFIFO-style atomic scope
@@ -207,12 +210,14 @@ attached ([`tb_arm9_isa_oracle.vhd`](../sim/tb_arm9_isa_oracle.vhd)); for
 the ISA fixture it runs a `PRODUCT_ORACLE` build without one
 condition-failed `MOVSNE pc, lr`, which the product core mishandles (r14_svc
 reads 0 afterwards). The pure `sliceStep` and freshly generated Verilog run
-those builds, the full ISA build, 25 variants that must fault exactly (each
+those builds, the full ISA build, 28 variants that must fault exactly (each
 hazard above, NV condition, misaligned PC and LDM base, SWP,
-VCOUNT write, LDM/STM past RAM, into the link or onto the ROM) with no store
-after the mailbox, and 7 that must hold one exact link offer (DISPCNT write,
-VCOUNT read, post-index and register-writeback transfers, a timer write, an
-IE read, a DISPSTAT write).
+VCOUNT write, LDM/STM past RAM, into the link, into OAM or onto the ROM,
+the first word past the engine A registers and past the palettes) with no
+store after the mailbox, and 11 that must hold one exact link offer
+(DISPCNT write, VCOUNT read, post-index and register-writeback transfers, a
+timer write, an IE read, a DISPSTAT write, and the last halfword, word or
+byte of the engine A, engine B, palette and OAM spans).
 
 `sim/run_clash_arm9_irq.sh` checks IRQ exceptions on the composed
 [`Nds.WholeCore.Arm9Soc`](src/Nds/WholeCore/Arm9Soc.hs), where
@@ -242,8 +247,15 @@ nine builds that must fault 1 at the instruction (SUBS pc and MRS SPSR in
 System mode, MSR to FIQ mode, T, Q or an empty mask, user-bank LDM/STM `^`
 in IRQ mode, and an exception return from an SPSR naming FIQ mode). The
 harness raises its external IF sources only where the runner asks
-(`--link-read`, `--store-irq ADDR MASK`, `--retire-irq PC MASK`) and fails
-unless each one fired.
+(`--link-read`, `--store-irq ADDR MASK`, `--irq-before PC MASK`) and fails
+unless each one fired. `--irq-before` makes the IRQ line first high in the
+first cycle in which the instruction at PC is the oldest uncommitted one,
+placed from the retire stream rather than from pipeline timing: a probe run
+without that source finds the cycle in which the instruction just before PC
+is reported retired (retire is reported the cycle after commit, in order,
+so PC is still uncommitted then); the real run raises IF one cycle earlier,
+because IF is a register, and then requires that same retire at that cycle
+and the IRQ vector as the very next retire.
 
 `sim/run_clash_arm9_thumb.sh` checks Thumb, interworking, multiplies, SWI
 and the modes with three assembled fixtures and hand-derived mailboxes.
@@ -263,9 +275,12 @@ System and Thumb, the shared User/System bank and User-mode MSR.
 `Arm9Soc` with real timer 0 overflows): an IRQ pending at an exception
 return into Thumb is taken before the first Thumb instruction (R14_irq =
 next + 4, SPSR.T), a timer IRQ in a Thumb loop returns by `LDM {.., pc}^`,
-and an IF bit the harness raises when a Thumb BL prefix retires is taken
-between prefix and suffix, after which the suffix still links and lands
-correctly. The product `nds_cpu9` (no I/O for the first two, timers and
+and an IF bit the harness raises with `--irq-before` at the BL suffix (the
+second halfword of the Thumb BL at `bl_prefix`) is taken between prefix and
+suffix, after which the suffix still links and lands correctly. The same
+trigger passes on the frozen staged slice too; placing it before the
+prefix instead gives R14_irq − `bl_prefix` = 4, not 6, so the mailbox
+value forces the split to happen. The product `nds_cpu9` (no I/O for the first two, timers and
 `nds_irq` for the third) matches all 46 Thumb words, all 50 interwork
 words of a `PRODUCT_ORACLE` build that first copies the CPSR into SPSR_svc
 (the entry deviation above would otherwise show in the handler CPSR), and
@@ -382,23 +397,46 @@ never matters. The pure `sliceStep` turns a violation into an error, which
 fails every pure gate. It also forces its next state each step, so long
 pure runs hold one state.
 
-An instruction is a token that moves through stages. Each stage is a
-function from its own input record to its own output record with a valid
-bit: fetch → (Thumb expand) → decode (class, condition, register reads) →
-shift (the one barrel shifter; register shifts take a second cycle) → ALU
-(the one adder/logic unit, condition check, flags, register write) → mem
-(memory routes and beats, base writeback, LDM^ restore, multiply
-accumulate, the SWI link) → retire. Exactly one token is in flight; no stage
-reads another stage's pipeline register. Overlapping them later needs:
-- fetch-ahead with sequential PC prediction;
-- a flush of younger tokens on every PC write (branches, R15 data
-  processing, loads to R15, exception entry and return) and on every mode
-  or SPSR change, since the register row depends on the mode;
-- forwarding of ALU and load results into the shift stage's operands (the
-  register file reads one cycle ahead, so a dependent token would read the
-  old row);
-- a load-use interlock and a stall while the mem stage is busy;
-- IRQ sampling at the oldest token's boundary.
+Instructions overlap in a pipeline of token stages, each a function from
+its own input record to its own output record with a valid bit:
+
+fetch → (Thumb expand) → decode → E1 → E2 → mem → retire
+
+- decode classifies the (Thumb-expanded) opcode and presents register reads;
+- E1 collects the operands and runs the one barrel shifter;
+- E2 is the commit point: condition, the one adder/logic unit, flags, the
+  register write, branches and PSR transfers;
+- mem handles memory routes and beats, base writeback, the LDM^ restore,
+  multiply accumulate and the SWI link.
+
+Instructions commit in order, at most one per cycle, either in E2 or at
+the end of the mem stage; E2 waits while the mem stage is busy, so LDM/STM,
+multiplies and link waits hold the pipe. The hazard rules:
+- **Fetch-ahead:** sequential prediction, one word per cycle from the boot ROM
+  (unless a ROM load holds the port) and from local RAM through its
+  synchronous port. A misaligned or unrouted fetch PC becomes a fault token,
+  which faults only if it reaches commit.
+- **Flushes:** a passed branch, BX/BLX, data processing to R15 (exception
+  returns included) or any MSR in E2, and a load to R15, an LDM^ restore or
+  SWI entry in the mem stage, redirect fetch and drop every younger token. The
+  redirect follows from the class and condition. The target is never
+  compared with the next PC: that compare after the adder was the critical
+  path of the first pipelined fit.
+- **Store into fetched code:** a local-RAM store whose word matches the PC
+  of any fetched token or of the fetch in flight refetches from the
+  instruction after the store.
+- **Forwarding:** operands not yet read take a register-file write to their
+  row, including one made in the same cycle (the register file reads one
+  cycle ahead).
+- **Interlocks:** E1 waits for:
+  - an operand still owed by the mem stage (load-use, writeback, multiply,
+    LDM) or by an E2 token that writes it only later;
+  - a shifter operand that E2 is about to write;
+  - flags still pending, for RRX.
+- **IRQ:** sampled at the oldest uncommitted instruction (in E2, with the mem
+  stage empty). Taking it drops that instruction and everything younger,
+  writes SPSR_irq in that cycle and R14_irq (its address + 4) in the next,
+  then fetches the vector. Nothing younger has committed by then.
 
 Standalone Quartus 17.0.2 fits on 5CSEBA6U23I7 (no pins, all ports
 virtual, fresh Clash netlists). This was a local run, not reproducible from
@@ -411,23 +449,40 @@ with an added case for these tops. Worst setup and hold over the four corners:
 | slice before, 67.03 MHz | 5,287 | 1,154 | 4 (32,768) | 3 | **−8.287 ns** | +0.134 ns |
 | soc before, 33.51 MHz | 6,132 | 1,682 | 4 (32,768) | 3 | +4.816 ns | +0.164 ns |
 | soc before, 67.03 MHz | 6,168 | 1,682 | 4 (32,768) | 3 | **−8.256 ns** | +0.154 ns |
-| slice after, 33.51 MHz | 2,432 | 1,183 | 6 (34,816) | 3 | +13.282 ns | +0.127 ns |
-| slice after, 67.03 MHz | 2,473 | 1,183 | 6 (34,816) | 3 | +1.737 ns | +0.144 ns |
-| soc after, 33.51 MHz | 3,432 | 1,711 | 6 (34,816) | 3 | +12.454 ns | +0.124 ns |
-| soc after, 67.03 MHz | 3,442 | 1,711 | 6 (34,816) | 3 | +1.008 ns | +0.152 ns |
+| slice staged, 33.51 MHz | 2,432 | 1,183 | 6 (34,816) | 3 | +13.282 ns | +0.127 ns |
+| slice staged, 67.03 MHz | 2,473 | 1,183 | 6 (34,816) | 3 | +1.737 ns | +0.144 ns |
+| soc staged, 33.51 MHz | 3,432 | 1,711 | 6 (34,816) | 3 | +12.454 ns | +0.124 ns |
+| soc staged, 67.03 MHz | 3,442 | 1,711 | 6 (34,816) | 3 | +1.008 ns | +0.152 ns |
+| slice pipelined, 33.51 MHz | 3,275 | 1,360 | 6 (34,816) | 3 | +11.301 ns | +0.149 ns |
+| slice pipelined, 67.03 MHz | 3,338 | 1,360 | 6 (34,816) | 3 | +0.828 ns | +0.164 ns |
+| soc pipelined, 33.51 MHz | 4,254 | 1,888 | 6 (34,816) | 3 | +10.306 ns | +0.149 ns |
+| soc pipelined, 67.03 MHz | 4,341 | 1,888 | 6 (34,816) | 3 | +0.859 ns | +0.164 ns |
 
 Notes on the fits:
-- **Timing:** every corner of the "after" fits has positive setup and hold
-  slack at both clocks.
+- **Timing:** every corner of the staged and pipelined fits has positive
+  setup and hold slack at both clocks.
 - **Memory:** the 4 KiB local RAM is four M10K blocks and the register file
   two. The multiplier is three DSP blocks.
 - **Before:** the critical path was opcode → decode → register-file read
   mux → barrel shifter → ALU adders → register-file write mux, 21 logic
   levels in one cycle.
-- **After:** the worst 67.03 MHz path runs from the decode token's class
+- **Staged:** the worst 67.03 MHz path ran from the decode token's class
   field through the shift-amount select and the barrel shifter into the
-  shift token's operand register (10 levels). Next are opcode → ALU →
-  register-file write data.
+  shift token's operand register (10 levels).
+- **Pipelined, first fit:** 3,444 / 4,522 ALMs, but **−0.323 / −0.643 ns** at
+  67.03 MHz. The path ran from the E2 adder through a target ≠ next-PC compare into the
+  flush of every younger stage. Deciding redirects from the class and
+  condition instead (above) removed it without changing a single cycle of
+  the differential test.
+- **Pipelined, final:** the slice's worst 67.03 MHz path (14 levels) runs
+  from the E2 token's class through its deferred-destination hazard
+  vector, E1's advance and fetch's accept into the fetch register. The
+  SoC's worst path (10 levels) is in the timers' register-write logic.
+- **Store-into-fetched-code compare:** not on the critical path. It is
+  absent from the 20 worst setup paths of both 67.03 MHz fits, which end at
+  +1.047 ns (slice) and +1.190 ns (SoC). A scratch fit of the slice without
+  it is 3,190 ALMs at +0.719 ns, so the compare costs about 150 ALMs and no
+  clock speed.
 - **For scale:** the product `nds_cpu9` core row in the integrated product fit
   (`artifacts/zero-arm-graphics/stage0-fit/NDS4MiSTer.fit.rpt`) is 4,164
   ALMs, 3,404 registers and 9 DSP. Its caches (`nds_cache9`) add 1,954 ALMs
@@ -435,51 +490,111 @@ Notes on the fits:
   cores implement far more: caches, CP15, the full ARMv5TE ISA,
   pipelining and savestates.
 
-The restructure changes no behaviour. Every existing gate passes unmodified:
-all mailbox, fault, link-offer, card-address and RAM-retirement checks,
-including the IRQ fixture's free-running-timer slots. `run.sh --soc 10`
-still displays buffers 0..3 in its 10 frames, so its frame count is
-unchanged. The Thumb gate adds
-[`hs_arm9_banks.S`](../sim/tests/hs_arm9_banks.S): 14 hand-derived words with
-both SPSRs and all three R13/R14 banks live at once, plus RRX carry-out from
-bit 0. The product `nds_cpu9` matches all 14. It exists because two of 16
-CPU mutants (SVC and IRQ sharing one SPSR row; RRX carry taken from bit 31)
-survived the earlier fixtures. All 16 now fail the pure fixtures. The
-others cover:
-- banking: SVC or IRQ sharing a bank, R14 written to the wrong bank on IRQ
-  or SWI entry, LDM^ not reading the SPSR, STM reading a stale row;
-- writeback: none, to the wrong register, the pre-index address, LDM's
-  start address;
-- flags: logical C ignoring the shifter, no flag update, wrong V, MUL
-  clearing C/V.
+Pipelining changes no behaviour. The retire, store, link-offer and fault
+streams are the staged core's. Every gate passes with every fixture `.S`
+and `.expected` unmodified: all mailbox, fault, link-offer, card-address
+and RAM-retirement checks, including the IRQ fixture's
+free-running-timer slots. Two harness triggers that assumed the one-token
+core's timing changed:
+- **Thumb IRQ fixture:** its BL split now uses `--irq-before` (above).
+- **Witness RTL harness:** it took the requesting instruction's PC from
+  `BOOT_ADDR`, which now shows the fetch-ahead PC. It now takes that PC from
+  the retire stream.
+
+`run.sh --soc 10` now displays buffers 0..8 in its 10 frames (staged 0..3).
+Its polling loops run at CPU speed, and every acceptance check passes.
+The staged restructure added [`hs_arm9_banks.S`](../sim/tests/hs_arm9_banks.S)
+(14 words: both SPSRs and all three R13/R14 banks live at once, RRX
+carry-out from bit 0, matched by the product `nds_cpu9`) after two of 16
+banking, writeback and flag mutants survived the earlier fixtures; all 16
+fail the pure fixtures.
+
+`sim/run_clash_arm9_pipediff.sh` is the randomized differential gate
+([`Arm9PipeDiff.hs`](test/Arm9PipeDiff.hs)). It runs the pipelined
+`sliceStep` against the frozen staged step
+([`Arm9SliceStaged.hs`](test/Arm9SliceStaged.hs), commit fbb32bd, whose link
+spans track the product's) on seeded boot-ROM programs. The programs mix:
+- every data-processing and shift form, with conditions and flag writes;
+- multiplies, CLZ, MRS/MSR (flags, mode switches, SPSR write then read);
+- loads and stores in every addressing form, LDM/STM, link transfers and
+  loads to PC;
+- branches over blocks, BX/BLX into Thumb blocks with Thumb BL/BLX pairs;
+- SWI from both states, with SUBS/MOVS or LDM^ exception returns;
+- local-RAM code whose STR, STM beat or Thumb STRH rewrites the next one to
+  three instructions;
+- trampolines in the last ROM and RAM words, whose prefetch runs off the
+  end (a wrong-path fetch fault that must not fault);
+- in some seeds, a real-path fault: misaligned or unrouted target,
+  undefined instruction, link reply error.
+
+Both cores see random link stalls. On the pipelined core the IRQ line
+rises at random cycles, and in half the seeds at every Thumb BL/BLX prefix
+retire. Every entry must be legal:
+- the line was high and CPSR.I clear in that cycle;
+- the line was never low at entry;
+- entry came within 200 cycles of the line being high and unmasked.
+
+The oracle then takes each IRQ at the same instruction boundary. Retire,
+store and link streams, IRQ boundaries and faults must match exactly.
+Memory stays bounded at about 2 MB peak.
+
+1,000 seeds pass: 478,810 instructions in 1,139,117 cycles, 34,356 of them
+retired from local RAM, 1,306 Thumb BL/BLX pairs, 2,351 IRQs (676 between
+BL halves; worst latency 48 cycles) and 151 seeds ending in a fault. The
+gate fails unless a batch has IRQs between BL halves and local-RAM code.
+
+Nine pipeline mutants each fail it (failing seeds out of 1,000):
+
+| Mutant | Failing seeds | Also killed by fixtures |
+| --- | ---: | --- |
+| wrong forwarding source (A forwarded on D's row) | 1,000 | all |
+| no flush after a branch | 1,000 | all |
+| no flush after an exception return (E2 and LDM^) | 856 | interwork, irq, thumb-irq |
+| store-into-fetched-code flush dropped | 815 | none |
+| IRQ taken after the interrupted instruction committed | 711 | irq, thumb-irq |
+| wrong-path fetch fault not flushed | 606 | none |
+| IRQ only with an empty pipe, starving behind committing instructions (caught by the latency bound) | 552 | irq, thumb-irq |
+| no load-use stall | 111 | isa, mem, thumb, interwork, irq, thumb-irq |
+| no flush after MSR | 55 | interwork, banks, irq |
+
+On the earlier design, an MSR flush only on mode changes survived
+everything: SPSR readers forward from the write bus. The flush on every
+MSR stays as specified.
 
 Yosys 0.71 generic counts of `nds_arm9_slice` (`hierarchy; proc; flatten;
 opt; memory -nomap; opt; techmap; opt -fast; abc; stat`, RAMs kept as
 memories): 49,746 cells before the Thumb/mode/multiply work, 99,644 after
-it and 30,239 after this restructure.
+it and 30,239 after the staged restructure (not re-counted for the
+pipeline).
 
-Cycles per retired instruction, from the pure model, counting each
-instruction from the previous retirement to its own. Rows cover the ISA,
+Cycles per retired instruction, from the pure model. Rows cover the ISA,
 memory, Thumb and interwork fixtures, the direct-boot card loader and
 `run.sh --soc 10`. Link costs include the harness targets' reply latency.
+Before and staged count each instruction from the previous retirement to
+its own, since one instruction was in flight. Pipelined charges each cycle
+to the oldest instruction in E2 or the mem stage. When both are empty
+(refill after a redirect, fetch stall), the cycle goes to the instruction
+that retired last, so a taken branch carries its refill and a load its
+load-use interlock. Averages are cycles over instructions in every column.
 
-| Class (ARM, fetched from the boot ROM unless noted) | Before | After | ARM946E-S, melonDS accounting, cached |
-| --- | ---: | ---: | ---: |
-| data processing, condition failed, branch not taken | 3 | 5 | 1 |
-| branch taken, data processing to PC | 3 | 5 | 5 |
-| multiply / long multiply | 3 / 3 | 6 / 7 | 2 |
-| SWI | 3 | 6 | 5 |
-| load from boot ROM | 4 | 7 | 3 |
-| load / store local RAM | 5 / 5 | 8.5 / 8.2 | 3 |
-| load I/O over the link | 5 | 8 | 8 |
-| store VRAM over the link | 5.5 | 8.3 | 10 |
-| LDM / STM, per beat | 5.0 / 5.3 | 5.9 / 6.4 | 1.7 / 1.8 |
-| Thumb data processing, BL prefix | 3 | 6 | 1 |
-| Thumb branch taken | 3 | 6 | 5 |
-| Thumb load / store local RAM | 5 | 9 | 3 |
-| any instruction fetched from local RAM instead | +2 | +2 | +0 |
-| **average, boot loader (15,023 instructions)** | **3.10** | **5.17** | **2.03** |
-| **average, native `--soc 10`** | **3.37** | **5.30** | **2.13** (after mix) |
+| Class (ARM, fetched from the boot ROM unless noted) | Before | Staged | Pipelined | ARM946E-S, melonDS accounting, cached |
+| --- | ---: | ---: | ---: | ---: |
+| data processing | 3 | 5 | 1.20 (1.00 on the boot loader) | 1 |
+| condition failed, branch not taken | 3 | 5 | 1.0 | 1 |
+| branch taken / data processing to PC | 3 | 5 | 4.0 / 4.25 | 5 |
+| multiply / long multiply | 3 / 3 | 6 / 7 | 2.5 / 3 | 2 |
+| SWI | 3 | 6 | 5 | 5 |
+| load from boot ROM | 4 | 7 | 4.0 | 3 |
+| load / store local RAM | 5 / 5 | 8.5 / 8.2 | 5.4 / 4.2 | 3 |
+| load I/O over the link | 5 | 8 | 5.0 | 8 |
+| store VRAM over the link | 5.5 | 8.3 | 5.0 | 10 |
+| LDM / STM, per beat | 5.0 / 5.3 | 5.9 / 6.4 | 4.9 / 4.8 | 1.7 / 1.8 |
+| Thumb data processing, BL prefix | 3 | 6 | 1.15 / 1.0 | 1 |
+| Thumb branch taken | 3 | 6 | 4.3 | 5 |
+| Thumb load / store local RAM | 5 | 9 | 4.7 / 4.0 | 3 |
+| any instruction fetched from local RAM instead | +2 | +2 | +0 | +0 |
+| **average, boot loader (15,023 instructions)** | **3.10** | **5.17** | **1.82** | **2.03** |
+| **average, native `--soc 10`** | **3.37** | **5.30** | **2.11** | **2.61** (pipelined mix) |
 
 The ARM946E-S column assumes cached code and data, applying the rules of
 melonDS's `ARMv5` class:
@@ -491,8 +606,9 @@ melonDS's `ARMv5` class:
 - multiplies cost 1 + 1.
 
 Native's instruction mix depends on CPU speed, because the polling loops
-run fewer times on a slower core: 3.32 million instructions retire in the
-same 11.2 million cycles before, 2.12 million after.
+run more often on a faster core. In the same 11.2 million cycles, 3.32
+million instructions retire before, 2.12 million staged and 5.31 million
+pipelined. That accounting puts the three mixes at 3.02, 2.13 and 2.61.
 
 **How far from real time.** The boot loader's fixed work costs 30,469
 cycles under that accounting: 455 µs on a real DS ARM9 at 67.03 MHz.
@@ -500,19 +616,26 @@ cycles under that accounting: 455 µs on a real DS ARM9 at 67.03 MHz.
 | Core | Clock | Time | vs a real DS ARM9 |
 | --- | ---: | ---: | ---: |
 | Before | 33.51 MHz (fails 67.03) | 1,388 µs | 3.05× slower |
-| After | 67.03 MHz | 1,158 µs | 2.55× slower |
-| After | 33.51 MHz | 2,317 µs | 5.10× slower |
+| Staged | 67.03 MHz | 1,158 µs | 2.55× slower |
+| Staged | 33.51 MHz | 2,317 µs | 5.10× slower |
+| Pipelined | 67.03 MHz | 408 µs | 0.90× (on par) |
+| Pipelined | 33.51 MHz | 817 µs | 1.80× slower |
 
-A data-processing instruction takes 5 cycles against the real core's 1, so
-an ALU-bound loop is 5× slower at the same clock. Overlapping the stages
-(above) is what closes that gap.
+The pipelined core is on par with that estimate rather than truly faster.
+On the boot work, its taken branches cost 4 against the estimate's 5 and
+its link I/O loads 5 against the DS bus's 8. Together these outweigh its
+boot-ROM loads (4 against cached 3). The estimate is an accounting, not a
+measured DS. Data processing and not-taken branches now take 1 cycle from
+the boot ROM, as on the real core. A taken branch costs 4, the refill
+through fetch, decode, E1 and E2.
 
 Heap caps: every ARM9 and graphics runner compiles with `+RTS -M3g` and
-links its checkers with `-with-rtsopts=-M3g`. `GfxSliceCheck` now forces its
-per-tick state and log lines (strictness only). Unforced, it ran out of a
-3 GB heap even on the earlier slice. Forced, its peak residency is 126 MB,
-and its logs, frame and PPM are byte-identical between the earlier and the
-restructured slice.
+links its checkers with `-with-rtsopts=-M3g`. `tools/hs_native_slice/run.sh`
+(not an ARM9 runner) has no cap; its `--soc 10` evidence above comes from
+running it through a local `stack` wrapper that adds the same flags.
+`GfxSliceCheck` forces its per-tick state and log lines (strictness only).
+Unforced, it ran out of a 3 GB heap even on the earlier slice; forced, its
+peak residency was 126 MB.
 
 ## 3D inversion
 

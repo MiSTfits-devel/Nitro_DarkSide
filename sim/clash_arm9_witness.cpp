@@ -42,9 +42,9 @@ int main(int argc, char **argv) {
     top.eval(); clock(top); clock(top); top.RST = 0; top.eval();
     arm9_gpu_start();
     bool pending = false, pendingWrite = false, resetDone = false;
-    uint32_t reply = 0, requestPc = 0, requestOpcode = 0;
+    uint32_t reply = 0, requestPc = 0, requestOpcode = 0, lastRetirePc = 0;
     unsigned stores = 0, requests = 0, offerCycles = 0, replyCycles = 0;
-    bool held = false, awaitingRetire = false;
+    bool held = false, awaitingRetire = false, sawRetire = false;
     uint32_t held_addr = 0, held_data = 0;
     unsigned held_width = 0, held_lanes = 0, held_write = 0;
     for (int tick = 0; tick < 10000; ++tick) {
@@ -67,6 +67,10 @@ int main(int argc, char **argv) {
                     "GPU instruction did not retire exactly once after its reply");
             awaitingRetire = false;
         }
+        if (top.RETIRE_VALID) {
+            lastRetirePc = top.RETIRE_PC;
+            sawRetire = true;
+        }
         if (held)
             require(top.GPU_REQ_VALID && top.GPU_REQ_ADDR == held_addr && top.GPU_REQ_DATA == held_data &&
                     top.GPU_REQ_WIDTH == held_width && top.GPU_REQ_LANES == held_lanes &&
@@ -77,7 +81,10 @@ int main(int argc, char **argv) {
             held_width = top.GPU_REQ_WIDTH; held_lanes = top.GPU_REQ_LANES; held_write = top.GPU_REQ_WRITE;
         }
         if (top.GPU_REQ_VALID && offerCycles == 0) {
-            requestPc = top.BOOT_ADDR;
+            // This assembled witness is straight-line until its terminal
+            // branch. BOOT_ADDR may be a speculative fetch, not this PC.
+            require(sawRetire, "GPU request before preceding instruction retired");
+            requestPc = lastRetirePc + 4;
             require(requestPc >= 0xffff0000u && !(requestPc & 3) &&
                     (requestPc - 0xffff0000u) / 4 < rom.size(), "invalid request PC");
             requestOpcode = rom[(requestPc - 0xffff0000u) / 4];
@@ -95,7 +102,7 @@ int main(int argc, char **argv) {
                     !top.RETIRE_VALID && !top.STORE_VALID, "outputs active during reset");
             clock(top); clock(top);
             arm9_gpu_reset();
-            pending = held = awaitingRetire = false;
+            pending = held = awaitingRetire = sawRetire = false;
             offerCycles = replyCycles = stores = requests = 0;
             top.RST = 0;
             top.eval();

@@ -157,7 +157,7 @@ runOracle gpu rom opLimit = go 0 initialSlice Nothing [] 0
               w = fromIntegral (gpuReqWidth out) :: Int
               v = word (gpuReqData out)
               writing = gpuReqWrite out
-              memOp = a `shiftR` 24 == 6
+              memOp = a `shiftR` 24 `elem` [5, 6, 7]   -- palettes, VRAM, OAM
               op = if memOp then (if writing then 4 else 3) else (if writing then 2 else 1)
           r <- call gpu True [op, fromIntegral tick, 0, fromIntegral a, fromIntegral w, if writing then fromIntegral v else 0]
           let result = fromIntegral (r !! 2) :: Word32

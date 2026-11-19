@@ -69,11 +69,15 @@ faults hs_arm9_interwork interwork- 38 NEG_MRS_SPSR_USER:1 NEG_MOVS_PC_USER:1 NE
 build_rom banks hs_arm9_banks
 echo "banks hs_arm9_banks --scratch 30" >>"$out/cpu-cases"
 
-# Arm9Soc case: the harness raises IF bit 1 when the BL prefix retires.
+# Arm9Soc case: the harness raises IF bit 1 so that the line is first high
+# when the BL suffix (the second halfword of the Thumb BL at bl_prefix) is
+# the oldest uncommitted instruction; the checkers place this from the
+# core's retire stream (see --irq-before in clash/test/Arm9IrqCheck.hs).
 build_rom thumb-irq hs_arm9_thumb_irq
 build_rom thumb-irq-product hs_arm9_thumb_irq --defsym PRODUCT_ORACLE=1
 bl_prefix=$(symbol thumb-irq bl_prefix)
-irq_args="--retire-irq $bl_prefix 2"
+bl_suffix=$(printf '%08x' $((16#$bl_prefix + 2)))
+irq_args="--irq-before $bl_suffix 2"
 
 run_cpu() {
     local runner=$1 name source extra
