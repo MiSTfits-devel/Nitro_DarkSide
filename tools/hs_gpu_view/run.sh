@@ -35,6 +35,8 @@ fi
 if [ "$mode" = closed-loop ]; then
     service=${HS_GPU_LIBRARY:-$out/hs-gpu-$$.dylib}
     if [ -z "${HS_GPU_LIBRARY:-}" ]; then
+        # This launch's private library; nothing else may map it after exit.
+        trap 'rm -f "$service"' EXIT
         # A distinct output inode per launch: never overwrite a mapped dylib.
         (cd "$repo/clash" && stack --resolver lts-22.43 ghc -- -O2 -dynamic \
             -shared -fPIC -flink-rts -threaded -no-hs-main -isrc -itest \

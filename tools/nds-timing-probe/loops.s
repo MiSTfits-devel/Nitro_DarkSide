@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Identical ARM-state instruction sequences, linked into separate regions. */
 .syntax unified
 .arm

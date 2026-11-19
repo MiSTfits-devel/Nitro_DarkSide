@@ -715,12 +715,6 @@ int main(int argc, char** argv)
         }
         else
             getFramebuffers(nds.GPU, top, bot);
-        // --no-text-dump: no text frame dump is produced at all (the dump path
-        // positionals are ignored), so the 98k-line hex formatting is skipped.
-        if (!noTextDump)
-        {
-            fprintf(d, "frame %d\n", n);
-        }
         if (clockLog)
         {
             const unsigned long long a9 = nds.ARM9Timestamp >> nds.ARM9ClockShift;
@@ -733,9 +727,14 @@ int main(int argc, char** argv)
                     frameMs, nowMs, liveInput.seq, liveInput.acked, ackWallMs);
             fflush(clockLog);
         }
+        // --no-text-dump: no text frame dump is produced at all (the dump path
+        // positionals are ignored), so the 98k-line hex formatting is skipped.
         if (!noTextDump)
+        {
+            fprintf(d, "frame %d\n", n);
             for (int i = 0; i < 256 * 192; i++)
                 fprintf(d, "%08x\n", top[i]);
+        }
         if (db)
         {
             fprintf(db, "frame %d\n", n);
@@ -823,7 +822,7 @@ int main(int argc, char** argv)
             }
             printf("hs-profile estimated time inside device calls: %.1f ms\n", totalMs);
         }
-        printf("dumped %d frames to %s\n", frames, dumppath);
+        if (!noTextDump) printf("dumped %d frames to %s\n", frames, dumppath);
         return nds.HsGpuFailed() ? 4 : 0;
     }
 
@@ -913,6 +912,6 @@ int main(int argc, char** argv)
 #ifndef NDS4MISTER_VENDORED_FORK
     if (irq7census > 0) printIrq7Census(frames);
 #endif
-    printf("dumped %d frames to %s\n", frames, dumppath);
+    if (!noTextDump) printf("dumped %d frames to %s\n", frames, dumppath);
     return 0;
 }

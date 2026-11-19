@@ -89,6 +89,9 @@ work/
 __pycache__/
 *.pyc
 
+# Locally built ARM9 timing probe; the .nds is already covered by *.nds.
+tools/nds-timing-probe/*.elf
+
 # Reproducible project-owned movie hooks; source and build script are tracked.
 /tools/standalone_host/fmv/guest/*.bin
 

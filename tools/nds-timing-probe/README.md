@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # ARM9 timing cartridge
 
 This is a standalone DS-mode homebrew ROM, built from these sources with devkitPro's open-source libnds and Calico ARM7 runtime; it requires no BIOS, firmware, retail ROM, or other proprietary inputs to build. It does not write to the card or console. Use a DS flashcart such as an R4 on DS, or your usual CFW homebrew launcher on DSi. Copy `nds-timing-probe.nds` to the SD card, launch it as **DS/DSi-compatible homebrew in DS mode**, and photograph the complete results screen. Include which console model was used. Repeat on both consoles; START takes another set. Power off or use your launcher's normal exit when finished.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /*
     NDS4MiSTer closed-loop Haskell GPU transport.
 
