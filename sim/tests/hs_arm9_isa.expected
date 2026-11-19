@@ -1,0 +1,54 @@
+000056aa  # 0  cond pass mask, NZCV=0000 (bit k = condition k, EQ..AL)
+00006a6a  # 1  NZCV=0001
+000055a6  # 2  NZCV=0010
+00006966  # 3  NZCV=0011
+000066a9  # 4  NZCV=0100
+00006a69  # 5  NZCV=0101
+000066a5  # 6  NZCV=0110
+00006a65  # 7  NZCV=0111
+00006a9a  # 8  NZCV=1000
+0000565a  # 9  NZCV=1001
+00006996  # 10 NZCV=1010
+00005556  # 11 NZCV=1011
+00006a99  # 12 NZCV=1100
+00006659  # 13 NZCV=1101
+00006a95  # 14 NZCV=1110
+00006655  # 15 NZCV=1111
+80000000  # 16 adds 7fffffff+1            NZCV 1001
+00000000  # 17 adds ffffffff+1            0110
+ffffffff  # 18 subs 0-1                   1000
+7fffffff  # 19 subs 80000000-1            0011
+fffffffe  # 20 rsbs 3-5                   1000
+00000004  # 21 adcs 1+2+C(1), after adds  0000
+00000002  # 22 sbcs 5-2-!C(1), after subs 0010
+0000000d  # 23 rscs 10-3-!C(0)            0010
+96838022  # 24 NZCV history of 16..23
+00000002  # 25 movs 80000001 lsl #1       0010
+00000000  # 26 movs 80000001 lsr #32      0110
+ffffffff  # 27 movs 80000000 asr #32      1010
+c0000000  # 28 movs 80000001 rrx, C=1     1010
+78123456  # 29 movs 12345678 ror #8       0000
+12345678  # 30 movs lsl r=0, C kept (1)   0010
+00000000  # 31 movs 80000001 lsl r=32     0110
+00000000  # 32 movs 80000001 lsr r=33     0100
+26aa0264  # 33 NZCV history of 25..32
+ffffffff  # 34 movs 80000000 asr r=200    1010
+12345678  # 35 movs ror r=32              0000
+81234567  # 36 movs ror r=36              1010
+00000070  # 37 ands #f0 (unrotated imm keeps C); history also has movs #80000000
+a0aa2677  # 38 NZCV: asr200 ror32 ror36 movs#imm ands cmp cmn teq
+00000000  # 39 eors (after cmp 1,80000000 = 1001)  0101
+edcba987  # 40 mvns                       1001
+00345678  # 41 bics #ff000000 (rotated imm sets C) 0011
+92345678  # 42 orrs 80000001 lsl #31, C=bit1 1001
+00095939  # 43 NZCV history: cmp eors mvns bics orrs
+00000037  # 44 subs/bne loop 10..1
+00000085  # 45 lt hi taken, lo gt not; blt bhs ble taken, bgt not
+00000600  # 46 bl result 6 << 8 | (lr - ret_site)
+00000111  # 47 bl, blx eq-return (moveq pc,lr), blx bx-return
+00000012  # 48 add pc, pc, r0 lsl #2 jump table, case 2
+0000005a  # 49 failed predicates left r1 untouched
+cafef00d  # 50 streq taken
+cafef00d  # 51 ldreq taken, reads 50 back
+00000077  # 52 blne skipped: lr untouched
+40000000  # 53 skipped addsne/cmpne: flags still Z

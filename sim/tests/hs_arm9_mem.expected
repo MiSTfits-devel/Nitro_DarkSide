@@ -1,0 +1,46 @@
+00000020  # 0  post-index fill ends at &S[8]: (r0 - S) after eight STR [r0], #4
+eeeeeeee  # 1  LDR [r0, #-4]! = S[7] 88888888, then [r0, #-8]! = S[5] 66666666, summed
+00000014  # 2  base after both pre-index writebacks: &S[5] - S
+44444444  # 3  [r12, r2 lsl #2], r2 = 3: S[3]
+77777777  # 4  [&S[8], -r2 lsl #2], r2 = 2: S[6]
+33333333  # 5  [r12, 0x80000000 lsr #28] = +8: S[2]
+22222222  # 6  [&S[2], fffffff0 asr #2] = -4: S[1]
+77777777  # 7  [&S[6]+0x20000000, -(2 ror #4)]: S[6]
+55555555  # 8  [&S[4]-0x80000008, 0x10 rrx] with C=1 = +0x80000008: S[4]
+88888888  # 9  [r0], r2 lsl #2 (S[0]) + [r0, r2 lsl #2]! (S[6])
+00006614  # 10 [r0], -r2 then LDRB [r0], #-1 at &S[5]+1 = 66; (r0 - S) | 66 << 8
+00000020  # 11 base after STR [r0], r2 / [r0, r2]! / [r0, -r2 lsl #1]!: &S[8] - S
+ffffffff  # 12 S[8] = a5a5a5a5 xor 5a5a5a5a (LDMIA readback)
+a5a5a5a5  # 13 S[9] from STR [r0, #-4]
+5a5a5a5a  # 14 S[10] from STR [r0, r2]!
+02fe7f81  # 15 S[11] built by four STRB (post-index imm and register)
+ffffff81  # 16 LDRSB [r0]
+0000007f  # 17 LDRSB [r0, r2], r2 = 1
+000002fc  # 18 LDRSB [r0, #2]! (fffffffe) + LDRSH [r0] (000002fe)
+7f8102fe  # 19 LDRH [r0], #-2 (02fe) | LDRSH (7f81) << 16
+ffff8001  # 20 LDRSH [r0, #-2]! of STRH 8001
+7ffe8001  # 21 S[12] after two STRH
+80008001  # 22 LDRSH [r0, -r2]! (ffff8001) + S[13] = 80010000 after STRH [r0, #6]
+aaaaaaaa  # 23 LDMIA S[0..3] summed
+bbbbbbbb  # 24 LDMIB!/LDMDA agree (xor 0) + LDMDB! S[4] + S[5]
+00000010  # 25 LDMDB! writeback: &S[4] - S
+00000000  # 26 STMDB! from 0x02000100 and STMIA! {base} both end at &S[14]
+0000000a  # 27 S[8]  STMIA!  (eight-word LDMIA with base in list, then STMIA to the mailbox)
+0000000b  # 28 S[9]  STMIA!
+0000000e  # 29 S[10] STMDA
+0000000c  # 30 S[11] STMIB
+0000000d  # 31 S[12] STMIB (also the base register's loaded value)
+020000f4  # 32 S[13] STMIA r9!, {r9}: original base
+0000001f  # 33 S[14] STMDB!
+0000002f  # 34 S[15] STMDB!
+deadbeef  # 35 LDMIA from the boot ROM
+01234567  # 36
+89abcdef  # 37
+0000000f  # 38 recursive sum(5) with PUSH {r4, lr} / POP {r4, pc}
+00000040  # 39 stack pointer back at 0x02000100: sp - S
+00000007  # 40 STR lr, [sp, #-4]! / LDR pc, [sp], #4 return
+00000099  # 41 LDR pc from a ROM literal reached after_jump
+020000c0  # 42 condition-failed writebacks left r0 = S
+0000005a  # 43 condition-failed loads left r1
+400000d3  # 44 flags still Z only
+33333333  # 45 S[0] + S[1]: condition-failed stores wrote nothing
