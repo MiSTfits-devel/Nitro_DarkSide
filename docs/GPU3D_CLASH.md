@@ -15,7 +15,7 @@ exists.
 
 This tree is now the single canonical `Nds.Gpu3D` workstream. The complete 3D
 model, its melonDS oracles and its gates were imported from the sibling
-workstream `<local worktree>` at clean worktree commit
+workstream (a separate local `Nitro_DarkSide-clean` checkout) at clean worktree commit
 `20dca93808aa3cf13ef8356dd756829c44176f0e`. At import, this tree's
 2D/TARDIS modules (`Nds.Gpu2D.*`, `Nds.Gpu.Unified`) were preserved, as was
 the current-tree-only `Nds.Gpu3D.Budget`. Subsequent 2D, unified replay and
