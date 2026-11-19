@@ -68,7 +68,7 @@ target_include_directories(melonds_fwdump PRIVATE ${MELONDS_DIR}/src)
 target_link_libraries(melonds_fwdump PRIVATE core)
 
 # Two-CPU fixture under melonDS: second oracle for Nds.WholeCore.DualSoc
-# (sim/run_clash_dual_soc.sh, MELONDS_DUAL=1).
+# From the repo root: MELONDS_DUAL=sim/melonds_tracer/build-vendored/melonds_dual sim/run_clash_dual_soc.sh
 add_executable(melonds_dual main_dual.cpp Platform.cpp)
 target_compile_features(melonds_dual PRIVATE cxx_std_17)
 target_include_directories(melonds_dual PRIVATE ${MELONDS_DIR}/src)
