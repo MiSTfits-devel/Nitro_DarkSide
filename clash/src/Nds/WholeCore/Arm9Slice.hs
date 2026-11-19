@@ -217,7 +217,7 @@ data ShTok = ShTok
   , sD     :: Word            -- ^ store data or the SPSR of an exception return
   } deriving (Generic, NFDataX)
 
-data MPhase = MRoute | MBoot | MBiosProt | MLocal | MRam | MOffer | MAwait | MCheck | MBeat
+data MPhase = MRoute | MBoot | MBiosProt | MPostFlag | MLocal | MRam | MOffer | MAwait | MCheck | MBeat
   | MWriteBack | MRestore | MMulAcc | MMulHi | MSwiLink
   deriving (Eq, Generic, NFDataX)
 
@@ -240,6 +240,11 @@ data MemSt = MemSt
   , mulOp      :: Word          -- ^ multiply opcode (destinations, S, long)
   , mulProd    :: BitVector 64
   } deriving (Generic, NFDataX)
+
+-- Architectural R15 of the actual load/store instruction, not the fetch
+-- address or last retired PC. A held token retains its origin across stalls.
+memoryR15 :: MemSt -> Word
+memoryR15 m = tagPc (mTag m) + if tagThumb (mTag m) then 4 else 8
 
 data RetTok = RetTok { rTag :: Tag, rNext :: Word }
   deriving (Generic, NFDataX)
@@ -273,12 +278,13 @@ data Cpu = Cpu
   , mpu       :: M.Mpu
   , execPage  :: Maybe (BitVector 20, Bool, Bool) -- virtual page, user, executable
   , bios7Prot :: BitVector 16 -- ARM7 BIOSPROT: first nonzero write locks it until reset
+  , postFlag :: BitVector 2 -- native per-CPU latch; a guest branch/SWI does not reset it
   } deriving (Generic, NFDataX)
 
 -- | Reset: SVC mode, ARM state, IRQ and FIQ masked (CPSR 0x000000d3).
 initialCpu :: Arch -> Cpu
 initialCpu a = Cpu (Psr 0 True True False 0x13 0x2078) (Fetch (bootBase a) False Nothing False) Nothing Nothing
-  Nothing Nothing Nothing Nothing Nothing Nothing 0 0 M.resetMpu Nothing 0
+  Nothing Nothing Nothing Nothing Nothing Nothing 0 0 M.resetMpu Nothing 0 0
 
 -- | One cycle's effects besides the next CPU state. Each RAM has one write
 -- port; the register file has two read ports.
@@ -563,6 +569,12 @@ routeTo arch a
   | not (aligned a) = Left 2
   | inBoot arch addr && not (accessWrite a) = Right MBoot
   | nativeBios arch && not (armV5 arch) && addr == 0x04000308 && accessWidth a /= 1 = Right MBiosProt
+  | nativeBios arch && addr == 0x04000300 =
+      case accessWidth a of
+        1 -> Right MPostFlag
+        2 | armV5 arch || not (accessWrite a) || accessData a .&. 0xc000 == 0 -> Right MPostFlag
+        4 | armV5 arch && not (accessWrite a) -> Right MPostFlag
+        _ -> Left 3 -- not a POST access: e.g. combined ARM7 HALTCNT command
   | inRam arch addr = Right MLocal
   | fabricMap arch && ioMap arch == Arm7Map && (addr == 0x04000240 || addr == 0x04000241) &&
       accessWidth a == 1 && not (accessWrite a) = Right MLocal -- VRAMSTAT/WRAMSTAT byte reads
@@ -578,6 +590,7 @@ blockFault arch store addr = case routeTo arch (Access addr 4 store False 0 0) o
   Left code -> code
   Right MOffer -> 3
   Right MBiosProt -> 3
+  Right MPostFlag -> 3
   Right _ -> 0
 
 lowestReg :: BitVector 16 -> Index 16
@@ -1384,13 +1397,14 @@ data MemOut = MemOut
   , moReadB  :: Maybe Row
   } deriving (Generic, NFDataX)
 
-memStage :: Arch -> M.Mpu -> BitVector 16 -> SliceIn -> Word -> Word -> Word -> Psr -> MemSt -> MemOut
-memStage arch prot biosProt i ramWord portA portB s m = case mPhase m of
+memStage :: Arch -> M.Mpu -> BitVector 16 -> BitVector 2 -> SliceIn -> Word -> Word -> Word -> Psr -> MemSt -> MemOut
+memStage arch prot biosProt post i ramWord portA portB s m = case mPhase m of
   MRoute -> case protectedRoute acc of
     Left code -> faulted code (accessAddr acc)
     Right p -> stay m { mPhase = p }
   MBoot -> loaded
   MBiosProt -> if accessWrite acc then complete m else loaded
+  MPostFlag -> if accessWrite acc then complete m else loaded
   MLocal -> stay m { mPhase = MRam }
   MRam
     | accessWrite acc -> (complete m) { moStore = Just (accessAddr acc .&. 0xfffffffc, stored) }
@@ -1414,6 +1428,7 @@ memStage arch prot biosProt i ramWord portA portB s m = case mPhase m of
     in case protectedRoute beat of
          Left code -> faulted code (blockAddr m)
          Right MOffer -> faulted 3 (blockAddr m) -- no block transfer to IO in this core
+         Right MPostFlag -> faulted 3 (blockAddr m)
          Right p -> stay m { mPhase = p, pending = beat }
   MWriteBack -> (finish m { writeBack = False }) { moReg = Just (regRow (mode s) (wbReg m), wbValue m) }
   MRestore -> case setCpsr arch True portA s of
@@ -1453,11 +1468,12 @@ memStage arch prot biosProt i ramWord portA portB s m = case mPhase m of
   raw = case mPhase m of
     MBoot -> extract acc (if blockedBios then maxBound else bootWord i)
     MBiosProt -> zeroExtend biosProt
+    MPostFlag -> zeroExtend post
     MRam -> extract acc ramWord
     _ -> gpuReplyData i
   -- The data access belongs to the executing instruction, not the
   -- speculative fetch PC (which may already have left the BIOS).
-  instructionPc = tagPc (mTag m) + if tagThumb (mTag m) then 4 else 8
+  instructionPc = memoryR15 m
   blockedBios = nativeBios arch && not (armV5 arch) &&
     (instructionPc >= 0x4000 || (accessAddr acc < zeroExtend biosProt && instructionPc >= zeroExtend biosProt))
   masked = raw .&. widthMask (accessWidth acc)
@@ -1518,7 +1534,7 @@ transition arch s1 i ramWord portA portB
   seqNext tag = tagPc tag + stepOf (tagThumb tag)
 
   -- Mem stage: the oldest instruction in flight, if any.
-  mOut = fmap (memStage arch (mpu s) (bios7Prot s) i ramWord portA portB p) (mq s)
+  mOut = fmap (memStage arch (mpu s) (bios7Prot s) (postFlag s) i ramWord portA portB p) (mq s)
   pM = maybe p moPsr mOut
   mRet = mOut >>= moRetire
   mStore = mOut >>= moStore
@@ -1689,6 +1705,12 @@ transition arch s1 i ramWord portA portB
         Just m | nativeBios arch && not (armV5 arch) && mPhase m == MBiosProt && accessWrite (pending m) && bios7Prot s == 0 ->
           C.slice d15 d0 (accessData (pending m)) .&. 0xfffe
         _ -> bios7Prot s
+    , postFlag = case mq s of
+        Just m | nativeBios arch && mPhase m == MPostFlag && accessWrite (pending m) &&
+                 (armV5 arch || memoryR15 m < 0x4000) ->
+          let v=accessData (pending m)
+          in pack (armV5 arch && testBit v 1) ++# pack (testBit (postFlag s) 0 || testBit v 0)
+        _ -> postFlag s
     , storeObs = mStore
     }
 

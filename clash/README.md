@@ -1293,6 +1293,104 @@ were executing another delay. This is not a claim that the remaining
 guest trace matches or that the cart boots. ARM9 independently stops
 at the ITCM configuration write described above.
 
+### Native reset overlay: POSTFLG
+
+The frozen native-reset v1 socket first requests `04000300` after four
+ARM9 and five ARM7 retirements. This newer CPU-local overlay, not a change
+to the v1 evidence, implements [DS POSTFLG](https://problemkaputt.de/gbatek-ds-power-control.htm).
+Each CPU owns a separate latch: bit 0 is sticky until the console's
+hardware reset, bit 1 is ordinary R/W on ARM9 and always zero on ARM7.
+A guest jump to its reset vector or a software interrupt is *not* that
+hardware reset. A MiSTer reset which drives the core's reset input starts
+a fresh console epoch. No POST flag is seeded in the native socket.
+
+Both CPUs support byte reads/writes and aligned halfword reads at `0300`.
+Halfword stores update the low byte; an ARM7 halfword commanding the
+adjacent HALTCNT (`bits 15:14 != 0`) faults instead of claiming to halt,
+sleep or enter GBA mode. ARM9 also supports aligned word reads. Word
+writes and ARM7 word reads are not implemented POST accesses: they fault
+rather than treating other lanes as zero-valued devices. These cases are
+distinguished by the pinned [reference I/O handlers](https://github.com/SplashDev88/NDS4MiSTer/blob/edac8c91deea34cd1992eb11eb98877bfd42be8b/third_party/melonDS/src/NDS.cpp).
+ARM7 writes require the store token's architectural R15 to be below
+`4000` (ARM instruction PC+8, Thumb PC+4); an out-of-BIOS write of a
+supported width completes without changing the latch. The current fetch
+address, last retirement and SVC/User mode are not permission signals.
+
+`sim/run_clash_postflag.sh GENERATED_NATIVE_CPU_HDL` builds two public
+reset ROMs. The ARM7 guest executes its own WRAM stores in ARM and Thumb,
+redirects back into BIOS, and tests stores on either side of the R15
+boundary. ARM9 sets its flag and uses IPCSYNC to let ARM7 prove it still
+reads zero before its allowed write. Both take an SWI back through reset.
+Both reset epochs passed with 38 ARM9 and 78 ARM7 retirements each;
+205/209 master clocks were held, including 14/17 at the ARM7 BIOS edge.
+The separate unsupported-width/HALTCNT cases all trapped at `04000300`.
+
+**Actual no-cart checkpoint (v2 CPU socket only).** With locally supplied
+native BIOSes, the former POSTFLG stops now retire: ARM9 byte load at
+`ffff011c` (record 5), ARM7 byte load at `00002cdc` (record 6). ARM9
+matches all **14** retired PCs through `ffff0140`; the next guest word
+store from `ffff0144` targets card **ROMCTRL `040001a4`** at clock 53.
+No card command is acknowledged in this CPU-only run. ARM7 matches all
+**128** captured reference PCs and retires **17,733** instructions by the
+100,000-clock limit, last PC `0000120e`. Its later PCs have not been
+compared. Neither this nor the separate SPI gate demonstrates a booted
+menu or cartridge. Reproduce the private comparison with
+`sim/run_clash_native_reset.sh GENERATED_NATIVE_CPU_HDL --bios-bin BIOS9 BIOS7`,
+supplying `NATIVE_REF_BUILD` (instrumented melonDS build) and
+`NATIVE_FIRMWARE` (local read-only input) to enable the no-cart PC oracle.
+
+### Native ARM7 firmware SPI and keypad
+
+`Nds.WholeCore.SystemSpi` is the guest-side peripheral used by `BiosTileSoc`.
+Both CPUs see active-low KEYINPUT and their own KEYCNT. ARM7 also sees RCNT
+register storage, EXTKEYIN (X/Y, pen, lid), and SPICNT/SPIDATA at
+`040001c0/c2`. Completed bytes raise IF bit 23 when enabled; keypad and
+lid-open events use bits 12 and 22. Bytes take 64/128/256/512 ARM7 enables
+at the four baud settings. A backing-store miss can extend busy beyond
+that interval. MMIO replies remain valid until accepted.
+
+The three selects are power-management registers (including a shutdown
+request), firmware flash, and touchscreen/microphone ADC. Firmware `03`
+reads and `02`/`0a` byte programs use the 24-bit command address mirrored
+at 256 KiB. `06`/`04` set/clear write enable; `05` reads WEL and the cache's
+actual writeback-in-progress bit. Programs require WEL. Byte overwrite
+and sequential address progression follow the [v1.0.1 NTR SPI
+model](https://github.com/SplashDev88/NDS4MiSTer/blob/edac8c91deea34cd1992eb11eb98877bfd42be8b/rtl/nds_nitro_spi.vhd);
+this is not a general-purpose NOR controller with erase commands. `9f`
+returns the NTR JEDEC ID. Unsupported flash commands/device 3 fault;
+they do not report a successful write. A final program byte can release
+chip select on the same edge. The release cache waits for the write and
+keeps the sector dirty until the matching slot-1 commit.
+
+Touch samples are ADC-domain values, not raw cursor pixels: the hardware
+interpolates the supplied native settings endpoints, truncates towards
+zero, and clamps to 12 bits. At release it returns X=0, Y=`fff`. The
+native upload is profile index **6**; calibration is taken from the
+selected `0x70`-byte settings payload after the eight metadata bytes,
+not from direct-game personal-page index **7**. X endpoints use settings
+offsets `58/5e` (ADC) and `5c/62` (pixels); Y uses `5a/60` and `5d/63`.
+One restoring division step per master clock fits inside the fastest byte.
+The module does not select a user-settings copy, modify the original
+dump, or invent calibration when the endpoints are invalid.
+The frozen stock-compatible launcher still validates **identity** calibration
+only; independent non-identity conversions here are not a host capability
+or hardware-in-the-loop qualification.
+
+Run `sim/run_clash_system_spi.sh` for the isolated generated-hardware
+oracle. To also run `hs_system_spi_guest.S`, pass the root of a generated
+native `DualSoc` HDL tree as its only argument. This second gate wires the
+generated CPUs to the generated peripheral and the release
+`nds_firmware_cache` on separate clocks. A public ARM7 reset program
+issued **171 SPICNT polls**, changed byte `0321ab` to `9d`, observed WIP,
+waited for the matching slot-1 commit and reread its byte. It also
+acknowledged the real SPI interrupt, checked START/X/pen and calibrated
+X, and requested shutdown (678 ARM7 retirements, 4,323 master clocks
+including reset). The medium is a generated arithmetic pattern in
+simulation; the test verifies all 512 outgoing sector bytes. No BIOS,
+console firmware or cartridge is needed. This is neither an OS or
+commercial firmware boot, physical storage durability, nor a board
+timing/fit measurement.
+
 ### What separates this from booting a commercial game
 
 - **BIOS and KEY1.** No ARM9/ARM7 BIOS, no firmware boot, no KEY1/KEY2
