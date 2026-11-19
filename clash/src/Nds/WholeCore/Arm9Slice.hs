@@ -227,6 +227,7 @@ data MemSt = MemSt
   , mTag       :: Tag
   , mNext      :: Word          -- ^ next PC (a load to R15 replaces it)
   , pending    :: Access
+  , loadLane   :: BitVector 2   -- ^ native ARM946 single word load, original byte offset
   , blockLeft  :: BitVector 16  -- ^ LDM/STM registers still to transfer, current beat included
   , blockAddr  :: Word
   , blockStore :: Bool
@@ -1317,8 +1318,8 @@ aluStage arch protection s (ShTok d a b sc pass dv)
       CLinkOnly -> (s, write 14 result, Nothing, Nothing, ToRetire next)
       CSwi -> (s, Just (spsrRow 0x13, cpsrWord s), Nothing, Nothing, ToMem (mem MSwiLink))
       CSingle -> (s, Nothing, Nothing, Nothing, ToMem (mem MRoute)
-        { pending = Access (if preIndex then result else a) width (not load) signed rd
-                      (if load then 0 else dv .&. widthMask width)
+        { pending = Access busAddr width (not load) signed rd (if load then 0 else dv .&. widthMask width)
+        , loadLane = if nativeSingle && load && width == 4 then C.slice d1 d0 effective else 0
         , writeBack = baseWrite, wbReg = rn, wbValue = result })
       CBlock -> (s, Nothing, Nothing, Nothing, ToMem (mem MCheck)
         { blockLeft = regList, blockAddr = start, blockStore = not load
@@ -1341,6 +1342,14 @@ aluStage arch protection s (ShTok d a b sc pass dv)
   load = testBit op 20
   up = testBit op 23
   preIndex = testBit op 24
+  -- ARM946E-S c1[1] is reserved SBZ (DDI0201D table 2-9). Bus address
+  -- alignment never rounds the base/writeback value or rotates store data.
+  nativeSingle = nativeBios arch && armV5 arch
+  effective = if preIndex then result else a
+  busAddr | not nativeSingle = effective
+          | width == 4 = effective .&. 0xfffffffc
+          | width == 2 = effective .&. 0xfffffffe
+          | otherwise = effective
   baseWrite = not preIndex || testBit op 21
   setFlags = testBit op 20
   testOp = C.slice d24 d23 op == 2
@@ -1377,7 +1386,7 @@ aluStage arch protection s (ShTok d a b sc pass dv)
           Nothing -> if dCls d == CBx then testBit target 0 else th
         target' = if dCls d == CBx then target .&. complement 1 else target
     in (s { thumb = t' }, if dLink d then write 14 link else Nothing, Nothing, Nothing, ToRetire target')
-  mem p = MemSt p tag next (Access 0 4 False False 0 0) 0 0 False 0 0 False 0 0 False False op 0
+  mem p = MemSt p tag next (Access 0 4 False False 0 0) 0 0 0 False 0 0 False 0 0 False False op 0
   -- One 33x33 multiplier: operands sign-extended for SMULL/SMLAL.
   longForm = testBit op 23
   operand v = unpack ((if longForm && testBit op 22 then pack (msb v) else 0) ++# v) :: Signed 33
@@ -1478,6 +1487,8 @@ memStage arch prot biosProt post i ramWord portA portB s m = case mPhase m of
     (instructionPc >= 0x4000 || (accessAddr acc < zeroExtend biosProt && instructionPc >= zeroExtend biosProt))
   masked = raw .&. widthMask (accessWidth acc)
   value
+    | nativeBios arch && armV5 arch && accessWidth acc == 4 =
+        rotateR raw (fromIntegral (loadLane m ++# (0 :: BitVector 3)))
     | not (accessSigned acc) = masked
     | accessWidth acc == 1 = pack (resize (unpack (C.slice d7 d0 masked) :: Signed 8) :: Signed 32)
     | otherwise = pack (resize (unpack (C.slice d15 d0 masked) :: Signed 16) :: Signed 32)

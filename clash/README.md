@@ -1391,6 +1391,35 @@ console firmware or cartridge is needed. This is neither an OS or
 commercial firmware boot, physical storage durability, nor a board
 timing/fit measurement.
 
+### Native ARM946 single-transfer alignment
+
+Native ARM9 performs a misaligned word LDR as **one aligned transfer**
+followed by `ROR(8 × original_byte_lane)`; STR sends the unrotated word to
+the aligned address. Halfword LDRH/LDRSH/STRH drop address bit 0; LDRSH
+sign-extends the aligned halfword. Byte operations still use their original
+address. Pre/post-index register writeback uses the effective calculation,
+not the rounded bus address. This applies before routing to BIOS, RAM or
+MMIO, not as a special case for a cartridge address. See [DS memory
+alignments](https://www.problemkaputt.de/gbatek-arm-cpu-memory-alignments.htm).
+On **ARM946E-S**, c1 bit 1 is reserved SBZ, not a guest-writable alignment
+switch ([ARM DDI0201D, Table 2-9](https://documentation-service.arm.com/static/5e8e3ee588295d1e18d3aa82)).
+ARM7 and multi-register/doubleword semantics are not implemented by this change.
+
+`sim/run_clash_native_alignment.sh GENERATED_NATIVE_CPU_HDL` runs public ARM
+and Thumb guest code against a registered BIOS and a stalled byte-array MMIO
+responder. It checks all original word lanes, odd signed/unsigned halfwords,
+word/halfword/byte lanes and data, base writeback, and the CP15 SBZ readback.
+The previous POSTFLG netlist faults on the first odd public load at
+`ffff00f5`; the native alignment netlist passes (66 retirements, eight
+independently checked external transfers).
+
+In the separate no-cart native socket with generated `CardNative`, the
+former failing STR at `ffff0148` (effective `040001a1`) issues one word
+transfer at `040001a0` after ROMCTRL. The first **128 PCs on each CPU**
+matched the local reference. At the **100,000-clock** bound ARM9/ARM7 had
+retired **22,225 / 17,733** instructions with no fault or unserved request.
+No comparison beyond those prefixes or firmware menu boot is claimed.
+
 ### What separates this from booting a commercial game
 
 - **BIOS and KEY1.** No ARM9/ARM7 BIOS, no firmware boot, no KEY1/KEY2
@@ -1409,8 +1438,9 @@ timing/fit measurement.
 - **RTC.** No real-time clock.
 - **Input, display.** No KEYINPUT/EXTKEYIN and no DS LCD schedule in this
   system (the GPU rows above are separate gates).
-- **Unaligned accesses on both CPUs.** These fail closed with fault 2. On
-  hardware an unaligned LDR returns the aligned word rotated right by
+- **Legacy unaligned accesses.** The legacy CPU configurations fail closed
+  with fault 2; see the separate native ARM9 singles gate. On hardware
+  an unaligned LDR returns the aligned word rotated right by
   8 × (address & 3), and STR, STRH, LDM and STM ignore the low address
   bits. An unaligned LDRH is force-aligned on the ARM9 but rotated on the
   ARM7, and the ARM7's LDRSH at an odd address acts as LDRSB. Code written
