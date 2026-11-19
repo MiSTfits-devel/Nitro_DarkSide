@@ -14,7 +14,8 @@ module memory_fabric_gate(input CLK, RST, CV, ARM7, WR, input [31:0] ADDR,
     wire [12:0] a;
     wire [1:0] ba;
     wire ck,cke,cs,we,ras,cas,dqmh,dqml;
-    nds_clash_sdram sd(.clk(CLK), .rst(RST), .sd_req(SREQ), .sd_write(SWRITE),
+    // This gate exercises power reset only; soft holds have a separate pin gate.
+    nds_clash_sdram sd(.clk(CLK), .init(RST), .rst(RST), .client_reset(), .sd_req(SREQ), .sd_write(SWRITE),
         .sd_half_addr(SADDR), .sd_lanes(SBE), .sd_data(SDATA), .sd_done(DONE), .sd_read_data(Q),
         .SDRAM_DQ(dq), .SDRAM_A(a), .SDRAM_BA(ba), .SDRAM_CLK(ck), .SDRAM_CKE(cke),
         .SDRAM_nCS(cs), .SDRAM_nWE(we), .SDRAM_nRAS(ras), .SDRAM_nCAS(cas),

@@ -42,7 +42,7 @@
 -- (ARM9 IF bit 19). Cart-bus timing (gap1/gap2, clock rate) is not modelled.
 module Nds.WholeCore.Card
   ( CardIn(..), CardBus(..), CardReply(..), CardOut(..), CardState
-  , noCartridge, initialCard, cardStep, cardOwns
+  , noCartridge, initialCard, cardStep, cardStepNative, cardOwns, cardSpiControl
   ) where
 
 import Prelude ()
@@ -89,7 +89,7 @@ data CardOut = CardOut
   , cardBusy        :: Bool
   } deriving (Eq, Show, Generic, NFDataX)
 
-data Source = Ones | Chip | Rom
+data Source = Ones | Zero | Chip | Rom
   deriving (Eq, Generic, NFDataX)
 
 data CardState = CardState
@@ -121,7 +121,17 @@ cardOwns a = (a >= 0x040001a0 && a < 0x040001a2) || (a >= 0x040001a4 && a < 0x04
   || (a >= 0x04100010 && a < 0x04100014)
 
 cardStep :: CardState -> (CardBus, CardIn) -> (CardState, (CardReply, CardOut))
-cardStep s (b, i) = (if started s then s' else powerUp, (replyOut, out))
+cardStep = cardStepWith False True False
+
+-- | Native slot interface. An unselected CPU can still operate its own
+-- controller, but receives ones; an empty powered DS slot receives zeroes.
+-- These are disconnected-bus responses, not successful authentication.
+-- The legacy 'cardStep' retains its original fail-closed fixture contract.
+cardStepNative :: Bool -> Bool -> CardState -> (CardBus, CardIn) -> (CardState, (CardReply, CardOut))
+cardStepNative = cardStepWith True
+
+cardStepWith :: Bool -> Bool -> Bool -> CardState -> (CardBus, CardIn) -> (CardState, (CardReply, CardOut))
+cardStepWith native selected spiBusy s (b, i) = (if started s then s' else powerUp, (replyOut, out))
  where
   powerUp = initialCard
     { started = True, dataMode = cardDirectBoot i
@@ -143,7 +153,7 @@ cardStep s (b, i) = (if started s then s' else powerUp, (replyOut, out))
   synth = busy s && source s /= Rom && toFetch s /= 0 && count s < 2
   pushVal
     | arrived = Just (cardRomReplyData i)
-    | synth = Just (if source s == Chip then cardChipId i else 0xffffffff)
+    | synth = Just (case source s of Chip -> cardChipId i; Zero -> 0; _ -> 0xffffffff)
     | otherwise = Nothing
 
   -- CPU access: lanes and positioned data.
@@ -165,7 +175,7 @@ cardStep s (b, i) = (if started s then s' else powerUp, (replyOut, out))
   isCmd = addr >= 0x040001a8 && addr < 0x040001b0
   isData = addr >= 0x04100010 && addr < 0x04100014
 
-  spiView = zeroExtend (spiCnt s) :: Word
+  spiView = zeroExtend (if spiBusy then setBit (spiCnt s) 7 else spiCnt s) :: Word
   ctrlView = romCnt s .|. (if busy s then 0x80000000 else 0) .|. (if count s /= 0 then 0x00800000 else 0)
   spiMask = resize laneMask :: BitVector 16
   spiData = resize laneData :: BitVector 16
@@ -190,15 +200,19 @@ cardStep s (b, i) = (if started s then s' else powerUp, (replyOut, out))
   b7Addr = redirected .&. cardRomMask i
   aligned = slice d1 d0 cmdAddr == 0
   decoded :: Maybe (Source, Word, BitVector 12)
-  decoded = case (dataMode s, c !! (0 :: Int)) of
-    (False, 0x9f) -> Just (Ones, 0, 0)
-    (False, 0x00) | aligned -> Just (Rom, 0, slice d11 d0 cmdAddr)
-    (False, 0x90) -> Just (Chip, 0, 0)
-    (True, 0xb7) | aligned -> Just (Rom, b7Addr .&. complement 0xfff, slice d11 d0 b7Addr)
-    (True, 0xb8) -> Just (Chip, 0, 0)
-    _ -> Nothing
-  startable = cardInserted i && testBit (spiCnt s) 15 && not (testBit (spiCnt s) 13)
-    && not (testBit ctrlStored 30) && testBit ctrlStored 29 && decoded /= Nothing
+  disconnected = native && (not (cardInserted i) || not selected)
+  decoded
+    | disconnected = Just (if cardInserted i then Ones else Zero, 0, 0)
+    | otherwise = case (dataMode s, c !! (0 :: Int)) of
+        (False, 0x9f) -> Just (Ones, 0, 0)
+        (False, 0x00) | aligned -> Just (Rom, 0, slice d11 d0 cmdAddr)
+        (False, 0x90) -> Just (Chip, 0, 0)
+        (True, 0xb7) | aligned -> Just (Rom, b7Addr .&. complement 0xfff, slice d11 d0 b7Addr)
+        (True, 0xb8) -> Just (Chip, 0, 0)
+        _ -> Nothing
+  startable = (disconnected || cardInserted i && testBit ctrlStored 29)
+    && testBit (spiCnt s) 15 && not (testBit (spiCnt s) 13)
+    && not (testBit ctrlStored 30) && decoded /= Nothing
 
   -- Outcome of an accepted access: reply (value, fault) and register updates.
   popping = accept && isData && not writing && width == 4 && count s /= 0
@@ -236,3 +250,7 @@ cardStep s (b, i) = (if started s then s' else powerUp, (replyOut, out))
     Just (src, base, off) -> run
       { busy = True, source = src, page = base, offset = off
       , toFetch = wordsFor, toPop = wordsFor, count = 0, inflight = False }
+
+-- | The controller's stored AUXSPICNT bits (busy is supplied separately).
+cardSpiControl :: CardState -> BitVector 16
+cardSpiControl = spiCnt

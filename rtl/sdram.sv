@@ -28,7 +28,11 @@ module sdram
 
 	// Number of clk cycles before refresh is due; the original 3x/4x
 	// platform defaults are unchanged. Lower this for slower controllers.
-	parameter integer REFRESH_CYCLES = 750
+	parameter integer REFRESH_CYCLES = 750,
+
+	// Sample the returning DQ on clk's falling edge (the previous SDRAM
+	// beat is still valid). Only the 67 MHz Clash board adapter opts in.
+	parameter bit DQ_CAPTURE_NEGEDGE = 1'b0
 )
 (
 	input             init,
@@ -105,6 +109,13 @@ reg        chip = 1'b1;
 reg        refresh_due = 0;
 
 reg [15:0] dq_reg;
+generate
+	if (DQ_CAPTURE_NEGEDGE) begin : g_capture_falling
+		always @(negedge clk) dq_reg <= SDRAM_DQ;
+	end else begin : g_capture_rising
+		always @(posedge clk) dq_reg <= SDRAM_DQ;
+	end
+endgenerate
 reg [15:0] dq_p1, dq_p2, dq_p3;
 
 wire [15:0] dqu1 = DQ_PIPE ? dq_p1 : dq_reg;
@@ -229,7 +240,6 @@ always @(posedge clk) begin
 	data_ready_delay2 <= data_ready_delay2>>1;
 	data_ready_delay3 <= data_ready_delay3>>1;
 
-	dq_reg <= SDRAM_DQ;
 	dq_p1  <= dq_reg;
 	dq_p2  <= dq_reg;
 	dq_p3  <= dq_reg;
@@ -393,6 +403,11 @@ always @(posedge clk) begin
 		state <= STATE_STARTUP;
 		refresh_count <= startup_refresh_max - sdram_startup_cycles;
 		refresh_due   <= 0;
+		// A latched request otherwise holds an unknown (or pre-reset)
+		// value until its own channel gets a grant. In particular ch1
+		// would block ch2 indefinitely on a ch2-only cold start.
+		{ch1_rq, ch2_rq, ch3_rq} <= 0;
+		{pre_ch1, pre_ch2, pre_ch3} <= 0;
 	end
 
    if (ch2_cancel) begin

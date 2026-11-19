@@ -57,6 +57,8 @@ module Nds.WholeCore.TileSoc
   , socInFrom
   , topOf
   , TopOut (..)
+  , tileDisplay
+  , displayControl
   , tileSoc
   , tileSocTopEntity
   ) where
@@ -152,6 +154,9 @@ data GpuOut = GpuOut
   , goFault :: !(BitVector 16)
   , goVc    :: !(Unsigned 9)
   , goH     :: !(Unsigned 12)
+  , goMemHold :: !Bool -- ^ do not start a CPU VRAM or bank-map mutation
+  , goEngine :: !Bit   -- ^ logical engine issuing the current tile reads
+  , goLineMiss, goLateBg, goBlackLine, goFlush, goJobsBusy :: !Bool
   } deriving (Generic, NFDataX)
 
 ------------------------------------------------------------------------------
@@ -205,6 +210,8 @@ data Ctl = Ctl
   , cCnt     :: !(Vec 9 Byte)   -- ^ VRAMCNT_A..I
   , cScreens :: !Bool           -- ^ POWCNT1 bit 0 at frame start
   , cH       :: !(Unsigned 12)
+  , cSlot    :: !(Unsigned 10)  -- ^ physical-memory top: no divider on scanout-to-RAM
+  , cThird   :: !(Unsigned 2)
   , cVc      :: !(Unsigned 9)
   , cPend    :: !(Vec 4 Bool)   -- ^ jobs to issue: BG A, BG B, OBJ A, OBJ B
   , cBgKind  :: !(Vec 2 JobKind) -- ^ JBg or JClear per engine
@@ -213,6 +220,7 @@ data Ctl = Ctl
   , cRun     :: !Bool           -- ^ an issued job is running
   , cRunEng  :: !Bit
   , cRunBg   :: !Bool           -- ^ ... and it emits pixels
+  , cDrain, cWarm :: !Bool -- ^ physical port: drain late jobs, scrub sprite halves, re-prime
   , cInfo    :: !(Vec 4 LineInfo)
   , cFault   :: !(BitVector 16)
   } deriving (Eq, Show, Generic, NFDataX)
@@ -239,7 +247,9 @@ initialGpu = Gpu
        , cEng = repeat (EngRegs 0 (repeat 0) (repeat 0) (repeat 0) 0 (repeat 0) 0 False)
        , cStat = 0, cMatch = False, cPower = 0, cCnt = repeat 0, cScreens = False
        , cH = 0, cVc = 0, cPend = repeat False, cBgKind = repeat JClear, cBgLine = 0, cObjLine = 0
+       , cSlot = 0, cThird = 0
        , cRun = False, cRunEng = 0, cRunBg = False
+       , cDrain=False, cWarm=False
        , cInfo = repeat (LineInfo (repeat CBlack) False), cFault = 0 })
   (Dp Nothing Nothing)
   (Outs (Video False False False False 0) Nothing)
@@ -404,7 +414,12 @@ irqSetOf c = (if vblankIrq then 1 else 0) .|. (if hblankIrq then 2 else 0) .|. (
 -- | One clock of the GPU target: next state and outputs. Reads of the
 -- RAM data refer to the addresses driven the cycle before.
 gpuStep :: Gpu -> GpuIn -> (Gpu, GpuOut)
-gpuStep g@(Gpu c d o) i = (Gpu c' d' o', out)
+gpuStep = gpuStepMode False
+
+-- Full-memory systems fetch through the physical VRAM fabric, not this
+-- demo's A-D windows and F-only OBJ palette. All other refusals still apply.
+gpuStepMode :: Bool -> Gpu -> GpuIn -> (Gpu, GpuOut)
+gpuStepMode external g@(Gpu c d o) i = (Gpu c' d' o', out)
   where
     link = cLink c
     tout = giTile i
@@ -427,6 +442,19 @@ gpuStep g@(Gpu c d o) i = (Gpu c' d' o', out)
 
     -- jobs ---------------------------------------------------------------
     busy = or (cPend c) || cRun c
+    -- A deadline is not a memory fault. Finish the in-flight group with
+    -- its original coordinates, black its late row and all skipped rows.
+    -- Then scrub both sprite halves via the tile's existing reset sweep;
+    -- the first renderable HBlank only primes next-line OBJ. This avoids
+    -- compositing stale sprites without clearing VRAM, palette or OAM.
+    miss = external && hblank && busy && not (cDrain c)
+    -- The group includes next-line OBJ work. If only that work is late
+    -- the previous line's two BG/composite buffers are already complete.
+    lateBg = miss && (cPend c !! (0::Int) || cPend c !! (1::Int) || (cRunBg c && cRun c && not (toReady tout)))
+    flush = external && cDrain c && not busy
+    prime = external && cWarm c && toReady tout && hblank
+    launch = hblank && (not external || (not busy && not (cDrain c) && (not (cWarm c) || prime)))
+    blackLine = external && hblank && drawsLine && (not launch || prime)
     engOn :: Bit -> Bool
     engOn e = testBit (cPower c) (if e == 0 then 1 else 9)
     -- issue the lowest pending job when the engine is idle
@@ -470,7 +498,7 @@ gpuStep g@(Gpu c d o) i = (Gpu c' d' o', out)
     reqAddr = maybe 0 rqAddr req
     reqMapped = bankMapped (cCnt c) reqBank
     reqInWindow = resize reqAddr < bankWords reqBank
-    reqOutside = isJust req && reqMapped && not reqInWindow
+    reqOutside = not external && isJust req && reqMapped && not reqInWindow
     resp = case dResp d of
       Just (b, zero) -> Just (if zero then 0 else pack (reverse (giVram i !! b)))
       Nothing -> Nothing
@@ -509,18 +537,21 @@ gpuStep g@(Gpu c d o) i = (Gpu c' d' o', out)
           _ -> CBlack
     drawFault e = cScreens c && engOn e && (modeOf e > 1 || (modeOf e == 1 && blankOf e))
     -- OBJ extended palettes: engine A needs bank F as its OBJ extended palette
-    extFault e = engOn e && testBit (erDisp (cEng c !! e)) 31 && objWill e
+    extFault e = not external && engOn e && testBit (erDisp (cEng c !! e)) 31 && objWill e
                  && (e == 1 || cCnt c !! (5 :: Int) /= 0x85)
     objWill e = let r = cEng c !! e in testBit (erHist r !! (0 :: Int) .&. erDisp r) 12
     drawsLine = vc < 192
     objLine = if vc < 191 then Just (resize vc + 1) else if vc == 262 then Just 0 else Nothing :: Maybe (Unsigned 8)
-    hbPend = (drawsLine && engOn 0) :> (drawsLine && engOn 1) :> (isJust objLine && engOn 0) :> (isJust objLine && engOn 1) :> Nil
+    hbPend = (drawsLine && not prime && engOn 0) :> (drawsLine && not prime && engOn 1)
+               :> (isJust objLine && engOn 0) :> (isJust objLine && engOn 1) :> Nil
     hbKind :: Bit -> JobKind
     hbKind e = case codeOf e of CNormal -> JBg; _ -> JClear
     hbInfo = LineInfo (codeOf 0 :> codeOf 1 :> Nil) (testBit (cPower c) 15)
+    blackInfo = LineInfo (repeat CBlack) False
+    infos = if lateBg && vc>0 && vc<=192 then replace (resize (cBgLine c) :: Unsigned 2) blackInfo (cInfo c) else cInfo c
     hbFault = (if drawsLine && (drawFault 0 || drawFault 1) then bit 1 else 0)
           .|. (if isJust objLine && (extFault 0 || extFault 1) then bit 2 else 0)
-          .|. (if busy then bit 4 else 0)
+          .|. (if not external && busy then bit 4 else 0)
 
     -- link ---------------------------------------------------------------
     a = lAddr link
@@ -533,7 +564,8 @@ gpuStep g@(Gpu c d o) i = (Gpu c' d' o', out)
       TBad -> False
       _ -> True
     -- a held write waits to start; the second half of a split word write never waits
-    holding = holdKind && not (lSub link) && (busy || (h >= fromIntegral hblankCycle - 2 && h <= fromIntegral hblankCycle))
+    memHold = busy || (h >= fromIntegral hblankCycle - 2 && h <= fromIntegral hblankCycle)
+    holding = holdKind && not (lSub link) && memHold
     executing = lPhase link == LExec && not holding
     halfData = if lSub link then slice d31 d16 (lData link) else slice d15 d0 (lData link)
     subAddr = if lSub link then a + 2 else a
@@ -642,7 +674,7 @@ gpuStep g@(Gpu c d o) i = (Gpu c' d' o', out)
     pend1 = case pendIx of
       Just k | issue -> replace k False (cPend c)
       _ -> cPend c
-    pend' = if hblank && not faulted then zipWith (||) pend1 hbPend else pend1
+    pend' = if launch && not faulted then zipWith (||) pend1 hbPend else pend1
     vc' = if h == fromIntegral (lineCycles - 1) then (if vc == fromIntegral (lineCount - 1) then 0 else vc + 1) else vc
     h' = if h == fromIntegral (lineCycles - 1) then 0 else h + 1
     tileFault = if toFault tout /= 0 then bit 0 else 0
@@ -656,15 +688,19 @@ gpuStep g@(Gpu c d o) i = (Gpu c' d' o', out)
       , cCnt = if commitOk && wr && isCnt tgt then cntNew else cCnt c
       , cScreens = if frameStart then testBit (cPower c) 0 else cScreens c
       , cH = h'
+      , cSlot = if h == fromIntegral (lineCycles - 1) then 0 else cSlot c + if cThird c==2 then 1 else 0
+      , cThird = if cThird c==2 then 0 else cThird c+1
       , cVc = vc'
       , cPend = pend'
-      , cBgKind = if hblank then hbKind 0 :> hbKind 1 :> Nil else cBgKind c
-      , cBgLine = if hblank then resize vc else cBgLine c
-      , cObjLine = if hblank then fromMaybe 0 objLine else cObjLine c
+      , cBgKind = if launch then hbKind 0 :> hbKind 1 :> Nil else cBgKind c
+      , cBgLine = if launch then resize vc else cBgLine c
+      , cObjLine = if launch then fromMaybe 0 objLine else cObjLine c
+      , cDrain = miss || (cDrain c && not flush)
+      , cWarm = flush || (cWarm c && not prime)
       , cRun = running'
       , cRunEng = runEng'
       , cRunBg = runBg'
-      , cInfo = if hblank && drawsLine then replace (resize vc :: Unsigned 2) hbInfo (cInfo c) else cInfo c
+      , cInfo = if hblank && drawsLine then replace (resize vc :: Unsigned 2) (if blackLine then blackInfo else hbInfo) infos else infos
       , cFault = cFault c .|. newFault }
 
     -- display line buffer: engine pixels of BG jobs; scanout reads
@@ -673,8 +709,8 @@ gpuStep g@(Gpu c d o) i = (Gpu c' d' o', out)
       _ -> Nothing
     -- scanout: slot p = h / 3; the RAM read for slot p is issued at h = 3p + 1
     -- and the video register loads at h = 3p + 2 (pixel enable visible at 3p + 3)
-    slotNext = (h + 1) `div` 3
-    issueRd = h `mod` 3 == 1
+    slotNext = if external then resize (cSlot c) else (h + 1) `div` 3
+    issueRd = if external then cThird c == 1 else h `mod` 3 == 1
     pictureVc = vc >= fromIntegral pictureLine0 && vc < fromIntegral pictureLine0 + 192
     py = resize (vc - fromIntegral pictureLine0) :: Unsigned 8
     active = slotNext >= fromIntegral activeSlot0 && slotNext < fromIntegral activeSlot0 + 512
@@ -713,7 +749,8 @@ gpuStep g@(Gpu c d o) i = (Gpu c' d' o', out)
       , goTxn = oTxn o
       , goFault = cFault c
       , goVc = vc
-      , goH = h }
+      , goH = h, goMemHold = memHold, goEngine = cRunEng c
+      , goLineMiss=miss, goLateBg=lateBg, goBlackLine=blackLine, goFlush=flush, goJobsBusy=busy }
 
 -- | A 16-bit palette word through the renderer's 6-bit line word to 8-bit
 -- RGB (as "Nds.Gpu2D.Line".@expandColor15@ then TraceRender's @expand@):
@@ -804,11 +841,18 @@ tileSoc
   -> Signal System Word -> Signal System TopOut
 tileSoc clk rst en bootIn = topOf <$> cpuOut <*> gpuOut
   where
-    gpuState = Gpu <$> reg gC <*> reg gD <*> reg gO
-    reg :: NFDataX a => (Gpu -> a) -> Signal System a
-    reg f = register clk rst en (f initialGpu) (f <$> gpu')
-    cpuOut = cpuPart clk rst en (socInFrom <$> bootIn <*> (gpuLinkOut <$> gpuState))
-    (gpu', gpuOut) = unbundle (gpuStep <$> gpuState <*> (GpuIn <$> cpuOut <*> tileOut <*> vramQ <*> dispQ))
+    cpuOut = cpuPart clk rst en (socInFrom <$> bootIn <*> link)
+    (link, gpuOut) = tileDisplay clk rst en cpuOut
+
+-- | The display target, one shared tile engine, VRAM and display-line RAM.
+-- Both SoCs use these same registers and memories. Link outputs depend only
+-- on the target register, not on the CPU bus driven back into it.
+tileDisplay
+  :: Clock System -> Reset System -> Enable System -> Signal System SocOut
+  -> (Signal System LinkOut, Signal System GpuOut)
+tileDisplay clk rst en cpuOut = (link, gpuOut)
+  where
+    (link, gpuOut) = displayControl False clk rst en cpuOut tileOut vramQ
     tileOut = tilePart clk rst en (goTile <$> gpuOut)
     -- sixteen 16-bit lane RAMs: banks A and C 4,096 words, B and D 512
     vram = goVram <$> gpuOut
@@ -822,6 +866,20 @@ tileSoc clk rst en bootIn = topOf <$> cpuOut <*> gpuOut
     bankQ b = bundle (lane b 0 :> lane b 1 :> lane b 2 :> lane b 3 :> Nil)
     smallQ b = bundle (smallLane b 0 :> smallLane b 1 :> smallLane b 2 :> smallLane b 3 :> Nil)
     vramQ = bundle (bankQ 0 :> smallQ 1 :> bankQ 2 :> smallQ 3 :> Nil)
+
+-- | Link, line scheduler and scanout; the full-memory variant supplies
+-- actual variable-latency tile responses outside this block. The display
+-- line buffer is local in either case (it stores completed colours).
+displayControl
+  :: Bool -> Clock System -> Reset System -> Enable System -> Signal System SocOut
+  -> Signal System TileOut -> Signal System VramQ -> (Signal System LinkOut, Signal System GpuOut)
+displayControl external clk rst en cpuOut tileOut vramQ = (gpuLinkOut <$> gpuState, gpuOut)
+  where
+    gpuState = Gpu <$> reg gC <*> reg gD <*> reg gO
+    reg :: NFDataX a => (Gpu -> a) -> Signal System a
+    reg f = register clk rst en (f initialGpu) (f <$> gpu')
+    step = if external then gpuStepMode True else gpuStep
+    (gpu', gpuOut) = unbundle (step <$> gpuState <*> (GpuIn <$> cpuOut <*> tileOut <*> vramQ <*> dispQ))
     dispQ = blockRam clk en (replicate (SNat @2048) 0) (goDispRd <$> gpuOut) (goDispWr <$> gpuOut)
 
 -- Separate Verilog modules for the parts (readable netlist, exact error

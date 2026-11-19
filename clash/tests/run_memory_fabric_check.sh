@@ -16,6 +16,10 @@ cd "$root/clash"
 GHCRTS=-M3g stack exec clash -- +RTS -M6g -RTS --verilog -isrc -fclash-no-escaped-identifiers \
     -outputdir "$out/obj" -fclash-hdldir "$out/hdl" test/MemoryFabricTop.hs
 cd "$root"
+iverilog -g2012 -s sdram_session_reset -I sim -o "$out/session_reset" \
+    rtl/nds_clash_sdram.sv rtl/sdram.sv sim/sdram_model.sv sim/altddio_out_stub.sv \
+    clash/tests/sdram_session_reset.sv
+vvp "$out/session_reset"
 verilator --cc --exe --build -j 2 -Wno-fatal --top-module memory_fabric_gate -I"$root/sim" --Mdir "$out/vobj" \
     -CFLAGS "-std=c++17 -fwrapv -I$root/third_party/melonDS/src -I$ref/melonds-core/src" \
     -LDFLAGS "$ref/CMakeFiles/nds_gx2d_bg_oracle.dir/Platform.cpp.o $ref/melonds-core/src/libcore.a $ref/melonds-core/src/teakra/src/libteakra.a" \

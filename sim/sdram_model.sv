@@ -17,7 +17,8 @@
 
 module sdram_model #(
 	parameter integer TRCD_CK = 2,   // required ACTIVE -> READ/WRITE gap, in chip clocks
-	parameter integer VERBOSE = 0
+	parameter integer VERBOSE = 0,
+	parameter integer DQ_RETURN_PS = 0 // total modeled launch-to-receiver delay
 )(
 	input             clk_pin,   // SDRAM_CLK, as the chip sees it
 	input             cke,
@@ -29,6 +30,8 @@ module sdram_model #(
 	input      [12:0] A,
 	inout      [15:0] DQ
 );
+	timeunit 1ps;
+	timeprecision 1ps;
 
 `include "sdram_pat.vh"
 
@@ -61,7 +64,13 @@ reg  [15:0] sd [0:NS-1];
 
 reg  [15:0] dq_out = 0;
 reg         dq_oe  = 0;
-assign DQ = dq_oe ? dq_out : 16'bz;
+generate
+	if (DQ_RETURN_PS > 0) begin : g_delayed_read_driver
+		assign #(DQ_RETURN_PS) DQ = dq_oe ? dq_out : 16'bz;
+	end else begin : g_ideal_read_driver
+		assign DQ = dq_oe ? dq_out : 16'bz;
+	end
+endgenerate
 
 wire [2:0] cmd = {nRAS, nCAS, nWE};
 localparam [2:0] C_NOP = 3'b111, C_ACT = 3'b011, C_RD = 3'b101, C_WR = 3'b100,

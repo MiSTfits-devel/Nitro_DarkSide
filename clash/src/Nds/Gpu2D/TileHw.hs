@@ -98,6 +98,7 @@ module Nds.Gpu2D.TileHw
   , tileStep
     -- * Circuit
   , tileHw
+  , tileHwExtPort
   , tileHwTopEntity
     -- * Encodings
   , layerBackdrop
@@ -250,6 +251,7 @@ data RamOps = RamOps
   , opObjRd  :: !Slot
   , opObjWr  :: !(Maybe (Slot, BitVector 64))
   , opExtRd  :: !(Unsigned 12)
+  , opExtDemand :: !(Maybe ExtAddr) -- ^ only on a selected extended OBJ colour
   , opExtWr  :: !(Vec 2 (Maybe (Unsigned 12, BitVector 16)))
   } deriving (Eq, Show, Generic, NFDataX)
 
@@ -850,6 +852,7 @@ tileStep (St c d o) inp q = (St c' d' o', out, ops)
       , opObjRd = resize wr'
       , opObjWr = if take' && not isMapResp && not isRowResp then Just (resize objRcv, respData) else Nothing
       , opExtRd = if objWins then unpack (slice d11 d0 lb) else 0
+      , opExtDemand = if useExt then Just (unpack (pack eng ++# slice d11 d0 lb)) else Nothing
       , opExtWr = extWr False :> extWr True :> Nil }
 
 -- | A placeholder for the column logic when no sprite is latched (its
@@ -872,6 +875,19 @@ tileHw
   -> Signal dom TileIn -> Signal dom TileOut
 tileHw clk rst en inp = out
   where
+    (out, ops) = tileHwExtPort clk rst en inp extQ
+    extRam i = blockRam clk en (replicate (SNat @4096) 0) (opExtRd <$> ops) ((!! i) . opExtWr <$> ops)
+    extQ = bundle (extRam (0 :: Int) :> extRam 1 :> Nil)
+
+-- | Same tile pipeline, without private OBJ extended palette RAM. The
+-- caller supplies the previous enabled step's physical palette read and
+-- may stall the pipeline (and ALL its internal RAMs) on a missing word.
+tileHwExtPort
+  :: forall dom. KnownDomain dom
+  => Clock dom -> Reset dom -> Enable dom -> Signal dom TileIn
+  -> Signal dom (Vec 2 (BitVector 16)) -> (Signal dom TileOut, Signal dom RamOps)
+tileHwExtPort clk rst en inp extQ = (out, ops)
+  where
     -- control, datapath and output registers built separately (see 'St')
     reg :: NFDataX a => (St -> a) -> Signal dom a
     reg f = register clk rst en (f stInit) (f <$> st')
@@ -886,8 +902,6 @@ tileHw clk rst en inp = out
     lbQ = blockRam clk en (replicate (SNat @1024) 0) (opLbRd <$> ops) (opLbWr <$> ops)
     descQ = blockRam clk en (replicate (SNat @64) (unpack 0)) (opDescRd <$> ops) (opDescWr <$> ops)
     objQ = blockRam clk en (replicate (SNat @64) 0) (opObjRd <$> ops) (opObjWr <$> ops)
-    extRam i = blockRam clk en (replicate (SNat @4096) 0) (opExtRd <$> ops) ((!! i) . opExtWr <$> ops)
-    extQ = bundle (extRam (0 :: Int) :> extRam 1 :> Nil)
 
 data TopOut = TopOut
   { tReady    :: Bool
